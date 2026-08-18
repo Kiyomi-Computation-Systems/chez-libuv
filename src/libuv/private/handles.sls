@@ -267,7 +267,16 @@
   ;;     design spec's own record row, is not.
   ;;
   ;; `read-buf` is a uptr (0 when there is none), `read-buf-len` its size in
-  ;; bytes, and `reading?` mirrors whether uv_read_start is currently active.
+  ;; bytes.
+  ;;
+  ;; `reading?` RECORDS CALLER INTENT -- a successful uv-read-start! not yet
+  ;; followed by uv-read-stop! -- NOT libuv's live read state (final-review
+  ;; triage, Task 9 Minors; decided post-v0.1). libuv clears its own
+  ;; UV_HANDLE_READING on EOF and stops the watcher on read errors, so a
+  ;; field that mirrored libuv would need per-arm knowledge of stream.c that
+  ;; varies across the supported 1.x range; intent needs none. The EOF and
+  ;; error dispatchers therefore deliberately leave it set. No production
+  ;; code reads it today; tests/test-tcp.sps locks the semantics in by name.
   (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
     (parent uv-handle-record)
     (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!)

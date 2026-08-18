@@ -1336,6 +1336,17 @@
   (list s-fires-before-direct s-eof-before-direct)
   (list s-data-fires s-eof-fires))
 
+;; reading? records CALLER INTENT -- started and not yet stopped -- not
+;; libuv's live read state (the handles.sls record comment; final-review
+;; triage decision). At this point s-peer has been delivered a real EOF
+;; (the shutdown section above) AND an error (the ENOBUFS arm just now),
+;; and the flag must have survived both: only uv-read-stop! clears it.
+(test-equal "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!"
+  '(reading not-reading)
+  (list (if (tcp-reading? s-peer) 'reading 'not-reading)
+        (begin (uv-read-stop! s-peer)
+               (if (tcp-reading? s-peer) 'reading 'not-reading))))
+
 ;; Design spec S5's tolerance rule, on the read path: a read completion can
 ;; be queued behind a uv_close, and the handle it names is 'closing by the
 ;; time it is delivered. Refusing to deliver there would drop the EOF a
