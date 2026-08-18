@@ -79,10 +79,13 @@ jobs:
       - name: Build (vendored path)
         run: make HAVE_PKG=no build
 
-      # The stamp trick in the Makefile's $(ACQ_STAMP) forces a relink here:
-      # without it, the pkg-config-linked shim above would still be sitting
+      # The Makefile's $(ACQ_STAMP) plus `relink-guard` force a relink here:
+      # without them, the pkg-config-linked shim above would still be sitting
       # in build/lib and this step would silently test the SAME artifact
-      # twice instead of the vendored one.
+      # twice instead of the vendored one. The stamp alone is not enough --
+      # it compares mtimes, and make 3.81 does that at one-second granularity
+      # (see the guard's comment in the Makefile); this runner's make 4.x
+      # would have got away with it.
       - name: Check purity of native-free suites (vendored path)
         run: make HAVE_PKG=no check-purity
 
@@ -137,6 +140,24 @@ jobs:
           rm -f tests/test-aaci-sabotage.sps
           echo "test target correctly failed, and no suite was masked"
 
+      # LAST, because it starts with `make clean`. A release guard that never
+      # runs in CI is a comment: this is the step that proves `make prod`
+      # really produces a counters-free shim (tests/check-prod.sps fails
+      # unless every counter reads zero while a loop and a bound tcp handle
+      # are demonstrably alive) and that the following `make build` relinks
+      # the dev artifact back, rather than leaving a release build in place
+      # for dev callers. pkg-config is present on this runner, so `prod`
+      # links against the system libuv and rebuilds nothing vendored.
+      - name: Release build guard (make prod -> check-prod)
+        run: |
+          make prod
+          make build
+          if make check-prod; then
+            echo "::error::check-prod passed against a dev shim"
+            exit 1
+          fi
+          echo "check-prod correctly refused the dev shim"
+
   macos:
     name: macos (pkg-config + vendored, no leak claim)
     runs-on: macos-latest
@@ -177,3 +198,18 @@ jobs:
       # read a green result here as "no leaks" -- that is the Linux job's job.
       - name: Memory (ASan, no leak detection)
         run: make test-memory
+
+      # Same guard as the linux job, and it is worth running on both: the
+      # relink it depends on is a make-version-sensitive question (macOS
+      # ships make 3.81, whose one-second mtime granularity is what
+      # `relink-guard` exists to defeat). LAST, because `prod` starts with
+      # `make clean`.
+      - name: Release build guard (make prod -> check-prod)
+        run: |
+          make prod
+          make build
+          if make check-prod; then
+            echo "::error::check-prod passed against a dev shim"
+            exit 1
+          fi
+          echo "check-prod correctly refused the dev shim"
