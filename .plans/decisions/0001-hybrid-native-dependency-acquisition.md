@@ -1,6 +1,6 @@
 # ADR-0001: Acquire libuv via pkg-config with a pinned vendored submodule fallback, shared-only
 
-- **Status:** Proposed — to be accepted with Stage 0 spike evidence
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md)

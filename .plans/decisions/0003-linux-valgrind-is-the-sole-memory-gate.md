@@ -1,6 +1,6 @@
 # ADR-0003: Linux Valgrind is the sole memory-leak gate; macOS ASan is supplementary
 
-- **Status:** Proposed — to be accepted with Stage 0 spike evidence
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md)

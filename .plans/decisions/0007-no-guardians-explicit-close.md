@@ -1,6 +1,6 @@
 # ADR-0007: No guardians — `uv_close` is always explicit, never GC-driven
 
-- **Status:** Proposed — to be accepted with Stage 0 spike evidence
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0008](0008-static-trampolines-and-handle-registry.md)
