@@ -240,6 +240,24 @@ for the same decision is `test-tcp.sps`'s "the in-flight write request is
 registered against its handle's loop", which covers the write request's
 registration directly.
 
+> **Addendum (Task 9, Stage 5).** Mutation 19's gap is now closed by a
+> detector of its own rather than by the write request's twin.
+> `tests/test-tcp.sps` gained **"the in-flight connect request is registered
+> against its handle's loop"** — the connect request captured from
+> `connect-loopback!`, with its `registry-loop-of` asserted while the request
+> is still in flight, which is the only window in which its entry exists. A
+> connect request that is never registered now fails that row by name instead
+> of hanging the suite. Nothing above this line was rewritten; this is the
+> only change to the Stage 4 record.
+>
+> Stage 5 also answers the fixture weakness that turned this mutation into a
+> hang in the first place: `uv-run 'once` blocks when nothing is due, so
+> `run-until`'s iteration cap never got to count. `tests/uv-testing.sls` now
+> also provides `run-until/ticking` (see `.plans/stage-5-mutation-log.md`,
+> "What the first pass changed"). The Stage 4 rows were deliberately left on
+> plain `run-until` — they are not re-verified here, and a later stage that
+> touches them should move them over.
+
 
 ## Verification runs behind this log
 
