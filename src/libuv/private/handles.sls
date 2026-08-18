@@ -580,20 +580,24 @@
   ;; callbacks land on a 'closing handle (an in-flight write losing its race
   ;; against uv_close completes with 'ECANCELED), and refusing to deliver
   ;; there would drop the one notification that says the block is gone.
-  (define (complete-request! name who count-free! req-ptr status)
-    (let ((req (registry-ref req-ptr)))
+  ;; `block-ptr`, not `req-ptr`: the latter would shadow the record accessor
+  ;; of the same name (final-review triage, Task 8 Minors). The name also
+  ;; says what it is -- the address of the whole co-allocated block, which
+  ;; is what gets freed.
+  (define (complete-request! name who count-free! block-ptr status)
+    (let ((req (registry-ref block-ptr)))
       (if (uv-req? req)
           (let ((loop (handle-loop (req-handle req)))
                 (on-complete (req-on-complete req)))
-            (registry-deregister! req-ptr)
-            (free! req-ptr)
+            (registry-deregister! block-ptr)
+            (free! block-ptr)
             (count-free!)
             (set-req-ptr! req 0)
             (when on-complete
               (dispatch-guarded
                loop
                (lambda () (on-complete (status->err status who))))))
-          (record-orphan-callback! name req-ptr))))
+          (record-orphan-callback! name block-ptr))))
 
   ;; The write payload lives INSIDE the write request's own block (design
   ;; spec S7: "exactly one foreign-alloc, sized for
