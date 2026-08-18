@@ -112,7 +112,10 @@ asan.log*
 lsan.log*
 *.valgrind
 vgcore.*
-core
+# Root-level only (leading `/`): an unanchored `core` would also match any
+# future directory named core anywhere in the tree (e.g. src/libuv/core/),
+# silently dropping it from `git add`. Real core dumps land at the repo root.
+/core
 # PID-suffixed, not a bare extension wildcard: an unqualified `core.*` would
 # also match a fixture literally named core.<word>, silently dropping it
 # from `git add`. Real core dumps are core.<pid>, never core.<word>.
