@@ -7,9 +7,19 @@ UNAME_S     := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   SHLIB_EXT := dylib
   SHLIB_LDFLAGS := -dynamiclib
+  CFLAGS_POSIX :=
 else
   SHLIB_EXT := so
   SHLIB_LDFLAGS := -shared -fPIC
+  # glibc hides POSIX types behind feature-test macros under -std=c99's
+  # strict mode -- notably pthread_rwlock_t, which libuv's own
+  # <uv/unix.h> uses and which our -std=c99 (kept deliberately strict,
+  # see CFLAGS_BASE below) would otherwise leave undeclared. macOS's
+  # headers expose it regardless of -std, which is why this was invisible
+  # until Linux CI's glibc caught it. _POSIX_C_SOURCE=200809L (POSIX.1-2008)
+  # is what pthread_rwlock_t needs; _DEFAULT_SOURCE restores the other
+  # glibc/BSD extensions a bare _POSIX_C_SOURCE would otherwise suppress.
+  CFLAGS_POSIX := -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
 endif
 
 BUILD_DIR   := build
@@ -19,7 +29,7 @@ CONFIG_SLS  := src/libuv/private/config.sls
 VENDOR_DIR  := vendor/libuv
 VENDOR_BUILD:= $(BUILD_DIR)/vendor
 
-CFLAGS_BASE := -std=c99 -Wall -Wextra -Werror -Wconversion -Wshadow -Wpointer-arith -fPIC
+CFLAGS_BASE := -std=c99 -Wall -Wextra -Werror -Wconversion -Wshadow -Wpointer-arith -fPIC $(CFLAGS_POSIX)
 CFLAGS_DEV  := $(CFLAGS_BASE) -g -O0 -DCHEZ_LIBUV_DEBUG_COUNTERS
 CFLAGS_PROD := $(CFLAGS_BASE) -O2
 
