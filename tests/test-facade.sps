@@ -236,6 +236,16 @@
         ((uv-errno-error? err) (uv-errno-error-errno err))
         (else (list 'unexpected err))))
 
+;; The `(bv start end)` span an on-data callback is handed, copied out. Spelt
+;; here rather than taken from (uv-testing) for the same reason the loopback
+;; helpers are not used: nothing in this suite may stand between it and the
+;; facade.
+(define (facade-span->bytevector bv start end)
+  (let* ((n (- end start))
+         (out (make-bytevector n)))
+    (bytevector-copy! bv start out 0 n)
+    out))
+
 (define fl (make-uv-loop))
 (define fserver (make-uv-tcp fl))
 
@@ -254,11 +264,26 @@
 (define f-connect-err 'connect-cb-never-fired)
 (define f-write-err 'write-cb-never-fired)
 (define f-shutdown-err 'shutdown-cb-never-fired)
+(define f-read 'on-data-never-fired)
+(define f-eof 'on-eof-never-fired)
+(define f-read-error 'on-error-never-fired)
 
 (uv-listen! fserver 128
             (lambda (err)
               (collect)
-              (when (not err) (set! f-accepted (uv-accept! fserver)))))
+              (when (not err)
+                (set! f-accepted (uv-accept! fserver))
+                (uv-read-start! f-accepted
+                                (lambda (bv start end)
+                                  (collect)
+                                  (set! f-read (utf8->string
+                                                (facade-span->bytevector
+                                                 bv start end))))
+                                (lambda () (collect) (set! f-eof 'eof))
+                                (lambda (rerr)
+                                  (collect)
+                                  (set! f-read-error
+                                        (facade-err->symbol rerr)))))))
 
 (define fclient (make-uv-tcp fl))
 
@@ -287,7 +312,8 @@
 (let drain ((i 0))
   (when (and (< i 32)
              (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
-                 (eq? f-accepted 'never-accepted)))
+                 (eq? f-accepted 'never-accepted)
+                 (eq? f-read 'on-data-never-fired)))
     (uv-run fl 'once)
     (drain (+ i 1))))
 
@@ -302,6 +328,18 @@
 
 (test-equal "uv-shutdown! is re-exported and its completion reports success"
   'no-error (facade-err->symbol f-shutdown-err))
+
+(test-equal "uv-read-start! is re-exported and delivered the payload to the peer"
+  "facade" f-read)
+
+(test-equal "reading through the facade fired no error callback"
+  'on-error-never-fired f-read-error)
+
+(test-equal "uv-read-stop! is re-exported and stops a running read"
+  'stopped
+  (guard (e (#t (list 'raised e)))
+    (uv-read-stop! f-accepted)
+    'stopped))
 
 (uv-loop-teardown! fl)
 

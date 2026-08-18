@@ -5,14 +5,22 @@
 ;;; connection plumbing shared across suites").
 ;;;
 ;;; Stage 3 needed exactly one procedure. Stage 4 adds the loopback plumbing
-;;; S11 also mentions, now that there is a suite to exercise it.
+;;; S11 also mentions, now that there is a suite to exercise it. Stage 5 adds
+;;; the two pieces a read test needs and a write test did not: a payload that
+;;; is the same on every run, and somewhere to put the spans that arrive.
 ;;;
 ;;; NOT pure: (libuv loop) reaches (libuv private native). No suite importing
 ;;; this library may appear in the Makefile's PURE_TESTS.
 (library (uv-testing)
-  (export run-until bind-loopback! connect-loopback! loopback-address)
+  (export run-until run-until/ticking
+          bind-loopback! connect-loopback! loopback-address
+          seeded-bytes
+          make-byte-collector byte-collector? collect-span!
+          collector-count collector-bytes)
   (import (rnrs)
           (libuv loop)
+          (libuv handle)
+          (libuv timer)
           (libuv tcp))
 
   ;; Step the loop until `pred` holds, or until `max-iters` steps have been
@@ -51,6 +59,49 @@
             ((>= i max-iters) 'iterations-exhausted)
             (else (uv-run loop 'once) (step (+ i 1))))))
 
+  ;; run-until, with a 1 ms repeating timer armed for the duration.
+  ;;
+  ;; WHY THIS EXISTS. `uv-run loop 'once` BLOCKS until the loop's next due
+  ;; event. That is what makes a 1 ms timer test deterministic, but it also
+  ;; means a predicate that never holds -- on a loop whose only remaining
+  ;; handles are waiting on a socket that will never be readable -- leaves
+  ;; the FIRST step blocked in the kernel, where run-until's iteration cap
+  ;; never gets to count. The suite then hangs instead of failing, and design
+  ;; spec S11's "failure is iteration exhaustion, never wall-clock elapsed
+  ;; time" quietly stops being true.
+  ;;
+  ;; A timer that fires every millisecond gives 'once something to return
+  ;; for, so the cap does the deciding again and a broken delivery path
+  ;; produces 'iterations-exhausted -- a NAMED assertion failure -- rather
+  ;; than a stuck process. This was measured, not theorised: four Stage 5
+  ;; mutations (an EOF routed to on-error, a span framed wrongly, an alloc_cb
+  ;; that answers a corrupt buffer) all hung the suite before this existed
+  ;; and all fail by name with it (.plans/stage-5-mutation-log.md).
+  ;;
+  ;; EVERY WAIT WHOSE PREDICATE DEPENDS ON A CALLBACK BEING DELIVERED SHOULD
+  ;; USE THIS ONE. Plain run-until is right where something else already
+  ;; guarantees the loop keeps waking (a timer of the suite's own), or where
+  ;; the predicate is about a timer in the first place.
+  ;;
+  ;; The ticker is closed before returning, and its close is DRAINED, so a
+  ;; caller that goes straight from here to a debug-counter assertion does
+  ;; not see this fixture's own handle still live.
+  (define (run-until/ticking loop pred max-iters)
+    (let ((ticker (make-uv-timer loop)))
+      ;; The tick callback deliberately does nothing -- not even (collect).
+      ;; This timer is a fixture whose only job is to wake the loop; design
+      ;; spec S11's GC-pressure rule is carried by the callbacks UNDER TEST,
+      ;; every one of which collects, and a full collection every millisecond
+      ;; for the length of a megabyte transfer would buy no coverage at a
+      ;; cost measured in seconds.
+      (uv-timer-start! ticker (lambda (t) #f) 1 1)
+      (let ((outcome (run-until loop pred max-iters)))
+        (uv-timer-stop! ticker)
+        (uv-close! ticker)
+        ;; A close callback is already pending, so these steps cannot block.
+        (run-until loop (lambda () (eq? (uv-handle-state ticker) 'closed)) 8)
+        outcome)))
+
   ;; --- loopback plumbing (ADR-0010, design spec S11) ---------------------
   ;; "Every TCP test binds 127.0.0.1:0, reads the real ephemeral port back
   ;; via uv_tcp_getsockname, and connects to it from the same loop and
@@ -75,6 +126,73 @@
 
   ;; (connect-loopback! tcp port on-connect) -- starts a connect to
   ;; 127.0.0.1:port. The connect COMPLETES in a later uv-run, like every
-  ;; other callback in this binding.
+  ;; other callback in this binding. Answers the request record uv-tcp-connect!
+  ;; returned, so a caller can assert on the in-flight request.
   (define (connect-loopback! tcp port on-connect)
-    (uv-tcp-connect! tcp loopback-address port on-connect)))
+    (uv-tcp-connect! tcp loopback-address port on-connect))
+
+  ;; --- deterministic payloads (design spec S11) ---------------------------
+  ;; A linear congruential generator with a CALLER-SUPPLIED seed and no other
+  ;; input. Deliberately not `random` and deliberately not the clock: a suite
+  ;; that compares a megabyte byte-for-byte has to be able to say which byte
+  ;; differed and have that mean the same thing on the next run. The
+  ;; constants are the classic ANSI-C ones; the high bits are the ones taken,
+  ;; because the low bits of an LCG modulo a power of two have short periods
+  ;; (bit 0 alternates), which would make a "random" payload that a wrong
+  ;; offset could still match.
+  ;;
+  ;; This is a test fixture, not a source of randomness: nothing here is
+  ;; suitable for anything but filling a buffer with bytes that are stable,
+  ;; unequal to their neighbours, and not all the same value.
+  (define lcg-modulus 2147483648)       ; 2^31
+  (define lcg-multiplier 1103515245)
+  (define lcg-increment 12345)
+
+  (define (seeded-bytes n seed)
+    (unless (and (integer? n) (exact? n) (>= n 0))
+      (assertion-violation 'seeded-bytes "length must be a non-negative exact integer" n))
+    (unless (and (integer? seed) (exact? seed) (>= seed 0))
+      (assertion-violation 'seeded-bytes "seed must be a non-negative exact integer" seed))
+    (let ((bv (make-bytevector n)))
+      (let fill ((i 0) (x (mod seed lcg-modulus)))
+        (if (= i n)
+            bv
+            (let ((next (mod (+ (* lcg-multiplier x) lcg-increment) lcg-modulus)))
+              (bytevector-u8-set! bv i (mod (div next 65536) 256))
+              (fill (+ i 1) next))))))
+
+  ;; --- accumulating what a read delivered ---------------------------------
+  ;; Somewhere for on-data to put its spans, plus the running byte count a
+  ;; run-until predicate can test without concatenating a megabyte on every
+  ;; loop iteration.
+  ;;
+  ;; IT KEEPS THE CALLER'S BYTEVECTOR RATHER THAN COPYING IT, on purpose.
+  ;; ADR-0009 says every on-data delivery is a FRESH copy; a collector that
+  ;; copied immediately would be just as green against a binding that handed
+  ;; the same scratch bytevector out on every read, because the corruption
+  ;; would happen after the copy. Holding the references means the
+  ;; byte-for-byte comparison at the end of a chunked transfer is also the
+  ;; assertion that each delivery was its own object.
+  (define-record-type (byte-collector make-byte-collector byte-collector?)
+    (fields (mutable spans collector-spans set-collector-spans!)
+            (mutable count collector-count set-collector-count!))
+    (protocol (lambda (new) (lambda () (new '() 0)))))
+
+  (define (collect-span! collector bv start end)
+    (set-collector-spans! collector
+                          (cons (list bv start end) (collector-spans collector)))
+    (set-collector-count! collector
+                          (+ (collector-count collector) (- end start))))
+
+  ;; Everything collected so far, in arrival order, as one bytevector.
+  (define (collector-bytes collector)
+    (let ((out (make-bytevector (collector-count collector))))
+      (let copy ((spans (reverse (collector-spans collector))) (at 0))
+        (if (null? spans)
+            out
+            (let* ((span (car spans))
+                   (bv (car span))
+                   (start (cadr span))
+                   (end (caddr span)))
+              (bytevector-copy! bv start out at (- end start))
+              (copy (cdr spans) (+ at (- end start)))))))))

@@ -34,7 +34,11 @@
         ;; uv-is-closing is libuv's own answer to "is this handle closing?",
         ;; used below to cross-check the Scheme-side state field against the
         ;; C-side flag rather than against itself.
-        (only (libuv private native) live-counts dispatcher-ref uv-is-closing)
+        ;; alloc-zeroed / free! are here for the ONE row group that has to
+        ;; register a request block of its own to make a dispatcher raise
+        ;; before its guard -- see "the dispatch seam" below.
+        (only (libuv private native)
+              live-counts dispatcher-ref uv-is-closing alloc-zeroed free!)
         (uv-testing)
         (only (chezscheme) collect))
 
@@ -769,56 +773,51 @@
   '((timer . 424242) (close . 424243))
   (list-tail (orphan-callback-events) orphans-before))
 
-;; --- the dispatch seam Stages 4 and 5 plug into --------------------------
+;; --- the dispatch seam, now that every slot holds a real dispatcher ------
 ;; The eight slots in (libuv private native) are installed exactly once, by
 ;; (libuv private handles), at library initialisation. The callback types no
-;; stage has implemented yet are installed as raising stubs that the
+;; stage had implemented yet were installed as raising stubs that the
 ;; installed closure reaches THROUGH a mutable table -- so a later stage
 ;; replaces one by name, with no second install-callback-dispatchers! call.
 ;;
-;; STAGE 4 SPENT FOUR OF THE SIX. 'connection, 'write-done, 'shutdown and
-;; 'connect now hold real dispatchers, so they are no longer stubs and are
-;; not listed below; tests/test-tcp.sps asserts that they are real rather
-;; than stubbed (a stub and a real dispatcher on an unregistered pointer
-;; leave the SAME orphan record behind, so the discriminating call has to be
-;; made against a registered TCP pointer, which needs (libuv tcp)). What is
-;; left here is Stage 5's pair.
-;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so. The
-;; six stubs raise -- but the closure libuv actually calls is the seam's, and
-;; `dispatch-guarded` cannot help here: it runs INSIDE timer-dispatch and
-;; close-dispatch, i.e. only once a dispatcher has been entered. An unguarded
-;; seam would deliver these raises straight into a C frame (spike FINDINGS
-;; Q2: exit 255, no teardown). So each call must return normally AND leave a
-;; record behind -- containment without a record would be a silent swallow,
-;; which is worse than the crash.
-(define stub-orphans-before (length (orphan-callback-events)))
-
-(for-each
- (lambda (name)
-   (test-equal (string-append "the " (symbol->string name)
-                              " stub's raise is contained by the seam, not delivered into C")
-     'contained
-     (guard (e (#t (list 'escaped-into-the-caller e)))
-       ((dispatcher-ref name) 909090 0 0)
-       'contained)))
- '(alloc read))
-
-;; 909090 is registered to nothing, so there is no loop to record against and
-;; the orphan list is where the containment has to show up. The pointer is
-;; carried through, so a seam that recorded a placeholder is visible too.
-(test-equal "every contained stub raise was recorded, in order, naming its callback type"
-  '((alloc . 909090) (read . 909090))
-  (list-tail (orphan-callback-events) stub-orphans-before))
-
-;; The other half of the fork: when the pointer IS registered, the seam has
-;; an error cell to use, so a dispatcher raise surfaces through the
-;; documented channel (uv-run) instead of a list nobody reads.
+;; THE STUBS ARE GONE. Stage 4 spent four of the six ('connection,
+;; 'write-done, 'shutdown, 'connect) and Stage 5 spent the last two ('alloc,
+;; 'read), so every name now holds a real dispatcher and the rows that used
+;; to fire a stub and watch the seam contain its raise cannot be written that
+;; way any more. This is what replaced them, and the property under test is
+;; unchanged.
+;;
+;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so.
+;; `dispatch-guarded` protects the USER's callback but runs INSIDE a
+;; dispatcher, so anything raised before a dispatcher gets that far -- a bug
+;; in its own registry lookup, or a registry entry whose contents are not the
+;; shape it expects -- is covered by the guard around the installed closure
+;; and by nothing else. Unguarded, spike FINDINGS Q2 applies: exit 255, no
+;; teardown, no foreign-free.
+;;
+;; With no stubs left, the way to make a dispatcher raise before its own
+;; guard is a request record whose `handle` field is not a handle:
+;; complete-request! reads the owning loop off that field FIRST (it has to --
+;; the steps after it leave the record pointing at nothing), so the record
+;; accessor raises there, outside every dispatch-guarded. That is a shipped
+;; code path reached through exported constructors, not a test-only hook;
+;; this binding has no test-only hooks in its production libraries.
 (define seam-loop (make-uv-loop))
-(define seam-timer (make-uv-timer seam-loop))
+(define seam-block (alloc-zeroed 64))
+(define seam-req (%make-uv-req-record seam-block 'write 'not-a-handle #f))
 (define seam-orphans-before (length (orphan-callback-events)))
 
-((dispatcher-ref 'alloc) (handle-ptr seam-timer) 0 0)
+(registry-register! seam-block 'write-req seam-loop seam-req)
 
+(test-equal "a dispatcher raising before its own guard does not escape into its caller"
+  'contained
+  (guard (e (#t (list 'escaped-into-the-caller e)))
+    ((dispatcher-ref 'write-done) seam-block 0)
+    'contained))
+
+;; The registered fork of the seam's guard: the entry knows its loop, so the
+;; contained object goes on that loop's error cell rather than into the
+;; orphan list.
 (test-equal "a contained raise on a REGISTERED pointer goes to the loop, not the orphan list"
   0 (- (length (orphan-callback-events)) seam-orphans-before))
 
@@ -828,35 +827,46 @@
   'callback-error
   (if (uv-callback-error? seam-raise) 'callback-error 'not-callback-error))
 
-;; Pinned to the who-condition the ALLOC stub carries, not merely to
-;; "some &uv-error": every stub raises the same SHAPE, so a seam that
-;; contained the wrong callback type's raise -- or that manufactured a
-;; condition of its own -- would satisfy `uv-error?` just as well.
-(test-equal "...carrying the stub's own condition as its cause"
-  '(uv-error alloc)
+;; Pinned to WHAT was contained, not merely to "something was". The cause has
+;; to be the condition the dispatcher itself raised -- an assertion from a
+;; record accessor, which is emphatically not one of this binding's own
+;; condition types -- so a seam that manufactured a &uv-error of its own
+;; instead of carrying the original through fails here.
+(test-equal "...carrying the raise the dispatcher actually made, not one of the seam's own"
+  '(assertion not-a-uv-error)
   (let ((cause (uv-callback-error-cause seam-raise)))
-    (list (if (uv-error? cause) 'uv-error 'not-the-stub-condition)
-          (if (who-condition? cause) (condition-who cause) 'no-who))))
+    (list (if (assertion-violation? cause) 'assertion 'not-an-assertion)
+          (if (uv-error? cause) 'a-uv-error 'not-a-uv-error))))
+
+;; The dispatcher raised before it could pop or free anything, so this suite
+;; owns the cleanup -- and the balance rows at the end of the file are what
+;; would notice if it did not happen.
+(registry-deregister! seam-block)
+(free! seam-block)
 
 (uv-loop-teardown! seam-loop)
 
-(install-dispatch-procedure! 'alloc (lambda args (list 'replaced-alloc args)))
-
-(test-equal "install-dispatch-procedure! replaces a stub without a second slot install"
-  '(replaced-alloc (1 2 3))
-  ((dispatcher-ref 'alloc) 1 2 3))
-
-(test-equal "replacing an already-replaced dispatcher is refused, naming who and why"
+;; --- the seam's install-once rule, with every name spoken for ------------
+;; Every name is installed, so every install-dispatch-procedure! call from
+;; here on is refused. What each row below pins down is WHICH refusal, and
+;; that a refused call changes nothing.
+(test-equal "replacing a dispatcher a later stage installed is refused, naming who and why"
   '(uv-install-dispatch-procedure! dispatch-procedure-already-installed)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
-    (install-dispatch-procedure! 'alloc (lambda args 'again))
+    (install-dispatch-procedure! 'read (lambda args 'hijacked))
     'no-raise))
 
-(test-equal "the refused replacement did not rebind the slot"
-  '(replaced-alloc (1 2 3))
-  ((dispatcher-ref 'alloc) 1 2 3))
+;; A hijacked slot would answer 'hijacked and record nothing; the real read
+;; dispatcher cannot resolve 606060, so it records an orphan naming itself.
+;; That is the discriminating observation, and it is why this row calls the
+;; slot rather than inspecting it.
+(test-equal "the refused replacement left the real read dispatcher in place"
+  '((read . 606060))
+  (let ((before (length (orphan-callback-events))))
+    ((dispatcher-ref 'read) 606060 0 0)
+    (list-tail (orphan-callback-events) before)))
 
 (test-equal "replacing this stage's own timer dispatcher is refused, naming who and why"
   '(uv-install-dispatch-procedure! dispatch-procedure-already-installed)
@@ -874,6 +884,9 @@
     (install-dispatch-procedure! 'not-a-callback-type (lambda args 'nope))
     'no-raise))
 
+;; The argument checks run in a fixed order, and this row is what says so:
+;; 'read is already installed, so a not-a-procedure argument would be refused
+;; by EITHER check -- and the reason it names is the one that runs first.
 (test-equal "install-dispatch-procedure! rejects a dispatcher that is not a procedure"
   '(uv-install-dispatch-procedure! not-a-procedure)
   (guard (e ((uv-invalid-argument? e)
@@ -881,14 +894,6 @@
             (#t 'wrong-condition))
     (install-dispatch-procedure! 'read 'not-a-procedure)
     'no-raise))
-
-;; Still the STUB, not some half-installed replacement: only the stub raises,
-;; and only a raise leaves an orphan record behind.
-(test-equal "the refused install left the read stub in place"
-  '((read . 606060))
-  (let ((before (length (orphan-callback-events))))
-    ((dispatcher-ref 'read) 606060 0 0)
-    (list-tail (orphan-callback-events) before)))
 
 ;; --- balance -------------------------------------------------------------
 (uv-loop-teardown! l)
