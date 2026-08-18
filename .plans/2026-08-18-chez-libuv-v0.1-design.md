@@ -1,7 +1,8 @@
 # Design Spec: chez-libuv v0.1
 
 - **Date:** 2026-08-18
-- **Status:** Proposed — Stage 0 spike pending; see [ADR index](#2-decisions-summary)
+- **Status:** Accepted (2026-08-18) — Stage 0 spike complete
+  (`spike/FINDINGS.md`); see [ADR index](#2-decisions-summary)
 - **Supersedes:** nothing. Refines `.plans/chez-http-server-architecture.md` §1
   (the transport-layer box in that diagram)
 - **Scope:** v0.1 of the Chez Scheme binding for libuv
@@ -44,8 +45,11 @@ abstraction this binding would otherwise have to design and justify.
 ## 2. Decisions summary
 
 Each row is an ADR under `.plans/decisions/`; the ADR carries the full
-context, alternatives, and consequences. All ten are `Status: Proposed` —
-Stage 0's spike produces the evidence that flips them to `Accepted`.
+context, alternatives, and consequences. All ten are
+`Status: Accepted (2026-08-18)`, flipped at Stage 0 exit on the evidence in
+`spike/FINDINGS.md`; 0002 and 0008 cite that evidence directly (Q1/Q2), the
+other eight had no spike dependency. ADR-0008's *decision* survived the spike
+unchanged, but its *rationale* was corrected by the Q2 finding — see §8.
 
 | ADR | Decision |
 |---|---|
@@ -123,8 +127,9 @@ never needed:
 4. **Pointer types are uniform.** Every handle, request, and buffer pointer
    crossing the boundary is declared `uptr`. `nread` (the read callback's
    signed byte count, which also carries `UV_EOF` and negative error codes)
-   is declared `ssize_t`, falling back to `iptr` if the spike's Q0 round-trip
-   shows Chez has no native `ssize_t` mapping. `define-ftype` is used for
+   is declared `ssize_t`, confirmed by spike Q3 to be a native Chez foreign
+   type — and confirmed load-bearing there, since binding it unsigned routes
+   `UV_EOF` into the data path as `2^64 − 4095`. `define-ftype` is used for
    exactly one type, `uv_buf_t` — the only libuv struct this binding
    constructs rather than merely receiving a pointer to.
 
@@ -286,8 +291,28 @@ the original condition type still matches. This wrapped re-raise on the way
 out of `uv-run` is the one sanctioned deliberate-escape path in the whole
 binding: raise inside a callback, catch around `uv-run`.
 
-This policy is contingent on Stage 0 spike Q2 confirming what a Scheme
-`raise` crossing a libuv C stack frame actually does; see
+**Why store-and-reraise, given that propagation actually works.** Stage 0
+spike Q2 (`spike/FINDINGS.md`) measured what a Scheme `raise` crossing a libuv
+C stack frame does, and refuted this design's original premise. A raise *does*
+propagate through libuv's C frames into a `guard` established outside the
+blocking `uv_run`, condition type and fields intact, and the loop object
+survives — a second `uv_run` afterwards runs normally and teardown returns `0`.
+The policy is kept anyway, for two measured reasons:
+
+- **Escaping silently loses events.** Whatever the abandoned libuv frame had
+  left to do that iteration does not happen, and nothing reports it. Raising
+  from a read callback (invoked from deep inside `uv__io_poll`) permanently
+  discarded a pending `UV_EOF` — it never arrived, even after a full drain —
+  while raising from a timer callback lost nothing. A failure mode that varies
+  with libuv's internal call depth is not something a caller can reason about.
+- **An unguarded raise terminates the process** (exit `255`, no teardown, no
+  `uv_loop_close`, no `foreign-free`). Guarding every trampoline body is
+  therefore mandatory regardless of which delivery policy is chosen.
+
+Store-and-reraise buys determinism and event completeness, not safety from an
+impossible unwind: `uv_run` returns through its own C epilogue with every
+callback libuv had queued already delivered, and the caller gets a loop in a
+defined state. See
 [ADR-0008](decisions/0008-static-trampolines-and-handle-registry.md).
 
 **Legal from inside a callback:** `uv-close!`, `uv-read-start!` /
