@@ -162,6 +162,19 @@
   ;; never a raw int (ADR-0006). Nothing is freed on that path: the loop is
   ;; still open and still usable, which is exactly what a caller who needs to
   ;; close their handles first requires.
+  ;;
+  ;; V0.2 DECISION (final review, Task 6 triage): a pending callback error is
+  ;; silently discarded when the caller skips the next uv-run and goes
+  ;; straight here -- the error cell lives on the record, nothing in this
+  ;; procedure reads it, and closing makes it unreachable. v0.1 ships that
+  ;; as-is: inventing a delivery channel at close time would change this
+  ;; procedure's contract (today it raises only for a running loop, a bad
+  ;; argument, or libuv's own errno). v0.2 must pick one deliberately --
+  ;; either re-raise the composed &uv-callback-error from here, exactly as
+  ;; uv-run's exit does, or document the discard as the contract. Until
+  ;; then: the error is only ever lost by calling THIS procedure directly;
+  ;; uv-run re-raises it, and uv-loop-teardown!'s drain delivers it after
+  ;; the close.
   (define (uv-loop-close! loop)
     (require-loop loop 'uv-loop-close!)
     (when (loop-running? loop)
@@ -169,6 +182,15 @@
     (when (eq? (loop-state loop) 'open)
       (let ((ptr (loop-pointer loop 'uv-loop-close!)))
         (uv-check (uv-loop-close ptr) 'uv-loop-close!)
+        ;; 'closed the INSTANT the native close succeeds, before the registry
+        ;; pop and the free: nothing after uv_loop_close can un-close the
+        ;; native loop, so a raise from a later step (unreachable today --
+        ;; the entry is registered and the pointer valid by construction)
+        ;; must not leave a record still claiming 'open over a loop libuv
+        ;; has already shut down, where a retried close! would hand the
+        ;; closed loop back to uv_loop_close. Final-review triage item;
+        ;; ordering rationale recorded in .plans/stage-2-mutation-log.md.
+        (set-loop-state! loop 'closed)
         (registry-deregister! ptr)
         (free! ptr)
         ;; Zeroed IMMEDIATELY at the freeing site (design spec S10): a freed
@@ -176,7 +198,6 @@
         ;; wrongly (spike FINDINGS Q1), so the stored pointer is the only
         ;; thing that can make a use-after-free detectable.
         (set-loop-ptr! loop 0)
-        (set-loop-state! loop 'closed)
         (count-loop-free!))))
 
   ;; An upper bound on drain iterations, not a timeout. Design spec S11:

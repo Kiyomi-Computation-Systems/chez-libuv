@@ -317,3 +317,21 @@ Recorded observations (informational, not assertions):
   design spec §3 scopes `(libuv)` to "re-exports + `uv-version(-compatible?)`",
   and `tests/test-facade.sps` reaches the second source through a renamed
   private import so the cross-check cannot be mistaken for a public API.
+
+## Post-v0.1 cleanup round (chore/post-v0.1-cleanup)
+
+**`uv-loop-close!` record-update ordering — property uncovered, and why.**
+Final-review triage moved `set-loop-state!` to run immediately after the
+`uv-check` on `uv_loop_close`, ahead of `registry-deregister!`/`free!`: once
+the native close has succeeded, nothing later can un-close it, so a raise
+from a later step must not leave a record still claiming `'open` over a loop
+libuv has already shut down (a retried `close!` would hand the closed loop
+straight back to `uv_loop_close`). No test watches this ordering fail, and
+that is recorded here rather than papered over: the window is unreachable
+through the public API — by the time `uv-check` has passed, the entry is
+registered and the pointer valid by construction, so `registry-deregister!`
+and `free!` cannot raise — and R6RS gives a suite no seam to make an imported
+`registry-deregister!` raise mid-close. The ordering is therefore asserted by
+this entry and the comment at the call site, not by a mutation; any future
+change that makes those steps fallible must bring the test this entry could
+not.
