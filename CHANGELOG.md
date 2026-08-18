@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+- **Added** `&uv-libuv-unavailable`, raised when libuv's own shared object
+  cannot be resolved or loaded — a subtype of `&uv-shim-unavailable`, so
+  guards on the parent keep matching (previously both failures were raised
+  as the parent, with the `path` field as the only discriminant).
+  Re-exported from `(libuv)`; sharper predicate `uv-libuv-unavailable?`.
+
 ## 0.1.0 — 2026-08-18
 
 The first release: a legible, low-level mirror of libuv's event loop, TCP

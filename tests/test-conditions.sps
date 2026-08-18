@@ -110,6 +110,49 @@
     (raise (make-uv-shim-unavailable "/sentinel/shim/path-7c2e"))
     'no-raise))
 
+;; --- &uv-libuv-unavailable: a SUBTYPE of &uv-shim-unavailable --------------
+;; The libuv shared object failing to load is a different failure from the
+;; shim failing to load, but v0.1 raised both as &uv-shim-unavailable with
+;; the path field as the only discriminant (README.org's condition table
+;; promised a subtype consideration). The subtype keeps the old contract --
+;; every uv-shim-unavailable? guard still matches -- while letting a caller
+;; ask the sharper question. Deliberately NOT in the sibling matrix below:
+;; it is a subtype, not a sibling, and the matrix's "own predicate only"
+;; rule does not apply to it.
+
+(test-equal "libuv-unavailable predicate accepts its own instance"
+  #t
+  (guard (e ((uv-libuv-unavailable? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-libuv-unavailable "/sentinel/libuv/path-9e4a"))
+    'no-raise))
+
+(test-equal "libuv-unavailable carries the attempted path through the inherited accessor"
+  "/sentinel/libuv/path-9e4a"
+  (guard (e ((uv-libuv-unavailable? e) (uv-shim-unavailable-path e))
+            (#t 'wrong-condition))
+    (raise (make-uv-libuv-unavailable "/sentinel/libuv/path-9e4a"))
+    'no-raise))
+
+(test-equal "libuv-unavailable IS a shim-unavailable: existing guards keep matching"
+  #t
+  (guard (e ((uv-shim-unavailable? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-libuv-unavailable "/sentinel/libuv/path-9e4a"))
+    'no-raise))
+
+(test-equal "libuv-unavailable is a uv-error"
+  #t
+  (guard (e ((uv-error? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-libuv-unavailable "/sentinel/libuv/path-9e4a"))
+    'no-raise))
+
+;; The direction that must NOT hold: a plain shim failure is not a libuv
+;; failure, or the sharper predicate would be no discrimination at all.
+(test-equal "a plain shim-unavailable is NOT a libuv-unavailable"
+  'not-libuv
+  (if (uv-libuv-unavailable? (make-uv-shim-unavailable "/sentinel/shim/path-7c2e"))
+      'libuv
+      'not-libuv))
+
 ;; --- &uv-version-incompatible (compiled runtime) --------------------------
 ;; Both fields are ints; distinct nonzero sentinels so a compiled/runtime
 ;; swap cannot hide behind two same-typed fields.
@@ -232,6 +275,12 @@
 ;; predicate, and must NOT satisfy any sibling's predicate. Looping over the
 ;; full instances x predicates matrix covers every pair, not just the one
 ;; example the brief names (handle-closed vs errno-error).
+;;
+;; &uv-libuv-unavailable is deliberately ABSENT from this catalog: it is a
+;; subtype of &uv-shim-unavailable, not a sibling, so the matrix's "own
+;; predicate only" rule does not describe it. Its cross-type behaviour --
+;; parent predicate matches, sharper predicate does not match the parent --
+;; is asserted in its own section above.
 
 (define sibling-catalog
   (list (list 'uv-errno-error

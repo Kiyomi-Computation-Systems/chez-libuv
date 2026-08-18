@@ -162,6 +162,13 @@
               (uv-constant-unavailable-name cu)
               'not-a-constant-unavailable))))
 
+(test-equal "&uv-libuv-unavailable is re-exported and subtypes &uv-shim-unavailable"
+  '(libuv-unavailable also-shim-unavailable "/nope/libuv")
+  (let ((e (make-uv-libuv-unavailable "/nope/libuv")))
+    (list (if (uv-libuv-unavailable? e) 'libuv-unavailable 'not-libuv-unavailable)
+          (if (uv-shim-unavailable? e) 'also-shim-unavailable 'not-shim-unavailable)
+          (uv-shim-unavailable-path e))))
+
 ;; --- the re-exported handle and timer surfaces --------------------------
 ;; Driven through the facade alone, for the same reason as the loop rows
 ;; above: every name below has to come from src/libuv.sls or this file does

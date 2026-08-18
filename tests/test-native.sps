@@ -1062,6 +1062,46 @@
     (load-shim a-real-non-library-file)
     'no-raise))
 
+;; --- the libuv leg: the SUBTYPE, through the same two procedures ---------
+;; native.sls's uv-loaded definition routes libuv's own shared objects
+;; through resolve-shim-path and load-shim with make-uv-libuv-unavailable,
+;; so a libuv-path failure is no longer mislabeled as the shim's (the
+;; final-review triage item). The maker argument is asserted here directly;
+;; tests/test-shim-loading.sps drives the real uv-loaded wiring end to end
+;; in a subprocess and greps for the subtype's name.
+;;
+;; Each row asserts the SHARPER predicate. The plain rows above prove the
+;; default maker still answers the parent type, so the pair together is what
+;; shows the argument actually selects the condition.
+(test-equal "resolve-shim-path raises the caller-supplied maker: the libuv leg gets the subtype"
+  '(libuv-unavailable "/no/such/libuv.dylib")
+  (guard (e ((uv-libuv-unavailable? e)
+             (list 'libuv-unavailable (uv-shim-unavailable-path e)))
+            (#t 'wrong-condition))
+    (resolve-shim-path "/no/such/libuv.dylib" #f make-uv-libuv-unavailable)
+    'no-raise))
+
+(test-equal "load-shim raises the caller-supplied maker on a real dlopen failure"
+  '(libuv-unavailable #t)
+  (guard (e ((uv-libuv-unavailable? e)
+             (list 'libuv-unavailable
+                   (string=? (uv-shim-unavailable-path e)
+                             a-real-non-library-file)))
+            (#t 'wrong-condition))
+    (load-shim a-real-non-library-file make-uv-libuv-unavailable)
+    'no-raise))
+
+;; The two-argument resolve-shim-path and one-argument load-shim keep their
+;; old contract: without a maker they still raise the PARENT type and not
+;; the subtype, so no existing caller's discrimination changed underneath it.
+(test-equal "without a maker, resolve-shim-path still raises the plain parent type"
+  'parent-only
+  (guard (e ((uv-libuv-unavailable? e) 'subtype)
+            ((uv-shim-unavailable? e) 'parent-only)
+            (#t 'wrong-condition))
+    (resolve-shim-path "/no/such/path.dylib" #f)
+    'no-raise))
+
 ;; The path this process actually resolved is the generated one, since the
 ;; suite runs with CHEZ_LIBUV_SHIM unset. Positive control for everything
 ;; above: if resolve-shim-path were broken in the other direction, the
