@@ -253,13 +253,17 @@ $(ACQ_STAMP): | $(LIB_DIR)
 	rm -f $(BUILD_DIR)/.acquisition-*
 	touch $@
 
-# The same mechanism for the build FLAVOR, and it is what makes `prod` and
-# `build` stop overwriting each other invisibly: flipping FLAVOR changes this
-# prerequisite's identity, so the shim relinks. Without it, `make prod &&
-# make test` would run the dev suites' counter rows against a counters-free
-# prod shim (they would rightly fail), and `make build` after `make prod`
-# would leave a release artifact in place for dev callers -- while `make prod
-# && package` shipped whatever the last link happened to be.
+# The same mechanism for the build FLAVOR: which flavor the artifact in
+# build/lib was linked as, recorded as a filename so that flipping FLAVOR
+# changes this prerequisite's identity. What is at stake is that `make prod
+# && make test` must not run the dev suites' counter rows against a
+# counters-free prod shim, that `make build` after `make prod` must not leave
+# a release artifact in place for dev callers, and that `make prod &&
+# package` must not ship whatever the last link happened to be.
+#
+# THIS STAMP RECORDS; IT DOES NOT ENFORCE. Being a prerequisite is not enough
+# to force the relink -- see `relink-guard` below, which is the half that
+# works.
 FLAVOR_STAMP := $(BUILD_DIR)/.flavor-$(FLAVOR)
 
 $(FLAVOR_STAMP): | $(LIB_DIR)

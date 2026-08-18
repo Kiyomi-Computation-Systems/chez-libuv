@@ -113,6 +113,11 @@
           (mutable deliveries client-deliveries set-client-deliveries!)
           (mutable writes-done client-writes-done set-client-writes-done!)
           (mutable write-error client-write-error set-client-write-error!)
+          ;; Its OWN field, not folded into write-error: a shutdown that
+          ;; failed and a write that failed are different claims, and a row
+          ;; named after one of them must not be able to fail because of the
+          ;; other.
+          (mutable shutdown-error client-shutdown-error set-client-shutdown-error!)
           (mutable read-error client-read-error set-client-read-error!)
           (mutable eofs client-eofs set-client-eofs!)
           (mutable finishing client-finishing set-client-finishing!)
@@ -124,7 +129,8 @@
      (lambda (index tcp payload)
        (new index tcp payload (make-byte-collector)
             'connect-callback-never-fired 0 0
-            'no-write-error 'on-error-never-fired 0 #f #f #f #f)))))
+            'no-write-error 'no-shutdown-error 'on-error-never-fired 0
+            #f #f #f #f)))))
 
 (define-record-type (peer %make-peer peer?)
   (fields tcp
@@ -283,7 +289,7 @@
     (uv-shutdown! (client-tcp c)
                   (lambda (err)
                     (collect)
-                    (when err (set-client-write-error! c (err->symbol err)))
+                    (when err (set-client-shutdown-error! c (err->symbol err)))
                     (uv-close! (client-tcp c))))))
 
 ;; --- the backpressure smoke, folded into the real traffic ----------------
@@ -504,6 +510,10 @@
   (list (all-clients (lambda (c) (= 3 (client-writes-done c))))
         (all-clients (lambda (c) (eq? 'no-write-error (client-write-error c))))))
 
+(test-equal "no client's shutdown failed"
+  'all
+  (all-clients (lambda (c) (eq? 'no-shutdown-error (client-shutdown-error c)))))
+
 (test-equal "no client's read ended in an error"
   'all
   (all-clients (lambda (c) (eq? 'on-error-never-fired (client-read-error c)))))
@@ -547,6 +557,18 @@
       'no-write-errors
       (map peer-write-error peers)))
 
+;; PER PEER, not just in total: eight connections each echoed one client's
+;; payload. A total alone would also be satisfied by one connection carrying
+;; everything -- which is what a server whose per-connection closures shared
+;; state would look like.
+(test-equal "each of the eight peers echoed exactly one 32 KiB payload"
+  (list client-count payload-size)
+  (list (length peers)
+        (let ((sizes (map peer-echoed peers)))
+          (if (for-all (lambda (n) (= n payload-size)) sizes)
+              payload-size
+              sizes))))
+
 ;; #f, from a procedure whose #t means "work remains" -- a loop that ran dry
 ;; (design spec S5). Read with 'nowait so it cannot block.
 (test-equal "the loop has nothing left to run"
@@ -576,9 +598,13 @@
 (test-equal "a full collection after teardown leaves every counter at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (debug-live-counts)))
 
-;; INFORMATIONAL, never asserted: how libuv fragmented 512 KiB of loopback
+;; INFORMATIONAL, never asserted. How libuv fragmented 512 KiB of loopback
 ;; traffic into deliveries is kernel policy and differs between platforms,
-;; between kernels, and between runs.
+;; between kernels, and between runs. So is whether a client sees the server's
+;; FIN before its own close completes, which is what its on-eof count records;
+;; and a peer whose shutdown raced the client's full close can legitimately
+;; report ENOTCONN. Asserting any of the three would be asserting the kernel's
+;; scheduling.
 (display "  [informational] on-data deliveries: clients=")
 (display (fold-left + 0 (map (lambda (i) (client-deliveries (client-at i)))
                              '(0 1 2 3 4 5 6 7))))
@@ -586,6 +612,11 @@
 (display (fold-left + 0 (map peer-deliveries peers)))
 (display " bytes echoed=")
 (display server-echoed)
+(display " client eofs=")
+(display (fold-left + 0 (map (lambda (i) (client-eofs (client-at i)))
+                             '(0 1 2 3 4 5 6 7))))
+(display " peer shutdowns=")
+(write (map peer-shutdown-error peers))
 (newline)
 
 (test-end "echo")

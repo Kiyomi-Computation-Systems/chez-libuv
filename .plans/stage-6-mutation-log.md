@@ -64,7 +64,9 @@ the connection phase, the seventeen-handle peak and the sixteen read buffers
 answer. `peers=9` in the informational line is the server's deliveries: it
 received all the traffic and echoed none of it.
 
-Adding the `uv-write!` turns it green at 30 assertions.
+Adding the `uv-write!` turns it green. (The suite's own review pass then
+added two rows — a per-peer echo total and a client-shutdown observer — so it
+stands at 32.)
 
 ## Method
 
@@ -88,7 +90,7 @@ Identical to `.plans/stage-{1,2,3,4,5}-mutation-log.md`:
 
 ## Summary
 
-Fifteen mutations. Fourteen caught by name; one recorded as equivalent, with
+Seventeen mutations. Sixteen caught by name; one recorded as equivalent, with
 the reasoning below rather than a silence.
 
 | # | File | Mutation | Caught by |
@@ -109,6 +111,8 @@ the reasoning below rather than a silence.
 | 13 | `tests/check-prod.sps` | the live-scope witnesses removed: the probe observes the counters without allocating anything | `check-prod: FAIL: the probe never had a live scope -- no ephemeral port was bound: unset` |
 | 14 | `Makefile` | `$(FLAVOR_STAMP)` dropped from `$(SHIM)`'s prerequisites | `make build FLAVOR=prod && make test` → 45 counter rows fail across five suites |
 | 15 | `Makefile` | the flavor stamp kept but `relink-guard` removed | `make prod && make test` **in the same second** → the same 45 rows. **This was the real defect, found by running the guard rather than by reading it** — see below |
+| 16 | `tests/test-echo.sps` | the per-connection closures share state: every peer's echo accounting lands on one peer record | `each of the eight peers echoed exactly one 32 KiB payload`, **and nothing else** |
+| 17 | `tests/test-echo.sps` | the server closes each peer abruptly as soon as its echo write completes, instead of waiting for EOF | nine rows, including `no client's read ended in an error`, `every peer saw exactly one EOF…` and `each of the eight peers echoed exactly one 32 KiB payload` |
 
 ### Mutation 15 is not hypothetical; it shipped for an hour
 
@@ -199,6 +203,18 @@ this machine the runs alternate between 9 and 10 client deliveries with no
 change to the code. The counts are printed as an informational line. A suite
 that asserted them would fail on a different kernel while nothing was wrong.
 
+**`no client's shutdown failed` is an observer row, and no mutation tried
+produced a failing shutdown.** It is the same class as `no client's read
+ended in an error`: a field seeded with a sentinel (`'no-shutdown-error`)
+that only a real error can replace, asserted so that a failure which *does*
+happen is named rather than silent. Mutation 17 was aimed at it — an abrupt
+peer close ought to make the clients' shutdowns fail — and it broke nine
+other rows instead, because with the peers closing early no client ever
+reaches 32 KiB and therefore none of them ever shuts down. The property is
+recorded as uncovered rather than dropped: the row costs one line, reads a
+field that would otherwise be write-only, and its sentinel is not producible
+by any success path.
+
 **The capstone's `(libuv)`-only import claim has no mutation, because it is
 enforced by the expander rather than by an assertion.** A name the facade
 stops exporting is an unbound identifier at expand time — the suite does not
@@ -247,15 +263,15 @@ shim (`CFLAGS_DEV`, `-DCHEZ_LIBUV_DEBUG_COUNTERS`) except where stated:
 
 | Run | Result |
 |---|---|
-| `make test` (pkg-config leg) ×2 | ALL SUITES PASSED, exit 0 both times — 812 assertions |
-| `make HAVE_PKG=no test` (vendored leg) ×2 | ALL SUITES PASSED, exit 0 both times — same 812 |
+| `make test` (pkg-config leg) ×2 | ALL SUITES PASSED, exit 0 both times — 814 assertions |
+| `make HAVE_PKG=no test` (vendored leg) ×2 | ALL SUITES PASSED, exit 0 both times — same 814 |
 | `make check-pins`, `make check-purity`, `make check-help` | green on both legs |
 | `make check-prod` against a **dev** shim | FAILS, exit 1, naming the counters that moved (recorded verbatim in the Task 10 report) |
 | `make prod` (both legs) | clean → `-O2` link → `check-prod: PASS` |
 | `make test` immediately after `make prod` (both legs) | `relink-guard` fires, the shim relinks dev, ALL SUITES PASSED |
 | `make test-memory` (macOS ASan preload) | exit 0, every suite passed, **no sanitizer diagnostic**. Not a leak claim: LeakSanitizer is unsupported on arm64 and ADR-0003 makes Linux Valgrind the sole memory gate. What it does show is that this stage's workload — seventeen TCP handles, 512 KiB through sixteen reused 64 KiB buffers, and a read stopped and restarted from inside callbacks — produces no use-after-free or double-free that ASan can see. |
-| `tests/test-echo.sps` alone, five consecutive runs | 30 assertions, identical every time; 0.4 s wall each (the design spec's budget was 30 s) |
+| `tests/test-echo.sps` alone, repeated runs | 32 assertions, identical every time; 0.4 s wall each (the design spec's budget was 30 s) |
 
 Per-suite assertion counts, identical across every `make test` run:
-`conditions` 89, `echo` 30, `facade` 40, `lifecycle` 64, `loop` 106,
+`conditions` 89, `echo` 32, `facade` 40, `lifecycle` 64, `loop` 106,
 `native` 170, `shim-loading` 19, `tcp` 166, `timer` 128.
