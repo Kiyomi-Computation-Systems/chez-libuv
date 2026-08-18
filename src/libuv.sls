@@ -60,10 +60,11 @@
   (import (rnrs)
           (libuv loop)
           (libuv private conditions)
-          ;; uv-version is renamed on the way in: this library exports a
-          ;; procedure of the same name with a different contract (the
-          ;; version STRING, not the packed int), and the packed int is
-          ;; re-exported below under a name that says which it is.
+          ;; uv-version is renamed on the way in purely to resolve a name
+          ;; clash: this library exports a procedure of the same name with a
+          ;; different contract (the version STRING, not the packed int).
+          ;; The packed int itself is NOT re-exported -- see the export list
+          ;; above, which says why.
           (rename (only (libuv private native)
                         ensure-native-loaded! uv-version uv-version-string
                         shim-compiled-version version-compatible?)

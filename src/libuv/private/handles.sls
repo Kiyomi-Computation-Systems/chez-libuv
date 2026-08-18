@@ -31,7 +31,14 @@
           loop-ptr set-loop-ptr!
           loop-state set-loop-state!
           loop-running? set-loop-running!
-          loop-pending-error set-loop-pending-error!
+          ;; set-loop-pending-error! is deliberately NOT exported: the
+          ;; #f-sentinel hole this record's `no-pending` marker exists to
+          ;; close (see below) can only be reintroduced by a caller who can
+          ;; write the slot directly. Reading it (uv-run's re-raise) needs
+          ;; loop-pending-error; asking whether there IS one needs the
+          ;; predicate; emptying it needs clear-loop-pending-error!. Nothing
+          ;; outside this library needs to set it, so nothing outside can.
+          loop-pending-error
           loop-has-pending-error? clear-loop-pending-error!
           loop-deferred-error-list set-loop-deferred-error-list!
           loop-open? require-open-loop require-loop loop-pointer
