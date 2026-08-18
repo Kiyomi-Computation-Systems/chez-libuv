@@ -51,12 +51,15 @@ jobs:
       # native boot files with no pre-existing Chez required -- and the
       # result is cached on the pinned version so only a version bump ever
       # pays the build cost again.
+      # -v2: the v1 key cached a build that never finished (see the disable
+      # flags below) -- bumping the suffix means the retry can't be served a
+      # poisoned cache entry from the failed run under the old key.
       - name: Cache built Chez Scheme
         id: cache-chez
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.chez-install
-          key: chez-${{ env.CHEZ_FLOOR_VERSION }}-linux-${{ runner.arch }}
+          key: chez-${{ env.CHEZ_FLOOR_VERSION }}-linux-${{ runner.arch }}-v2
 
       - name: Build Chez Scheme (pinned; apt's is 9.5.x, below the floor)
         if: steps.cache-chez.outputs.cache-hit != 'true'
@@ -65,7 +68,20 @@ jobs:
             "https://github.com/cisco/ChezScheme/releases/download/v${CHEZ_FLOOR_VERSION}/csv${CHEZ_FLOOR_VERSION}.tar.gz"
           tar xzf /tmp/chez.tar.gz -C /tmp
           cd "/tmp/csv${CHEZ_FLOOR_VERSION}"
-          ./configure --prefix="${{ github.workspace }}/.chez-install"
+          # --disable-x11 --disable-curses: the expeditor (Chez's REPL line
+          # editor) otherwise #includes X11/Xlib.h and curses.h/term.h at
+          # compile time -- headers this minimal runner's toolchain doesn't
+          # have (confirmed: v1 died at exactly that X11 include, error 2).
+          # Both flags turn into #define DISABLE_X11 / DISABLE_CURSES in the
+          # generated config.h, which routes expeditor.c around those
+          # #includes entirely (X11's is `#ifdef LIBX11`-gated, and version.h
+          # only sets LIBX11 when DISABLE_X11 is unset; curses falls back to
+          # the bundled nocurses.h) rather than merely deferring the
+          # dependency to link time. Safe here because this binding only ever
+          # runs Chez via `--program`, never the interactive REPL the
+          # expeditor serves.
+          ./configure --disable-x11 --disable-curses \
+            --prefix="${{ github.workspace }}/.chez-install"
           # Serial, not -j: verified locally that parallel make races the pb
           # bootstrap stage ("rule for target did not create it:
           # .../nanopass.so") -- an intermittent failure a cache can't paper
