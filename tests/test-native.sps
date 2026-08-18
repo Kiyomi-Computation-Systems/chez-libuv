@@ -160,6 +160,61 @@
 (test-equal "the shim's compiled version and the runtime libuv are both in range"
   #t (version-compatible? (shim-compiled-version) (uv-version)))
 
+;; --- the version gate's RAISE arm and its payload -----------------------
+;; version-compatible? is a pure predicate; the gate that acts on it is
+;; check-version-compatible!, and against a matching shim its raise arm runs
+;; zero times per process. Calling it directly with synthetic versions is
+;; therefore the only way the &uv-version-incompatible payload can be
+;; asserted at all -- without these, swapping the condition's two arguments
+;; would be an entirely uncaught mutation.
+;;
+;; The two probes are DISTINCT and both out of range, so a compiled/runtime
+;; swap cannot hide behind two same-typed fields (the same discipline
+;; test-conditions.sps uses for this condition type).
+(define incompatible-compiled (- range-lo 2))
+(define incompatible-runtime  (- range-lo 1))
+
+(test-equal "check-version-compatible! returns the runtime version for an in-range pair"
+  range-hi (check-version-compatible! range-lo range-hi))
+
+(test-equal "check-version-compatible! raises uv-version-incompatible for an out-of-range pair"
+  #t
+  (guard (e ((uv-version-incompatible? e) #t) (#t 'wrong-condition))
+    (check-version-compatible! incompatible-compiled incompatible-runtime)
+    'no-raise))
+
+(test-equal "the raised condition carries the COMPILED version in its compiled field"
+  incompatible-compiled
+  (guard (e ((uv-version-incompatible? e) (uv-version-incompatible-compiled e))
+            (#t 'wrong-condition))
+    (check-version-compatible! incompatible-compiled incompatible-runtime)
+    'no-raise))
+
+(test-equal "the raised condition carries the RUNTIME version in its runtime field"
+  incompatible-runtime
+  (guard (e ((uv-version-incompatible? e) (uv-version-incompatible-runtime e))
+            (#t 'wrong-condition))
+    (check-version-compatible! incompatible-compiled incompatible-runtime)
+    'no-raise))
+
+;; A shim built against an unsupported header while the runtime is fine must
+;; still be rejected, and must report the in-range runtime unaltered -- the
+;; asymmetric case, where a payload swap is most tempting to overlook.
+(test-equal "an out-of-range compiled version with an in-range runtime still raises, payload intact"
+  (list (- range-lo 1) range-hi)
+  (guard (e ((uv-version-incompatible? e)
+             (list (uv-version-incompatible-compiled e)
+                   (uv-version-incompatible-runtime e)))
+            (#t 'wrong-condition))
+    (check-version-compatible! (- range-lo 1) range-hi)
+    'no-raise))
+
+(test-equal "the raised condition is also a uv-error"
+  #t
+  (guard (e ((uv-error? e) #t) (#t 'wrong-condition))
+    (check-version-compatible! incompatible-compiled incompatible-runtime)
+    'no-raise))
+
 ;; uv_version_string() and the packed uv_version() must agree. Not asserted
 ;; against a hardcoded "1.52.1", which would only pin the fixture: the
 ;; expected value is DECODED from the packed integer, so a stale pointer, an
@@ -436,7 +491,20 @@
 ;; --- c-string->string (ADR-0009) ----------------------------------------
 ;; NULL must stay distinguishable from the empty string: uv_err_name_r and
 ;; friends can return either, and conflating them invents data.
-(test-equal "c-string->string maps NULL to #f" #f (c-string->string 0))
+;;
+;; Written as (not …) with expected #t, NOT as expected #f: SRFI-64 folds any
+;; raise in the actual expression into #f, so `(test-equal … #f (c-string->string 0))`
+;; would pass identically against a c-string->string that blew up on a null
+;; address -- the exact AGENTS.md trap. The (not …) form turns a raise into a
+;; propagating failure instead.
+(test-equal "c-string->string maps NULL to #f"
+  #t (not (c-string->string 0)))
+
+;; ...and #f specifically, not some other false-ish answer. Paired with the
+;; above so the distinction from "" below is pinned from both directions.
+(test-equal "c-string->string's NULL answer is exactly #f, not '() or 0"
+  'is-false
+  (let ((v (c-string->string 0))) (if (eq? v #f) 'is-false v)))
 
 (let ((buf (foreign-alloc 1)))
   (foreign-set! 'unsigned-8 buf 0 0)
@@ -494,6 +562,42 @@
   (test-equal "zero-out! clears every byte it was given"
     #t (all-bytes-equal? addr 64 0))
   (foreign-free addr))
+
+;; zero-out! is in the group whose contract is "fails as a structured
+;; condition rather than a segfault". (zero-out! 0 64) writes through NULL,
+;; so the null check is the difference between a condition and a crash.
+(test-equal "zero-out! rejects a null destination"
+  'uv-zero-out!
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (zero-out! 0 64)
+    'no-raise))
+
+;; The rejection must happen BEFORE any write. An inexact length is the case
+;; that discriminates: `(< i 3.0)` is perfectly true, so an unvalidated
+;; zero-out! would zero three bytes and only then (never) complain. The
+;; buffer is seeded #xff, asserted #xff, then must still be #xff afterwards.
+(let ((addr (foreign-alloc 64)))
+  (let fill ((i 0))
+    (when (< i 64) (foreign-set! 'unsigned-8 addr i #xff) (fill (+ i 1))))
+  (test-equal "the zero-out!-ordering probe buffer really was seeded non-zero first"
+    #t (all-bytes-equal? addr 64 #xff))
+  (test-equal "zero-out! rejects an inexact length"
+    'uv-zero-out!
+    (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+              (#t 'wrong-condition))
+      (zero-out! addr 3.0)
+      'no-raise))
+  (test-equal "zero-out! wrote nothing before rejecting"
+    #t (all-bytes-equal? addr 64 #xff))
+  (foreign-free addr))
+
+(test-equal "zero-out! rejects a negative length"
+  'uv-zero-out!
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (zero-out! 4096 -1)
+    'no-raise))
 
 ;; zero-out! must not run past its length. Seeded the same way: the guard
 ;; byte is set non-zero, checked non-zero, then must SURVIVE the call.
@@ -671,6 +775,18 @@
 
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
+
+;; SEED / PRECONDITION, asserted before the six-class matrix below. Every
+;; assertion in that matrix requires the DEV shim (built with
+;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
+;; production shim the counter entry points are no-ops whose live queries
+;; always return 0, so all six "increments are visible" assertions would
+;; fail while pointing at cross-wiring that is not there. This names the
+;; real precondition first, so it is the assertion that fails, by name.
+(count-loop-new!)
+(test-equal "seed: this suite requires the debug-counter shim (a live query must move)"
+  1 (live-count 'loop))
+(count-loop-free!)
 
 ;; All six classes, not just one. There are eighteen near-identical entry
 ;; point names in the shim, and binding count-timer-new! to

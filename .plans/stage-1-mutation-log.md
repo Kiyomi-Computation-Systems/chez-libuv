@@ -279,7 +279,8 @@ constant table in `src/libuv-shim.c`, against `tests/test-native.sps` and
    mutated source.
 
 **Baseline** (before any mutation, reconfirmed after all of them):
-`test-native` 123 assertions, `test-shim-loading` 19, both exit 0.
+`test-native` 123 assertions, `test-shim-loading` 19, both exit 0. The review
+round below (M51–M55) raises `test-native` to **136**.
 
 ## Summary
 
@@ -321,7 +322,8 @@ constant table in `src/libuv-shim.c`, against `tests/test-native.sps` and
 | 49 | native.sls | `uv-req-size` bound to `uv_handle_size` | FAIL, exit 1 | "uv_req_size(UV_WRITE) agrees with the shim's sizeof(uv_write_t)"; "…UV_CONNECT…"; "…UV_SHUTDOWN…" |
 | 50 | constants.sls | `uv-timer-type` accessor reads the `UV_TCP` key | FAIL, exit 1 | "uv_handle_size(UV_TIMER) agrees with the shim's sizeof(uv_timer_t)"; "the tcp and timer handle type tags are distinct" |
 
-**30 of 32 mutations caught** (M19–M50, counting 26b/27b/44b). Three were
+**30 of 32 mutations caught** (M19–M50, counting 26b/27b/44b); with the review
+round below, **35 of 37**. Three were
 uncaught on the first attempt and are recorded as such above — each produced a
 real fix, described below. Two remain uncaught by design, both named and
 explained rather than left silent.
@@ -562,6 +564,49 @@ reverted on, the scratch copies outside the repository. The three code changes
 this task made in the repo (`resolve-shim-path`'s uniform absoluteness check,
 the three `uv_req_type` shim constants, and the `PURE_TESTS` comment) were
 deliberate fixes, each covered above.
+
+## Review round: five further mutations (M51–M55)
+
+Added after task review flagged an unguarded `zero-out!`, an expected-`#f`
+assertion, an unexercised raise arm, and an unnamed suite precondition. Same
+method; baseline after the fixes is **136 assertions** in `test-native`.
+
+| # | Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|---|
+| 51 | native.sls | `zero-out!`'s null-destination check removed — `(zero-out! 0 64)` writes through NULL | FAIL, exit 1 | "zero-out! rejects a null destination" |
+| 52 | native.sls | `zero-out!`'s length validation removed (null check kept) | FAIL, exit 1 | "zero-out! rejects an inexact length"; **"zero-out! wrote nothing before rejecting"**; "zero-out! rejects a negative length" |
+| 53 | native.sls | `check-version-compatible!`'s payload swapped: `(make-uv-version-incompatible runtime compiled)` | FAIL, exit 1 | "the raised condition carries the COMPILED version in its compiled field"; "…the RUNTIME version in its runtime field"; "an out-of-range compiled version with an in-range runtime still raises, payload intact" |
+| 54 | native.sls | `check-version-compatible!`'s raise arm removed (always returns `runtime`) | FAIL, exit 1 | "check-version-compatible! raises uv-version-incompatible for an out-of-range pair" + the three payload assertions + "the raised condition is also a uv-error" |
+| 55 | **libuv-shim.c build** | The suite run against a **production** shim (`-O2`, no `CHEZ_LIBUV_DEBUG_COUNTERS`), i.e. the counters compiled to no-ops | FAIL, exit 1 | **"seed: this suite requires the debug-counter shim (a live query must move)" fails FIRST**, ahead of the six per-class failures it explains |
+
+**5/5 caught.** Notes:
+
+- **M51 does not crash.** Chez signals an invalid memory reference for
+  `foreign-set!` at address 0 rather than letting the process die, so SRFI-64
+  folds it and the assertion fails by name — predicted to be a bare SIGSEGV,
+  measured to be a clean named failure. Either way the check is the difference
+  between a structured `&uv-invalid-argument` and an unhandled fault, which is
+  what the surrounding group's contract promises.
+- **M52 is the ordering mutation.** An inexact length is what discriminates:
+  `(< i 3.0)` is perfectly true, so an unvalidated `zero-out!` zeroes three
+  bytes and only then fails to complain. "zero-out! wrote nothing before
+  rejecting" is the assertion that proves the guard runs *ahead of* the loop
+  rather than merely existing; a negative length alone would have been vacuous,
+  since the loop writes nothing for it either way.
+- **M53 is the mutation the review predicted would be uncaught, and was.**
+  Before this round the `&uv-version-incompatible` raise arm lived inline in
+  `ensure-native-loaded!`, where it runs zero times per process against a
+  matching shim. Extracting it as the exported `check-version-compatible!` —
+  the same seam that already makes `resolve-shim-path` and `load-shim`
+  testable — is what makes the payload assertable at all. The two probe
+  versions are distinct and both out of range, so a swap cannot hide behind
+  two same-typed integer fields; M53 confirms both field assertions are live.
+- **M55 is a build-configuration mutation, not a source one.** The six
+  per-class counter assertions hard-require the dev shim, and against a prod
+  shim they fail saying "increments are visible" — which reads as cross-wiring
+  that is not there. The new seed assertion fails *first* and names the actual
+  cause. (The run also fails "the shim this process loaded is the one
+  config.sls names", correctly: the probe supplies an override.)
 
 ## Carried into Stage 2 (Task 6)
 

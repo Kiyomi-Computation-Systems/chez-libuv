@@ -29,7 +29,7 @@
   (export ;; loading and the init gate
           ensure-native-loaded! native-init-count native-initialized?
           resolve-shim-path load-shim shim-file
-          version-supported? version-compatible?
+          version-supported? version-compatible? check-version-compatible!
 
           ;; version queries
           shim-compiled-version uv-version uv-version-string
@@ -304,7 +304,15 @@
   ;; where a bad index stops being a Scheme error and becomes a segfault or a
   ;; silent heap corruption, so every one of these fails as a structured
   ;; condition instead.
+  ;; Validated on the same terms as its neighbours, and BEFORE the loop: an
+  ;; unvalidated (zero-out! 0 64) writes through NULL, and an inexact length
+  ;; compares fine against `<` and would zero a prefix before anything
+  ;; noticed. Both now fail as a structured condition with nothing written.
   (define (zero-out! addr len)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-zero-out! 'null-or-invalid-destination)))
+    (unless (and (integer? len) (exact? len) (>= len 0))
+      (raise (make-uv-invalid-argument 'uv-zero-out! 'length-out-of-range)))
     (let loop ((i 0))
       (when (< i len)
         (foreign-set! 'unsigned-8 addr i 0)
@@ -434,6 +442,19 @@
     (and (version-supported? compiled)
          (version-supported? runtime)))
 
+  ;; The gate itself, as a named exported procedure rather than an inline
+  ;; expression inside ensure-native-loaded! -- the same reasoning that makes
+  ;; resolve-shim-path and load-shim ordinary procedures. Against a matching
+  ;; shim and library the raise arm runs zero times per process, so calling
+  ;; it directly with synthetic versions is the ONLY way its PAYLOAD can be
+  ;; asserted: without that, swapping the condition's compiled/runtime
+  ;; arguments would be an uncaught mutation. Returns `runtime` on success so
+  ;; the happy path has a value only success produces.
+  (define (check-version-compatible! compiled runtime)
+    (if (version-compatible? compiled runtime)
+        runtime
+        (raise (make-uv-version-incompatible compiled runtime))))
+
   ;; The name-keyed constant lookup handed to (libuv private constants).
   ;; Returns the value, or #f when the shim's table has no such name -- the
   ;; #f is consumed immediately by constants.sls, which turns it into
@@ -494,10 +515,7 @@
   (define (ensure-native-loaded!)
     (with-mutex init-mutex
       (unless initialized?
-        (let ((compiled (shim-compiled-version))
-              (runtime  (uv-version)))
-          (unless (version-compatible? compiled runtime)
-            (raise (make-uv-version-incompatible compiled runtime))))
+        (check-version-compatible! (shim-compiled-version) (uv-version))
         (constants-init! lookup-constant raw-errno-count
                          errno-name-at raw-errno-value)
         (validate-uv-buf-layout!)
