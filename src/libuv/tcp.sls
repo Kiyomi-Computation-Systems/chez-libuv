@@ -4,10 +4,11 @@
 ;;; the one socket option v0.1 needs. Closing a TCP handle is (libuv
 ;;; handle)'s uv-close!, because the close protocol is generic.
 ;;;
-;;; READING IS STAGE 5. uv-read-start! / uv-read-stop! and the alloc and read
-;;; dispatchers are not here yet; the record's read-path fields are already
-;;; declared (see (libuv private handles)) and the close dispatcher already
-;;; frees the buffer they will point at.
+;;; Reading is here too, as of Stage 5: uv-read-start! / uv-read-stop! and
+;;; the per-handle buffer of design spec S6. The alloc and read DISPATCHERS
+;;; live in (libuv private handles) with every other dispatcher; what belongs
+;;; here is the buffer's allocation and the two verbs that arm and disarm the
+;;; read.
 ;;;
 ;;; NO PROCEDURE HERE TAKES OR RETURNS A POINTER. A TCP handle is an opaque
 ;;; record and make-uv-tcp is the only way to get one; the request records
@@ -31,7 +32,8 @@
   (export make-uv-tcp
           uv-tcp-bind! uv-tcp-getsockname-port
           uv-listen! uv-accept! uv-tcp-connect!
-          uv-write! uv-shutdown! uv-tcp-nodelay!)
+          uv-write! uv-shutdown! uv-tcp-nodelay!
+          uv-read-start! uv-read-stop!)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -140,6 +142,22 @@
   ;; (spike FINDINGS Q3). The family byte is deliberately NOT read here --
   ;; its offset and width differ between Darwin and Linux (FINDINGS Q3 again)
   ;; and nothing in this procedure needs it.
+  ;;
+  ;; THE NAMELEN IS READ BACK, not merely written. libuv's out-parameter says
+  ;; how many bytes of `addr` it actually filled in (16 for a sockaddr_in, 28
+  ;; for a sockaddr_in6), and the two bytes this procedure decodes have to be
+  ;; INSIDE that. Without the check, a short answer would be decoded out of
+  ;; the zeroed tail of the scratch and returned as port 0 -- a plausible,
+  ;; in-range, entirely wrong number, which is the same failure shape the
+  ;; byte-order note above exists to prevent. The refusal arm is not
+  ;; reachable through this API on either supported platform (recorded in
+  ;; .plans/stage-5-mutation-log.md); the acceptance arm is asserted at two
+  ;; different real namelens, IPv4's and IPv6's, so a check written too
+  ;; strictly fails a test.
+  ;;
+  ;; Everything runs inside the guard, including the decode, so there is one
+  ;; freeing rule for every path out rather than one for the native call and
+  ;; another for the arithmetic after it.
   (define (uv-tcp-getsockname-port tcp)
     (require-open-tcp tcp 'uv-tcp-getsockname-port)
     (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
@@ -150,11 +168,14 @@
         (c-int-set! len (sizeof-sockaddr-storage))
         (uv-check (uv-tcp-getsockname
                    (handle-pointer tcp 'uv-tcp-getsockname-port) addr len)
-                  'uv-tcp-getsockname-port))
-      (let ((port (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
-        (free! addr)
-        (free! len)
-        port)))
+                  'uv-tcp-getsockname-port)
+        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
+          (raise (make-uv-invalid-argument 'uv-tcp-getsockname-port
+                                           'sockaddr-too-small-for-a-port)))
+        (let ((port (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
+          (free! addr)
+          (free! len)
+          port))))
 
   ;; --- listening ----------------------------------------------------------
   ;; The callback is stored BEFORE uv_listen, not after: a connection can
@@ -304,6 +325,103 @@
         (uv-check (uv-shutdown-native block (handle-pointer tcp 'uv-shutdown!))
                   'uv-shutdown!))
       req))
+
+  ;; --- reading (design spec S6) -------------------------------------------
+  ;; (uv-read-start! tcp on-data on-eof on-error [buffer-size])
+  ;;
+  ;;   on-data  (bv start end) -- a FRESH bytevector per delivery, handed as a
+  ;;            SPAN so a future zero-copy variant can answer a sub-range of a
+  ;;            larger buffer without changing the call shape (ADR-0009).
+  ;;   on-eof   () -- the end of the stream, which is NOT an error and is
+  ;;            never wrapped in a condition (design spec S6, ADR-0006).
+  ;;   on-error (condition) -- a plain object, never raised across the
+  ;;            callback boundary (design spec S8). The handle is not closed:
+  ;;            what to do about a read error is the caller's decision.
+  ;;
+  ;; All three are REQUIRED. There is no "just give me the data" arity,
+  ;; because a stream whose end and whose failure both go unnoticed is not a
+  ;; simplification -- it is the two bugs this split exists to prevent.
+  (define default-read-buffer-size 65536)
+
+  (define uv-read-start!
+    (case-lambda
+      ;; #f, not the default size: "the caller did not ask for a size" and
+      ;; "the caller asked for 65536" are different questions to the
+      ;; buffer-size rule below, and collapsing them here would make a
+      ;; re-start with the size omitted fail against any handle whose buffer
+      ;; was fixed at anything else.
+      ((tcp on-data on-eof on-error)
+       (start-reading! tcp on-data on-eof on-error #f))
+      ((tcp on-data on-eof on-error buffer-size)
+       (start-reading! tcp on-data on-eof on-error buffer-size))))
+
+  ;; EVERY CHECK FIRST, THE ALLOCATION AFTER THEM, the native call after
+  ;; that, and the record updated only once libuv has said yes -- the same
+  ;; order, and for the same reasons, as uv-write!.
+  ;;
+  ;; The callbacks are stored AFTER the native call, unlike uv-listen!'s: a
+  ;; uv_read_start that libuv refuses (UV_EALREADY on a handle that is
+  ;; already reading, UV_ENOTCONN on one that is not connected) must not
+  ;; leave this handle's stored callbacks swapped for a read that never
+  ;; started. Nothing can be delivered in the window either way, since libuv
+  ;; only ever calls read_cb from inside uv_run.
+  (define (start-reading! tcp on-data on-eof on-error buffer-size)
+    (require-open-tcp tcp 'uv-read-start!)
+    (require-callback on-data 'uv-read-start! 'on-data-not-a-procedure)
+    (require-callback on-eof 'uv-read-start! 'on-eof-not-a-procedure)
+    (require-callback on-error 'uv-read-start! 'on-error-not-a-procedure)
+    (when buffer-size
+      (unless (and (integer? buffer-size) (exact? buffer-size)
+                   (positive? buffer-size))
+        (raise (make-uv-invalid-argument 'uv-read-start!
+                                         'buffer-size-out-of-range))))
+    (ensure-read-buffer! tcp buffer-size)
+    (uv-check (uv-read-start-native (handle-pointer tcp 'uv-read-start!))
+              'uv-read-start!)
+    (set-tcp-on-data! tcp on-data)
+    (set-tcp-on-eof! tcp on-eof)
+    (set-tcp-on-error! tcp on-error)
+    (set-tcp-reading! tcp #t))
+
+  ;; The per-handle buffer of design spec S6, allocated by the FIRST
+  ;; uv-read-start! and never again -- which is what lets the alloc dispatcher
+  ;; be infallible: it has an already-allocated pointer to hand back on every
+  ;; read and never allocates on the hot path.
+  ;;
+  ;; ITS SIZE IS FIXED BY THAT FIRST CALL, and a later call asking for a
+  ;; different explicit size is REFUSED rather than honoured. Honouring it
+  ;; would mean freeing the old buffer here, and design spec S6 makes the
+  ;; close dispatcher the only place that buffer may ever be freed -- so that
+  ;; a read completion queued against it (Windows' overlapped model) cannot
+  ;; outlive it. A caller who wants a different size closes the handle.
+  ;;
+  ;; A call that omits the size is not asking for anything, so it is always
+  ;; allowed. That is what makes re-starting after a stop the cheap operation
+  ;; backpressure needs it to be.
+  ;;
+  ;; NOTHING FREES THE BUFFER ON A FAILURE PATH, including one where
+  ;; uv_read_start goes on to fail: the buffer belongs to the HANDLE, not to
+  ;; the read, and the close dispatcher will free it exactly once.
+  (define (ensure-read-buffer! tcp buffer-size)
+    (if (zero? (tcp-read-buf tcp))
+        (let ((size (or buffer-size default-read-buffer-size)))
+          (set-tcp-read-buf! tcp (alloc-zeroed size))
+          (set-tcp-read-buf-len! tcp size)
+          (count-read-buffer-new!))
+        (when (and buffer-size (not (= buffer-size (tcp-read-buf-len tcp))))
+          (raise (make-uv-invalid-argument 'uv-read-start!
+                                           'buffer-size-fixed)))))
+
+  ;; Stopping a stream that is not reading is rc 0 at the libuv level, so this
+  ;; is idempotent without a state test of its own. The stored callbacks and
+  ;; the buffer are left alone on purpose: a stop is backpressure, not a
+  ;; teardown, and the next uv-read-start! is meant to be able to pass the
+  ;; same callbacks against the same buffer (design spec S6).
+  (define (uv-read-stop! tcp)
+    (require-open-tcp tcp 'uv-read-stop!)
+    (uv-check (uv-read-stop (handle-pointer tcp 'uv-read-stop!))
+              'uv-read-stop!)
+    (set-tcp-reading! tcp #f))
 
   ;; --- socket options -----------------------------------------------------
   ;; The one v0.1 needs. A boolean is required rather than accepted-and-

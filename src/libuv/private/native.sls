@@ -66,14 +66,16 @@
           uv-timer-set-repeat uv-timer-get-repeat
           uv-close-native uv-is-closing
 
-          ;; the TCP and stream entry points (design spec S5, S7). The four
-          ;; that take a C function pointer -- uv_listen, uv_tcp_connect,
-          ;; uv_write and uv_shutdown -- are NOT exported raw, for the same
-          ;; reason as uv_timer_start and uv_close above: their wrappers bake
-          ;; in this library's own trampoline entry points.
+          ;; the TCP and stream entry points (design spec S5, S6, S7). The
+          ;; five that take a C function pointer -- uv_listen, uv_tcp_connect,
+          ;; uv_write, uv_shutdown and uv_read_start (which takes two) -- are
+          ;; NOT exported raw, for the same reason as uv_timer_start and
+          ;; uv_close above: their wrappers bake in this library's own
+          ;; trampoline entry points.
           uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-nodelay
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
+          uv-read-start-native uv-read-stop
           uv-ip4-addr uv-ip6-addr
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
@@ -344,6 +346,15 @@
     (foreign-procedure "uv_write" (uptr uptr uptr unsigned-int uptr) int))
   (define raw-shutdown
     (foreign-procedure "uv_shutdown" (uptr uptr uptr) int))
+
+  ;; uv_read_start takes TWO callback pointers (uv_alloc_cb, uv_read_cb) and
+  ;; is the only entry point here that does. uv_read_stop takes none, so it
+  ;; needs no wrapper and is exported as it is; it returns 0 even when the
+  ;; stream was not reading, which is what makes uv-read-stop! idempotent.
+  (define raw-read-start
+    (foreign-procedure "uv_read_start" (uptr uptr uptr) int))
+  (define uv-read-stop
+    (foreign-procedure "uv_read_stop" (uptr) int))
 
   ;; --- uv_buf_t (design spec S4 rule 4) ---------------------------------
   ;; The one libuv struct this binding CONSTRUCTS rather than merely holding
@@ -777,6 +788,8 @@
   (define write-cb-entry      (foreign-callable-entry-point write-done-callable))
   (define connect-cb-entry    (foreign-callable-entry-point connect-callable))
   (define shutdown-cb-entry   (foreign-callable-entry-point shutdown-callable))
+  (define alloc-cb-entry      (foreign-callable-entry-point alloc-callable))
+  (define read-cb-entry       (foreign-callable-entry-point read-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -818,6 +831,19 @@
   ;; (uv-shutdown-native req-ptr stream-ptr) -> int (an errno).
   (define (uv-shutdown-native req-ptr stream-ptr)
     (raw-shutdown req-ptr stream-ptr shutdown-cb-entry))
+
+  ;; (uv-read-start-native stream-ptr) -> int (an errno).
+  ;;
+  ;; BOTH callbacks are baked in here, together, and that pairing is the whole
+  ;; reason this wrapper exists: libuv calls alloc_cb and read_cb as a pair on
+  ;; every read, and handing it the two entry points the other way round is
+  ;; not a type error in any language involved -- it would be libuv writing a
+  ;; buffer descriptor through what it believes is a read completion. The
+  ;; pairing is asserted end to end by tests/test-tcp.sps, where a read that
+  ;; arrived through the alloc dispatcher shows up as data that never
+  ;; arrives.
+  (define (uv-read-start-native stream-ptr)
+    (raw-read-start stream-ptr alloc-cb-entry read-cb-entry))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

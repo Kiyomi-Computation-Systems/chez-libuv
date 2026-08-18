@@ -3,13 +3,14 @@
 ;;; design spec S5 ("The registry is the GC root"), S8 (store-and-reraise),
 ;;; and ADR-0007 (no guardians: closing is explicit, never GC-timed).
 ;;;
-;;; Stage 2 delivered the registry and the loop record. Stage 3 adds the
+;;; Stage 2 delivered the registry and the loop record. Stage 3 added the
 ;;; handle records, the full 'open -> 'closing -> 'closed state machine, the
-;;; callback guard, and the timer and close dispatchers -- and fills both
+;;; callback guard, and the timer and close dispatchers -- and filled both
 ;;; seams: (libuv private native)'s eight dispatcher slots and this library's
-;;; own `close-handle!`. The remaining six callback types are installed as
-;;; raising stubs that Stages 4-5 replace by name through
-;;; `install-dispatch-procedure!`, with no second slot install.
+;;; own `close-handle!`. The remaining six callback types were installed as
+;;; raising stubs that Stages 4 and 5 replaced by name through
+;;; `install-dispatch-procedure!`, with no second slot install. As of Stage 5
+;;; there are no stubs left: all eight names hold a real dispatcher.
 ;;;
 ;;; THIS LIBRARY'S BODY HAS EFFECTS. Instantiating it fills the process-global
 ;;; dispatcher slots, so any suite whose import chain reaches this file finds
@@ -97,13 +98,28 @@
           ;;   count-timer-free! the freeing site owns its counter (S10).
           ;;   the dispatcher slots: this library fills all eight, once, in
           ;;                     its own body (S4).
+          ;;   uv-buf-set!       the alloc dispatcher's whole job (S6): fill
+          ;;                     the uv_buf_t libuv passed with the handle's
+          ;;                     own buffer.
+          ;;   copy-out          the read dispatcher's whole job (ADR-0009):
+          ;;                     a FRESH copy per delivery, so nothing the
+          ;;                     caller keeps points into foreign memory.
           (only (libuv private native)
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-free!
+                uv-buf-set! copy-out
                 uv-errno-condition
-                dispatcher-names install-callback-dispatchers!))
+                dispatcher-names install-callback-dispatchers!)
+          ;; UV_EOF is READ FROM THE SHIM's table, never transcribed as
+          ;; -4095 (ADR-0005). The read dispatcher's EOF/error split is the
+          ;; one comparison in this binding where a transcribed constant
+          ;; would be invisible: -4095 is platform-independent, so a literal
+          ;; would pass every test on every platform this project supports
+          ;; and still be a violation of the rule that keeps every other
+          ;; constant honest.
+          (only (libuv private constants) uv-eof))
 
   ;; --- the loop record ---------------------------------------------------
   ;; Fields, per design spec S5 and S8:
@@ -604,6 +620,107 @@
     (complete-request! 'shutdown 'uv-shutdown! no-request-counter
                        req-ptr status))
 
+  ;; --- the Stage 5 read-path dispatchers (design spec S6) ----------------
+  ;; uv_alloc_cb: void (*)(uv_handle_t *handle, size_t suggested, uv_buf_t *buf).
+  ;;
+  ;; THIS DISPATCHER IS INFALLIBLE, and that is a requirement rather than an
+  ;; observation. Design spec S6: uv-read-start! allocates one reusable buffer
+  ;; per handle "so the alloc_cb libuv invokes on every read is infallible --
+  ;; it hands back an already-allocated pointer, never allocates on the hot
+  ;; path". Every step below is a hashtable lookup, a record-field read, or a
+  ;; foreign-set! through a validated ftype; none of them can raise, so the
+  ;; seam's guard has nothing to contain on this path. KEEP IT THAT WAY:
+  ;; anything added here that CAN raise (an allocation, a uv-check, one of
+  ;; native.sls's validating helpers) breaks the invariant even though the
+  ;; seam would still catch it, because libuv has no error path for an
+  ;; alloc_cb that fails to answer -- the buffer it gets is the one it reads
+  ;; into.
+  ;;
+  ;; `suggested` is deliberately ignored. The buffer is the handle's own and
+  ;; its size was fixed by the first uv-read-start!; libuv's hint is a hint.
+  ;;
+  ;; A pointer this binding cannot resolve, or a handle with no buffer, gets
+  ;; base = 0 / len = 0, which libuv reads as "the user cannot or will not
+  ;; handle this read" and turns into a read_cb carrying UV_ENOBUFS
+  ;; (vendor/libuv/src/unix/stream.c, lines 1050-1053) -- a condition
+  ;; delivered to on-error below, never a crash and never a silent stall.
+  (define (alloc-dispatch handle-ptr suggested buf-ptr)
+    (let ((handle (registry-ref handle-ptr)))
+      (if (and (uv-tcp-record? handle)
+               (valid-pointer? (tcp-read-buf handle)))
+          (uv-buf-set! buf-ptr (tcp-read-buf handle) (tcp-read-buf-len handle))
+          (uv-buf-set! buf-ptr 0 0))))
+
+  ;; uv_read_cb: void (*)(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf).
+  ;;
+  ;; `nread` is ssize_t and the four arms are design spec S6's, in the order
+  ;; that makes each one unambiguous: positive is data, zero is libuv's
+  ;; "nothing to read this time" (never EOF), UV_EOF is its own callback, and
+  ;; every other negative is an error condition OBJECT. Spike FINDINGS Q3
+  ;; measured what binding `nread` unsigned would do instead: UV_EOF arrives
+  ;; as 2^64 - 4095, `(> nread 0)` is true, and the end of the stream is
+  ;; delivered as four gigabytes of data.
+  ;;
+  ;; NO HANDLE STATE CHECK, deliberately -- the same rule as the request
+  ;; dispatchers above (design spec S5's tolerance clause). A read completion
+  ;; can be queued behind a uv_close, and refusing to deliver it there would
+  ;; drop the EOF a caller's own bookkeeping may be waiting for.
+  ;;
+  ;; THE `buf` ARGUMENT IS NOT DEREFERENCED. libuv hands read_cb back the
+  ;; same uv_buf_t alloc-dispatch filled in, and alloc-dispatch fills it with
+  ;; the handle's own buffer and nothing else -- so `(tcp-read-buf handle)`
+  ;; and `buf->base` are the same address by construction. Reading the
+  ;; record's own field keeps this dispatcher's data source inside the
+  ;; binding's bookkeeping (if the two ever disagreed, copying from the
+  ;; foreign pointer would be the less safe of the two answers), and it is
+  ;; what makes the nread = 0, UV_EOF and error arms callable from a test
+  ;; with a null buf -- which is the only way the nread = 0 arm is observable
+  ;; at all, since no public API can ask libuv for one.
+  (define (read-dispatch stream-ptr nread buf-ptr)
+    (let ((handle (registry-ref stream-ptr)))
+      (if (uv-tcp-record? handle)
+          (cond ((positive? nread) (deliver-read-data! handle nread))
+                ((zero? nread) #f)
+                ((= nread (uv-eof)) (deliver-read-eof! handle))
+                (else (deliver-read-error! handle nread)))
+          (record-orphan-callback! 'read stream-ptr))))
+
+  ;; The copy happens INSIDE the guard, not before it: copy-out validates its
+  ;; source, and a zero or absent buffer here would mean the registry and the
+  ;; read state had come apart -- which is a callback error to record on the
+  ;; loop, exactly like a raise from the user's own callback, rather than a
+  ;; segfault.
+  ;;
+  ;; The span is `(bv 0 nread)` -- start and end, not a bare bytevector, so a
+  ;; future zero-copy variant can answer a sub-range of a larger buffer
+  ;; without changing the call shape (design spec S6, ADR-0009).
+  (define (deliver-read-data! handle nread)
+    (let ((on-data (tcp-on-data handle)))
+      (when on-data
+        (dispatch-guarded
+         (handle-loop handle)
+         (lambda ()
+           (on-data (copy-out (tcp-read-buf handle) nread) 0 nread))))))
+
+  ;; EOF is NOT an error and is never wrapped in a condition (design spec S6,
+  ;; ADR-0006): it is its own callback, taking no arguments, because there is
+  ;; nothing to report beyond "that was the last byte".
+  (define (deliver-read-eof! handle)
+    (let ((on-eof (tcp-on-eof handle)))
+      (when on-eof
+        (dispatch-guarded (handle-loop handle) on-eof))))
+
+  ;; `who` is uv-read-start!, the public procedure that started the read --
+  ;; the same rule the request dispatchers follow. The handle is NOT closed
+  ;; here: design spec S6 says "the binding never auto-closes the handle on a
+  ;; read error", so what happens next is the caller's decision.
+  (define (deliver-read-error! handle nread)
+    (let ((on-error (tcp-on-error handle)))
+      (when on-error
+        (dispatch-guarded
+         (handle-loop handle)
+         (lambda () (on-error (uv-errno-condition nread 'uv-read-start!)))))))
+
   ;; uv_close_cb: void (*)(uv_handle_t *handle). THE ONLY PLACE A HANDLE
   ;; POINTER IS FREED (design spec S5, S10).
   ;;
@@ -745,8 +862,16 @@
   ;; cannot service, and quietly doing nothing would leave a handle or a
   ;; request in a state nothing will ever complete. The raise is CONTAINED by
   ;; the seam's own guard below -- `dispatch-guarded` is no help here, since
-  ;; it is invoked inside timer-dispatch and close-dispatch, i.e. only once a
-  ;; dispatcher has already been entered successfully.
+  ;; it is invoked inside a dispatcher, i.e. only once one has already been
+  ;; entered successfully.
+  ;;
+  ;; AS OF STAGE 5 NOTHING REACHES THIS. Every name in `dispatcher-names` is
+  ;; seeded with it below and then replaced, so it survives as the default
+  ;; for a callback type ADDED to that list later -- which is exactly when
+  ;; the stub's own property (a name with no implementation fails loudly and
+  ;; contained, rather than silently doing nothing) starts mattering again.
+  ;; It is kept for that, and because deleting it would make the seeding loop
+  ;; below need a different kind of placeholder anyway.
   (define (unimplemented-dispatcher name)
     (lambda args
       (raise (condition
@@ -832,18 +957,23 @@
                 dispatcher-names)
       (hashtable-set! dispatch-table 'timer timer-dispatch)
       (hashtable-set! dispatch-table 'close close-dispatch)
-      ;; Stage 4's four go in through the SEAM rather than by writing the
-      ;; table directly, even though they live in this same file: that is the
-      ;; documented once-per-name path (ADR-0008, and
+      ;; Stages 4 and 5's six go in through the SEAM rather than by writing
+      ;; the table directly, even though they live in this same file: that is
+      ;; the documented once-per-name path (ADR-0008, and
       ;; .plans/stage-3-mutation-log.md's "the seam Stages 4 and 5 plug
-      ;; into"), and using it here means the path Stage 5 will take is the
-      ;; one already exercised rather than one nothing has run.
+      ;; into"), and using it here means the path is the one already
+      ;; exercised rather than one nothing has run. With these six there are
+      ;; no stubs left: every callback type this binding declares now has an
+      ;; implementation, and every name is spoken for against a later
+      ;; install.
       (for-each (lambda (entry)
                   (install-dispatch-procedure! (car entry) (cdr entry)))
                 (list (cons 'connection connection-dispatch)
                       (cons 'write-done write-done-dispatch)
                       (cons 'shutdown   shutdown-dispatch)
-                      (cons 'connect    connect-dispatch)))
+                      (cons 'connect    connect-dispatch)
+                      (cons 'alloc      alloc-dispatch)
+                      (cons 'read       read-dispatch)))
       ;; Looked up by name at fire time, never captured here: that
       ;; indirection is the whole seam. Guarded, because this closure is what
       ;; libuv actually calls.

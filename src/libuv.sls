@@ -10,8 +10,8 @@
 ;;; they need are taken from them.
 ;;;
 ;;; (libuv handle) and (libuv timer) landed with Stage 3; (libuv tcp)'s write
-;;; path landed with Stage 4 and its read path follows with Stage 5. The list
-;;; is deliberately written out by name rather than re-exported wholesale: a
+;;; path landed with Stage 4 and its read path with Stage 5. The list is
+;;; deliberately written out by name rather than re-exported wholesale: a
 ;;; facade that exported whatever its imports happened to have would leak a
 ;;; private binding the day someone added one.
 (library (libuv)
@@ -36,15 +36,16 @@
           uv-timer-repeat uv-timer-set-repeat!
 
           ;; --- TCP, from (libuv tcp) ---
-          ;; The write half (design spec S7). uv-read-start! / uv-read-stop!
-          ;; join this list with Stage 5. uv-tcp? and uv-close! are already
-          ;; above, in the handle block: they are generic over handle types
-          ;; by design, and a second TCP-specific spelling of either would be
-          ;; a second thing to keep in step.
+          ;; Both halves: the write path of design spec S7 and the read path
+          ;; of S6. uv-tcp? and uv-close! are already above, in the handle
+          ;; block: they are generic over handle types by design, and a
+          ;; second TCP-specific spelling of either would be a second thing
+          ;; to keep in step.
           make-uv-tcp
           uv-tcp-bind! uv-tcp-getsockname-port
           uv-listen! uv-accept! uv-tcp-connect!
           uv-write! uv-shutdown! uv-tcp-nodelay!
+          uv-read-start! uv-read-stop!
 
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to
