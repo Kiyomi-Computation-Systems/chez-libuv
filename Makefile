@@ -67,13 +67,17 @@ TESTS        := $(wildcard tests/test-*.sps)
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
-# stay free of native imports. Only test-conditions.sps qualifies (Task 4,
-# landed): it imports (rnrs), (srfi :64), and (libuv private conditions)
+# stay free of native imports. As of Task 5 only test-conditions.sps
+# qualifies: it imports (rnrs), (srfi :64), and (libuv private conditions)
 # only, and that library imports (rnrs) only, so its whole chain never
-# reaches (libuv private native). $(wildcard) names exactly the pure suites
-# that exist on disk -- not a hardcoded list that would need editing as
-# later tasks add more of them (or would silently keep testing a deleted
-# file).
+# reaches (libuv private native). test-native.sps and test-shim-loading.sps
+# are deliberately NOT here -- both import native code by design, and
+# test-shim-loading.sps sets CHEZ_LIBUV_SHIM itself in its children.
+#
+# This is an explicit, per-suite list, NOT a tests/test-*.sps wildcard: the
+# default for a new suite must be "not claimed pure", so adding a genuinely
+# pure suite is a deliberate edit here. $(wildcard) is kept only so a
+# DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps)
 
 .PHONY: all build deps check-pins check-purity check-help help dev test test-memory vendor clean prod deps-info

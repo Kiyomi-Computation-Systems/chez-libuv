@@ -32,6 +32,13 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "UV_TCP",         UV_TCP },
   { "UV_TIMER",       UV_TIMER },
 
+  /* uv_req_type tags, needed to call uv_req_size() -- the request-side
+   * counterpart of UV_TCP/UV_TIMER above. They come from the enum, not from
+   * the position of a #define, for the same reason as everything else here. */
+  { "UV_WRITE",       UV_WRITE },
+  { "UV_CONNECT",     UV_CONNECT },
+  { "UV_SHUTDOWN",    UV_SHUTDOWN },
+
   { "SIZEOF_UV_LOOP_T",     (long)sizeof(uv_loop_t) },
   { "SIZEOF_UV_TCP_T",      (long)sizeof(uv_tcp_t) },
   { "SIZEOF_UV_TIMER_T",    (long)sizeof(uv_timer_t) },
