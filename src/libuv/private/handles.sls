@@ -644,6 +644,11 @@
   ;; handle this read" and turns into a read_cb carrying UV_ENOBUFS
   ;; (vendor/libuv/src/unix/stream.c, lines 1050-1053) -- a condition
   ;; delivered to on-error below, never a crash and never a silent stall.
+  ;;
+  ;; THE WHOLE BUFFER, FROM ITS BASE, IS THE ANSWER THIS DISPATCHER MAY GIVE:
+  ;; read-dispatch copies out of (tcp-read-buf handle), not out of buf->base
+  ;; (see its own note below), so answering a SUB-RANGE here would have to
+  ;; change both sites together or the copy would start at the wrong address.
   (define (alloc-dispatch handle-ptr suggested buf-ptr)
     (let ((handle (registry-ref handle-ptr)))
       (if (and (uv-tcp-record? handle)

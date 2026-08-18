@@ -278,6 +278,58 @@
 (test-equal "the loop of the raising callback tore down cleanly"
   registry-count-at-start (registry-count))
 
+;; --- row 7b: the ticking fixture disarms itself when the body raises ----
+;; uv-testing's run-until/ticking arms a 1 ms timer of its OWN for the length
+;; of a wait. Row 7 above proves a raising callback reaches the caller through
+;; uv-run; this row proves that when it does so from inside a ticking wait,
+;; the fixture's timer does not stay behind on the loop.
+;;
+;; This is a row about the TEST PLUMBING, and it lives here because the
+;; counters are the only thing that can see the difference: a leaked ticker is
+;; not visible in the fixture's return value (there isn't one -- the wait
+;; raised), only in the next assertion that asks the loop what is still live.
+;; Every suite that waits through a raising callback would otherwise measure a
+;; loop the fixture is still holding open, and the capstone
+;; (tests/test-echo.sps) waits that way on every error path it has.
+(define ticking-loop (make-uv-loop))
+(define ticking-timer (make-uv-timer ticking-loop))
+(define ticking-live-inside 0)
+
+(uv-timer-start! ticking-timer
+                 (lambda (handle)
+                   (collect)
+                   ;; Two: this timer and the fixture's ticker. Reading it
+                   ;; from INSIDE the callback is what makes the count below
+                   ;; a difference rather than an absolute -- the fixture's
+                   ;; timer demonstrably existed at this instant.
+                   (set! ticking-live-inside (live-count 'timer))
+                   (raise (make-uv-invalid-argument 'on-timeout 'deliberate)))
+                 1 0)
+
+;; A predicate that can never hold: the wait ends by the raise or not at all.
+(define ticking-outcome
+  (guard (e ((uv-callback-error? e) (uv-invalid-argument-reason e))
+            (#t 'wrong-condition))
+    (run-until/ticking ticking-loop (lambda () #f) 32)
+    'no-raise))
+
+(test-equal "seed: the ticking fixture's own timer was live alongside the raising one"
+  2 ticking-live-inside)
+
+(test-equal "a raise inside a ticking wait still reaches the caller"
+  'deliberate ticking-outcome)
+
+;; ONE, not two: the raising timer is still live (nothing closed it), and the
+;; fixture's ticker is gone -- closed AND drained on the way out. An
+;; unwind-unsafe fixture leaves 2 here.
+(test-equal "the ticking fixture disarmed its own timer on the unwind path"
+  1 (live-count 'timer))
+
+(uv-loop-teardown! ticking-loop)
+
+(test-equal "the loop of the raising ticking wait tore down cleanly"
+  registry-count-at-start (registry-count))
+
 ;; --- row 8: 100 timer iterations, with a full collection on each --------
 (define timer-peak-live 0)
 (define timer-fires 0)

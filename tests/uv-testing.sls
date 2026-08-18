@@ -86,6 +86,19 @@
   ;; The ticker is closed before returning, and its close is DRAINED, so a
   ;; caller that goes straight from here to a debug-counter assertion does
   ;; not see this fixture's own handle still live.
+  ;;
+  ;; IT IS DISARMED ON THE UNWIND PATH TOO, and that is the whole reason the
+  ;; guard below exists. `run-until` raises whenever a callback under test
+  ;; raised: uv-run's store-and-reraise policy (design spec S8) turns that
+  ;; into an &uv-callback-error out of the very `uv-run` this fixture is
+  ;; driving. Without the guard the ticker stays ARMED on the loop, and every
+  ;; later assertion in the suite is measuring a loop this fixture is still
+  ;; holding open -- a live timer in the counters, a non-empty live-handle
+  ;; snapshot, a loop that never runs dry, and a teardown that has one more
+  ;; handle to close than the test thinks it created. The capstone
+  ;; (tests/test-echo.sps) leans on this helper for every wait including the
+  ;; ones a raising callback ends, so the leak would be attributed to the code
+  ;; under test rather than to the fixture.
   (define (run-until/ticking loop pred max-iters)
     (let ((ticker (make-uv-timer loop)))
       ;; The tick callback deliberately does nothing -- not even (collect).
@@ -95,12 +108,33 @@
       ;; for the length of a megabyte transfer would buy no coverage at a
       ;; cost measured in seconds.
       (uv-timer-start! ticker (lambda (t) #f) 1 1)
-      (let ((outcome (run-until loop pred max-iters)))
-        (uv-timer-stop! ticker)
-        (uv-close! ticker)
-        ;; A close callback is already pending, so these steps cannot block.
-        (run-until loop (lambda () (eq? (uv-handle-state ticker) 'closed)) 8)
+      (let ((outcome
+             (guard (e (#t
+                        ;; The disarm is itself guarded HERE and nowhere else:
+                        ;; a condition raised while unwinding would REPLACE the
+                        ;; callback error the caller is trying to see, which is
+                        ;; the one thing worse than a leaked ticker. On the
+                        ;; normal path below it is deliberately left unguarded,
+                        ;; so a fixture that cannot clean up after a SUCCESSFUL
+                        ;; wait still fails loudly.
+                        (guard (cleanup-failure (#t #f))
+                          (disarm-ticker! loop ticker))
+                        (raise e)))
+               (run-until loop pred max-iters))))
+        (disarm-ticker! loop ticker)
         outcome)))
+
+  ;; Stop, close and DRAIN the close of the fixture's own timer. Every step is
+  ;; conditional on the state that step needs, because this also runs on the
+  ;; unwind path, where the body may have closed the ticker or the whole loop
+  ;; already.
+  (define (disarm-ticker! loop ticker)
+    (when (uv-handle-open? ticker)
+      (uv-timer-stop! ticker)
+      (uv-close! ticker))
+    ;; A close callback is already pending, so these steps cannot block.
+    (when (uv-loop-open? loop)
+      (run-until loop (lambda () (eq? (uv-handle-state ticker) 'closed)) 8)))
 
   ;; --- loopback plumbing (ADR-0010, design spec S11) ---------------------
   ;; "Every TCP test binds 127.0.0.1:0, reads the real ephemeral port back

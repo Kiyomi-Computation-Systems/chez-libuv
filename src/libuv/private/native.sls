@@ -367,6 +367,13 @@
   ;; here -- it does not pretend to work, it refuses).
   (define-ftype uv-buf (struct (base uptr) (len size_t)))
 
+  ;; DELIBERATELY UNVALIDATED, unlike copy-in!/copy-out/zero-out! next door,
+  ;; and that is load-bearing rather than an omission: it is what makes
+  ;; alloc-dispatch (src/libuv/private/handles.sls, see its "THIS DISPATCHER
+  ;; IS INFALLIBLE" note at handles.sls:626) unable to raise. libuv has no
+  ;; error path for an alloc_cb that fails to answer, so a check added here
+  ;; would turn a bad argument into a raise on the one call site that must
+  ;; not have one.
   (define (uv-buf-set! addr base len)
     (let ((p (make-ftype-pointer uv-buf addr)))
       (ftype-set! uv-buf (base) p base)
