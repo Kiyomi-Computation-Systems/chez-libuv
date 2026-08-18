@@ -31,7 +31,15 @@ changing the call shape callers already depend on.
 **Writes:** the caller's bytevector is copied into one `foreign-alloc`'d
 block built by `uv-write!` (design spec §7); the caller's own bytevector is
 free to be reclaimed the instant `uv-write!` returns, and the block is freed
-in the write-done dispatcher after `on-complete` runs.
+in the write-done dispatcher **before** `on-complete` runs.
+
+> **Corrected 2026-08-18 (Stage 4).** This paragraph originally read "after
+> `on-complete` runs", contradicting design spec §7's "pops the request entry
+> and frees the block **before** invoking `(on-complete err)`". The spec is
+> the authority and is what the implementation and
+> `.plans/stage-4-mutation-log.md` (mutation 3) enforce: freeing first is what
+> bounds memory on a stream with many queued writes by the code rather than by
+> how long each callback happens to take. Only this ADR's wording was wrong.
 
 Vectored (scatter-gather) writes are deferred: under a copying design,
 multiple source buffers are equivalent to one concatenated copy, so there is
