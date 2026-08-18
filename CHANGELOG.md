@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## [0.1.0] — 2026-08-18
+## 0.1.0 — 2026-08-18
 
 The first release: a legible, low-level mirror of libuv's event loop, TCP
 sockets and timers as an R6RS library for Chez Scheme. Transport only — it
@@ -79,11 +79,18 @@ Four decisions shape everything else, and each has its own record under
   a generated `config.sls` carrying absolute paths so the loader never
   searches, the validated-never-searched `CHEZ_LIBUV_SHIM` override, Akku
   packaging, and CI over macOS and Linux on both acquisition paths.
-- `make prod` / `make check-prod`: a validated `FLAVOR` variable and a
-  `build/.flavor-*` stamp that forces a relink on a flavor flip, plus a
-  behavioural probe that fails unless the built shim really is the
-  counters-free release artifact. `prod` and `build` write the same path, so
-  `make prod && make test && package` used to package a dev relink.
+- `make prod` / `make check-prod`: a validated `FLAVOR` variable, a
+  `build/.flavor-*` stamp recording which flavor the artifact was linked as,
+  and `relink-guard` — the first prerequisite of `build`, which **deletes**
+  an artifact whose recorded provenance no longer matches what was asked for.
+  The deletion is what forces the relink, not the stamp: make 3.81 compares
+  mtimes at one-second granularity and treats equal as up to date, so a stamp
+  recreated in the same second as the previous link forces nothing, while a
+  missing artifact is rebuilt whatever the clock said. The guard covers a
+  change of acquisition path too. Alongside them, a behavioural probe that
+  fails unless the built shim really is the counters-free release artifact.
+  `prod` and `build` write the same path, so `make prod && make test &&
+  package` used to package a dev relink.
 - `tests/test-echo.sps`, the capstone: an echo server and eight concurrent
   in-process clients on one loop, 512 KiB of loopback traffic compared byte
   for byte, with a read-stop/read-start applied and released from inside

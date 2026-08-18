@@ -569,10 +569,17 @@
               payload-size
               sizes))))
 
-;; #f, from a procedure whose #t means "work remains" -- a loop that ran dry
-;; (design spec S5). Read with 'nowait so it cannot block.
+;; A loop that ran dry (design spec S5). Read with 'nowait so it cannot block.
+;;
+;; NOT `#f (uv-run loop 'nowait)`, even though #f is exactly what uv-run
+;; answers here: uv-run can RAISE -- it is the procedure that re-raises
+;; whatever a callback raised this run, and it refuses a closed loop with
+;; &uv-handle-closed -- and SRFI-64 turns any raise in a test's actual
+;; expression into #f (AGENTS.md's named trap). The row would then pass on the
+;; one outcome it most needs to report. 'no-work is producible only by uv-run
+;; returning.
 (test-equal "the loop has nothing left to run"
-  #f (uv-run loop 'nowait))
+  'no-work (if (uv-run loop 'nowait) 'work 'no-work))
 
 (test-equal "the facade's live-handle snapshot is empty before teardown"
   '() (uv-loop-live-handles loop))
@@ -589,8 +596,10 @@
 (test-equal "uv-loop-teardown! and a second uv-loop-close! both succeed"
   'torn-down teardown-outcome)
 
+;; Same reasoning as the row above: uv-loop-open? raises on an argument that
+;; is not a loop at all, and a raise reads as #f here.
 (test-equal "the loop is closed afterwards"
-  #f (uv-loop-open? loop))
+  'closed (if (uv-loop-open? loop) 'open 'closed))
 
 ;; --- balance -------------------------------------------------------------
 (collect)

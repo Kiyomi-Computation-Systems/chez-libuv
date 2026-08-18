@@ -171,6 +171,57 @@ make: *** [check-prod] Error 1
 (no output: nothing was rebuilt)
 ```
 
+### The guard's own failure mode, checked rather than reasoned about
+
+A guard that deletes the artifact has a failure mode of its own, and the
+chez-cmark-gfm session hit it (their PR #10): their first fix did the deletion
+**inside a recipe of the shim's own prerequisite**, and on make 3.81 that is
+*worse* than the bug — make has already stat'd the target by then, skips the
+rule on the same-second comparison, and the build exits 0 **with no artifact
+at all**. `relink-guard` avoids that by construction (it is a prerequisite of
+the phony `build`, so `$(SHIM)` is stat'd only when make reaches it, after the
+guard has run), but "by construction" is a claim, so it was run under
+`/usr/bin/make` (GNU Make 3.81) with the shim's mtime forced *equal* to the
+stamp's — the same-second repro — in both flavor directions and across an
+acquisition flip:
+
+```
+### setup: clean, then build FLAVOR=prod        →  34800 bytes, -O2
+### force mtime equality
+17:59:19 build/lib/libchezlibuv.dylib
+17:59:19 build/.flavor-prod
+### DIRECTION 1: prod -> dev,  /usr/bin/make build
+relink-guard: shim provenance changed (flavor=dev, acquisition=pkgconfig); relinking
+cc … -g -O0 -DCHEZ_LIBUV_DEBUG_COUNTERS … -o build/lib/libchezlibuv.dylib
+(a) exit=0
+(b) artifact exists: YES        (36816 bytes)
+(c) flavor: dev (correct: check-prod refused it)
+### force mtime equality again, DIRECTION 2: dev -> prod
+17:59:20 build/lib/libchezlibuv.dylib
+17:59:20 build/.flavor-dev
+relink-guard: shim provenance changed (flavor=prod, acquisition=pkgconfig); relinking
+(a) exit=0
+(b) artifact exists: YES
+(c) flavor: prod (correct: check-prod accepted it)
+### control: no flip
+exit=0
+artifact unchanged: YES
+```
+
+and, with the acquisition stamp forced to the shim's own second, vendored →
+pkg-config:
+
+```
+links against: @rpath/libuv.1.dylib                       (before)
+relink-guard: shim provenance changed (flavor=dev, acquisition=pkgconfig); relinking
+(b) artifact exists: YES
+(c) links against: /opt/homebrew/opt/libuv/lib/libuv.1.dylib   (after)
+```
+
+Exit 0, artifact present, provenance actually flipped, and nothing rebuilt
+when there was no flip. The cached-stat trap does not bite at this position in
+the graph.
+
 ## Uncovered, and why
 
 **Mutation 3a (`uv-loop-teardown!` skipped) is equivalent, not undetected.**

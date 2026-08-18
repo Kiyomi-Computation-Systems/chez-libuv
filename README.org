@@ -137,10 +137,18 @@ fails unless every counter reads zero while they are demonstrably alive. That
 is a *behavioural* check on the artifact rather than a claim about the
 command that produced it, because ~prod~ and ~build~ write the same file:
 before this existed, ~make prod && make test && package~ shipped a debug
-build, since ~test~ depends on ~build~ and ~build~ relinked. A
-~build/.flavor-*~ stamp now makes a flavor flip force a relink in both
-directions, so ~make test~ after ~make prod~ self-heals back to a dev shim —
-and the suites' counter rows keep working.
+build, since ~test~ depends on ~build~ and ~build~ relinked.
+
+What makes the flip take is ~relink-guard~, the first prerequisite of
+~build~: a ~build/.flavor-*~ stamp *records* which flavor the artifact was
+linked as, and the guard *deletes* the artifact when that no longer matches
+what was asked for. The deletion is the load-bearing part, not the stamp —
+make 3.81 (which macOS ships) compares mtimes at one-second granularity and
+treats equal as up to date, so a stamp recreated in the same second as the
+previous link — exactly what ~make prod && make test~ does — forces nothing at
+all, while a missing artifact is rebuilt whatever the clock said. So ~make
+test~ after ~make prod~ self-heals back to a dev shim, the suites' counter
+rows keep working, and the same guard covers a change of acquisition path.
 
 * Quickstart
 
