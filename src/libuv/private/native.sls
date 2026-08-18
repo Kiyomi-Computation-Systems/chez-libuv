@@ -688,6 +688,11 @@
   ;; install happens after this library's body has finished running, so a
   ;; trampoline that captured its slot's value up front would capture the
   ;; stub forever.
+  ;;
+  ;; The per-fire hashtable lookup was measured against a vector-slot
+  ;; replacement and kept: it costs ~6 ns of a >=26 microsecond fire, ~0.02%
+  ;; of the cheapest callback path this binding can execute
+  ;; (.plans/2026-08-18-dispatch-benchmark.md).
   (define (dispatcher-ref name)
     (let ((proc (hashtable-ref dispatchers name #f)))
       (or proc

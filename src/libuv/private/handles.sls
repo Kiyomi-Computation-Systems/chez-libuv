@@ -944,6 +944,13 @@
           (loop-record-error! loop obj)
           (record-orphan-callback! name ptr))))
 
+  ;; The rest-args list this closure conses per fire, and its second
+  ;; hashtable lookup (dispatch-procedure), were measured against an
+  ;; arity-specific case-lambda replacement and kept: together with
+  ;; dispatcher-ref's lookup they cost ~6 ns of a >=26 microsecond fire
+  ;; (.plans/2026-08-18-dispatch-benchmark.md) -- and the rest-args half of
+  ;; that is pure noise, since Chez compiles this shape as well as the fixed
+  ;; arities.
   (define (seam-closure name)
     (lambda args
       (let ((ptr (if (pair? args) (car args) 0)))
