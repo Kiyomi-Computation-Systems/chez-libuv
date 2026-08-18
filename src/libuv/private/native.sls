@@ -47,6 +47,19 @@
           ;; runtime sizes
           uv-loop-size uv-handle-size uv-req-size
 
+          ;; the loop entry points (design spec S5). These are the RAW
+          ;; bindings, one per libuv function, with libuv's own return
+          ;; conventions intact -- uv-loop-run answers uv_run's int, not a
+          ;; boolean. (libuv loop) owns the public spellings (uv-run,
+          ;; uv-stop!, uv-loop-alive?, uv-now, uv-loop-close!) and every
+          ;; policy decision about them.
+          uv-loop-init uv-loop-run uv-loop-stop
+          uv-loop-alive uv-loop-now uv-loop-close
+
+          ;; callback dispatcher slots (ADR-0008, design spec S4)
+          dispatcher-names dispatcher-ref dispatchers-installed?
+          install-callback-dispatchers!
+
           ;; debug counters (design spec S10)
           live-counts
           count-loop-new!        count-loop-free!
@@ -215,6 +228,28 @@
   (define uv-loop-size   (foreign-procedure "uv_loop_size" () size_t))
   (define uv-handle-size (foreign-procedure "uv_handle_size" (int) size_t))
   (define uv-req-size    (foreign-procedure "uv_req_size" (int) size_t))
+
+  ;; --- the loop entry points (design spec S5, spike/01-callback-gc.ss) ---
+  ;; Every pointer is `uptr` (design spec S4 rule 4).
+  ;;
+  ;; uv_run's int is NOT an errno: it is 0 for "nothing left to do" and
+  ;; nonzero for "handles or requests are still active", which is the exact
+  ;; case uv-check's header warns must not be routed through it. (libuv
+  ;; loop)'s uv-run interprets it directly.
+  ;;
+  ;; uv_loop_close's int IS an errno (-EBUSY when handles remain open --
+  ;; spike FINDINGS Q2 measured -16), so that one goes through uv-check.
+  ;;
+  ;; uv_now returns uint64_t milliseconds; binding it `unsigned-64` rather
+  ;; than `long` keeps it exact on every ILP32/LLP64 target and keeps the
+  ;; value unsigned, which matters because the clock is an arbitrary origin,
+  ;; not a small number.
+  (define uv-loop-init  (foreign-procedure "uv_loop_init"  (uptr) int))
+  (define uv-loop-run   (foreign-procedure "uv_run"        (uptr int) int))
+  (define uv-loop-stop  (foreign-procedure "uv_stop"       (uptr) void))
+  (define uv-loop-alive (foreign-procedure "uv_loop_alive" (uptr) int))
+  (define uv-loop-now   (foreign-procedure "uv_now"        (uptr) unsigned-64))
+  (define uv-loop-close (foreign-procedure "uv_loop_close" (uptr) int))
 
   ;; --- uv_buf_t (design spec S4 rule 4) ---------------------------------
   ;; The one libuv struct this binding CONSTRUCTS rather than merely holding
@@ -424,6 +459,91 @@
           (cons 'write-req   (live-write-req))
           (cons 'connect-req (live-connect-req))
           (cons 'read-buffer (live-read-buffer))))
+
+  ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
+  ;; The eight trampolines Task 7 declares here as `foreign-callable`s have
+  ;; mechanical bodies: they call the slot named for their callback type.
+  ;; The slots' CONTENTS -- all dispatch policy, including the
+  ;; store-and-reraise guard of design spec S8 -- are installed exactly once
+  ;; by (libuv private handles), which is what keeps this file, the one
+  ;; reviewed for FFI declarations, free of policy.
+  ;;
+  ;; The slots live HERE rather than in handles.sls for an import-graph
+  ;; reason, not a stylistic one: handles.sls calls uv_stop (design spec S8's
+  ;; "and uv_stop is called on that loop"), so handles.sls imports this
+  ;; library. A trampoline body reaching the other way would close the cycle,
+  ;; and R6RS libraries may not import circularly. The registry lookup the
+  ;; design spec describes in the trampoline body therefore happens one step
+  ;; later, inside the installed dispatcher itself -- same two steps, same
+  ;; file boundary, no cycle.
+  ;;
+  ;; Task 6 creates no foreign-callables: only the slots, the stubs, and the
+  ;; install gate exist yet.
+  (define dispatcher-names
+    '(alloc read connection write-done close timer shutdown connect))
+
+  (define dispatchers (make-eq-hashtable))
+  (define dispatchers-installed #f)
+
+  (define (dispatchers-installed?) dispatchers-installed)
+
+  ;; The uninstalled stub. It raises rather than returning a harmless value
+  ;; because a callback firing before its policy exists means libuv is
+  ;; already holding a pointer to a trampoline this binding cannot service --
+  ;; there is no state in which quietly doing nothing is right. Raising from
+  ;; inside a C frame is survivable exactly once, at development time; see
+  ;; ADR-0008 on why the real dispatchers guard their bodies instead.
+  (define (uninstalled-dispatcher name)
+    (lambda args
+      (raise (condition
+              (make-uv-error)
+              (make-who-condition name)
+              (make-message-condition
+               "callback dispatchers have not been installed")))))
+
+  ;; A definition, not a bare expression: R6RS library bodies take all their
+  ;; definitions before any expression, and this seeding has to run before
+  ;; anything can look a slot up. Same shape as the `uv-loaded` definition
+  ;; above, for the same reason.
+  (define dispatchers-seeded
+    (for-each (lambda (name)
+                (hashtable-set! dispatchers name (uninstalled-dispatcher name)))
+              dispatcher-names))
+
+  ;; Looked up by name at fire time, never cached at declaration time: the
+  ;; install happens after this library's body has finished running, so a
+  ;; trampoline that captured its slot's value up front would capture the
+  ;; stub forever.
+  (define (dispatcher-ref name)
+    (let ((proc (hashtable-ref dispatchers name #f)))
+      (or proc
+          (raise (make-uv-invalid-argument 'uv-dispatcher-ref
+                                           'unknown-dispatcher)))))
+
+  ;; alist: (name . procedure) for all eight names, in any order.
+  ;;
+  ;; All-or-nothing, and once only. A partial install would leave some slots
+  ;; holding the raising stub while libuv already had their addresses; a
+  ;; second install would let dispatch policy be rebound underneath a running
+  ;; loop, which ADR-0008 rules out ("a second call asserts").
+  (define (install-callback-dispatchers! alist)
+    (when dispatchers-installed
+      (raise (make-uv-invalid-argument 'uv-install-callback-dispatchers!
+                                       'dispatchers-already-installed)))
+    (unless (and (list? alist)
+                 (= (length alist) (length dispatcher-names))
+                 (for-all (lambda (name)
+                            (let ((entry (assq name alist)))
+                              (and entry (procedure? (cdr entry)))))
+                          dispatcher-names))
+      (raise (make-uv-invalid-argument 'uv-install-callback-dispatchers!
+                                       'incomplete-dispatcher-set)))
+    ;; Committed only after the whole set has been validated, so a refused
+    ;; install leaves every slot exactly as it was.
+    (for-each (lambda (name)
+                (hashtable-set! dispatchers name (cdr (assq name alist))))
+              dispatcher-names)
+    (set! dispatchers-installed #t))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)
