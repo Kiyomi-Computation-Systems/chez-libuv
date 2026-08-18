@@ -922,6 +922,88 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
+;; --- the eight callback dispatcher slots, BEFORE anything installs them --
+;; These rows live here, and only here, because this is the one suite whose
+;; import chain never reaches (libuv private handles) -- and handles.sls
+;; installs the eight dispatchers in its own library body, at instantiation
+;; (design spec S4: "the slots themselves are filled exactly once, by
+;; handles.sls"). In every other suite's process the install has therefore
+;; already happened before the first test line runs, so the uninstalled
+;; state, the partial-install refusal, and the install itself are only
+;; observable from here.
+;;
+;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
+;; every "not installed yet" assertion has to run before the install below.
+(test-equal "dispatcher-names names the eight callback types the design commits to"
+  '(alloc read connection write-done close timer shutdown connect)
+  dispatcher-names)
+
+(test-equal "before installation, dispatchers-installed? is false"
+  'not-installed (if (dispatchers-installed?) 'installed 'not-installed))
+
+(for-each
+ (lambda (name)
+   (test-equal (string-append "an uninstalled " (symbol->string name)
+                              " dispatcher raises &uv-error when invoked")
+     'uv-error
+     (guard (e ((uv-error? e) 'uv-error) (#t 'wrong-condition))
+       ((dispatcher-ref name) 0)
+       'no-raise)))
+ dispatcher-names)
+
+(test-equal "dispatcher-ref rejects a name that is not one of the eight"
+  '(uv-dispatcher-ref unknown-dispatcher)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (dispatcher-ref 'not-a-callback-type)
+    'no-raise))
+
+;; A partial install must be refused OUTRIGHT, leaving nothing installed --
+;; a half-installed dispatcher table would hand libuv a trampoline that
+;; raises from inside a C frame.
+(test-equal "an install missing one of the eight is refused, naming who and why"
+  '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (install-callback-dispatchers! (list (cons 'timer (lambda args 'partial))))
+    'no-raise))
+
+(test-equal "the refused install left the slots uninstalled"
+  'not-installed (if (dispatchers-installed?) 'installed 'not-installed))
+
+;; Stand-ins for the real dispatchers (which live in handles.sls, out of
+;; this process's reach): each answers with its own name, so a cross-wired
+;; slot is visible.
+(install-callback-dispatchers!
+ (map (lambda (name) (cons name (lambda args (list 'stub name args))))
+      dispatcher-names))
+
+(test-equal "after installation, dispatchers-installed? is true"
+  'installed (if (dispatchers-installed?) 'installed 'not-installed))
+
+(for-each
+ (lambda (name)
+   (test-equal (string-append "the " (symbol->string name)
+                              " slot now answers with the procedure installed for it")
+     (list 'stub name '(7))
+     ((dispatcher-ref name) 7)))
+ dispatcher-names)
+
+(test-equal "a second install is refused, naming who and why"
+  '(uv-install-callback-dispatchers! dispatchers-already-installed)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (install-callback-dispatchers!
+     (map (lambda (name) (cons name (lambda args 'second))) dispatcher-names))
+    'no-raise))
+
+(test-equal "the refused second install did not rebind a slot"
+  (list 'stub 'timer '(7))
+  ((dispatcher-ref 'timer) 7))
+
 (test-end "native")
 
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))

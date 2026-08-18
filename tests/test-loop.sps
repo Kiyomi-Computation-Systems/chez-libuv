@@ -14,13 +14,20 @@
 ;;; zeroes the stored uptr immediately" (S10) is a statement about a field,
 ;;; and an assertion on the public surface alone cannot see it.
 ;;;
-;;; ORDER IS LOAD-BEARING in two places, both marked below: the callback
-;;; dispatcher slots and the close-handle! hook are process-global and
-;;; install-once, so their "not installed yet" assertions have to run before
-;;; the installs that the sweep test needs.
+;;; THE DISPATCHER SLOTS AND THE CLOSE HOOK ARE ALREADY INSTALLED HERE. Both
+;;; are process-global and install-once, and (libuv private handles) fills
+;;; them in its own library body -- which this suite's import chain runs
+;;; before the first test line. Their uninstalled behaviour is asserted in
+;;; tests/test-native.sps instead, the one suite that never imports
+;;; handles.sls; see the section below for why that split exists.
 (import (rnrs)
         (srfi :64)
         (libuv loop)
+        ;; Stage 3: the teardown sweep is exercised with a REAL handle now,
+        ;; so this suite needs the timer constructor and the generic handle
+        ;; state accessor. Nothing else here goes through them.
+        (libuv handle)
+        (libuv timer)
         (libuv private handles)
         (libuv private conditions)
         ;; `only` rather than a plain import: (libuv private native) exports
@@ -171,64 +178,24 @@
 (test-equal "uv-now does not go backwards across a run"
   'monotone (if (>= now-after now-before) 'monotone 'went-backwards))
 
-;; --- the eight callback dispatcher slots (ADR-0008) ---------------------
-;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
-;; every "not installed yet" assertion has to run before the install below.
+;; --- the eight callback dispatcher slots and the close hook (ADR-0008) --
+;; Both are process-global and install-once, and as of Stage 3 both are
+;; already filled before this suite's first line runs: (libuv private
+;; handles) installs the eight dispatchers and the real close-handle! in its
+;; own library body, and this suite imports it. So what is assertable HERE
+;; is the installed state and the refusal of a second install.
+;;
+;; The pre-install state -- the raising stubs, the partial-install refusal,
+;; the install itself -- is asserted in tests/test-native.sps, the one suite
+;; whose import chain never reaches handles.sls and whose process therefore
+;; still has empty slots. Moving those rows there rather than deleting them
+;; is what keeps the uninstalled behaviour covered at all.
 (test-equal "dispatcher-names names the eight callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect)
   dispatcher-names)
 
-(test-equal "before installation, dispatchers-installed? is false"
-  'not-installed (if (dispatchers-installed?) 'installed 'not-installed))
-
-(for-each
- (lambda (name)
-   (test-equal (string-append "an uninstalled " (symbol->string name)
-                              " dispatcher raises &uv-error when invoked")
-     'uv-error
-     (guard (e ((uv-error? e) 'uv-error) (#t 'wrong-condition))
-       ((dispatcher-ref name) 0)
-       'no-raise)))
- dispatcher-names)
-
-(test-equal "dispatcher-ref rejects a name that is not one of the eight"
-  '(uv-dispatcher-ref unknown-dispatcher)
-  (guard (e ((uv-invalid-argument? e)
-             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
-            (#t 'wrong-condition))
-    (dispatcher-ref 'not-a-callback-type)
-    'no-raise))
-
-;; A partial install must be refused OUTRIGHT, leaving nothing installed --
-;; a half-installed dispatcher table would hand libuv a trampoline that
-;; raises from inside a C frame.
-(test-equal "an install missing one of the eight is refused, naming who and why"
-  '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
-  (guard (e ((uv-invalid-argument? e)
-             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
-            (#t 'wrong-condition))
-    (install-callback-dispatchers! (list (cons 'timer (lambda args 'partial))))
-    'no-raise))
-
-(test-equal "the refused install left the slots uninstalled"
-  'not-installed (if (dispatchers-installed?) 'installed 'not-installed))
-
-;; The stub procedures are Task 6's stand-in for Task 7's real dispatchers;
-;; each answers with its own name so a cross-wired slot is visible.
-(install-callback-dispatchers!
- (map (lambda (name) (cons name (lambda args (list 'stub name args))))
-      dispatcher-names))
-
-(test-equal "after installation, dispatchers-installed? is true"
+(test-equal "importing (libuv private handles) has already installed the dispatchers"
   'installed (if (dispatchers-installed?) 'installed 'not-installed))
-
-(for-each
- (lambda (name)
-   (test-equal (string-append "the " (symbol->string name)
-                              " slot now answers with the procedure installed for it")
-     (list 'stub name '(7))
-     ((dispatcher-ref name) 7)))
- dispatcher-names)
 
 (test-equal "a second install is refused, naming who and why"
   '(uv-install-callback-dispatchers! dispatchers-already-installed)
@@ -239,42 +206,36 @@
      (map (lambda (name) (cons name (lambda args 'second))) dispatcher-names))
     'no-raise))
 
-(test-equal "the refused second install did not rebind a slot"
-  (list 'stub 'timer '(7))
-  ((dispatcher-ref 'timer) 7))
+;; The refusal is not merely a raise: the slots must still hold handles.sls's
+;; own dispatchers afterwards. A timer callback for a pointer the registry
+;; does not know is the observable, side-effect-free way to ask -- the real
+;; dispatcher records an orphan event and returns, where the raising stub
+;; and any test-installed replacement would not.
+(test-equal "the refused second install left handles.sls's dispatchers in place"
+  'dispatched-by-handles
+  (let ((before (length (orphan-callback-events))))
+    ((dispatcher-ref 'timer) 5150)
+    (if (equal? (list-tail (orphan-callback-events) before) '((timer . 5150)))
+        'dispatched-by-handles
+        'slot-was-rebound)))
 
-;; --- the close-handle! hook (Task 7 fills it) ---------------------------
-;; ORDER IS LOAD-BEARING for the same reason as the dispatcher slots.
-(test-equal "close-handle! raises &uv-error until Task 7 installs a real one"
-  'uv-error
-  (guard (e ((uv-error? e) 'uv-error) (#t 'wrong-condition))
-    (close-handle! '(0 . not-a-handle))
-    'no-raise))
-
-;; The probe stands in for Task 7's uv-close!: it records what it was handed
-;; and drops the entry from the registry, which is what makes the teardown
-;; sweep below observable.
-(define closed-handles '())
-
-(install-close-handle!
- (lambda (handle)
-   (set! closed-handles (cons handle closed-handles))
-   (registry-deregister! (car handle))))
-
-(test-equal "close-handle! now routes to the installed procedure"
-  'routed
-  (let ((probe (cons 987654321 'probe-handle)))
-    (registry-register! (car probe) 'timer l0 probe)
-    (close-handle! probe)
-    (set! closed-handles (cdr closed-handles))   ; not part of the sweep test
-    (if (registry-ref (car probe)) 'still-registered 'routed)))
+(test-equal "the close-handle! hook was installed by handles.sls too"
+  'installed (if (close-handle-installed?) 'installed 'not-installed))
 
 (test-equal "a second close-handle! install is refused, naming who and why"
   '(uv-install-close-handle! close-handle-already-installed)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
-    (install-close-handle! (lambda (handle) 'second))
+    (install-close-handle! (lambda (handle on-close) 'second))
+    'no-raise))
+
+(test-equal "the installed close-handle! refuses something that is not a handle"
+  '(uv-close! not-a-uv-handle)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (close-handle! '(0 . not-a-handle))
     'no-raise))
 
 ;; --- the registry, directly ---------------------------------------------
@@ -571,18 +532,25 @@
        (cons "uv-loop-deferred-errors" (lambda () (uv-loop-deferred-errors dead-loop)))))
 
 ;; --- uv-loop-teardown! --------------------------------------------------
-;; The sweep is exercised with a REGISTERED (fake) handle rather than over an
-;; empty registry: an empty sweep passes whether the sweep loop is there or
-;; not. Task 7 replaces the probe with the real uv-close!.
+;; The sweep is exercised with a REGISTERED handle rather than over an empty
+;; registry: an empty sweep passes whether the sweep loop is there or not.
+;; Stage 3 replaced Stage 2's probe with a real timer, which makes the row
+;; below an assertion about the actual close protocol.
+;;
+;; The timer is deliberately NEVER STARTED. An armed one would keep the loop
+;; alive, so a teardown that failed to sweep would BLOCK in the drain's
+;; uv-run rather than fail -- a hang is not a test result. An unstarted
+;; timer is still in libuv's handle queue, so an unswept one makes
+;; uv_loop_close answer EBUSY and the first row below fails by name.
 (define td-loop (make-uv-loop))
-(define td-handle (cons 31337 'fake-timer))
+(define td-timer (make-uv-timer td-loop))
 (define td-live-before (live-count 'loop))
 
-(registry-register! (car td-handle) 'timer td-loop td-handle)
-(set! closed-handles '())
+(test-equal "seed: the timer is listed as a live handle of its loop"
+  'listed (if (memq td-timer (uv-loop-live-handles td-loop)) 'listed 'missing))
 
-(test-equal "seed: the fake handle is listed as a live handle of its loop"
-  'listed (if (memq td-handle (uv-loop-live-handles td-loop)) 'listed 'missing))
+(test-equal "seed: the timer is live in the counters before teardown"
+  1 (live-count 'timer))
 
 (test-equal "uv-loop-teardown! on an open loop returns without raising"
   'torn-down
@@ -591,10 +559,10 @@
     'torn-down))
 
 (test-equal "teardown swept the loop's registered handles through close-handle!"
-  'swept
-  (if (and (= 1 (length closed-handles)) (eq? td-handle (car closed-handles)))
-      'swept
-      'not-swept))
+  'closed (uv-handle-state td-timer))
+
+(test-equal "the swept handle was freed, not merely forgotten"
+  0 (live-count 'timer))
 
 (test-equal "teardown closed the loop after the sweep"
   'closed (loop-state td-loop))

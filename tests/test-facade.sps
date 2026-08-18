@@ -28,7 +28,12 @@
         (srfi :64)
         (libuv)
         (rename (only (libuv private native) uv-version)
-                (uv-version libuv-packed-version)))
+                (uv-version libuv-packed-version))
+        ;; (collect) only, so this suite's timer callback obeys design spec
+        ;; S11's "every timer callback calls (collect)" like every other. It
+        ;; is not a name the facade could be expected to supply, so it cannot
+        ;; stand in for a dropped re-export.
+        (only (chezscheme) collect))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -156,6 +161,65 @@
           (if (uv-constant-unavailable? cu)
               (uv-constant-unavailable-name cu)
               'not-a-constant-unavailable))))
+
+;; --- the re-exported handle and timer surfaces --------------------------
+;; Driven through the facade alone, for the same reason as the loop rows
+;; above: every name below has to come from src/libuv.sls or this file does
+;; not expand.
+(define hl (make-uv-loop))
+(define ht (make-uv-timer hl))
+(define ht-fires 0)
+(define ht-closed 'on-close-never-ran)
+
+(test-equal "uv-timer? and uv-handle? are re-exported and accept a timer"
+  '(timer handle)
+  (list (if (uv-timer? ht) 'timer 'not-a-timer)
+        (if (uv-handle? ht) 'handle 'not-a-handle)))
+
+(test-equal "uv-tcp? is re-exported and answers #f for a timer"
+  'not-a-tcp (if (uv-tcp? ht) 'a-tcp 'not-a-tcp))
+
+(test-equal "uv-handle-open?, uv-handle-closing? and uv-handle-state are re-exported"
+  '(#t #f open)
+  (list (uv-handle-open? ht) (uv-handle-closing? ht) (uv-handle-state ht)))
+
+(test-equal "uv-handle-loop is re-exported"
+  'same (if (eq? hl (uv-handle-loop ht)) 'same 'different))
+
+(uv-timer-start! ht
+                 (lambda (timer) (collect) (set! ht-fires (+ ht-fires 1)))
+                 1 7)
+
+(test-equal "uv-timer-repeat is re-exported and reads the interval back"
+  7 (uv-timer-repeat ht))
+
+(test-equal "uv-timer-start! is re-exported and its callback fires"
+  1 (begin (uv-run hl 'once) ht-fires))
+
+(uv-timer-stop! ht)
+
+(test-equal "uv-timer-stop! is re-exported and disarms the timer"
+  1 (begin (uv-run hl 'nowait) ht-fires))
+
+(test-equal "uv-timer-again! is re-exported and re-arms a stopped repeating timer"
+  2 (begin (uv-timer-again! ht) (uv-run hl 'once) ht-fires))
+
+(uv-timer-stop! ht)
+(uv-timer-set-repeat! ht 0)
+
+(test-equal "uv-timer-set-repeat! is re-exported"
+  0 (uv-timer-repeat ht))
+
+(uv-close! ht (lambda () (set! ht-closed 'on-close-ran)))
+(uv-run hl 'default)
+
+(test-equal "uv-close! is re-exported and runs its on-close callback"
+  'on-close-ran ht-closed)
+
+(test-equal "the closed timer's state is re-exported as 'closed"
+  'closed (uv-handle-state ht))
+
+(uv-loop-teardown! hl)
 
 ;; --- call-with-uv-loop, through the facade ------------------------------
 (test-equal "call-with-uv-loop is re-exported and returns the body's value"
