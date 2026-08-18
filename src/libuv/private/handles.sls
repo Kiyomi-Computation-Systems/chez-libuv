@@ -3,11 +3,18 @@
 ;;; design spec S5 ("The registry is the GC root"), S8 (store-and-reraise),
 ;;; and ADR-0007 (no guardians: closing is explicit, never GC-timed).
 ;;;
-;;; Stage 2 delivers the registry and the loop record. The handle records
-;;; themselves (timer, TCP), the lifecycle state machine's 'closing arm, and
-;;; the eight dispatcher procedures arrive with Tasks 7-9; the seams they
-;;; plug into -- `close-handle!` and (libuv private native)'s dispatcher
-;;; slots -- exist here now, and refuse to be used until they are filled.
+;;; Stage 2 delivered the registry and the loop record. Stage 3 adds the
+;;; handle records, the full 'open -> 'closing -> 'closed state machine, the
+;;; callback guard, and the timer and close dispatchers -- and fills both
+;;; seams: (libuv private native)'s eight dispatcher slots and this library's
+;;; own `close-handle!`. The remaining six callback types are installed as
+;;; raising stubs that Stages 4-5 replace by name through
+;;; `install-dispatch-procedure!`, with no second slot install.
+;;;
+;;; THIS LIBRARY'S BODY HAS EFFECTS. Instantiating it fills the process-global
+;;; dispatcher slots, so any suite whose import chain reaches this file finds
+;;; them already installed (tests/test-native.sps is the one suite that does
+;;; not, which is where the uninstalled behaviour is asserted).
 ;;;
 ;;; WHY THE REGISTRY IS A GLOBAL. libuv hands a callback nothing but the
 ;;; firing handle's C pointer. The registry is what turns that pointer back
@@ -43,17 +50,40 @@
           loop-deferred-error-list set-loop-deferred-error-list!
           loop-open? require-open-loop require-loop loop-pointer
 
-          ;; the callback error policy (design spec S8)
-          loop-record-error!
+          ;; the handle records (design spec S5's handle rows). The
+          ;; constructors are %-prefixed and private-by-convention for the
+          ;; same reason the loop's is: a record whose ptr did not come from
+          ;; a successful uv_*_init is a segfault waiting to happen.
+          %make-uv-handle-record uv-handle? %make-uv-timer-record uv-timer?
+          handle-ptr handle-kind handle-loop
+          handle-state set-handle-state!
+          handle-on-close set-handle-on-close!
+          timer-on-timeout set-timer-on-timeout!
+          require-handle require-open-handle handle-pointer
 
-          ;; the close seam Task 7 fills
-          close-handle! install-close-handle! close-handle-installed?)
+          ;; the callback error policy (design spec S8)
+          loop-record-error! dispatch-guarded orphan-callback-events
+
+          ;; the close protocol, and the seam Stages 4-5 replace their own
+          ;; dispatchers through
+          close-handle! install-close-handle! close-handle-installed?
+          install-dispatch-procedure!)
   (import (rnrs)
           (libuv private conditions)
-          ;; uv_stop only: design spec S8 requires the loop to be stopped
-          ;; when the FIRST callback error is recorded, and that recording
-          ;; happens here, in the policy, not at the call site.
-          (only (libuv private native) uv-loop-stop))
+          ;; The FFI surface this library needs, and nothing more:
+          ;;   uv-loop-stop      design spec S8 stops the loop when the FIRST
+          ;;                     callback error is recorded, and that
+          ;;                     recording happens here, in the policy, not
+          ;;                     at the call site.
+          ;;   uv-close-native   the close protocol (S5) starts here.
+          ;;   free!             and ends here: the close dispatcher is the
+          ;;                     ONLY place a handle pointer is freed.
+          ;;   count-timer-free! the freeing site owns its counter (S10).
+          ;;   the dispatcher slots: this library fills all eight, once, in
+          ;;                     its own body (S4).
+          (only (libuv private native)
+                uv-loop-stop uv-close-native free! count-timer-free!
+                dispatcher-names install-callback-dispatchers!))
 
   ;; --- the loop record ---------------------------------------------------
   ;; Fields, per design spec S5 and S8:
@@ -143,6 +173,79 @@
         (raise (make-uv-invalid-argument who 'null-loop-pointer)))
       ptr))
 
+  ;; --- the handle records (design spec S5) -------------------------------
+  ;; One parent record for everything that is a HANDLE (as opposed to a loop
+  ;; or a request), plus one child per handle type. The parent carries
+  ;; exactly the fields the generic machinery needs -- the close protocol,
+  ;; the state machine, and the loop backpointer -- so `uv-close!`, the close
+  ;; dispatcher, and the teardown sweep are written once and reused verbatim
+  ;; by the TCP handle Stage 4 adds as a second child. That is why this lives
+  ;; here and not in timer.sls.
+  ;;
+  ;; Fields:
+  ;;   ptr       the foreign-alloc'd uv_timer_t / uv_tcp_t, ZEROED the moment
+  ;;             the close dispatcher frees it (S10) -- a freed uv_* pointer
+  ;;             answers plausibly and wrongly rather than faulting (spike
+  ;;             FINDINGS Q1), so the zeroed slot is the only thing that can
+  ;;             make a use-after-free detectable.
+  ;;   kind      'timer | 'tcp -- the registry's kind, the &uv-handle-closed
+  ;;             kind, and the debug-counter class, all one symbol.
+  ;;   loop      the owning loop record. IMMUTABLE: a handle cannot migrate
+  ;;             between loops, and the close dispatcher needs it to reach
+  ;;             the error policy after the pointer is already gone.
+  ;;   state     'open | 'closing | 'closed
+  ;;   on-close  the caller's close callback, or #f
+  (define-record-type (uv-handle-record %make-uv-handle-record uv-handle?)
+    (fields (mutable ptr      handle-ptr      set-handle-ptr!)
+            (immutable kind   handle-kind)
+            (immutable loop   handle-loop)
+            (mutable state    handle-state    set-handle-state!)
+            (mutable on-close handle-on-close set-handle-on-close!))
+    (protocol
+     (lambda (new)
+       (lambda (ptr kind loop) (new ptr kind loop 'open #f)))))
+
+  ;; The timer adds exactly one field: the callback uv_timer_start armed it
+  ;; with. It is stored on the Scheme side rather than read back out of the
+  ;; uv_timer_t because libuv's copy is a C function pointer -- always this
+  ;; binding's single timer trampoline, which says nothing about WHICH
+  ;; Scheme procedure should run.
+  (define-record-type (uv-timer-record %make-uv-timer-record uv-timer?)
+    (parent uv-handle-record)
+    (fields (mutable on-timeout timer-on-timeout set-timer-on-timeout!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop) ((pargs->new ptr 'timer loop) #f)))))
+
+  ;; Type check first, state check second, and both raise DIFFERENT
+  ;; conditions -- the same split as require-loop / require-open-loop, and
+  ;; for the same reason: handing a string to uv-timer-stop! is a caller bug,
+  ;; while touching a handle that has been closed is the documented lifecycle
+  ;; error callers guard for (design spec S9). Returns the handle so the
+  ;; happy path has a value only success produces.
+  (define (require-handle handle who)
+    (unless (uv-handle? handle)
+      (raise (make-uv-invalid-argument who 'not-a-uv-handle)))
+    handle)
+
+  ;; 'closing is NOT open: a handle whose close has been started must refuse
+  ;; new work even though its pointer is still live, because the close
+  ;; dispatcher is already scheduled to free it.
+  (define (require-open-handle handle who)
+    (require-handle handle who)
+    (unless (eq? (handle-state handle) 'open)
+      (raise (make-uv-handle-closed (handle-kind handle))))
+    handle)
+
+  ;; The one way to read a handle pointer for a native call, mirroring
+  ;; loop-pointer: a zero here means something already freed this handle and
+  ;; is about to hand NULL to libuv.
+  (define (handle-pointer handle who)
+    (let ((ptr (handle-ptr handle)))
+      (unless (valid-pointer? ptr)
+        (raise (make-uv-invalid-argument who 'null-handle-pointer)))
+      ptr))
+
   ;; --- the registry ------------------------------------------------------
   ;; uptr -> entry. eqv, not eq: pointers are exact integers wide enough to
   ;; be bignums on a 64-bit host, and bignums are not eq? to each other.
@@ -228,18 +331,139 @@
                      (valid-pointer? (loop-ptr loop)))
             (uv-loop-stop (loop-ptr loop))))))
 
-  ;; --- the close seam ----------------------------------------------------
-  ;; uv-loop-teardown!'s sweep closes every handle registered against the
-  ;; loop, but no handle TYPE exists until Task 7, and the close protocol
-  ;; (design spec S5: uv_close, then the close dispatcher frees the pointer
-  ;; and zeroes it) belongs with the handle records that Task 7 introduces.
+  ;; --- the callback guard (design spec S8, ADR-0008) ---------------------
+  ;; EVERY dispatcher body runs inside this. Not a style rule: spike
+  ;; FINDINGS Q2 measured an unguarded raise from a foreign-callable
+  ;; terminating the process outright -- exit 255, no teardown, no
+  ;; uv_loop_close, no foreign-free. The guard is what turns that into a
+  ;; recorded error and a stopped loop, which uv-run then re-raises from
+  ;; Scheme, outside every C frame.
   ;;
-  ;; So this is a slot, not a procedure: Task 7 installs the real uv-close!
-  ;; here, and until it does, sweeping a registered handle raises rather than
-  ;; silently leaking it. Install-once for the same reason as the dispatcher
-  ;; slots -- close policy must not be rebindable underneath a live handle.
+  ;; The clause is `#t`, not a condition predicate: R6RS `raise` takes ANY
+  ;; object, and a callback that raises a symbol (or #f) must be caught here
+  ;; exactly like one that raises a condition. A predicate clause would let
+  ;; those unwind into libuv.
+  ;;
+  ;; Nothing is returned to libuv: uv_timer_cb and uv_close_cb are void.
+  ;;
+  ;; Stages 4-5: this is the procedure your dispatchers must call through.
+  (define (dispatch-guarded loop thunk)
+    (guard (e (#t (loop-record-error! loop e)))
+      (thunk)))
+
+  ;; --- the orphan fallback -----------------------------------------------
+  ;; A trampoline receives nothing but a pointer. If the registry has no
+  ;; entry for it there is no loop record, hence no error cell to record
+  ;; against and no loop to stop -- design spec S8's policy has no arm for
+  ;; this case because it cannot be expressed. Raising is not an option
+  ;; either (that is the process death above). So the event is recorded in a
+  ;; module-level list and the dispatcher returns.
+  ;;
+  ;; This is a bug reporter, not a recovery mechanism: a callback for an
+  ;; unregistered pointer means libuv is holding a handle this binding has
+  ;; already forgotten, which is exactly the double-free-shaped defect
+  ;; registry-register!'s duplicate check exists to prevent. Tests assert the
+  ;; list, so the situation is observable rather than silent.
+  (define orphan-events '())
+
+  (define (record-orphan-callback! kind ptr)
+    (set! orphan-events (cons (cons kind ptr) orphan-events)))
+
+  ;; Freshly consed, in occurrence order.
+  (define (orphan-callback-events) (reverse orphan-events))
+
+  ;; --- the dispatchers (design spec S4/S5/S8) ----------------------------
+  ;; uv_timer_cb: void (*)(uv_timer_t *handle).
+  ;;
+  ;; Only an 'open timer gets its callback. A 'closing one has had uv_close
+  ;; called on it -- libuv stops the timer as part of that, so this arm is
+  ;; not reachable through libuv today; it is a state check rather than a
+  ;; race guard, and it is what stops a timeout from being delivered to a
+  ;; handle whose pointer is already scheduled to be freed. (Design spec S5
+  ;; tolerates 'closing for REQUEST callbacks -- an in-flight write
+  ;; completing with 'ECANCELED -- which is a different dispatcher.)
+  (define (timer-dispatch handle-ptr)
+    (let ((handle (registry-ref handle-ptr)))
+      (if (uv-timer? handle)
+          (when (eq? (handle-state handle) 'open)
+            (let ((on-timeout (timer-on-timeout handle)))
+              (when on-timeout
+                (dispatch-guarded (handle-loop handle)
+                                  (lambda () (on-timeout handle))))))
+          (record-orphan-callback! 'timer handle-ptr))))
+
+  ;; uv_close_cb: void (*)(uv_handle_t *handle). THE ONLY PLACE A HANDLE
+  ;; POINTER IS FREED (design spec S5, S10).
+  ;;
+  ;; THE ORDER IS THE SPECIFICATION, not an implementation detail:
+  ;;   1. pop the registry entry   -- so nothing can dispatch on this pointer
+  ;;                                  again, and so the address is free to be
+  ;;                                  reused by a later foreign-alloc without
+  ;;                                  colliding with a stale entry
+  ;;   2. free the read buffer     -- Stage 5's per-handle buffer; nothing to
+  ;;                                  free for a timer
+  ;;   3. free the handle pointer
+  ;;   4. bump the counter for this kind, at the freeing site (S10)
+  ;;   5. zero the stored uptr     -- immediately, at the freeing site, so a
+  ;;                                  use-after-free is a structured
+  ;;                                  condition rather than the plausible
+  ;;                                  wrong answer spike Q1 measured
+  ;;   6. transition to 'closed
+  ;;   7. THEN run the user's on-close, under the guard
+  ;; Step 7 last is what makes "touching the handle from inside on-close
+  ;; deterministically raises &uv-handle-closed" true by construction rather
+  ;; than by timing.
+  (define (close-dispatch handle-ptr)
+    (let ((handle (registry-ref handle-ptr)))
+      (if (uv-handle? handle)
+          (begin
+            (registry-deregister! handle-ptr)
+            (free! handle-ptr)
+            (count-handle-free! (handle-kind handle))
+            (set-handle-ptr! handle 0)
+            (set-handle-state! handle 'closed)
+            (let ((on-close (handle-on-close handle)))
+              (when on-close
+                (dispatch-guarded (handle-loop handle) on-close))))
+          (record-orphan-callback! 'close handle-ptr))))
+
+  ;; One counter class per handle kind (design spec S10). Stage 4 adds the
+  ;; 'tcp arm next to this one; a kind with no arm has no counter class yet,
+  ;; and since `kind` is set by the constructors in this file, that cannot
+  ;; be reached from outside it.
+  (define (count-handle-free! kind)
+    (case kind
+      ((timer) (count-timer-free!))
+      (else #f)))
+
+  ;; --- the close protocol (design spec S5) -------------------------------
+  ;; IDEMPOTENT BY AN EXPLICIT STATE TEST, and the on-close argument of a
+  ;; second call is deliberately DROPPED rather than replacing the first: the
+  ;; close is already in flight, so the callback the caller registered when
+  ;; they started it is the one that has to run. Silently replacing it would
+  ;; make which callback runs depend on how many times a caller happened to
+  ;; call uv-close!.
+  ;;
+  ;; Nothing is freed here. uv_close only SCHEDULES close_cb; the dispatcher
+  ;; above is where the pointer dies. That asymmetry is why no dynamic-wind
+  ;; may wrap a handle's lifetime (design spec S5).
+  (define (real-close-handle! handle on-close)
+    (require-handle handle 'uv-close!)
+    (unless (or (not on-close) (procedure? on-close))
+      (raise (make-uv-invalid-argument 'uv-close! 'on-close-not-a-procedure)))
+    (when (eq? (handle-state handle) 'open)
+      (set-handle-on-close! handle on-close)
+      (set-handle-state! handle 'closing)
+      (uv-close-native (handle-pointer handle 'uv-close!))))
+
+  ;; --- the close seam ----------------------------------------------------
+  ;; uv-loop-teardown!'s sweep (in (libuv loop)) closes every handle
+  ;; registered against the loop, and it must do so without importing the
+  ;; handle types -- so it calls through this slot. The slot is filled once,
+  ;; by this library's own body below, for the same reason as the dispatcher
+  ;; slots: close policy must not be rebindable underneath a live handle.
   (define close-handle-proc
-    (lambda (handle)
+    (lambda (handle on-close)
       (raise (condition
               (make-uv-error)
               (make-who-condition 'uv-close-handle!)
@@ -250,7 +474,12 @@
 
   (define (close-handle-installed?) close-handle-installed)
 
-  (define (close-handle! handle) (close-handle-proc handle))
+  ;; The optional on-close is what makes this the whole of (libuv handle)'s
+  ;; uv-close!; the teardown sweep uses the one-argument form.
+  (define close-handle!
+    (case-lambda
+      ((handle) (close-handle-proc handle #f))
+      ((handle on-close) (close-handle-proc handle on-close))))
 
   (define (install-close-handle! proc)
     (when close-handle-installed
@@ -260,4 +489,80 @@
       (raise (make-uv-invalid-argument 'uv-install-close-handle!
                                        'not-a-procedure)))
     (set! close-handle-proc proc)
-    (set! close-handle-installed #t)))
+    (set! close-handle-installed #t))
+
+  ;; --- filling the eight dispatcher slots (ADR-0008) ---------------------
+  ;; The slots in (libuv private native) take one procedure each, exactly
+  ;; once, for the life of the process. Stage 3 can only implement two of the
+  ;; eight, and a second install-callback-dispatchers! call is (rightly)
+  ;; refused -- so the eight procedures installed below are thin closures
+  ;; that look their real implementation up in this table AT FIRE TIME.
+  ;;
+  ;; THE SEAM FOR STAGES 4 AND 5: a later stage calls
+  ;; install-dispatch-procedure! with one of the six names still stubbed
+  ;; here. That replaces the implementation behind an already-installed slot
+  ;; without touching the slot, so the once-only guarantee ADR-0008 makes
+  ;; about the slots survives intact. Each name is still install-once in its
+  ;; own right, and the two names this stage implements are already spoken
+  ;; for -- so nothing can be rebound underneath a running loop.
+  (define dispatch-table (make-eq-hashtable))
+
+  ;; The stub for a callback type whose stage has not landed. It raises for
+  ;; the same reason native.sls's uninstalled stub does: a callback of this
+  ;; type firing means libuv holds a pointer to a trampoline this binding
+  ;; cannot service, and quietly doing nothing would leave a handle or a
+  ;; request in a state nothing will ever complete. It is reachable only
+  ;; from a code path no Stage-3 API can start, and the guard above catches
+  ;; it if one ever is.
+  (define (unimplemented-dispatcher name)
+    (lambda args
+      (raise (condition
+              (make-uv-error)
+              (make-who-condition name)
+              (make-message-condition
+               "this callback type is not implemented in this version")))))
+
+  (define (dispatch-procedure name)
+    (or (hashtable-ref dispatch-table name #f)
+        (raise (make-uv-invalid-argument 'uv-dispatch-procedure
+                                         'unknown-dispatcher))))
+
+  (define (install-dispatch-procedure! name proc)
+    (unless (memq name dispatcher-names)
+      (raise (make-uv-invalid-argument 'uv-install-dispatch-procedure!
+                                       'unknown-dispatcher)))
+    (unless (procedure? proc)
+      (raise (make-uv-invalid-argument 'uv-install-dispatch-procedure!
+                                       'not-a-procedure)))
+    (when (memq name installed-dispatch-names)
+      (raise (make-uv-invalid-argument 'uv-install-dispatch-procedure!
+                                       'dispatch-procedure-already-installed)))
+    (hashtable-set! dispatch-table name proc)
+    (set! installed-dispatch-names (cons name installed-dispatch-names)))
+
+  ;; The names whose real implementation is in place. Seeded with this
+  ;; stage's two, so install-dispatch-procedure! refuses to hijack them by
+  ;; the same rule that stops a later stage installing twice.
+  (define installed-dispatch-names '(timer close))
+
+  ;; A definition, not a bare expression: R6RS library bodies take all their
+  ;; definitions before any expression, and this wiring has to run before
+  ;; anything can fire a callback or sweep a handle. Same shape, and same
+  ;; reason, as native.sls's `uv-loaded`.
+  (define dispatchers-wired
+    (begin
+      (for-each (lambda (name)
+                  (hashtable-set! dispatch-table name
+                                  (unimplemented-dispatcher name)))
+                dispatcher-names)
+      (hashtable-set! dispatch-table 'timer timer-dispatch)
+      (hashtable-set! dispatch-table 'close close-dispatch)
+      ;; Looked up by name at fire time, never captured here: that
+      ;; indirection is the whole seam.
+      (install-callback-dispatchers!
+       (map (lambda (name)
+              (cons name
+                    (lambda args (apply (dispatch-procedure name) args))))
+            dispatcher-names))
+      (install-close-handle! real-close-handle!)
+      'wired)))

@@ -9,17 +9,30 @@
 ;;; so that the version queries can be expressed, and only the four names
 ;;; they need are taken from them.
 ;;;
-;;; Tasks 7-9 extend the export list with (libuv handle), (libuv timer), and
-;;; (libuv tcp) as those libraries land. The list is deliberately written out
-;;; by name rather than re-exported wholesale: a facade that exported
-;;; whatever its imports happened to have would leak a private binding the
-;;; day someone added one.
+;;; (libuv handle) and (libuv timer) landed with Stage 3; (libuv tcp) follows
+;;; with Stages 4-5. The list is deliberately written out by name rather than
+;;; re-exported wholesale: a facade that exported whatever its imports
+;;; happened to have would leak a private binding the day someone added one.
 (library (libuv)
   (export ;; --- the event loop, from (libuv loop) ---
           make-uv-loop uv-loop? uv-loop-open?
           uv-run uv-stop! uv-loop-alive? uv-now
           uv-loop-live-handles uv-loop-deferred-errors
           uv-loop-close! uv-loop-teardown! call-with-uv-loop
+
+          ;; --- handles, from (libuv handle) ---
+          ;; There is no uv-handle-closed? state predicate: that name belongs
+          ;; to &uv-handle-closed's condition predicate, four lines below.
+          ;; (libuv handle) explains the split; the third state is read with
+          ;; uv-handle-state.
+          uv-handle? uv-timer? uv-tcp?
+          uv-handle-open? uv-handle-closing? uv-handle-state
+          uv-handle-loop uv-close!
+
+          ;; --- timers, from (libuv timer) ---
+          make-uv-timer
+          uv-timer-start! uv-timer-stop! uv-timer-again!
+          uv-timer-repeat uv-timer-set-repeat!
 
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to
@@ -59,6 +72,8 @@
           uv-callback-error-cause)
   (import (rnrs)
           (libuv loop)
+          (libuv handle)
+          (libuv timer)
           (libuv private conditions)
           ;; uv-version is renamed on the way in purely to resolve a name
           ;; clash: this library exports a procedure of the same name with a

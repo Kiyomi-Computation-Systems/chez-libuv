@@ -196,29 +196,57 @@
   ;; completed one -- close_cb fires from inside uv_run, and until it does,
   ;; uv_loop_close would answer EBUSY.
   ;;
-  ;; OPEN QUESTION FOR TASK 7, recorded rather than guessed at: the drain
-  ;; calls uv-run, so a callback error stored during teardown re-raises out of
-  ;; here and leaves the loop OPEN and unclosed. With no callbacks in Stage 2
-  ;; that path is unreachable, and inventing a policy for it now would mean
-  ;; shipping an untested one. Task 7 decides -- the candidates are to let it
-  ;; escape as it does now, or to close the loop first and re-raise after --
-  ;; and whichever it picks gets an assertion.
+  ;; A CALLBACK ERROR DURING THE DRAIN IS CAUGHT, THE TEARDOWN IS FINISHED,
+  ;; AND THE ERROR IS RE-RAISED AFTERWARDS. This was Stage 2's recorded open
+  ;; question; Stage 3 made it reachable (an on-close callback that raises)
+  ;; and decided it here. The alternative -- letting the first re-raise
+  ;; escape as it stood -- leaves the loop OPEN with its handles half-closed,
+  ;; which is precisely the invisible cleanup obligation spike FINDINGS Q2
+  ;; measured and design spec S8 exists to avoid: the caller sees an error,
+  ;; goes to close the loop, and gets EBUSY with no explanation. Teardown's
+  ;; contract is that the loop is closed when it returns, and an error raised
+  ;; by one on-close callback is not a reason to abandon the other handles.
+  ;;
+  ;; Only &uv-callback-error is caught -- the class uv-run itself
+  ;; manufactures. Anything else (a broken pointer, a closed loop) is a
+  ;; failure of the teardown machinery rather than a message from a callback,
+  ;; and escapes immediately.
+  ;;
+  ;; Only the FIRST is kept, matching the pending/deferred split of S8. Later
+  ;; drain iterations clear the deferred list as they go, which is the one
+  ;; thing this policy costs: an error deferred during teardown is reported
+  ;; by count only if the caller read it before the next iteration. Recorded
+  ;; in .plans/stage-3-mutation-log.md rather than papered over.
+  (define teardown-no-error (list 'no-error))
+
+  ;; Answers 'drained, 'work, or the caught &uv-callback-error object.
+  (define (drain-step loop)
+    (guard (e ((uv-callback-error? e) e))
+      (if (uv-run loop 'default) 'work 'drained)))
+
   (define (uv-loop-teardown! loop)
     (require-loop loop 'uv-loop-teardown!)
     (when (loop-running? loop)
       (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
     (when (eq? (loop-state loop) 'open)
       (for-each close-handle! (registry-snapshot-for-loop loop))
-      (let drain ((i 0))
-        (cond ((not (uv-run loop 'default)) 'drained)
-              ((< i max-drain-iterations) (drain (+ i 1)))
-              (else
-               (raise (condition
-                       (make-uv-error)
-                       (make-who-condition 'uv-loop-teardown!)
-                       (make-message-condition
-                        "loop still had work after the drain bound"))))))
-      (uv-loop-close! loop)))
+      (let drain ((i 0) (stored teardown-no-error))
+        (let ((outcome (drain-step loop)))
+          (cond ((eq? outcome 'drained)
+                 (uv-loop-close! loop)
+                 (unless (eq? stored teardown-no-error) (raise stored)))
+                ((< i max-drain-iterations)
+                 (drain (+ i 1)
+                        (if (and (eq? stored teardown-no-error)
+                                 (not (eq? outcome 'work)))
+                            outcome
+                            stored)))
+                (else
+                 (raise (condition
+                         (make-uv-error)
+                         (make-who-condition 'uv-loop-teardown!)
+                         (make-message-condition
+                          "loop still had work after the drain bound")))))))))
 
   ;; dynamic-wind is valid around a LOOP, unlike around an individual handle:
   ;; teardown is synchronous once entered, whereas a handle's close completes

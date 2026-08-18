@@ -56,6 +56,15 @@
           uv-loop-init uv-loop-run uv-loop-stop
           uv-loop-alive uv-loop-now uv-loop-close
 
+          ;; the timer and close entry points (design spec S5). The two that
+          ;; take a C function pointer -- uv_timer_start and uv_close -- are
+          ;; NOT exported raw: their wrappers below bake in this library's own
+          ;; trampoline entry points, which is what keeps every locked
+          ;; callable and every entry-point uptr inside this file.
+          uv-timer-init uv-timer-start-native uv-timer-stop uv-timer-again
+          uv-timer-set-repeat uv-timer-get-repeat
+          uv-close-native uv-is-closing
+
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
           install-callback-dispatchers!
@@ -76,6 +85,7 @@
           (only (chezscheme)
                 load-shared-object foreign-procedure foreign-ref foreign-set!
                 foreign-alloc foreign-free foreign-sizeof
+                foreign-callable foreign-callable-entry-point lock-object
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
                 file-regular? make-mutex with-mutex getenv)
@@ -250,6 +260,39 @@
   (define uv-loop-alive (foreign-procedure "uv_loop_alive" (uptr) int))
   (define uv-loop-now   (foreign-procedure "uv_now"        (uptr) unsigned-64))
   (define uv-loop-close (foreign-procedure "uv_loop_close" (uptr) int))
+
+  ;; --- the timer and close entry points (design spec S5) ----------------
+  ;; Every pointer is `uptr` (design spec S4 rule 4), including the two
+  ;; CALLBACK pointers -- uv_timer_start's uv_timer_cb and uv_close's
+  ;; uv_close_cb -- which is why these two are bound with a `raw-` prefix
+  ;; and reached only through the wrappers further down: those supply the
+  ;; entry point, so no caller outside this file ever holds one.
+  ;;
+  ;; The two timeouts are `unsigned-64` because libuv declares them
+  ;; uint64_t: milliseconds since the loop's now, unsigned, and wide enough
+  ;; that binding them `long` would be a silent narrowing on an ILP32 host.
+  ;;
+  ;; uv_timer_init/start/stop/again return errnos, so they go through
+  ;; uv-check at the call site; uv_timer_set_repeat and uv_close return
+  ;; void, and uv_is_closing returns a C boolean that is NOT an errno --
+  ;; routing that one through uv-check would make "yes, it is closing"
+  ;; (which is 1) raise.
+  (define uv-timer-init
+    (foreign-procedure "uv_timer_init" (uptr uptr) int))
+  (define raw-timer-start
+    (foreign-procedure "uv_timer_start" (uptr uptr unsigned-64 unsigned-64) int))
+  (define uv-timer-stop
+    (foreign-procedure "uv_timer_stop" (uptr) int))
+  (define uv-timer-again
+    (foreign-procedure "uv_timer_again" (uptr) int))
+  (define uv-timer-set-repeat
+    (foreign-procedure "uv_timer_set_repeat" (uptr unsigned-64) void))
+  (define uv-timer-get-repeat
+    (foreign-procedure "uv_timer_get_repeat" (uptr) unsigned-64))
+  (define raw-close
+    (foreign-procedure "uv_close" (uptr uptr) void))
+  (define uv-is-closing
+    (foreign-procedure "uv_is_closing" (uptr) int))
 
   ;; --- uv_buf_t (design spec S4 rule 4) ---------------------------------
   ;; The one libuv struct this binding CONSTRUCTS rather than merely holding
@@ -461,7 +504,7 @@
           (cons 'read-buffer (live-read-buffer))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
-  ;; The eight trampolines Task 7 declares here as `foreign-callable`s have
+  ;; The eight trampolines declared below as `foreign-callable`s have
   ;; mechanical bodies: they call the slot named for their callback type.
   ;; The slots' CONTENTS -- all dispatch policy, including the
   ;; store-and-reraise guard of design spec S8 -- are installed exactly once
@@ -476,9 +519,6 @@
   ;; design spec describes in the trampoline body therefore happens one step
   ;; later, inside the installed dispatcher itself -- same two steps, same
   ;; file boundary, no cycle.
-  ;;
-  ;; Task 6 creates no foreign-callables: only the slots, the stubs, and the
-  ;; install gate exist yet.
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect))
 
@@ -544,6 +584,98 @@
                 (hashtable-set! dispatchers name (cdr (assq name alist))))
               dispatcher-names)
     (set! dispatchers-installed #t))
+
+  ;; --- the eight static trampolines (ADR-0008, design spec S4/S10) ------
+  ;; ONE `foreign-callable` per callback TYPE, never per callback instance,
+  ;; each `lock-object`'d exactly once here and never unlocked, for the life
+  ;; of the process. That bound is the whole point of ADR-0008: libuv retains
+  ;; a callback pointer for the entire life of a handle, and a lock per
+  ;; handle or per request would leave the collector permanently unable to
+  ;; move an ever-growing set of code objects -- a leak by another name.
+  ;;
+  ;; ALL EIGHT ARE CREATED NOW, in Stage 3, even though only the timer and
+  ;; close callbacks can fire yet. Creating them together is what keeps
+  ;; `lock-object` in exactly one place, evaluated once; the later stages add
+  ;; dispatch policy behind the slots, not new locked objects. Spike
+  ;; FINDINGS Q1 measured the property this depends on: a locked callable's
+  ;; `foreign-callable-entry-point` was identical before and after both a
+  ;; default `(collect)` and a maximum-generation collection.
+  ;;
+  ;; Each body is mechanical and carries NO policy: look up the slot by name
+  ;; at FIRE time and call it. The lookup is deliberately not hoisted out of
+  ;; the lambda -- the install happens after this library's body has finished
+  ;; running, so a trampoline that captured its slot's value at declaration
+  ;; time would capture the raising stub forever.
+  ;;
+  ;; Signatures are libuv's own (vendor/libuv/include/uv.h, lines 323-335),
+  ;; and `nread` is `ssize_t`: spike Q3 confirmed it is a native Chez foreign
+  ;; type AND that binding it unsigned routes UV_EOF into the data path as
+  ;; 2^64 - 4095 (design spec S4 rule 4).
+  (define alloc-callable
+    (foreign-callable (lambda (handle suggested buf)
+                        ((dispatcher-ref 'alloc) handle suggested buf))
+                      (uptr size_t uptr) void))
+
+  (define read-callable
+    (foreign-callable (lambda (stream nread buf)
+                        ((dispatcher-ref 'read) stream nread buf))
+                      (uptr ssize_t uptr) void))
+
+  (define connection-callable
+    (foreign-callable (lambda (server status)
+                        ((dispatcher-ref 'connection) server status))
+                      (uptr int) void))
+
+  (define write-done-callable
+    (foreign-callable (lambda (req status)
+                        ((dispatcher-ref 'write-done) req status))
+                      (uptr int) void))
+
+  (define close-callable
+    (foreign-callable (lambda (handle) ((dispatcher-ref 'close) handle))
+                      (uptr) void))
+
+  (define timer-callable
+    (foreign-callable (lambda (handle) ((dispatcher-ref 'timer) handle))
+                      (uptr) void))
+
+  (define shutdown-callable
+    (foreign-callable (lambda (req status)
+                        ((dispatcher-ref 'shutdown) req status))
+                      (uptr int) void))
+
+  (define connect-callable
+    (foreign-callable (lambda (req status)
+                        ((dispatcher-ref 'connect) req status))
+                      (uptr int) void))
+
+  ;; A definition, not a bare expression, for the same reason as `uv-loaded`
+  ;; and `dispatchers-seeded` above: R6RS library bodies take all their
+  ;; definitions before any expression, and every lock has to be in place
+  ;; before an entry point below is read.
+  (define trampolines-locked
+    (for-each lock-object
+              (list alloc-callable read-callable connection-callable
+                    write-done-callable close-callable timer-callable
+                    shutdown-callable connect-callable)))
+
+  ;; The entry points are module-private ON PURPOSE (design spec S3: nothing
+  ;; outside private/ sees a pointer -- and these are the pointers whose
+  ;; misuse is least recoverable, since libuv would call a C address with the
+  ;; wrong argument shape). They leave this file only baked into the two
+  ;; wrappers below.
+  (define close-cb-entry (foreign-callable-entry-point close-callable))
+  (define timer-cb-entry (foreign-callable-entry-point timer-callable))
+
+  ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
+  (define (uv-timer-start-native timer-ptr timeout repeat)
+    (raw-timer-start timer-ptr timer-cb-entry timeout repeat))
+
+  ;; (uv-close-native handle-ptr) -> void. uv_close only STARTS the close;
+  ;; the close trampoline fires from inside a later uv_run iteration, which
+  ;; is where the pointer is actually freed (design spec S5).
+  (define (uv-close-native handle-ptr)
+    (raw-close handle-ptr close-cb-entry))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)
