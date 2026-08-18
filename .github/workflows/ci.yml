@@ -20,6 +20,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# README.org's declared floor. Both jobs assert the Chez they end up with
+# actually meets this rather than trusting the resolution step's choice of
+# binary -- see the "Assert Chez Scheme meets the floor" steps below.
+env:
+  CHEZ_FLOOR_VERSION: "10.4.1"
+
 jobs:
   linux:
     name: linux (vendored + valgrind)
@@ -29,11 +35,46 @@ jobs:
         with:
           submodules: recursive
 
+      # chezscheme deliberately absent here -- see the build step below.
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            chezscheme valgrind cmake pkg-config build-essential libuv1-dev
+            valgrind cmake pkg-config build-essential libuv1-dev
+
+      # apt's chezscheme on ubuntu-latest (noble) is 9.5.8 -- below this
+      # project's declared $CHEZ_FLOOR_VERSION floor (README.org), and no PPA
+      # covers it either: Launchpad only packages 10.4.1 for Ubuntu's
+      # in-development suite, not any released one this runner could use.
+      # Built from source instead. The release tarball ships prebuilt "pb"
+      # (portable bytecode) boot files, so `configure && make` self-hosts the
+      # native boot files with no pre-existing Chez required -- and the
+      # result is cached on the pinned version so only a version bump ever
+      # pays the build cost again.
+      - name: Cache built Chez Scheme
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.chez-install
+          key: chez-${{ env.CHEZ_FLOOR_VERSION }}-linux-${{ runner.arch }}
+
+      - name: Build Chez Scheme (pinned; apt's is 9.5.x, below the floor)
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/chez.tar.gz \
+            "https://github.com/cisco/ChezScheme/releases/download/v${CHEZ_FLOOR_VERSION}/csv${CHEZ_FLOOR_VERSION}.tar.gz"
+          tar xzf /tmp/chez.tar.gz -C /tmp
+          cd "/tmp/csv${CHEZ_FLOOR_VERSION}"
+          ./configure --prefix="${{ github.workspace }}/.chez-install"
+          # Serial, not -j: verified locally that parallel make races the pb
+          # bootstrap stage ("rule for target did not create it:
+          # .../nanopass.so") -- an intermittent failure a cache can't paper
+          # over, since it would resurface on every cache miss (a floor bump).
+          make
+          make install
+
+      - name: Add built Chez Scheme to PATH
+        run: echo "${{ github.workspace }}/.chez-install/bin" >> "$GITHUB_PATH"
 
       # Recorded rather than asserted: the project's documented libuv floor
       # came from one developer's machine, not from testing. Whatever this
@@ -48,7 +89,40 @@ jobs:
           pkg-config --exists libuv && echo "present: $(pkg-config --modversion libuv)" \
                                      || echo "absent (the vendored path covers this)"
 
-      # Ubuntu names the binary `chezscheme`; the Makefile defaults to `chez`.
+      # The build step above pins the binary to $CHEZ_FLOOR_VERSION, but this
+      # asserts it rather than trusting the pin: a cache hit could be serving
+      # a stale install from before a floor bump, and a version regression
+      # here should fail loudly rather than surface later as a mystifying
+      # native-feature error. Self-contained (does its own resolution) so it
+      # does not depend on the "Resolve the Chez binary" step's ordering.
+      - name: Assert Chez Scheme meets the declared floor
+        run: |
+          bin=""
+          for c in chez chezscheme scheme; do
+            if command -v "$c" >/dev/null; then bin="$c"; break; fi
+          done
+          if [ -z "$bin" ]; then
+            echo "::error::no Chez Scheme binary found to version-check" >&2
+            exit 1
+          fi
+          raw="$("$bin" --version 2>&1)"
+          ver="$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          if [ -z "$ver" ]; then
+            echo "::error::could not parse a version out of '$bin --version' ($raw)" >&2
+            exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$ver" "$CHEZ_FLOOR_VERSION" | sort -V | head -1)"
+          if [ "$lowest" != "$CHEZ_FLOOR_VERSION" ]; then
+            echo "::error::Chez Scheme $ver is below the declared floor $CHEZ_FLOOR_VERSION" >&2
+            exit 1
+          fi
+          echo "Chez Scheme $ver satisfies the $CHEZ_FLOOR_VERSION floor"
+
+      # The from-source install above names its binary `scheme` (Chez's own
+      # install default); apt's own package (were it ever usable) names it
+      # `chezscheme`. The Makefile defaults to `chez`. This tries all three
+      # so the resolution doesn't hardcode whichever one happens to be true
+      # of the current install method.
       - name: Resolve the Chez binary
         run: |
           if command -v chez >/dev/null; then echo "CHEZ=chez" >> "$GITHUB_ENV"
@@ -173,6 +247,43 @@ jobs:
         run: |
           echo "chez:  $(chez --version 2>&1)"
           echo "pkg-config libuv: $(pkg-config --modversion libuv)"
+
+      # homebrew's chezscheme happens to name its binary `chez` today, but
+      # nothing pins that -- same resolution as the linux job, not an
+      # assumption about brew's naming.
+      - name: Resolve the Chez binary
+        run: |
+          if command -v chez >/dev/null; then echo "CHEZ=chez" >> "$GITHUB_ENV"
+          elif command -v chezscheme >/dev/null; then echo "CHEZ=chezscheme" >> "$GITHUB_ENV"
+          elif command -v scheme >/dev/null; then echo "CHEZ=scheme" >> "$GITHUB_ENV"
+          else echo "no Chez Scheme binary found" >&2; exit 1; fi
+
+      # Same gate as the linux job: homebrew's chezscheme happens to be at
+      # $CHEZ_FLOOR_VERSION today, but a formula update could drop that, and
+      # this is what would catch it instead of a mystifying native-feature
+      # error further down.
+      - name: Assert Chez Scheme meets the declared floor
+        run: |
+          bin=""
+          for c in chez chezscheme scheme; do
+            if command -v "$c" >/dev/null; then bin="$c"; break; fi
+          done
+          if [ -z "$bin" ]; then
+            echo "::error::no Chez Scheme binary found to version-check" >&2
+            exit 1
+          fi
+          raw="$("$bin" --version 2>&1)"
+          ver="$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          if [ -z "$ver" ]; then
+            echo "::error::could not parse a version out of '$bin --version' ($raw)" >&2
+            exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$ver" "$CHEZ_FLOOR_VERSION" | sort -V | head -1)"
+          if [ "$lowest" != "$CHEZ_FLOOR_VERSION" ]; then
+            echo "::error::Chez Scheme $ver is below the declared floor $CHEZ_FLOOR_VERSION" >&2
+            exit 1
+          fi
+          echo "Chez Scheme $ver satisfies the $CHEZ_FLOOR_VERSION floor"
 
       - name: Scheme dependencies
         run: make deps

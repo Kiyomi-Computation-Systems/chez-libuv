@@ -376,10 +376,18 @@ ifeq ($(UNAME_S),Linux)
 # failures that have nothing to do with this binding's own memory
 # behaviour. io_uring stays ON for the normal `make test` run; only this
 # Valgrind leg forces libuv's epoll fallback.
+#
+# --errors-for-leak-kinds=definite (alongside --show-leak-kinds=definite):
+# Valgrind's own default for THIS flag is definite,possible, and a GC
+# runtime's interior pointers -- Chez's own, not this binding's -- routinely
+# classify as "possibly lost". Left at the default, the gate would exit 9 on
+# Chez's own runtime while not even displaying why, since --show-leak-kinds
+# alone controls what gets PRINTED, not what --error-exitcode reacts to.
 	@for t in $(MEMORY_TESTS); do \
 	  UV_USE_IO_URING=0 \
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) valgrind --error-exitcode=9 \
 	    --leak-check=full --show-leak-kinds=definite \
+	    --errors-for-leak-kinds=definite \
 	    $(CHEZ) --program $$t || exit 1; \
 	done
 else
