@@ -299,20 +299,27 @@ blocking `uv_run`, condition type and fields intact, and the loop object
 survives — a second `uv_run` afterwards runs normally and teardown returns `0`.
 The policy is kept anyway, for two measured reasons:
 
-- **Escaping silently loses events.** Whatever the abandoned libuv frame had
-  left to do that iteration does not happen, and nothing reports it. Raising
-  from a read callback (invoked from deep inside `uv__io_poll`) permanently
-  discarded a pending `UV_EOF` — it never arrived, even after a full drain —
-  while raising from a timer callback lost nothing. A failure mode that varies
-  with libuv's internal call depth is not something a caller can reason about.
+- **Escaping leaves an invisible cleanup obligation.** The abandoned
+  iteration's *event* survives: after escaping from a read callback (invoked
+  from deep inside `uv__io_poll`), draining the loop with the handles still
+  open and the read still started **redelivered the pending `UV_EOF` in full**,
+  and that late delivery ran the EOF branch the escape had skipped. What did
+  not happen is the callback's own work: at escape time that branch had not
+  run, the handles it would have closed stayed open, and nothing re-runs the
+  loop automatically. A caller who treats the raise as terminal and goes
+  straight to teardown gets `-16 (EBUSY)` from `uv_loop_close` and no
+  explanation. Escaping from a timer callback left nothing observable
+  outstanding, with a single active handle — a residue that varies with
+  libuv's internal call depth is not something a caller can reason about.
 - **An unguarded raise terminates the process** (exit `255`, no teardown, no
   `uv_loop_close`, no `foreign-free`). Guarding every trampoline body is
   therefore mandatory regardless of which delivery policy is chosen.
 
-Store-and-reraise buys determinism and event completeness, not safety from an
-impossible unwind: `uv_run` returns through its own C epilogue with every
-callback libuv had queued already delivered, and the caller gets a loop in a
-defined state. See
+Store-and-reraise buys determinism and a defined post-error loop state — not
+safety from an impossible unwind, and not rescue of lost events. `uv_run`
+returns through its own C epilogue and the caller gets a loop they can close;
+that every callback already queued for that iteration runs is a property of
+letting the iteration finish, not a Q2 measurement. See
 [ADR-0008](decisions/0008-static-trampolines-and-handle-registry.md).
 
 **Legal from inside a callback:** `uv-close!`, `uv-read-start!` /

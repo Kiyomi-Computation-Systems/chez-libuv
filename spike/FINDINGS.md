@@ -32,7 +32,7 @@ document is reproducible by re-running them.
 |---|---|
 | Q0 — load + call | **PASS.** `uv_version()` = `#x013401`, `uv_version_string()` = `"1.52.1"` via manual `uptr` copy. Definition-order trap reproduced and its exact message recorded. |
 | Q1 — **THE GATE** | **PASS.** 10,000/10,000 re-entries from inside a blocking `uv_run`, `(collect)` on every fire, exit 0, twice, byte-identical. Locked entry points do not move across `(collect)`. |
-| Q2 — raise across C | **PASS, with a refutation.** The plan assumed raising across C frames is unsafe. It is not *unsafe* here — the condition reaches an enclosing `guard`, and the loop survives — but it is **lossy and frame-dependent**. Store-and-reraise is retained, now justified by determinism rather than by safety. See "Q2 verdict" below. |
+| Q2 — raise across C | **PASS, with two refutations.** The plan assumed raising across C frames is unsafe: it is not — the condition reaches an enclosing `guard` and the loop survives. An earlier draft of this document then assumed the escape loses the abandoned iteration's events: it does not — measurement shows the `UV_EOF` is **redelivered**. What an escape actually costs is an invisible obligation (skipped cleanup, handles left open, `uv_loop_close` → `EBUSY`), plus process death if unguarded. Store-and-reraise retained. See "Q2 verdict". |
 | Q3 — uv_buf_t + loopback | **PASS.** All six callback signatures round-trip; 5 bytes delivered exactly; `ssize_t` is a real Chez foreign type and `UV_EOF` = `-4095` arrives intact. |
 
 Exit criterion 2 is met; ADRs 0001–0010 were flipped to `Accepted (2026-08-18)`
@@ -293,13 +293,13 @@ therefore the one part of the output that legitimately differs between runs.
 Both runs, verbatim:
 
 ```
-addresses: timer 10B108A10 -> 10B108A10 ; close 10B109010 -> 10B109010
-handle arg: allocated 104E7A670, callback saw 104E7A670
+addresses: timer 10AC8CA10 -> 10AC8CA10 ; close 10AC8D010 -> 10AC8D010
+handle arg: allocated 10446E670, callback saw 10446E670
 ```
 
 ```
-addresses: timer 10B764A10 -> 10B764A10 ; close 10B765010 -> 10B765010
-handle arg: allocated 104FB2670, callback saw 104FB2670
+addresses: timer 10747CA10 -> 10747CA10 ; close 10747D010 -> 10747D010
+handle arg: allocated 1011EE670, callback saw 1011EE670
 ```
 
 The addresses differ **between** runs (expected) and are identical **within**
@@ -382,8 +382,11 @@ design spec §12 Stage 0) is **not** required.
 
 ## Q2: a Scheme `raise` escaping a callback into C
 
-**Script:** `spike/02-raise.ss`, three scenarios, same timer setup throughout;
-the callback raises a custom `&spike-raise` condition on fire 3 of a maximum 6.
+**Script:** `spike/02-raise.ss`, three scenarios, the same timer setup across
+all three; the callback raises a custom `&spike-raise` condition on fire 3 of a
+maximum 6. The timer here is `timeout=1ms, repeat=1ms` — **not** Q1's
+`timeout=0`, which would race the first fire against the `uv_run` entry. Q1
+wants maximum fire pressure; Q2 wants a predictable fire 3.
 A `dynamic-wind` inside the callback distinguishes "the handler ran in place on
 top of a live C frame" from "the continuation was invoked and the C frames were
 abandoned" — only a real escape runs the after-thunk without the body having
@@ -423,7 +426,7 @@ MARKER: about to enter blocking uv_run
 Exception: spike raise from inside a libuv callback
 ```
 
-The `MARKER: uv_run returned normally to Scheme` line never printed. An
+The `MARKER: control resumed after uv_run form` line never printed. An
 unhandled raise inside a `foreign-callable` **kills the process**. Nothing
 after `uv_run` runs: no teardown, no `uv_loop_close`, no `foreign-free`.
 
@@ -447,7 +450,7 @@ MARKER: about to enter blocking uv_run
   [cb] raising on fire 3
   [dw] after-thunk ran WITHOUT normal completion -> a real escape
 MARKER: guard around uv_run FIRED
-MARKER: uv_run returned normally to Scheme
+MARKER: control resumed after uv_run form
 uv_run result = guard-fired
 fire count    = 3
 guard around uv_run received: the spike condition, fire=3
@@ -502,7 +505,7 @@ MARKER: about to enter blocking uv_run
   [cb] raising on fire 3
   [dw] after-thunk ran WITHOUT normal completion -> a real escape
   [tr] caught inside callback; storing + uv_stop
-MARKER: uv_run returned normally to Scheme
+MARKER: control resumed after uv_run form
 uv_run result = 1
 fire count    = 3
 guard around uv_run received: NOTHING (sentinel intact)
@@ -545,66 +548,151 @@ Every mechanical claim design spec §8 makes about this policy holds:
 The timer case is the shallow case. `uv__run_timers` runs near the top of a loop
 iteration with little in-progress state. Read callbacks run from inside
 `uv__io_poll`, much deeper. `spike/03-buf-loopback.ss` re-runs the escape from
-there (full output under Q3 below):
+there.
+
+Three aftermath modes were measured, each run twice, each stdout
+byte-identical across its two runs, all exiting `0`:
 
 ```bash
-chez --script spike/03-buf-loopback.ss /opt/homebrew/opt/libuv/lib/libuv.dylib raise-in-read-cb
+chez --script spike/03-buf-loopback.ss <libuv.dylib> raise-in-read-cb
+chez --script spike/03-buf-loopback.ss <libuv.dylib> drain-before-close
+chez --script spike/03-buf-loopback.ss <libuv.dylib> no-recovery
 ```
 
-Relevant lines, verbatim (byte-identical across two runs, exit `0` both times):
+All three escape identically — `uv_run returned = guard-fired`,
+`nread values = (5)`, `close_cb calls = 1`,
+`raise from read_cb: escaped-to-guard-around-uv-run`,
+`uv_loop_alive after uv_run = 1`. They differ only in what happens next.
+
+#### Is the abandoned iteration's `UV_EOF` lost, or merely deferred?
+
+**Measured, after an earlier draft of this document got it wrong.** That draft
+claimed the `UV_EOF` was "silently and permanently lost", citing a drain that
+had closed the peer and the server *before* running — so no `read_cb` could
+possibly have fired, and the check backing the claim could not fail. That is
+exactly the empty assertion AGENTS.md warns about, and it produced a wrong
+conclusion. `drain-before-close` fixes the method: it leaves every handle open
+and the read **still started**, then drains, bounded by a one-shot deadline
+timer so a genuinely-absent EOF cannot hang the script (the listening server
+keeps the loop alive on its own, so `uv_run` would otherwise block forever).
+
+**Actual observed output** (verbatim, `drain-before-close`):
 
 ```
-uv_run returned   = guard-fired
-...
-read_cb       calls = 1, nread values = (5)
-close_cb      calls = 1
-raise from read_cb: escaped-to-guard-around-uv-run
-uv_loop_alive after uv_run = 1
-MARKER: attempting recovery after the read_cb escape
-recovery: drain uv_run = 0, close_cb total = 3, uv_loop_alive = 0
-recovery: nread values after drain = (5)
+MARKER: draining with every handle still open and read still started
+uv_timer_init(deadline)  = 0
+uv_timer_start(250ms one-shot) = 0
+drain uv_run = 0 (deadline fired: yes)
+nread values BEFORE drain = (5)
+nread values AFTER  drain = (5 -4095)
+close_cb calls after drain = 3
+EOF redelivered? yes-eof-was-redelivered
 uv_loop_close = 0
+foreign-free  = done
+post-teardown collect = done
+
+--- drain-before-close verdict ---
+raise escaped uv_run into the Scheme guard: expected=escaped-to-guard-around-uv-run actual=escaped-to-guard-around-uv-run OK
+loop was left alive with handles open: expected=1 actual=1 OK
+at the escape, only the data read had been delivered: expected=(5) actual=(5) OK
+deadline timer bounded the drain: expected=yes actual=yes OK
+EOF is REDELIVERED, not lost: expected=yes-eof-was-redelivered actual=yes-eof-was-redelivered OK
+nread before drain (escape branch only): expected=(5) actual=(5) OK
+nread after drain (EOF arrives late): expected=(5 -4095) actual=(5 -4095) OK
+the late EOF ran the cleanup branch that the escape skipped: expected=3 actual=3 OK
+loop closable after drain: expected=0 actual=0 OK
+uv_loop_close returns 0: expected=0 actual=0 OK
+
+RESULT: DIAGNOSTIC-COMPLETE (see measured values above)
 ```
 
-Compare against the same script's non-raising run, where `nread values = (5 -4095)`.
+**The EOF is REDELIVERED, not lost.** `nread` goes from `(5)` before the drain
+to `(5 -4095)` after it, and `close_cb` goes from 1 to 3 — meaning the late EOF
+ran `read_cb`'s EOF branch, the very branch the escape had skipped, which
+closed the peer and the server. The loop then closed cleanly (`uv_loop_close =
+0`). On this platform's kqueue backend the readiness is level-triggered and the
+watcher registration survives the abandoned frame, so the event comes back the
+next time anything runs the loop.
 
-**The escape works from `uv__io_poll` too, and the loop is still recoverable —
-but the `UV_EOF` read is silently and permanently lost.** `nread values` is
-`(5)` before recovery and still `(5)` after a full drain: the pending EOF
-delivery that the abandoned iteration was going to make never happens, and no
-error is reported anywhere. Everything the abandoned C frame had left to do is
-simply skipped. Recovery was possible only because Scheme explicitly closed the
-two handles the skipped `read_cb` branch would have closed; without that,
-`uv_loop_close` returned `-16 (EBUSY: resource busy or locked)`.
+#### What does `uv_loop_close` return if the caller just tries to close?
+
+**Actual observed output** (verbatim, `no-recovery` — no closes, straight to
+`uv_loop_close` with the handles still open):
+
+```
+MARKER: calling uv_loop_close immediately, handles still open
+uv_loop_close with handles open = -16 (EBUSY: resource busy or locked)
+uv_loop_close = -16 (EBUSY: resource busy or locked)
+foreign-free  = done
+post-teardown collect = done
+
+--- no-recovery verdict ---
+raise escaped uv_run into the Scheme guard: expected=escaped-to-guard-around-uv-run actual=escaped-to-guard-around-uv-run OK
+loop was left alive with handles open: expected=1 actual=1 OK
+at the escape, only the data read had been delivered: expected=(5) actual=(5) OK
+measured uv_loop_close with handles open: -16 (EBUSY: resource busy or locked)
+uv_loop_close with handles open is nonzero: expected=#t actual=#t OK
+
+RESULT: DIAGNOSTIC-COMPLETE (see measured values above)
+```
+
+`-16 (EBUSY: resource busy or locked)`, now measured by a committed code path
+rather than asserted. (An earlier draft quoted this number from a scratch run
+that no committed script could reproduce.)
+
+#### What this actually costs
+
+The escape does **not** destroy the event. It costs the caller three things,
+all of them invisible from Scheme:
+
+1. **The callback's own cleanup never ran at escape time.** `read_cb`'s EOF
+   branch — the code that closes the peer and the server — was skipped. The
+   handles stayed open.
+2. **Nothing re-runs the loop automatically.** The deferred EOF arrives only
+   if the caller happens to call `uv_run` again. A caller who reasonably
+   treats the raise as terminal and goes straight to teardown never sees it.
+3. **Teardown then fails, with a code that does not explain itself.**
+   `uv_loop_close` returns `EBUSY` because of handles the caller never learned
+   were still open.
 
 ### Q2 verdict
 
 **The plan's premise is refuted; the plan's decision is retained, on new
-grounds.** Recorded honestly rather than reframed:
+grounds.** Recorded honestly rather than reframed — including the fact that an
+earlier draft of this section stated a *second* premise that measurement also
+refuted:
 
-| Design spec §8 / ADR-0008 said | Observed |
+| Claim | Status |
 |---|---|
-| raising across libuv's C frames is unsafe | **False on this platform.** The condition arrives intact at an enclosing `guard`; the loop survives; a second `uv_run` works; teardown returns 0. |
-| — | **But:** an *unguarded* raise kills the process outright (exit 255). |
-| — | **And:** the escape silently discards whatever the abandoned libuv frame had left to do. From `uv__io_poll`, a pending `UV_EOF` was lost with no error surfaced. |
+| Design spec §8 / ADR-0008: raising across libuv's C frames is unsafe | **Refuted.** The condition arrives intact at an enclosing `guard`; the loop survives; a second `uv_run` works; teardown returns 0. |
+| An earlier draft of this document: the escape permanently loses the abandoned iteration's events | **Refuted, by `drain-before-close`.** The `UV_EOF` is redelivered in full the next time the loop is run, and it then executes the cleanup branch the escape had skipped. |
+| An *unguarded* raise kills the process | **Holds.** Exit 255, no teardown, no `uv_loop_close`, no `foreign-free`. |
+| After an escape, teardown fails without explaining itself | **Holds, measured.** `uv_loop_close` with the abandoned handles still open returns `-16 (EBUSY)`. |
 
-Store-and-reraise remains the policy, now justified by **determinism and
-completeness**, not by safety:
+Store-and-reraise remains the policy, now justified by **determinism and the
+invisible obligation an escape leaves behind**, not by event loss and not by
+safety:
 
-1. Escaping loses events silently. Which events depends on which libuv frame
-   happened to be live when the raise occurred — the timer case lost nothing,
-   the read case lost an EOF. A binding whose failure mode varies with libuv's
-   internal call depth is not something callers can reason about.
-2. After an escape, the loop's handles are in whatever state the abandoned
-   iteration left them, so the caller inherits a cleanup obligation they cannot
-   see. Store-and-reraise lets `uv_run` return through its own C epilogue and
-   hands the caller a loop in a defined state (`store` scenario: second
-   `uv_run` and teardown both clean).
-3. The mechanism §8 specifies is verified to work end to end, including the
-   requirement that a guard written against the original condition type still
-   matches after wrapping.
-4. Guarding every trampoline body is *independently* mandatory regardless of
-   this choice, because of the `bare` result.
+1. **Guarding every trampoline body is mandatory outright**, independent of any
+   other choice, because an unguarded raise terminates the process (exit 255)
+   with no teardown at all. This is the one unconditional result.
+2. **An escape silently transfers work to the caller.** The event itself is
+   deferred, not lost — but the callback's own cleanup branch did not run, the
+   handles it would have closed stay open, and nothing re-runs the loop
+   automatically. A caller who treats the raise as terminal and proceeds to
+   teardown gets `EBUSY` from `uv_loop_close` and no indication why.
+3. **The resulting state depends on which libuv frame was live.** Raising from
+   `uv__run_timers` left nothing observable outstanding, with a single active
+   handle; raising from `uv__io_poll` left two handles open and one event
+   pending. Callers cannot see libuv's internal call depth, so they cannot
+   predict which they are in.
+4. **Store-and-reraise has none of that.** `uv_run` returns through its own C
+   epilogue, every callback libuv had already queued for that iteration runs
+   (a mechanism property of letting the iteration finish, not something Q2
+   measured), and the caller gets a loop in a defined state — verified in the
+   `store` scenario, where the second `uv_run` and the whole teardown returned
+   0. The wrapped re-raise still matches a guard written against the original
+   condition type.
 
 **ADR-0008 is accepted with its decision unchanged and its rationale corrected.**
 The ADR text says a negative Q2 finding "changes the error-delivery mechanism
@@ -717,11 +805,11 @@ run — the one intentional non-determinism, kept off stdout for that reason. Th
 two runs printed:
 
 ```
-bound ephemeral port = 59863
+bound ephemeral port = 60561
 ```
 
 ```
-bound ephemeral port = 59866
+bound ephemeral port = 60563
 ```
 
 ### Callback signatures, as bound and verified
@@ -816,10 +904,13 @@ Changes the implementation stages should absorb from this spike:
 
 1. **`ssize_t`, not `iptr`.** Design spec §4 rule 4's fallback clause is dead;
    delete the hedge and bind `nread` as `ssize_t`.
-2. **Design spec §8 and ADR-0008's rationale for store-and-reraise is wrong as
-   written** — raising across C frames is *survivable* here. The decision
-   stands on determinism and event-loss grounds instead. Both documents should
-   be reworded to cite this file rather than the refuted premise.
+2. **Design spec §8 and ADR-0008's rationale for store-and-reraise was wrong as
+   written** — raising across C frames is *survivable* here, and the abandoned
+   iteration's events are *deferred rather than lost*. The decision stands, on
+   the grounds that an escape leaves the caller an invisible cleanup
+   obligation (skipped callback branch, handles left open, `uv_loop_close` →
+   `EBUSY`) whose shape depends on which libuv frame was live. Both documents
+   now cite this file rather than the refuted premises.
 3. **Guarding every trampoline body is mandatory**, independently of the
    store-and-reraise choice, because an unguarded raise kills the process
    (exit 255, no teardown).
@@ -834,3 +925,8 @@ Changes the implementation stages should absorb from this spike:
 7. **`__collect_safe` × callback re-entry is an open question**, deferred by
    design and recorded here so it is re-opened deliberately rather than
    stumbled into.
+8. **A stopped-mid-iteration loop still has its events waiting.** Because the
+   kqueue registration survives an abandoned frame, `uv-loop-teardown!` must
+   drain (design spec §5 already says so) rather than assume that a loop which
+   stopped early has nothing left to deliver — the pending `UV_EOF` in
+   `drain-before-close` arrived on the very next `uv_run`.

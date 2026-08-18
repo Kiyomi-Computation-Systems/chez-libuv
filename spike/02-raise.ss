@@ -18,6 +18,13 @@
 ;;; decides whether ADR-0008's store-and-reraise is a necessity or a taste.
 ;;;
 ;;; Constants come from spike/probe.
+;;;
+;;; The timer here uses timeout=1ms, repeat=1ms — NOT Q1's timeout=0, which
+;;; would race the first fire against the uv_run entry. Q1 wants maximum fire
+;;; pressure; Q2 wants a predictable fire 3.
+;;;
+;;; The foreign-callables here are deliberately left locked for the life of
+;;; the process and never unlocked — ADR-0008's process-lifetime rule.
 
 (import (chezscheme))
 
@@ -160,7 +167,7 @@
                     'guard-fired))
         (uv-run loop-ptr UV_RUN_DEFAULT))))
 
-(display "MARKER: uv_run returned normally to Scheme\n")
+(display "MARKER: control resumed after uv_run form\n")
 (printf "uv_run result = ~s\n" rc-run)
 (printf "fire count    = ~d\n" fire-count)
 (printf "guard around uv_run received: ~a\n"

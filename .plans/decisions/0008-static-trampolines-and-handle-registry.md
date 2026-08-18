@@ -52,26 +52,34 @@ rationale is now the following three observations, not the refuted one:
    a handler running in place: `uv_run` never returned its `int`, and a
    `dynamic-wind` inside the callback ran its after-thunk without the body
    having completed.
-2. **But the escape silently loses events.** Whatever the abandoned libuv
-   frame had left to do in that loop iteration simply does not happen, and
-   nothing reports it. Observed: raising from inside a read callback — which
-   libuv invokes from deep inside `uv__io_poll` — permanently discarded a
-   pending `UV_EOF`, which never arrived even after a full subsequent drain.
-   Raising from a timer callback (`uv__run_timers`, a much shallower frame)
-   lost nothing. **A failure mode that varies with libuv's internal call depth
-   is not something a caller can reason about**, and losing an EOF silently is
-   indistinguishable, from Scheme, from a peer that simply never closed.
+2. **But the escape hands the caller an invisible cleanup obligation.** The
+   abandoned iteration's *event* is not destroyed — measured directly: after
+   escaping from a read callback (which libuv invokes from deep inside
+   `uv__io_poll`), leaving every handle open and the read still started and
+   then draining the loop **redelivered the pending `UV_EOF` in full**, and
+   that late delivery then ran the EOF branch the escape had skipped. What is
+   lost is not the event but the *work the callback was going to do*: at the
+   moment of the escape that branch had not run, so the handles it would have
+   closed stayed open, and **nothing re-runs the loop automatically**. A
+   caller who reasonably treats the raise as terminal and proceeds straight to
+   teardown gets `-16 (EBUSY)` back from `uv_loop_close` — also measured — and
+   no indication of why. Raising from a timer callback (`uv__run_timers`, a
+   much shallower frame) left nothing observable outstanding, with a single
+   active handle. **A residue that varies with libuv's internal call depth is
+   not something a caller can reason about**, because callers cannot see which
+   frame was live.
 3. **And an unguarded raise kills the process.** With no handler anywhere, the
    raise reaches Chez's default handler and terminates the process with exit
    status `255` — no teardown, no `uv_loop_close`, no `foreign-free`. This
    makes guarding every trampoline body mandatory *independently* of which
    error-delivery policy is chosen.
 
-Store-and-reraise is therefore chosen for **determinism and event-loss
-prevention**, not because propagation is impossible. Letting `uv_run` return
-through its own C epilogue and re-raising from Scheme afterwards hands the
-caller a loop in a defined state, with every callback libuv had queued for
-that iteration already delivered.
+Store-and-reraise is therefore chosen for **determinism and for not leaving
+the caller an obligation they cannot see**, not because propagation is
+impossible and not because events are lost. Letting `uv_run` return through
+its own C epilogue and re-raising from Scheme afterwards hands the caller a
+loop in a defined state; that the iteration's already-queued callbacks all run
+is a property of letting the iteration finish, not a Q2 measurement.
 
 ## Consequences
 

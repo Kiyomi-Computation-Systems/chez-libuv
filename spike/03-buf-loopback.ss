@@ -2,7 +2,16 @@
 ;;; smallest possible in-process TCP loopback exchange through it.
 ;;;
 ;;; Usage:
-;;;   chez --script spike/03-buf-loopback.ss <libuv.dylib> [raise-in-read-cb]
+;;;   chez --script spike/03-buf-loopback.ss <libuv.dylib> [mode]
+;;; where [mode] is one of:
+;;;   normal              (default) the plain loopback exchange
+;;;   raise-in-read-cb    escape from read_cb, then close the handles Scheme
+;;;                       side and drain
+;;;   drain-before-close  escape from read_cb, then leave every handle open
+;;;                       and the read STILL STARTED and drain — does the
+;;;                       abandoned iteration's UV_EOF get redelivered?
+;;;   no-recovery         escape from read_cb, then call uv_loop_close
+;;;                       immediately with the handles still open
 ;;;
 ;;; What this proves:
 ;;;   * uv_buf_t can be constructed and read back through foreign-alloc /
@@ -16,26 +25,42 @@
 ;;;     port back with uv_tcp_getsockname, ntohs it by hand from
 ;;;     offsetof(sockaddr_in, sin_port) (ADR-0010's loopback test strategy).
 ;;;
-;;; Optional second argument `raise-in-read-cb` re-runs Q2's escape experiment
-;;; from a callback that fires from INSIDE uv__io_poll rather than from
-;;; uv__run_timers — a materially deeper libuv C frame, with in-progress poll
-;;; state. See FINDINGS.md Q2 for why that distinction matters.
+;;; The three raise modes re-run Q2's escape experiment from a callback that
+;;; fires from INSIDE uv__io_poll rather than from uv__run_timers — a
+;;; materially deeper libuv C frame, with in-progress poll state. See
+;;; FINDINGS.md Q2 for why that distinction matters. `drain-before-close` and
+;;; `no-recovery` exist specifically so the two claims FINDINGS makes about
+;;; the aftermath of an escape are measured rather than asserted.
 ;;;
 ;;; Every offset, size, and enum value below comes from spike/probe.
+;;;
+;;; The foreign-callables here are deliberately left locked for the life of
+;;; the process and never unlocked — ADR-0008's process-lifetime rule, which
+;;; is what makes the entry points libuv retains safe to hold.
 
 (import (chezscheme))
 
 (define argv (command-line-arguments))
-(define lib-path
-  (if (null? argv)
-      (begin (display "usage: 03-buf-loopback.ss <libuv.dylib> [raise-in-read-cb]\n")
-             (exit 2))
-      (car argv)))
-(define raise-in-read-cb?
-  (and (pair? argv) (pair? (cdr argv)) (string=? (cadr argv) "raise-in-read-cb")))
+(define (usage)
+  (display "usage: 03-buf-loopback.ss <libuv.dylib> \
+[normal|raise-in-read-cb|drain-before-close|no-recovery]\n")
+  (exit 2))
+
+(define lib-path (if (null? argv) (usage) (car argv)))
+
+(define mode
+  (if (or (null? argv) (null? (cdr argv))) "normal" (cadr argv)))
+
+(unless (member mode '("normal" "raise-in-read-cb" "drain-before-close" "no-recovery"))
+  (usage))
+
+;; All three non-normal modes raise from read_cb; they differ only in what
+;; they do with the loop afterwards.
+(define raise-in-read-cb? (not (string=? mode "normal")))
 
 ;;; --- probe-supplied constants (spike/probe output, verbatim) ---------------
 (define UV_TCP            12)
+(define UV_TIMER          13)
 (define UV_RUN_DEFAULT     0)
 (define UV_CONNECT         2)
 (define UV_WRITE           3)
@@ -70,6 +95,7 @@
 (define uv-loop-alive      (foreign-procedure "uv_loop_alive"      (uptr)           int))
 (define uv-run             (foreign-procedure "uv_run"             (uptr int)       int))
 (define uv-close           (foreign-procedure "uv_close"           (uptr uptr)      void))
+(define uv-is-closing      (foreign-procedure "uv_is_closing"      (uptr)           int))
 (define uv-tcp-init        (foreign-procedure "uv_tcp_init"        (uptr uptr)      int))
 (define uv-tcp-bind        (foreign-procedure "uv_tcp_bind"        (uptr uptr unsigned-int) int))
 (define uv-tcp-getsockname (foreign-procedure "uv_tcp_getsockname" (uptr uptr uptr) int))
@@ -81,6 +107,10 @@
 (define uv-write           (foreign-procedure "uv_write"
                                               (uptr uptr uptr unsigned-int uptr) int))
 (define uv-ip4-addr        (foreign-procedure "uv_ip4_addr"        (uptr int uptr)  int))
+(define uv-stop            (foreign-procedure "uv_stop"            (uptr)           void))
+(define uv-timer-init      (foreign-procedure "uv_timer_init"      (uptr uptr)      int))
+(define uv-timer-start     (foreign-procedure "uv_timer_start"
+                                              (uptr uptr unsigned-64 unsigned-64) int))
 (define uv-strerror        (foreign-procedure "uv_strerror"        (int)            uptr))
 (define uv-err-name        (foreign-procedure "uv_err_name"        (int)            uptr))
 
@@ -209,6 +239,12 @@
 (define name-len    (alloc-zeroed 4))
 (define read-buffer (alloc-zeroed READ-BUFFER-SIZE))
 (define loopback-ip (string->c-string "127.0.0.1"))
+;; Deadline timer, used only by `drain-before-close` to bound the drain so a
+;; non-redelivered EOF cannot hang the script forever (the listening server
+;; keeps the loop alive on its own).
+(define deadline-ptr   (alloc-zeroed (uv-handle-size UV_TIMER)))
+(define DEADLINE-MS    250)
+(define deadline-fired 'deadline-never-fired)   ; sentinel
 
 ;;; --- the six callbacks, each created once and locked once ------------------
 ;;; Signatures, from uv.h:
@@ -295,9 +331,18 @@
    (lambda (handle) (set! close-cb-calls (+ close-cb-calls 1)))
    (uptr) void))
 
+(define deadline-callable
+  (foreign-callable
+   (lambda (handle)
+     (set! deadline-fired 'yes)
+     (uv-stop loop-ptr))
+   (uptr) void))
+
+;; Locked once, never unlocked, for the life of the process (ADR-0008).
 (for-each lock-object
           (list alloc-callable read-callable write-callable
-                connect-callable connection-callable close-callable))
+                connect-callable connection-callable close-callable
+                deadline-callable))
 
 (define alloc-cb-ptr      (foreign-callable-entry-point alloc-callable))
 (define read-cb-ptr       (foreign-callable-entry-point read-callable))
@@ -305,6 +350,7 @@
 (define connect-cb-ptr    (foreign-callable-entry-point connect-callable))
 (define connection-cb-ptr (foreign-callable-entry-point connection-callable))
 (define close-cb-ptr      (foreign-callable-entry-point close-callable))
+(define deadline-cb-ptr   (foreign-callable-entry-point deadline-callable))
 
 ;;; --- bring the server up ----------------------------------------------------
 (printf "uv_loop_init      = ~a\n" (rc-name (uv-loop-init loop-ptr)))
@@ -380,17 +426,38 @@
 (define alive-after-run (uv-loop-alive loop-ptr))
 (printf "uv_loop_alive after uv_run = ~d\n" alive-after-run)
 
-;;; --- optional: is the loop recoverable after a read_cb escape? -------------
-;;; The escape skipped read_cb's own EOF branch, which is what would have
-;;; closed the peer and the server. Closing them here from Scheme separates
-;;; "the loop is unusable because control flow was abandoned" (recoverable)
-;;; from "the loop is unusable because libuv's state is broken" (not).
-(define recovery-drain-rc  'recovery-not-attempted)
-(define recovery-close-cbs 'recovery-not-attempted)
-(define recovery-alive     'recovery-not-attempted)
-(when (and raise-in-read-cb?
-           (eq? read-cb-raise-escaped 'escaped-to-guard-around-uv-run))
-  (display "MARKER: attempting recovery after the read_cb escape\n")
+;; nread deliveries at the moment control left uv_run, before any aftermath
+;; block below touches the loop.
+(define nread-at-escape nread-values)
+
+;;; ===========================================================================
+;;; Aftermath of the escape — one block per mode. These exist because the two
+;;; claims FINDINGS.md makes about what an escape costs must be MEASURED:
+;;;   * `drain-before-close` answers "is the abandoned iteration's UV_EOF lost,
+;;;     or merely deferred until something runs the loop again?" It must leave
+;;;     every handle open and the read STILL STARTED, otherwise no read_cb
+;;;     could fire and the question answers itself.
+;;;   * `no-recovery` answers "what does uv_loop_close actually return when the
+;;;     escape left handles open?" — measured, not predicted.
+;;;   * `raise-in-read-cb` is the original recoverability check: closing the
+;;;     handles from Scheme separates "unusable because control flow was
+;;;     abandoned" (recoverable) from "unusable because libuv's state is
+;;;     broken" (not).
+;;; ===========================================================================
+(define recovery-drain-rc   'not-applicable-in-this-mode)
+(define recovery-close-cbs  'not-applicable-in-this-mode)
+(define recovery-alive      'not-applicable-in-this-mode)
+(define nread-before-drain  'not-applicable-in-this-mode)
+(define nread-after-drain   'not-applicable-in-this-mode)
+(define eof-redelivered     'not-applicable-in-this-mode)
+(define no-recovery-close-rc 'not-applicable-in-this-mode)
+
+(define escaped?
+  (and raise-in-read-cb?
+       (eq? read-cb-raise-escaped 'escaped-to-guard-around-uv-run)))
+
+(when (and escaped? (string=? mode "raise-in-read-cb"))
+  (display "MARKER: closing handles from Scheme, then draining\n")
   (flush-output-port (current-output-port))
   (uv-close peer-ptr   close-cb-ptr)
   (uv-close server-ptr close-cb-ptr)
@@ -400,7 +467,47 @@
   (set! recovery-alive (uv-loop-alive loop-ptr))
   (printf "recovery: drain uv_run = ~s, close_cb total = ~s, uv_loop_alive = ~s\n"
           recovery-drain-rc recovery-close-cbs recovery-alive)
-  (printf "recovery: nread values after drain = ~s\n" nread-values))
+  ;; NOTE: the handles were closed BEFORE this drain, so no read_cb could fire
+  ;; during it. This value says nothing about whether the EOF was recoverable —
+  ;; that is what the `drain-before-close` mode below is for.
+  (printf "recovery: nread values after drain = ~s (handles were closed first)\n"
+          nread-values))
+
+(when (and escaped? (string=? mode "drain-before-close"))
+  (display "MARKER: draining with every handle still open and read still started\n")
+  (flush-output-port (current-output-port))
+  (set! nread-before-drain nread-values)
+  ;; A one-shot deadline timer bounds the drain. Without it, a NON-redelivered
+  ;; EOF would hang forever: the listening server keeps the loop alive by
+  ;; itself, so uv_run(DEFAULT) would block with nothing left to deliver.
+  ;; Bounded by iteration/deadline, never by "it seemed to finish".
+  (printf "uv_timer_init(deadline)  = ~a\n"
+          (rc-name (uv-timer-init loop-ptr deadline-ptr)))
+  (printf "uv_timer_start(~dms one-shot) = ~a\n" DEADLINE-MS
+          (rc-name (uv-timer-start deadline-ptr deadline-cb-ptr DEADLINE-MS 0)))
+  (set! recovery-drain-rc
+        (guard (e (#t 'guard-fired)) (uv-run loop-ptr UV_RUN_DEFAULT)))
+  (set! nread-after-drain nread-values)
+  (set! recovery-close-cbs close-cb-calls)
+  (set! eof-redelivered
+        (if (member UV_EOF nread-values) 'yes-eof-was-redelivered 'no-eof-never-arrived))
+  (printf "drain uv_run = ~s (deadline fired: ~s)\n" recovery-drain-rc deadline-fired)
+  (printf "nread values BEFORE drain = ~s\n" nread-before-drain)
+  (printf "nread values AFTER  drain = ~s\n" nread-after-drain)
+  (printf "close_cb calls after drain = ~d\n" close-cb-calls)
+  (printf "EOF redelivered? ~s\n" eof-redelivered)
+  ;; Whatever the answer, get the loop to a closable state before teardown.
+  (uv-close deadline-ptr close-cb-ptr)
+  (when (zero? (uv-is-closing peer-ptr))   (uv-close peer-ptr   close-cb-ptr))
+  (when (zero? (uv-is-closing server-ptr)) (uv-close server-ptr close-cb-ptr))
+  (uv-run loop-ptr UV_RUN_DEFAULT)
+  (set! recovery-alive (uv-loop-alive loop-ptr)))
+
+(when (and escaped? (string=? mode "no-recovery"))
+  (display "MARKER: calling uv_loop_close immediately, handles still open\n")
+  (flush-output-port (current-output-port))
+  (set! no-recovery-close-rc (uv-loop-close loop-ptr))
+  (printf "uv_loop_close with handles open = ~a\n" (rc-name no-recovery-close-rc)))
 
 ;;; --- teardown -------------------------------------------------------------
 (define rc-loop-close (uv-loop-close loop-ptr))
@@ -409,7 +516,7 @@
 (for-each foreign-free
           (list payload-ptr write-buf loop-ptr server-ptr client-ptr peer-ptr
                 connect-req write-req bind-addr conn-addr name-addr name-len
-                read-buffer loopback-ip))
+                read-buffer loopback-ip deadline-ptr))
 (display "foreign-free  = done\n")
 (collect (collect-maximum-generation))
 (display "post-teardown collect = done\n")
@@ -419,29 +526,69 @@
   (printf "~a: expected=~s actual=~s ~a\n"
           name expected actual (if (equal? expected actual) "OK" "MISMATCH")))
 
-;;; The raise variant is a diagnostic, not a gate: its whole point is that the
-;;; loopback exchange does NOT complete. It reports its own verdict and stops
+;;; The raise modes are diagnostics, not gates: their whole point is that the
+;;; loopback exchange does NOT complete. Each reports its own verdict and stops
 ;;; here rather than running the success checks below, which it must fail.
 (when raise-in-read-cb?
-  (display "\n--- raise-in-read-cb verdict ---\n")
+  (printf "\n--- ~a verdict ---\n" mode)
   (check "raise escaped uv_run into the Scheme guard"
          'escaped-to-guard-around-uv-run read-cb-raise-escaped)
-  (check "the pending EOF read was NEVER delivered" (list payload-len) nread-values)
   (check "loop was left alive with handles open" 1 alive-after-run)
-  (check "recovery: explicit close + drain finished the loop" 0 recovery-alive)
-  (check "recovery: all three close_cbs eventually fired" 3 recovery-close-cbs)
-  (check "recovery: uv_loop_close then returns 0" 0 rc-loop-close)
-  (let ((escaped-and-recovered
-         (and (eq? read-cb-raise-escaped 'escaped-to-guard-around-uv-run)
-              (equal? nread-values (list payload-len))
-              (eqv? recovery-alive 0)
-              (eqv? recovery-close-cbs 3)
-              (zero? rc-loop-close))))
+  (check "at the escape, only the data read had been delivered"
+         (list payload-len) nread-at-escape)
+
+  (cond
+    ((string=? mode "raise-in-read-cb")
+     (check "explicit close + drain finished the loop" 0 recovery-alive)
+     (check "all three close_cbs eventually fired" 3 recovery-close-cbs)
+     (check "uv_loop_close then returns 0" 0 rc-loop-close))
+
+    ((string=? mode "drain-before-close")
+     ;; THE measurement. Sentinel: `eof-redelivered` starts as
+     ;; 'not-applicable-in-this-mode, which neither branch can produce.
+     (check "deadline timer bounded the drain" 'yes deadline-fired)
+     ;; MEASURED FIRST, then locked in as a regression check. The sentinel
+     ;; 'not-applicable-in-this-mode is what a drain that never ran leaves
+     ;; behind, and 'no-eof-never-arrived is the opposite outcome — neither
+     ;; can be produced by the branch this expects.
+     (check "EOF is REDELIVERED, not lost"
+            'yes-eof-was-redelivered eof-redelivered)
+     (check "nread before drain (escape branch only)"
+            (list payload-len) nread-before-drain)
+     (check "nread after drain (EOF arrives late)"
+            (list payload-len UV_EOF) nread-after-drain)
+     ;; The redelivered EOF ran read_cb's EOF branch, which closes peer and
+     ;; server: 1 close_cb (the client, from write_cb) becomes 3.
+     (check "the late EOF ran the cleanup branch that the escape skipped"
+            3 recovery-close-cbs)
+     (check "loop closable after drain" 0 recovery-alive)
+     (check "uv_loop_close returns 0" 0 rc-loop-close))
+
+    ((string=? mode "no-recovery")
+     ;; THE measurement: what uv_loop_close actually returns with handles open.
+     (printf "measured uv_loop_close with handles open: ~a\n"
+             (rc-name no-recovery-close-rc))
+     (check "uv_loop_close with handles open is nonzero"
+            #t (not (eqv? no-recovery-close-rc 0)))))
+
+  (let ((ok (and (eq? read-cb-raise-escaped 'escaped-to-guard-around-uv-run)
+                 (eqv? alive-after-run 1)
+                 (cond
+                   ((string=? mode "raise-in-read-cb")
+                    (and (eqv? recovery-alive 0) (eqv? recovery-close-cbs 3)
+                         (zero? rc-loop-close)))
+                   ((string=? mode "drain-before-close")
+                    (and (eq? deadline-fired 'yes)
+                         (memq eof-redelivered
+                               '(yes-eof-was-redelivered no-eof-never-arrived))
+                         (eqv? recovery-alive 0)))
+                   ((string=? mode "no-recovery")
+                    (not (eqv? no-recovery-close-rc 'not-applicable-in-this-mode)))
+                   (else #f)))))
     (printf "\nRESULT: ~a\n"
-            (if escaped-and-recovered
-                "DIAGNOSTIC-AS-EXPECTED (escaped, EOF lost, recoverable by explicit close)"
+            (if ok "DIAGNOSTIC-COMPLETE (see measured values above)"
                 "DIAGNOSTIC-UNEXPECTED (see values above)"))
-    (exit (if escaped-and-recovered 0 1))))
+    (exit (if ok 0 1))))
 
 (display "\n--- checks ---\n")
 (check "uv_buf_t base round-trips"  #t (= readback-base payload-ptr))
