@@ -533,6 +533,15 @@
   ;; there is no state in which quietly doing nothing is right. Raising from
   ;; inside a C frame is survivable exactly once, at development time; see
   ;; ADR-0008 on why the real dispatchers guard their bodies instead.
+  ;;
+  ;; In a process that has instantiated (libuv private handles) this stub is
+  ;; unreachable FROM C, and structurally so: a trampoline's entry point
+  ;; reaches libuv only through uv-timer-start-native / uv-close-native, both
+  ;; of which are called from handles.sls or from a library that imports it,
+  ;; and instantiating handles.sls is what fills these slots. It can still be
+  ;; reached by calling `dispatcher-ref` directly from Scheme, which is how
+  ;; tests/test-native.sps asserts it (that suite never imports handles.sls,
+  ;; so its slots stay empty for the life of the process).
   (define (uninstalled-dispatcher name)
     (lambda args
       (raise (condition

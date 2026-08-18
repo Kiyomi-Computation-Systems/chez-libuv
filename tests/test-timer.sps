@@ -619,6 +619,14 @@
 ;; that queue. That is what makes "first error pending, second deferred"
 ;; reachable from real callbacks rather than from direct loop-record-error!
 ;; calls.
+;;
+;; WHICH of the two is "first" is also libuv's, not chance: the timer heap's
+;; comparator breaks a timeout tie on start_id, allocated from
+;; loop->timer_counter by uv_timer_start (vendor/libuv/src/timer.c:50-53).
+;; So the timer started FIRST fires first, and `ta`'s error is the pending
+;; one. Swapping the two uv-timer-start! calls below swaps the expected
+;; 'first / 'second marks with it -- that is a real property being asserted,
+;; not an ordering this test happens to have been written around.
 (define deferred-loop (make-uv-loop))
 (define fires-a 0)
 (define fires-b 0)
@@ -767,15 +775,58 @@
 ;; types this stage does not implement are installed as raising stubs that
 ;; the installed closure reaches THROUGH a mutable table -- so a later stage
 ;; replaces one by name, with no second install-callback-dispatchers! call.
+;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so. The
+;; six stubs raise -- but the closure libuv actually calls is the seam's, and
+;; `dispatch-guarded` cannot help here: it runs INSIDE timer-dispatch and
+;; close-dispatch, i.e. only once a dispatcher has been entered. An unguarded
+;; seam would deliver these raises straight into a C frame (spike FINDINGS
+;; Q2: exit 255, no teardown). So each call must return normally AND leave a
+;; record behind -- containment without a record would be a silent swallow,
+;; which is worse than the crash.
+(define stub-orphans-before (length (orphan-callback-events)))
+
 (for-each
  (lambda (name)
    (test-equal (string-append "the " (symbol->string name)
-                              " dispatcher raises &uv-error until its stage lands")
-     'uv-error
-     (guard (e ((uv-error? e) 'uv-error) (#t 'wrong-condition))
-       ((dispatcher-ref name) 0 0 0)
-       'no-raise)))
+                              " stub's raise is contained by the seam, not delivered into C")
+     'contained
+     (guard (e (#t (list 'escaped-into-the-caller e)))
+       ((dispatcher-ref name) 909090 0 0)
+       'contained)))
  '(alloc read connection write-done shutdown connect))
+
+;; 909090 is registered to nothing, so there is no loop to record against and
+;; the orphan list is where the containment has to show up. The pointer is
+;; carried through, so a seam that recorded a placeholder is visible too.
+(test-equal "every contained stub raise was recorded, in order, naming its callback type"
+  '((alloc . 909090) (read . 909090) (connection . 909090)
+    (write-done . 909090) (shutdown . 909090) (connect . 909090))
+  (list-tail (orphan-callback-events) stub-orphans-before))
+
+;; The other half of the fork: when the pointer IS registered, the seam has
+;; an error cell to use, so a dispatcher raise surfaces through the
+;; documented channel (uv-run) instead of a list nobody reads.
+(define seam-loop (make-uv-loop))
+(define seam-timer (make-uv-timer seam-loop))
+(define seam-orphans-before (length (orphan-callback-events)))
+
+((dispatcher-ref 'alloc) (handle-ptr seam-timer) 0 0)
+
+(test-equal "a contained raise on a REGISTERED pointer goes to the loop, not the orphan list"
+  0 (- (length (orphan-callback-events)) seam-orphans-before))
+
+(define seam-raise (guard (e (#t e)) (uv-run seam-loop 'nowait) 'no-raise))
+
+(test-equal "...and reaches the caller from uv-run as &uv-callback-error"
+  'callback-error
+  (if (uv-callback-error? seam-raise) 'callback-error 'not-callback-error))
+
+(test-equal "...carrying the stub's own condition as its cause"
+  'uv-error
+  (let ((cause (uv-callback-error-cause seam-raise)))
+    (if (uv-error? cause) 'uv-error 'not-the-stub-condition)))
+
+(uv-loop-teardown! seam-loop)
 
 (install-dispatch-procedure! 'alloc (lambda args (list 'replaced-alloc args)))
 
@@ -819,11 +870,13 @@
     (install-dispatch-procedure! 'read 'not-a-procedure)
     'no-raise))
 
+;; Still the STUB, not some half-installed replacement: only the stub raises,
+;; and only a raise leaves an orphan record behind.
 (test-equal "the refused install left the read stub in place"
-  'uv-error
-  (guard (e ((uv-error? e) 'uv-error) (#t 'wrong-condition))
-    ((dispatcher-ref 'read) 0 0 0)
-    'no-raise))
+  '((read . 606060))
+  (let ((before (length (orphan-callback-events))))
+    ((dispatcher-ref 'read) 606060 0 0)
+    (list-tail (orphan-callback-events) before)))
 
 ;; --- balance -------------------------------------------------------------
 (uv-loop-teardown! l)

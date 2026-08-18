@@ -36,7 +36,7 @@ when it passes; it is finished when you have watched it fail":
    status. A 120 s per-suite cap turns a mutation that hangs into a recorded
    `TIMEOUT` rather than a stuck run (Mutation 10 is the one that hit it).
 5. The scratch copy is restored from `.pristine` and all five suites are
-   re-run to confirm green before the next mutation. **Every one of the 23
+   re-run to confirm green before the next mutation. **Every one of the 25
    in-process mutations below was confirmed restored-green**; no mutation was
    ever left in place while another was applied.
 
@@ -47,7 +47,7 @@ probe — see its own section.
 
 | Suite | Assertions | Exit |
 |---|---|---|
-| `tests/test-timer.sps` | 132 | 0 |
+| `tests/test-timer.sps` | 136 | 0 |
 | `tests/test-lifecycle.sps` | 41 | 0 |
 | `tests/test-loop.sps` | 101 | 0 |
 | `tests/test-facade.sps` | 30 | 0 |
@@ -114,6 +114,8 @@ the broken decision; the rest are consequences.
 | 22 | The trampoline guard catches ANY raised object, not just conditions | `#t` clause → `(condition? e)` | FAIL, exit 1 | "a callback raising a NON-condition is caught by the guard too"; "the wrapped cause is the raised object itself" |
 | 23 | `uv-handle-state` refuses a non-handle rather than defaulting | `require-handle` deleted | FAIL, exit 1 | "uv-handle-state rejects a non-handle, naming who and why" — and *only* that one |
 | 24 | `uv-close!` actually calls `uv_close`, not just the Scheme state machine | the `uv-close-native` call deleted | FAIL, exit 255 / TIMEOUT | "libuv agrees the handle is closing, and did not before" (+30 rows across four suites; the timer suite then blocked on a handle that never closes) |
+| 25 | The seam closure libuv actually calls is itself guarded | the `guard` in `seam-closure` deleted | FAIL, exit 255 | all six "the … stub's raise is contained by the seam, not delivered into C" rows; "every contained stub raise was recorded, in order, naming its callback type" |
+| 26 | …and the containment RECORDS rather than swallows | `contain-dispatcher-raise!` gutted to `#f` | FAIL, exit 1 | "every contained stub raise was recorded, in order, naming its callback type"; "…and reaches the caller from uv-run as &uv-callback-error"; "…carrying the stub's own condition as its cause"; "the refused install left the read stub in place" |
 
 ### Notes on individual mutations
 
@@ -128,6 +130,29 @@ call the trampoline makes, with the handle's own pointer — once with the
 handle `'open` (the seed, so "the callback did not run" cannot pass against a
 dispatcher that never delivers anything) and once with it `'closing`. The
 mutation was then re-run and failed by name, alone.
+
+**Mutations 25 and 26 were added by review, and the defect they guard was
+real.** The closure installed into each native slot was
+`(lambda args (apply (dispatch-procedure name) args))` — **unguarded**. The
+comment at the stub claimed "the guard above catches it", and it did not:
+`dispatch-guarded` is invoked *inside* `timer-dispatch` and `close-dispatch`,
+so it protects the user's callback but nothing that raises before a
+dispatcher has been entered. The six stubs — and anything Stages 4-5 install
+— would have raised straight into a C frame. The seam closure is now guarded
+itself, the comment says what is true, and both halves of the new behaviour
+(containing the raise, and *recording* rather than swallowing it) have a
+mutation.
+
+Mutation 25's exit 255 is worth reading precisely: the six per-stub rows fail
+because each `test-equal`'s own guard catches what the seam should have, and
+then the suite *dies* at the next line, where the seam is called at top level
+with a registered pointer and nothing catches it (`Exception in alloc: this
+callback type is not implemented in this version`). That top-level call is as
+close to the C-frame case as an in-process suite can get. The genuine
+C-frame death is what Mutation 1's subprocess probe measures, and it is **not
+reconstructible for the seam in Stage 3**: the only dispatchers libuv can
+reach here are timer and close, both of which enter their bodies successfully
+and are already covered by that probe. Recorded rather than faked.
 
 **Mutation 20's exception text varies between runs** (`invalid relocation
 type 4` and `invalid relocation type 7` were both observed, as were
@@ -313,7 +338,23 @@ property is uncovered and why."
    the same shape, and the same reasoning, as `loop-pointer`'s arm in Stage
    2. It is a structured failure standing where a segfault would otherwise
    be, not a branch a caller can reach.
-5. **Multi-threaded / `__collect_safe` re-entry.** Still deliberately
+5. **`close-handle-proc`'s initial raising body** (handles.sls, "the close
+   seam"). It is **dead code**, and structurally so: the install is
+   unconditional, in this library's own body, so no importer can run a line
+   before it happens. Stage 2 had a suite row for it ("close-handle! raises
+   &uv-error until Task 7 installs a real one"); that row could not survive
+   the install moving into the library body and was dropped rather than
+   replaced. Flagged in review, and kept deliberately rather than deleted:
+   the slot still buys the once-only guarantee, which *is* tested
+   ("a second close-handle! install is refused, naming who and why"), and
+   `install-close-handle!`'s own validation arms are reachable. The
+   uninstalled *body* is not. If Stage 4 finds no other use for the
+   indirection — `(libuv loop)` could call a `close-handle!` exported
+   directly from here, with no cycle — the slot, its stub, and
+   `close-handle-installed?` should collapse into one procedure. Recorded
+   here so that decision is a deliberate one rather than an oversight
+   inherited twice.
+6. **Multi-threaded / `__collect_safe` re-entry.** Still deliberately
    untested, still named: spike FINDINGS Q1's "deliberately untested" section
    applies unchanged. `uv_run` is bound plain and v0.1 is single-threaded.
 
@@ -326,7 +367,8 @@ installs are thin closures that look their real implementation up in a
 handles.sls-internal table **at fire time**:
 
 ```
-native slot 'read  ->  (lambda args (apply (dispatch-procedure 'read) args))
+native slot 'read  ->  (seam-closure 'read)
+                            guards the whole call, then
                             dispatch-procedure reads dispatch-table
                             dispatch-table's 'read entry is a raising stub
 ```
@@ -342,7 +384,10 @@ Two rules for the new dispatchers, both load-bearing:
 
 - **Call through `dispatch-guarded`** (exported from
   `(libuv private handles)`) for every user callback. Mutation 1 above is
-  what happens otherwise.
+  what happens otherwise. The seam's own guard is a net, not a substitute:
+  it has only a pointer and a raised object, so it cannot stop the *right*
+  loop as precisely, and an error arriving there means a dispatcher failed
+  before it reached its own guard — a bug, not a delivered callback error.
 - **Handle the "not in the registry" case with `record-orphan-callback!`,
   never with a raise** — there is no loop record to record an error against,
   and raising from a C frame is the same process death.
@@ -351,7 +396,7 @@ Two rules for the new dispatchers, both load-bearing:
 
 | Check | Result |
 |---|---|
-| `make test` (`HAVE_PKG=yes`, pkg-config libuv 1.52.1), **run 1** | ALL SUITES PASSED — conditions 89, facade 30, lifecycle 41, loop 101, native 160, shim-loading 19, timer 131 (571 assertions) |
+| `make test` (`HAVE_PKG=yes`, pkg-config libuv 1.52.1), **run 1** | ALL SUITES PASSED — conditions 89, facade 30, lifecycle 41, loop 101, native 160, shim-loading 19, timer 136 = **576 assertions** |
 | `make test` (pkg-config), **run 2** | ALL SUITES PASSED — assertion counts byte-identical to run 1 |
 | `make HAVE_PKG=no test` (vendored submodule libuv 1.52.1), **run 1** | ALL SUITES PASSED — identical counts |
 | `make HAVE_PKG=no test` (vendored), **run 2** | ALL SUITES PASSED — identical counts |
@@ -363,6 +408,13 @@ The suite was run **twice on each acquisition leg specifically to shake timer
 nondeterminism**, since Stage 3 is the first stage whose assertions depend on
 libuv's scheduling. All four runs produced identical assertion counts and
 zero failures.
+
+Those four runs were taken at 572 assertions (timer 132), before review added
+the seam-guard rows. The review commit re-ran `test-timer`, `test-loop`,
+`test-native` and one full `make test` at **576** (timer 136); the earlier
+figure of "571" in the Stage 3 commit message and the first draft of this
+table was an arithmetic slip — 89+30+41+101+160+19+132 is 572, not 571 — and
+the totals here are now the summed, checked numbers.
 
 Recorded observations (informational, not assertions):
 

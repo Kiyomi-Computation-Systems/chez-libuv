@@ -291,6 +291,17 @@
     (let ((entry (hashtable-ref registry ptr #f)))
       (and entry (registry-entry-object entry))))
 
+  ;; The owning loop of a registered pointer, or #f. Distinct from
+  ;; registry-ref on purpose: the loop lives on the ENTRY, not on the object,
+  ;; so this answers for a request block (which has no loop field of its own)
+  ;; as well as for a handle, and it answers without knowing what kind of
+  ;; object is registered. The dispatcher seam's guard is the caller -- it has
+  ;; a raised object and a bare pointer, and needs the error cell that
+  ;; pointer belongs to.
+  (define (registry-loop-of ptr)
+    (let ((entry (hashtable-ref registry ptr #f)))
+      (and entry (registry-entry-loop entry))))
+
   (define (registry-count) (hashtable-size registry))
 
   ;; Every HANDLE registered against this loop. The loop's own entry is
@@ -511,9 +522,10 @@
   ;; the same reason native.sls's uninstalled stub does: a callback of this
   ;; type firing means libuv holds a pointer to a trampoline this binding
   ;; cannot service, and quietly doing nothing would leave a handle or a
-  ;; request in a state nothing will ever complete. It is reachable only
-  ;; from a code path no Stage-3 API can start, and the guard above catches
-  ;; it if one ever is.
+  ;; request in a state nothing will ever complete. The raise is CONTAINED by
+  ;; the seam's own guard below -- `dispatch-guarded` is no help here, since
+  ;; it is invoked inside timer-dispatch and close-dispatch, i.e. only once a
+  ;; dispatcher has already been entered successfully.
   (define (unimplemented-dispatcher name)
     (lambda args
       (raise (condition
@@ -545,6 +557,48 @@
   ;; the same rule that stops a later stage installing twice.
   (define installed-dispatch-names '(timer close))
 
+  ;; --- the seam's own guard ----------------------------------------------
+  ;; THE OUTERMOST SCHEME FRAME LIBUV CAN REACH. `dispatch-guarded` protects
+  ;; the USER's callback, but it runs *inside* timer-dispatch and
+  ;; close-dispatch -- so anything that raises before a dispatcher gets that
+  ;; far is not covered by it: the six stubs above, a bug in a dispatcher's
+  ;; own registry lookup, and whatever Stages 4-5 install here. Every one of
+  ;; those would otherwise unwind into a C stack frame, which spike FINDINGS
+  ;; Q2 measured as process death (exit 255, no teardown, no foreign-free).
+  ;; So the closure that goes into the native slot is guarded too, and this
+  ;; guard is the one that makes "nothing raised inside a callback is
+  ;; permitted to unwind into libuv" (design spec S8) true of the WHOLE
+  ;; dispatch path rather than of its last step.
+  ;;
+  ;; Where the caught object goes depends on whether there is anywhere to put
+  ;; it, which is the same fork the orphan fallback documents further up:
+  ;;
+  ;;   * pointer IS registered -> the entry knows its loop, so the object
+  ;;     goes on that loop's error cell and surfaces from uv-run as
+  ;;     &uv-callback-error, exactly like a user callback's raise. A Stage 4
+  ;;     dispatcher bug therefore reaches the caller through the documented
+  ;;     channel instead of a list nobody reads.
+  ;;   * pointer is NOT registered -> there is no error cell and no loop to
+  ;;     stop, so it is recorded as an orphan event. Ambiguity acknowledged:
+  ;;     an entry there means "a callback arrived that this binding could not
+  ;;     service", and does not distinguish an unknown pointer from a
+  ;;     dispatcher that raised on a known-bad one. It is a bug reporter of
+  ;;     last resort; both readings are bugs, and neither is recoverable.
+  ;;
+  ;; The first argument of all eight callback signatures is the handle or
+  ;; request pointer, which is why `(car args)` is the key to look up.
+  (define (contain-dispatcher-raise! name ptr obj)
+    (let ((loop (registry-loop-of ptr)))
+      (if loop
+          (loop-record-error! loop obj)
+          (record-orphan-callback! name ptr))))
+
+  (define (seam-closure name)
+    (lambda args
+      (let ((ptr (if (pair? args) (car args) 0)))
+        (guard (e (#t (contain-dispatcher-raise! name ptr e)))
+          (apply (dispatch-procedure name) args)))))
+
   ;; A definition, not a bare expression: R6RS library bodies take all their
   ;; definitions before any expression, and this wiring has to run before
   ;; anything can fire a callback or sweep a handle. Same shape, and same
@@ -558,11 +612,10 @@
       (hashtable-set! dispatch-table 'timer timer-dispatch)
       (hashtable-set! dispatch-table 'close close-dispatch)
       ;; Looked up by name at fire time, never captured here: that
-      ;; indirection is the whole seam.
+      ;; indirection is the whole seam. Guarded, because this closure is what
+      ;; libuv actually calls.
       (install-callback-dispatchers!
-       (map (lambda (name)
-              (cons name
-                    (lambda args (apply (dispatch-procedure name) args))))
+       (map (lambda (name) (cons name (seam-closure name)))
             dispatcher-names))
       (install-close-handle! real-close-handle!)
       'wired)))
