@@ -56,8 +56,9 @@ AGENTS.md's "a test is not finished until you have watched it fail":
 | 15 | Sibling discrimination | `uv-errno-error?` made an always-`#t` predicate | FAIL, exit 1 | "a bare callback-error does not satisfy uv-errno-error?"; "sibling discrimination: uv-handle-closed instance under uv-errno-error?"; "...uv-shim-unavailable..."; "...uv-version-incompatible..."; "...uv-constant-unavailable..."; "...uv-invalid-argument..."; "...uv-callback-error..." |
 | 16 | Sibling discrimination | `uv-handle-closed?` made an always-`#f` predicate (rejects its own instances) | FAIL, exit 1 | "handle-closed predicate accepts its own instance"; "handle-closed carries the kind"; "sibling discrimination: uv-handle-closed instance under uv-handle-closed?" |
 | 17 | Sibling discrimination (root) | `uv-error?` made an always-`#f` predicate | FAIL, exit 1 | "uv-error predicate accepts its own instance"; all 7 "\<type\> is a uv-error" tests; all 7 "subtype relationship: \<type\> instance satisfies uv-error?" tests; "composed condition also satisfies the family-wide uv-error?" |
+| 18 | Supertype declaration (root's own parent) | `&uv-error`'s own supertype changed from `&error` to `&warning` (`(define-condition-type &uv-error &error ...)` → `(define-condition-type &uv-error &warning ...)`, `conditions.sls` line 44) | FAIL, exit 1 | "uv-error is an R6RS &error" |
 
-**17/17 mutations caught**, every one by the exact assertion(s) the brief and
+**18/18 mutations caught**, every one by the exact assertion(s) the brief and
 AGENTS.md require — the failure traces through the asserted property itself
 (a predicate or accessor returning the wrong value), never through a syntax
 or import error. No mutation needed a test to be strengthened after the fact.
@@ -70,6 +71,24 @@ or import error. No mutation needed a test to be strengthened after the fact.
   `define-condition-type` parent choice per type, and this is the module's
   foundational property: every later stage's error handling assumes
   `uv-error?` catches the whole family.
+- **`&uv-error`'s own supertype declaration is a separate decision from the
+  seven children's parentage, and gets its own mutation (18)** — Mutations
+  1–7 all break a *child's* parent (`&uv-errno-error` etc. reparented away
+  from `&uv-error`); none of them touch line 44's
+  `(define-condition-type &uv-error &error make-uv-error uv-error?)` itself.
+  The design spec calls this out explicitly (S9 lists `&uv-error` as "root
+  condition, no fields, subtype of `&error`", the *only* type in the
+  hierarchy that names `&error` directly) and `conditions.sls`'s own header
+  comment repeats it ("`&uv-error` itself is the only one that derives from
+  `&error` directly"). Exactly one assertion guards it —
+  `tests/test-conditions.sps:30`, "uv-error is an R6RS &error" — and
+  Mutation 18 (changing `&uv-error`'s parent from `&error` to the sibling
+  R6RS condition type `&warning`, which is not an ancestor of `&error`)
+  confirms that assertion is live: it is the *only* one of 89 that fails,
+  which also confirms the mutation doesn't accidentally break `uv-error?`
+  itself (a type's own predicate is unaffected by what its declared parent
+  is) or any child's `uv-error?` check (unaffected for the same reason) —
+  the failure is isolated to exactly the property this decision governs.
 - **Field-identity mutations use swaps/rotations rather than one mutation per
   field** for the multi-field types (`&uv-errno-error`: 3 fields rotated in
   one edit, Mutation 8; `&uv-version-incompatible` and `&uv-invalid-argument`:
@@ -118,8 +137,9 @@ or import error. No mutation needed a test to be strengthened after the fact.
 ## Verbatim mutation transcripts
 
 Representative full transcripts (first parentage mutation, the field-rotation
-mutation, and the brief's named sibling-discrimination example); the rest
-followed the identical pattern and are recorded in the summary table above.
+mutation, the brief's named sibling-discrimination example, and the root's
+own supertype mutation); the rest followed the identical pattern and are
+recorded in the summary table above.
 
 ### Mutation 1 — `&uv-errno-error` parented under `&error`
 
@@ -168,6 +188,28 @@ EXIT=1
 ```
 Reverted, `diff` against pristine empty, rerun: `# of expected passes 89`, `EXIT=0`.
 
+### Mutation 18 — `&uv-error`'s own supertype changed from `&error` to `&warning`
+
+Added after review flagged that Mutations 1–7 only cover the seven
+*children's* parentage, never `&uv-error`'s own declared parent (`conditions.sls`
+line 44), a decision the design spec calls out by name (S9: `&uv-error` is
+"the only one that derives from `&error` directly"). `&warning` is a real,
+exported R6RS condition type (a sibling of `&serious`/`&error` in the
+standard hierarchy, not an ancestor of it), so this is a structurally valid
+`define-condition-type` parent — the failure below is semantic, not a
+syntax or import error.
+
+```
+$ CHEZSCHEMELIBDIRS="$SCRATCH/src:$REPO/tests:$REPO/build/scheme-libs" chez --program "$REPO/tests/test-conditions.sps"
+%%%% Starting test conditions
+FAIL uv-error is an R6RS &error
+# of expected passes      88
+# of unexpected failures  1
+EXIT=1
+```
+Caught by name on the first attempt — no test strengthening was needed.
+Reverted, `diff` against pristine empty, rerun: `# of expected passes 89`, `EXIT=0`.
+
 ## Final clean-tree confirmation
 
 ```
@@ -180,13 +222,12 @@ $ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-condit
 # of expected passes      89
 EXIT=0
 $ git status --short
-?? src/libuv/
-?? tests/
+(clean)
 ```
 The repo's own `src/libuv/private/conditions.sls` was never edited during
-mutation testing — every mutation above was applied to, and reverted on, the
-scratch copy outside the repository. `git status` shows only the two new
-untracked paths this task adds (`src/libuv/` and `tests/`), nothing modified.
+mutation testing — every mutation above, including Mutation 18 added during
+review, was applied to, and reverted on, the scratch copy outside the
+repository.
 
 ## Carried into Stage 1c (Task 5)
 
