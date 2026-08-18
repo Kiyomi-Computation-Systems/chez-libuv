@@ -318,3 +318,18 @@ restored-green diff-identical):
 | Target | Mutation | Result | Named test(s) that failed |
 |---|---|---|---|
 | handles.sls | `deliver-read-eof!` clears the flag (`set-tcp-reading! handle #f` ahead of delivery) — the rejected "mirror libuv" semantics | FAIL, exit 1 — the ONLY failure (167 other rows passed) | "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!" |
+
+**test-facade's hand-rolled drain: hangs-not-fails, fixed with a facade-only
+ticker.** The review flagged that `uv-run 'once` BLOCKS waiting for an
+event, so a mutation silencing the I/O chain left the facade suite hanging
+instead of failing — the iteration bound was never reached because
+iterations stopped arriving. A repeating facade-only timer (built from
+facade exports alone; (uv-testing) may not stand between that suite and the
+facade) guarantees every 'once returns. Demonstrated both ways under the
+same mutation (`connect-dispatch` delivery dropped, scratch copy,
+restored-green diff-identical):
+
+| Drain | Under the mutation |
+|---|---|
+| old (no ticker) | HANG — process still running after 15 s, killed by hand |
+| new (ticker) | exit 1 in seconds; "uv-tcp-connect! is re-exported and its callback reports success", "uv-write! …", "uv-shutdown! …", "uv-read-start! … delivered the payload" all failed BY NAME |
