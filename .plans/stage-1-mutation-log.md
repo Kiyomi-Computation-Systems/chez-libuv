@@ -380,6 +380,25 @@ name and announces the next one is non-discriminating, instead of the
 non-discrimination being silent. This is the "write down that the property is
 uncovered" rule turned into a runtime check.
 
+> **Amended 2026-08-18 (final review, CI run 4).** Real Valgrind runs showed
+> the seed itself failing there, root-caused as unobservable by design:
+> Memcheck's own freelist (`--freelist-vol`, ~20MB by default) exists
+> specifically to delay reusing a freed block, so it can still flag a
+> use-after-free against it — no warm-up depth lets an alloc-after-free
+> observe the just-freed block's leftover bytes under Memcheck, because
+> keeping that memory from being served back immediately is the whole point
+> of the mechanism. The seed is now environment-aware: `make test-memory`'s
+> Linux leg sets `CHEZ_LIBUV_UNDER_VALGRIND=1`, and under it the seed drops
+> to a weak form (fill a fresh block with `#xff`, assert the bytes read back
+> `#xff`) that proves the fill/read-back machinery works but nothing about
+> allocator dirt — so **under Valgrind, M35's mutation (`alloc-zeroed`
+> skipping its `zero-out!` call) is undetectable by this seed's line of
+> reasoning.** That is not a coverage gap in practice: detection is carried
+> by the plain `make test` runs, which exercise this exact suite on both CI
+> jobs and locally with the strong (recycled-dirt) form intact. This is
+> ADR-0003's own division of labor made explicit for this one test: the
+> Valgrind leg's job is leaks and addressability, not mutation coverage.
+
 ### M40 — `constants-init!`'s own guard was shadowed by `ensure-native-loaded!`'s
 
 Removing the double-init guard from `constants-init!` changed nothing

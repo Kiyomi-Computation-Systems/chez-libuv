@@ -407,8 +407,18 @@ ifeq ($(UNAME_S),Linux)
 # checking (invalid read/write, use-after-free, the leak checks above) stays
 # fully enabled and gating -- only the undefined-value class is scoped out.
 # See ADR-0003's amendment for the fuller record.
+#
+# CHEZ_LIBUV_UNDER_VALGRIND=1: tells tests/test-native.sps's dirty-memory
+# seed it is running under Memcheck, whose freelist (--freelist-vol,
+# default ~20MB) DELIBERATELY delays reusing a freed block -- exactly to
+# catch use-after-free -- so an alloc-after-free there can never observe the
+# just-freed block's leftover bytes. The property that seed exists to prove
+# (a plain allocator hands back dirty memory) is unobservable under Memcheck
+# by design, not by a bug in the seed; see the seed's own comment and the
+# stage-1 mutation log addendum for what that costs.
 	@for t in $(MEMORY_TESTS); do \
 	  UV_USE_IO_URING=0 \
+	  CHEZ_LIBUV_UNDER_VALGRIND=1 \
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) valgrind --error-exitcode=9 \
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \

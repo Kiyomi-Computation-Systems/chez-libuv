@@ -26,7 +26,7 @@
         ;; by the resolve-shim-path matrix. None collides with an (rnrs)
         ;; export (unlike file-exists? and exit, which do).
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
-              foreign-sizeof current-directory))
+              foreign-sizeof current-directory getenv))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -661,9 +661,7 @@
 ;; from the 4th cycle onward does the allocator actually recycle the same
 ;; bytes it was just handed. So this warms the SAME slot up across several
 ;; cycles and only asserts on the last one, with margin over the observed
-;; threshold. Whether Valgrind's allocator needs the same warm-up is
-;; unverifiable here (no Valgrind on macOS/arm64); this is the best local
-;; evidence available; the next CI run is the real test.
+;; threshold.
 (define (alloc-fill-free-cycle! size)
   (let ((a (foreign-alloc size)))
     (let fill ((i 0))
@@ -672,14 +670,37 @@
         (fill (+ i 1))))
     (foreign-free a)))
 
-(test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size"
-  #t
-  (begin
-    (let loop ((i 0)) (when (< i 8) (alloc-fill-free-cycle! churn-size) (loop (+ i 1))))
-    (let* ((a (foreign-alloc churn-size))
-           (dirty (any-nonzero? a churn-size)))
-      (foreign-free a)
-      dirty)))
+;; Root-caused under real Valgrind (run 4): recycled-dirt is unobservable
+;; there BY DESIGN, not by an insufficient warm-up. Memcheck's own freelist
+;; (--freelist-vol, ~20MB by default) exists SPECIFICALLY to delay reusing a
+;; freed block, so it can still flag a use-after-free against it -- no
+;; warm-up depth can make an alloc-after-free observe the just-freed block's
+;; leftover bytes there, because Memcheck's whole point is to keep serving
+;; genuinely different memory instead. make test-memory's Linux leg sets
+;; CHEZ_LIBUV_UNDER_VALGRIND=1 for exactly this reason: under it, the seed
+;; drops to the weak form below (proves the fill/read-back machinery works,
+;; nothing about allocator dirt) rather than asserting a property Valgrind
+;; makes structurally unobservable. See the stage-1 mutation log addendum
+;; for what this costs and where that coverage actually lives instead.
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size (valgrind: recycled-dirt unobservable by design)"
+      #t
+      (let ((a (foreign-alloc churn-size)))
+        (let fill ((i 0))
+          (when (< i churn-size)
+            (foreign-set! 'unsigned-8 a i #xff)
+            (fill (+ i 1))))
+        (let ((filled (all-bytes-equal? a churn-size #xff)))
+          (foreign-free a)
+          filled)))
+    (test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size"
+      #t
+      (begin
+        (let loop ((i 0)) (when (< i 8) (alloc-fill-free-cycle! churn-size) (loop (+ i 1))))
+        (let* ((a (foreign-alloc churn-size))
+               (dirty (any-nonzero? a churn-size)))
+          (foreign-free a)
+          dirty))))
 
 (churn-dirty-blocks! 32)
 (test-equal "alloc-zeroed returns zeroed memory even when the allocator hands back a dirty block"
