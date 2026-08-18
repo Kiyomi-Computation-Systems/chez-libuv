@@ -275,3 +275,18 @@ All on macOS 25.5.0 / arm64, Chez 10.4.1, libuv 1.52.1, dev shim
 Per-suite assertion counts, identical across all four `make test` runs:
 `conditions` 89, `facade` 37, `lifecycle` 60, `loop` 106, `native` 170,
 `shim-loading` 19, `tcp` 93, `timer` 132.
+
+## Post-v0.1 cleanup round (chore/post-v0.1-cleanup)
+
+The final whole-branch review flagged the payload-inside-block assertion as
+lower-bound-only (Task 8 deferred Minors): a payload placed past the block's
+end still satisfied "after the block start, after the uv_buf_t" while
+`copy-in!` scribbled on whatever the allocator put next — and, because
+`uv-buf-set!` records the same displaced address the copy wrote to, the peer
+still received the right bytes, so every existing row passed. One new row
+closes it, mutation-watched per AGENTS.md (scratch copy, restored-green
+confirmed diff-identical afterwards):
+
+| Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|
+| tcp.sls | `uv-write!`'s payload placed 16 bytes past its offset inside the block (`(+ block payload-offset 16)`) | FAIL, exit 1 — the ONLY failure in the suite (166 other rows passed, the lower-bound row among them) | "the payload's last byte lies inside the request's own block too" |

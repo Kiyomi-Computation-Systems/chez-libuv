@@ -584,6 +584,21 @@
   (let ((base (uv-buf-base span-buf)))
     (if (and (> base span-block) (> base span-buf)) 'inside (list 'outside base))))
 
+;; The UPPER bound, which the row above cannot see: a payload placed past
+;; the block's end still satisfies "after the block start, after the
+;; uv_buf_t" while copy-in! corrupts whatever the allocator put next
+;; (final-review triage, Task 8 Minors). The block's end is redone from the
+;; same constants uv-write! sizes it with -- span-buf is already
+;; block + aligned req size, so the end is that plus sizeof(uv_buf_t) plus
+;; the span's own 3 bytes -- not read back out of the binding.
+(test-equal "the payload's last byte lies inside the request's own block too"
+  'inside
+  (let ((base (uv-buf-base span-buf))
+        (block-end (+ span-buf (sizeof-uv-buf-t) 3)))
+    (if (<= (+ base 3) block-end)
+        'inside
+        (list 'past-the-end base block-end))))
+
 ;; The bytes themselves. A copy that read from offset 0 instead of `start`
 ;; would put "012" here -- same length, same completion, wrong payload, and
 ;; invisible to every other row in this suite until Stage 5 can read the
