@@ -10,6 +10,9 @@ All notable changes to this project are documented here. This project follows
   guards on the parent keep matching (previously both failures were raised
   as the parent, with the `path` field as the only discriminant).
   Re-exported from `(libuv)`; sharper predicate `uv-libuv-unavailable?`.
+- **Fixed** `copy-in!`/`copy-out` (private FFI helpers): a non-numeric span
+  argument now raises the structured `&uv-invalid-argument` instead of a
+  bare Chez assertion escaping from `exact?`.
 
 ## 0.1.0 — 2026-08-18
 
