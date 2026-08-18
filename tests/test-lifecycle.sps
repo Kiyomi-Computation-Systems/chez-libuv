@@ -8,8 +8,11 @@
 ;;; Stage 2 filled in the LOOP rows; Stage 3 added the TIMER rows (rows 6-8
 ;;; below: a timer's counters across an ordinary close, across a callback
 ;;; that raises, and across 100 make/start/fire/close iterations with a full
-;;; collection on each). TCP rows arrive with Stages 4-5, extending this
-;;; file rather than adding another one.
+;;; collection on each). Stage 4 added the TCP and REQUEST rows (rows 9-11: a
+;;; tcp handle across an ordinary close, the connect and write request blocks
+;;; across a close that races an in-flight write, and 100
+;;; connect/accept/close iterations with a full collection on each). The read
+;;; buffer's own row arrives with Stage 5.
 ;;;
 ;;; Every assertion here needs the DEV shim (CFLAGS_DEV,
 ;;; -DCHEZ_LIBUV_DEBUG_COUNTERS); against a production shim the live queries
@@ -24,9 +27,11 @@
         (libuv loop)
         (libuv handle)
         (libuv timer)
+        (libuv tcp)
         (libuv private handles)
         (libuv private conditions)
         (only (libuv private native) live-counts)
+        (uv-testing)
         (only (chezscheme) collect))
 
 (define runner (test-runner-simple))
@@ -303,6 +308,172 @@
   0 (live-count 'timer))
 
 (test-equal "100 timer iterations leave the registry at its baseline"
+  registry-count-at-start (registry-count))
+
+;; --- row 9: a tcp handle's whole lifecycle, closed normally -------------
+;; Stage 4's handle rows. Same shape as row 6, on the second handle type: the
+;; counters are asserted to MOVE first and to balance second, so a 'tcp arm
+;; missing from the freeing site's counter switch (design spec S10) fails
+;; here rather than passing as "balanced at zero throughout".
+(define tcp-loop (make-uv-loop))
+(define tcp-live-inside 0)
+(define tcp-registry-inside 0)
+
+(let ((s (make-uv-tcp tcp-loop)))
+  (bind-loopback! s)
+  (set! tcp-live-inside (live-count 'tcp))
+  (set! tcp-registry-inside (- (registry-count) registry-count-at-start))
+  (uv-close! s)
+  (uv-run tcp-loop 'default))
+
+(test-equal "seed: an open tcp handle is live in the counters"
+  1 tcp-live-inside)
+
+(test-equal "seed: an open tcp handle holds a registry entry (alongside its loop)"
+  2 tcp-registry-inside)
+
+(test-equal "an ordinary close returns the live tcp counter to zero"
+  0 (live-count 'tcp))
+
+(test-equal "an ordinary close of a tcp handle returns the registry to its loop alone"
+  1 (- (registry-count) registry-count-at-start))
+
+(uv-loop-teardown! tcp-loop)
+
+(test-equal "the tcp handle's loop tore down cleanly afterwards"
+  registry-count-at-start (registry-count))
+
+;; --- row 10: the request blocks, including a close that races a write ---
+;; A connect request and a write request are separate allocation classes
+;; (design spec S10), each freed in exactly one place -- its own completion
+;; dispatcher -- and each asserted to MOVE before it is asserted to balance.
+;; The write is deliberately still in flight when uv-close! is called, which
+;; is the 'ECANCELED path design spec S5 says request dispatchers must
+;; tolerate on a 'closing handle. Whichever ordering the platform produces,
+;; the block is freed exactly once.
+(define wl (make-uv-loop))
+(define w-peer 'never-accepted)
+(define w-connect-err 'connect-cb-never-fired)
+(define w-write-err 'write-cb-never-fired)
+(define w-closed 'on-close-never-ran)
+(define w-connect-req-inside 0)
+(define w-write-req-inside 0)
+
+(define wserver (make-uv-tcp wl))
+(define wport (bind-loopback! wserver))
+
+(uv-listen! wserver 128
+            (lambda (err)
+              (collect)
+              (when (not err) (set! w-peer (uv-accept! wserver)))))
+
+(define wclient (make-uv-tcp wl))
+
+(connect-loopback! wclient wport
+                   (lambda (err) (collect) (set! w-connect-err err)))
+
+(set! w-connect-req-inside (live-count 'connect-req))
+
+(run-until wl (lambda () (not (eq? w-connect-err 'connect-cb-never-fired))) 64)
+
+(test-equal "seed: an in-flight connect request is live in the counters"
+  1 w-connect-req-inside)
+
+(test-equal "the connect request's block is freed when the connect completes"
+  0 (live-count 'connect-req))
+
+(uv-write! wclient (string->utf8 "in flight")
+           (lambda (err) (collect) (set! w-write-err err)))
+
+(set! w-write-req-inside (live-count 'write-req))
+
+(uv-close! wclient (lambda () (collect) (set! w-closed 'on-close-ran)))
+
+(run-until wl
+           (lambda () (and (not (eq? w-write-err 'write-cb-never-fired))
+                           (eq? w-closed 'on-close-ran)))
+           64)
+
+(test-equal "seed: the write request was live when the close started"
+  1 w-write-req-inside)
+
+(test-equal "the on-close callback of the closed client ran"
+  'on-close-ran w-closed)
+
+(test-equal "a write racing a close still frees its block exactly once"
+  0 (live-count 'write-req))
+
+(uv-loop-teardown! wl)
+
+(test-equal "the request loop tore down with the registry at its baseline"
+  registry-count-at-start (registry-count))
+
+(test-equal "no tcp handle survived the request row"
+  0 (live-count 'tcp))
+
+;; --- row 11: 100 connect/accept/close iterations, collecting on each ----
+;; The GC-pressure axis of design spec S11, applied to the TCP path: the
+;; registry is the only GC root for an open handle or an in-flight request
+;; (ADR-0007), so a collection between connect and close must not disturb
+;; either.
+(define tcp-peak-live 0)
+(define connect-req-peak 0)
+(define accepts 0)
+(define connects 0)
+
+(call-with-uv-loop
+ (lambda (loop)
+   (let ((srv (make-uv-tcp loop)))
+     ;; `srv` is bound BEFORE the callback below is written, so the accept
+     ;; needs no forward reference (uv-testing's bind-loopback! comment).
+     (let ((port (bind-loopback! srv)))
+       (uv-listen! srv 128
+                   (lambda (err)
+                     (collect)
+                     (when (not err)
+                       (set! accepts (+ accepts 1))
+                       (uv-close! (uv-accept! srv)))))
+       (let iterate ((i 0))
+         (when (< i 100)
+           (let ((c (make-uv-tcp loop))
+                 (done #f))
+             (connect-loopback! c port
+                                (lambda (err) (collect) (set! done #t)))
+             ;; Sampled BEFORE the loop runs: at this instant exactly the
+             ;; server and this client are live and exactly one connect
+             ;; request is outstanding, so both peaks are deterministic
+             ;; rather than a function of when the peer's close lands.
+             (set! tcp-peak-live (max tcp-peak-live (live-count 'tcp)))
+             (set! connect-req-peak
+                   (max connect-req-peak (live-count 'connect-req)))
+             (run-until loop (lambda () (and done (= accepts (+ i 1)))) 64)
+             (set! connects (+ connects 1))
+             (collect)
+             (uv-close! c)
+             (run-until loop
+                        (lambda () (eq? 'closed (uv-handle-state c)))
+                        64))
+           (iterate (+ i 1))))))))
+
+(test-equal "seed: every iteration held the server plus its own client"
+  2 tcp-peak-live)
+
+(test-equal "seed: every iteration held exactly one outstanding connect request"
+  1 connect-req-peak)
+
+(test-equal "every one of the 100 connects completed"
+  100 connects)
+
+(test-equal "every one of the 100 connections was accepted"
+  100 accepts)
+
+(test-equal "100 connect/accept/collect/close iterations leave no live tcp handle"
+  0 (live-count 'tcp))
+
+(test-equal "100 connect/accept/collect/close iterations leave no live connect request"
+  0 (live-count 'connect-req))
+
+(test-equal "100 connect/accept/collect/close iterations leave the registry at its baseline"
   registry-count-at-start (registry-count))
 
 (collect)

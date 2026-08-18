@@ -221,6 +221,93 @@
 
 (uv-loop-teardown! hl)
 
+;; --- the re-exported tcp surface ----------------------------------------
+;; Same rule as the loop and timer rows above: every name here has to come
+;; from src/libuv.sls or this file does not expand. Deliberately NOT using
+;; (uv-testing)'s loopback helpers -- that library imports (libuv tcp)
+;; directly, and a helper standing between this suite and the facade is
+;; exactly what would let a dropped re-export go unnoticed.
+;;
+;; #f is never an expected value here (AGENTS.md): each callback's `err` is
+;; mapped to a symbol, and each observer is seeded with a symbol no success
+;; path can produce.
+(define (facade-err->symbol err)
+  (cond ((not err) 'no-error)
+        ((uv-errno-error? err) (uv-errno-error-errno err))
+        (else (list 'unexpected err))))
+
+(define fl (make-uv-loop))
+(define fserver (make-uv-tcp fl))
+
+(test-equal "make-uv-tcp is re-exported and its handle answers uv-tcp?"
+  '(a-tcp open)
+  (list (if (uv-tcp? fserver) 'a-tcp 'not-a-tcp) (uv-handle-state fserver)))
+
+(uv-tcp-bind! fserver "127.0.0.1" 0)
+
+(define fport (uv-tcp-getsockname-port fserver))
+
+(test-equal "uv-tcp-bind! and uv-tcp-getsockname-port are re-exported"
+  'ephemeral (if (and (> fport 1024) (< fport 65536)) 'ephemeral fport))
+
+(define f-accepted 'never-accepted)
+(define f-connect-err 'connect-cb-never-fired)
+(define f-write-err 'write-cb-never-fired)
+(define f-shutdown-err 'shutdown-cb-never-fired)
+
+(uv-listen! fserver 128
+            (lambda (err)
+              (collect)
+              (when (not err) (set! f-accepted (uv-accept! fserver)))))
+
+(define fclient (make-uv-tcp fl))
+
+(uv-tcp-connect! fclient "127.0.0.1" fport
+                 (lambda (err)
+                   (collect)
+                   (set! f-connect-err err)
+                   (uv-tcp-nodelay! fclient #t)
+                   (uv-write! fclient (string->utf8 "facade")
+                              (lambda (werr)
+                                (collect)
+                                (set! f-write-err werr)
+                                (uv-shutdown! fclient
+                                              (lambda (serr)
+                                                (collect)
+                                                (set! f-shutdown-err serr)))))))
+
+;; Bounded by iteration count, never by a clock (design spec S11). The whole
+;; chain above is driven by callbacks the loop itself delivers.
+;;
+;; BOTH ends are waited for, not just the client's chain: the listening
+;; socket's readability and the client's connect completion are separate poll
+;; events, and libuv does not promise them in the same iteration. Draining
+;; only until the shutdown completed left the accept unobserved on some runs
+;; and passed on others -- measured, not theorised.
+(let drain ((i 0))
+  (when (and (< i 32)
+             (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
+                 (eq? f-accepted 'never-accepted)))
+    (uv-run fl 'once)
+    (drain (+ i 1))))
+
+(test-equal "uv-tcp-connect! is re-exported and its callback reports success"
+  'no-error (facade-err->symbol f-connect-err))
+
+(test-equal "uv-listen! and uv-accept! are re-exported and produced a peer"
+  'a-tcp (if (uv-tcp? f-accepted) 'a-tcp (list 'not-a-tcp f-accepted)))
+
+(test-equal "uv-write! is re-exported and its completion reports success"
+  'no-error (facade-err->symbol f-write-err))
+
+(test-equal "uv-shutdown! is re-exported and its completion reports success"
+  'no-error (facade-err->symbol f-shutdown-err))
+
+(uv-loop-teardown! fl)
+
+(test-equal "the facade's tcp loop tore down and closed every handle"
+  '(closed closed) (list (uv-handle-state fserver) (uv-handle-state fclient)))
+
 ;; --- call-with-uv-loop, through the facade ------------------------------
 (test-equal "call-with-uv-loop is re-exported and returns the body's value"
   'body-value

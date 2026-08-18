@@ -258,6 +258,29 @@
 (test-equal "it does not appear in another loop's snapshot"
   '() (uv-loop-live-handles other-loop))
 
+;; uv-loop-teardown! sweeps this snapshot and calls close-handle! on every
+;; element, so it must contain HANDLES only. Requests live in the SAME table
+;; (design spec S5: one registry "for both handles and requests
+;; (discriminated by a kind field)"), and close-handle! rightly refuses
+;; anything that is not a handle record -- so a snapshot that included
+;; requests would make teardown raise 'not-a-uv-handle the moment a write was
+;; in flight, which is exactly the state Stage 4's close-with-a-pending-write
+;; row puts a loop in.
+(define fake-req (cons 4243 'fake-write-req))
+(registry-register! (car fake-req) 'write-req l0 fake-req)
+
+(test-equal "seed: the request entry really is in the registry"
+  'same (if (eq? fake-req (registry-ref (car fake-req))) 'same 'different))
+
+(test-equal "a request entry is NOT in its loop's live-handle snapshot"
+  'excluded
+  (if (memq fake-req (uv-loop-live-handles l0)) 'included 'excluded))
+
+(test-equal "the handle entry is still in that same snapshot"
+  'listed (if (memq fake-handle (uv-loop-live-handles l0)) 'listed 'missing))
+
+(registry-deregister! (car fake-req))
+
 (test-equal "registering the same pointer twice is refused, naming who and why"
   '(uv-registry-register! pointer-already-registered)
   (guard (e ((uv-invalid-argument? e)
@@ -273,6 +296,27 @@
             (#t 'wrong-condition))
     (registry-register! 0 'timer l0 fake-handle)
     'no-raise))
+
+;; THE ENTRY'S LOOP FIELD IS THE SEAM GUARD'S LAST RESORT, and this is the
+;; check that makes it total. `contain-dispatcher-raise!` -- the outermost
+;; Scheme frame libuv can reach -- resolves a raised object's destination
+;; with `registry-loop-of`, which reads THIS field, and then hands it to
+;; `loop-record-error!`, whose own `require-loop` would RAISE on anything
+;; that is not a loop record. That raise would be inside the guard's handler,
+;; i.e. outside the guard, i.e. straight into a C stack frame (spike FINDINGS
+;; Q2: exit 255, no teardown). Refusing the bad loop HERE, at the one place
+;; the field is ever written, is what makes that unreachable by construction
+;; rather than by hope.
+(test-equal "registry-register! rejects an entry whose loop is not a uv-loop"
+  '(uv-registry-register! loop-not-a-uv-loop)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (registry-register! 987654 'timer 'not-a-loop fake-handle)
+    'no-raise))
+
+(test-equal "the refused registration left nothing behind in the registry"
+  'absent (if (registry-ref 987654) 'present 'absent))
 
 (registry-deregister! (car fake-handle))
 

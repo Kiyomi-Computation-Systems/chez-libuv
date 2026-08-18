@@ -35,11 +35,12 @@
           shim-compiled-version uv-version uv-version-string
 
           ;; errors (ADR-0006)
-          errno->symbol errno->message uv-check
+          errno->symbol errno->message uv-check uv-errno-condition
 
           ;; boundary copying (ADR-0009)
           c-string->string
           alloc-zeroed zero-out! free! copy-in! copy-out
+          c-int-size c-int-ref c-int-set! read-net-u16
 
           ;; uv_buf_t, the one struct this binding constructs
           uv-buf-set! uv-buf-base uv-buf-len uv-buf-ftype-layout
@@ -64,6 +65,16 @@
           uv-timer-init uv-timer-start-native uv-timer-stop uv-timer-again
           uv-timer-set-repeat uv-timer-get-repeat
           uv-close-native uv-is-closing
+
+          ;; the TCP and stream entry points (design spec S5, S7). The four
+          ;; that take a C function pointer -- uv_listen, uv_tcp_connect,
+          ;; uv_write and uv_shutdown -- are NOT exported raw, for the same
+          ;; reason as uv_timer_start and uv_close above: their wrappers bake
+          ;; in this library's own trampoline entry points.
+          uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-nodelay
+          uv-listen-native uv-accept uv-tcp-connect-native
+          uv-write-native uv-shutdown-native
+          uv-ip4-addr uv-ip6-addr
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
@@ -294,6 +305,46 @@
   (define uv-is-closing
     (foreign-procedure "uv_is_closing" (uptr) int))
 
+  ;; --- the TCP and stream entry points (design spec S5, S7) -------------
+  ;; Every pointer is `uptr` (design spec S4 rule 4). The three scalar
+  ;; parameters mirror libuv's own declarations rather than being widened or
+  ;; narrowed here: uv_tcp_bind's `flags` and uv_write's `nbufs` are
+  ;; `unsigned int`, uv_listen's `backlog` and uv_tcp_nodelay's `enable` are
+  ;; `int`. `unsigned-int` is what spike/03-buf-loopback.ss bound and drove a
+  ;; real loopback write through.
+  ;;
+  ;; uv_ip4_addr / uv_ip6_addr take a `const char *` that they parse and
+  ;; discard before returning, so `string` is safe here specifically: Chez's
+  ;; marshalled copy lives for the duration of the call, and libuv writes the
+  ;; PARSED result into the caller's sockaddr rather than retaining the text
+  ;; (ADR-0009's "bytevectors cross the FFI only as arguments to synchronous
+  ;; calls that complete before the call returns", applied to a string).
+  ;;
+  ;; All of these return errnos and go through uv-check at the call site.
+  (define uv-tcp-init
+    (foreign-procedure "uv_tcp_init" (uptr uptr) int))
+  (define uv-tcp-bind
+    (foreign-procedure "uv_tcp_bind" (uptr uptr unsigned-int) int))
+  (define uv-tcp-getsockname
+    (foreign-procedure "uv_tcp_getsockname" (uptr uptr uptr) int))
+  (define uv-tcp-nodelay
+    (foreign-procedure "uv_tcp_nodelay" (uptr int) int))
+  (define uv-accept
+    (foreign-procedure "uv_accept" (uptr uptr) int))
+  (define uv-ip4-addr
+    (foreign-procedure "uv_ip4_addr" (string int uptr) int))
+  (define uv-ip6-addr
+    (foreign-procedure "uv_ip6_addr" (string int uptr) int))
+
+  (define raw-listen
+    (foreign-procedure "uv_listen" (uptr int uptr) int))
+  (define raw-tcp-connect
+    (foreign-procedure "uv_tcp_connect" (uptr uptr uptr uptr) int))
+  (define raw-write
+    (foreign-procedure "uv_write" (uptr uptr uptr unsigned-int uptr) int))
+  (define raw-shutdown
+    (foreign-procedure "uv_shutdown" (uptr uptr uptr) int))
+
   ;; --- uv_buf_t (design spec S4 rule 4) ---------------------------------
   ;; The one libuv struct this binding CONSTRUCTS rather than merely holding
   ;; a pointer to. The declaration below is the POSIX layout; on Windows
@@ -427,6 +478,42 @@
         (foreign-set! 'unsigned-8 dst i (bytevector-u8-ref bv (+ start i)))
         (loop (+ i 1)))))
 
+  ;; --- the C `int` out-parameter (uv_tcp_getsockname's namelen) ---------
+  ;; The width comes from the C ABI (foreign-sizeof), never from a literal 4:
+  ;; this is the same reasoning as lookup-constant's `long` out-parameter
+  ;; below, and it is what keeps the caller in (libuv tcp) from having to
+  ;; know anything about the platform's int.
+  (define (c-int-size) (foreign-sizeof 'int))
+
+  (define (c-int-ref addr)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-c-int-ref 'null-or-invalid-source)))
+    (foreign-ref 'int addr 0))
+
+  (define (c-int-set! addr value)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-c-int-set! 'null-or-invalid-destination)))
+    (unless (and (integer? value) (exact? value))
+      (raise (make-uv-invalid-argument 'uv-c-int-set! 'value-not-an-exact-integer)))
+    (foreign-set! 'int addr 0 value))
+
+  ;; ntohs, by hand, over two unsigned bytes. `sin_port` is stored in NETWORK
+  ;; byte order (big-endian) whatever the host's order is, so reading it as a
+  ;; host `unsigned-16` would answer a byte-swapped number on every
+  ;; little-endian target -- plausible, in range, and wrong (spike FINDINGS
+  ;; Q3, which did exactly this by hand and needed no htons/ntohs binding).
+  ;;
+  ;; Two unsigned-8 reads rather than one unsigned-16 plus a swap: this way
+  ;; the code has no host-order branch to get backwards, and it is identical
+  ;; on a big-endian host.
+  (define (read-net-u16 addr offset)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-read-net-u16 'null-or-invalid-source)))
+    (unless (and (integer? offset) (exact? offset) (>= offset 0))
+      (raise (make-uv-invalid-argument 'uv-read-net-u16 'offset-out-of-range)))
+    (+ (* 256 (foreign-ref 'unsigned-8 addr offset))
+       (foreign-ref 'unsigned-8 addr (+ offset 1))))
+
   (define (copy-out src len)
     (unless (and (integer? src) (exact? src) (positive? src))
       (raise (make-uv-invalid-argument 'uv-copy-out 'null-or-invalid-source)))
@@ -487,13 +574,24 @@
   ;; uv_strerror_r's text), &who, and &message, so both a uv-aware guard and
   ;; a generic condition report see what happened.
   (define (uv-check rc who)
-    (if (zero? rc)
-        rc
-        (let ((message (errno->message rc)))
-          (raise (condition
-                  (make-uv-errno-error (errno-value->symbol rc) rc message)
-                  (make-who-condition who)
-                  (make-message-condition message))))))
+    (if (zero? rc) rc (raise (uv-errno-condition rc who))))
+
+  ;; The same object, BUILT rather than raised. Design spec S9: "these are
+  ;; the same condition record types delivered as plain objects to
+  ;; asynchronous callbacks (on-error, on-complete's err argument) and raised
+  ;; synchronously from procedures that fail immediately." A callback's
+  ;; status int is not an exception -- raising it would unwind into libuv
+  ;; (ADR-0008) -- so the dispatchers in (libuv private handles) call this
+  ;; and pass the result along as a value.
+  ;;
+  ;; Factored out of uv-check rather than duplicated so the two can never
+  ;; describe the same errno differently.
+  (define (uv-errno-condition rc who)
+    (let ((message (errno->message rc)))
+      (condition
+       (make-uv-errno-error (errno-value->symbol rc) rc message)
+       (make-who-condition who)
+       (make-message-condition message))))
 
   (define (live-counts)
     (list (cons 'loop        (live-loop))
@@ -673,8 +771,12 @@
   ;; misuse is least recoverable, since libuv would call a C address with the
   ;; wrong argument shape). They leave this file only baked into the two
   ;; wrappers below.
-  (define close-cb-entry (foreign-callable-entry-point close-callable))
-  (define timer-cb-entry (foreign-callable-entry-point timer-callable))
+  (define close-cb-entry      (foreign-callable-entry-point close-callable))
+  (define timer-cb-entry      (foreign-callable-entry-point timer-callable))
+  (define connection-cb-entry (foreign-callable-entry-point connection-callable))
+  (define write-cb-entry      (foreign-callable-entry-point write-done-callable))
+  (define connect-cb-entry    (foreign-callable-entry-point connect-callable))
+  (define shutdown-cb-entry   (foreign-callable-entry-point shutdown-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -685,6 +787,37 @@
   ;; is where the pointer is actually freed (design spec S5).
   (define (uv-close-native handle-ptr)
     (raw-close handle-ptr close-cb-entry))
+
+  ;; The four stream wrappers, each baking in ITS OWN trampoline. Getting one
+  ;; of these pairings wrong is not a type error in any language involved --
+  ;; every entry point is a bare address and every one of these callbacks
+  ;; takes (uptr int) except close's -- so it would be libuv calling the
+  ;; wrong dispatcher with a plausible argument shape. The pairing is
+  ;; therefore asserted end to end by tests/test-tcp.sps, where a connection
+  ;; that arrived through the write-done dispatcher (or vice versa) shows up
+  ;; as a callback that never fires and a request that is never freed.
+  ;;
+  ;; (uv-listen-native server-ptr backlog) -> int (an errno).
+  (define (uv-listen-native server-ptr backlog)
+    (raw-listen server-ptr backlog connection-cb-entry))
+
+  ;; (uv-tcp-connect-native req-ptr handle-ptr addr-ptr) -> int (an errno).
+  ;; addr-ptr is a `const struct sockaddr *`; libuv copies what it needs
+  ;; before returning on every platform this build supports, but design spec
+  ;; S7 has the caller co-allocate it with the request anyway, so the
+  ;; question never has to be re-answered per platform.
+  (define (uv-tcp-connect-native req-ptr handle-ptr addr-ptr)
+    (raw-tcp-connect req-ptr handle-ptr addr-ptr connect-cb-entry))
+
+  ;; (uv-write-native req-ptr stream-ptr bufs-ptr nbufs) -> int (an errno).
+  ;; `bufs-ptr` points at an array of nbufs uv_buf_t; v0.1 always passes 1
+  ;; (design spec S7 defers vectored writes to a reserved uv-write*!).
+  (define (uv-write-native req-ptr stream-ptr bufs-ptr nbufs)
+    (raw-write req-ptr stream-ptr bufs-ptr nbufs write-cb-entry))
+
+  ;; (uv-shutdown-native req-ptr stream-ptr) -> int (an errno).
+  (define (uv-shutdown-native req-ptr stream-ptr)
+    (raw-shutdown req-ptr stream-ptr shutdown-cb-entry))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

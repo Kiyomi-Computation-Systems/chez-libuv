@@ -31,7 +31,7 @@
 (library (libuv private handles)
   (export ;; the registry
           registry-register! registry-deregister! registry-ref
-          registry-count registry-snapshot-for-loop
+          registry-loop-of registry-count registry-snapshot-for-loop
 
           ;; the loop record (design spec S5's loop row)
           %make-uv-loop-record uv-loop?
@@ -55,11 +55,27 @@
           ;; same reason the loop's is: a record whose ptr did not come from
           ;; a successful uv_*_init is a segfault waiting to happen.
           %make-uv-handle-record uv-handle? %make-uv-timer-record uv-timer?
+          %make-uv-tcp-record uv-tcp-record?
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
           timer-on-timeout set-timer-on-timeout!
+          tcp-on-connection set-tcp-on-connection!
+          ;; the read-path fields, declared now and filled by Stage 5 (see
+          ;; the record definition below for why they are declared here)
+          tcp-on-data set-tcp-on-data!
+          tcp-on-eof set-tcp-on-eof!
+          tcp-on-error set-tcp-on-error!
+          tcp-read-buf set-tcp-read-buf!
+          tcp-read-buf-len set-tcp-read-buf-len!
+          tcp-reading? set-tcp-reading!
           require-handle require-open-handle handle-pointer
+
+          ;; the request records (design spec S5's "for both handles and
+          ;; requests", S7's request-allocation pattern)
+          %make-uv-req-record uv-req?
+          req-ptr set-req-ptr! req-kind req-handle
+          req-on-complete set-req-on-complete!
 
           ;; the callback error policy (design spec S8)
           loop-record-error! dispatch-guarded orphan-callback-events
@@ -82,7 +98,11 @@
           ;;   the dispatcher slots: this library fills all eight, once, in
           ;;                     its own body (S4).
           (only (libuv private native)
-                uv-loop-stop uv-close-native free! count-timer-free!
+                uv-loop-stop uv-close-native free!
+                count-timer-free! count-tcp-free!
+                count-write-req-free! count-connect-req-free!
+                count-read-buffer-free!
+                uv-errno-condition
                 dispatcher-names install-callback-dispatchers!))
 
   ;; --- the loop record ---------------------------------------------------
@@ -217,6 +237,64 @@
      (lambda (pargs->new)
        (lambda (ptr loop) ((pargs->new ptr 'timer loop) #f)))))
 
+  ;; The TCP handle. `on-connection` is this stage's field; the six read-path
+  ;; fields after it are DECLARED NOW and used by Stage 5, deliberately:
+  ;;
+  ;;   * the close dispatcher below already frees `read-buf`, because design
+  ;;     spec S5 fixes the close order (pop registry -> free read buffer ->
+  ;;     free handle pointer) and S6 makes the close dispatcher the ONLY
+  ;;     place that buffer is ever freed. Splitting that arm across two
+  ;;     stages would mean shipping a close protocol that is right for one
+  ;;     handle type and incomplete for the other.
+  ;;   * a record's field list is its layout. Adding fields later is a
+  ;;     recompile of every importer; declaring the shape once, from the
+  ;;     design spec's own record row, is not.
+  ;;
+  ;; `read-buf` is a uptr (0 when there is none), `read-buf-len` its size in
+  ;; bytes, and `reading?` mirrors whether uv_read_start is currently active.
+  (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
+    (parent uv-handle-record)
+    (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!)
+            (mutable on-data       tcp-on-data       set-tcp-on-data!)
+            (mutable on-eof        tcp-on-eof        set-tcp-on-eof!)
+            (mutable on-error      tcp-on-error      set-tcp-on-error!)
+            (mutable read-buf      tcp-read-buf      set-tcp-read-buf!)
+            (mutable read-buf-len  tcp-read-buf-len  set-tcp-read-buf-len!)
+            (mutable reading       tcp-reading?      set-tcp-reading!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop)
+         ((pargs->new ptr 'tcp loop) #f #f #f #f 0 0 #f)))))
+
+  ;; --- the request records (design spec S5, S7) --------------------------
+  ;; A request is NOT a handle: it has no state machine, no close protocol,
+  ;; and exactly one lifetime rule -- it lives from the call that started it
+  ;; until its completion dispatcher frees its block. So it is a separate
+  ;; record type rather than another child of uv-handle-record, and the
+  ;; live-handle snapshot below excludes it by kind.
+  ;;
+  ;; Fields:
+  ;;   ptr         the ONE foreign-alloc'd block: the uv_*_t request, plus
+  ;;               whatever design spec S7 co-allocates with it (a uv_buf_t
+  ;;               and the payload copy for a write; a sockaddr_storage for a
+  ;;               connect). ZEROED the moment the block is freed, for the
+  ;;               same reason a handle's is.
+  ;;   kind        'write | 'shutdown | 'connect
+  ;;   handle      the stream the request runs on. IMMUTABLE, and the only
+  ;;               route from a completion back to the owning loop -- the
+  ;;               handle may already be 'closing by then (S5), but its loop
+  ;;               backpointer outlives everything.
+  ;;   on-complete the caller's completion callback, or #f
+  (define-record-type (uv-req-record %make-uv-req-record uv-req?)
+    (fields (mutable ptr        req-ptr         set-req-ptr!)
+            (immutable kind     req-kind)
+            (immutable handle   req-handle)
+            (mutable on-complete req-on-complete set-req-on-complete!))
+    (protocol
+     (lambda (new)
+       (lambda (ptr kind handle on-complete)
+         (new ptr kind handle on-complete)))))
+
   ;; Type check first, state check second, and both raise DIFFERENT
   ;; conditions -- the same split as require-loop / require-open-loop, and
   ;; for the same reason: handing a string to uv-timer-stop! is a caller bug,
@@ -262,14 +340,34 @@
   (define (valid-pointer? ptr)
     (and (integer? ptr) (exact? ptr) (positive? ptr)))
 
+  ;; The kinds that name a HANDLE, as opposed to a loop or a request. This
+  ;; is what registry-snapshot-for-loop filters on, and therefore what
+  ;; uv-loop-teardown! sweeps: every element of that snapshot is handed to
+  ;; close-handle!, which refuses anything that is not a handle record.
+  (define handle-kinds '(timer tcp))
+
   ;; kind:   'loop | 'timer | 'tcp | 'write-req | 'connect-req | 'shutdown-req
-  ;; loop:   the owning loop record (a loop owns itself)
+  ;; loop:   the owning loop record (a loop owns itself). A request registers
+  ;;         its HANDLE's loop, which is what makes registry-loop-of answer
+  ;;         for a request block too.
   ;; object: the Scheme record the dispatchers and the teardown sweep hand
   ;;         back to their callers
   (define (registry-register! ptr kind loop object)
     (unless (valid-pointer? ptr)
       (raise (make-uv-invalid-argument 'uv-registry-register!
                                        'null-or-invalid-pointer)))
+    ;; THE LOOP FIELD IS VALIDATED HERE BECAUSE contain-dispatcher-raise! --
+    ;; the outermost Scheme frame libuv can reach (see the seam's guard
+    ;; below) -- reads it back through registry-loop-of and hands it to
+    ;; loop-record-error!, whose require-loop would RAISE on a non-loop. That
+    ;; raise would happen inside the seam guard's HANDLER, i.e. outside the
+    ;; guard, i.e. into a C stack frame: spike FINDINGS Q2's exit 255, with
+    ;; no teardown and no foreign-free. Refusing a bad loop at the one place
+    ;; this field is ever written makes that unreachable by construction,
+    ;; which is a check rather than a comment (AGENTS.md).
+    (unless (uv-loop? loop)
+      (raise (make-uv-invalid-argument 'uv-registry-register!
+                                       'loop-not-a-uv-loop)))
     (when (hashtable-contains? registry ptr)
       ;; Two live objects on one address means something was freed without
       ;; being deregistered, and the dispatchers would deliver this handle's
@@ -304,10 +402,16 @@
 
   (define (registry-count) (hashtable-size registry))
 
-  ;; Every HANDLE registered against this loop. The loop's own entry is
-  ;; excluded by kind -- a loop that appeared in its own snapshot would be
-  ;; handed to close-handle! by uv-loop-teardown!, which is not a thing that
-  ;; can be uv_close'd.
+  ;; Every HANDLE registered against this loop -- an INCLUSION test on
+  ;; handle-kinds, not an exclusion of 'loop. Both the loop's own entry and
+  ;; every request entry have to stay out of this list, and for the same
+  ;; reason: uv-loop-teardown! hands each element to close-handle!, which
+  ;; refuses anything that is not a handle record. A snapshot that excluded
+  ;; only 'loop would make teardown raise 'not-a-uv-handle the moment a write
+  ;; or a connect was in flight -- and an in-flight request needs no sweeping
+  ;; anyway: libuv fires every request callback before the close callback of
+  ;; the handle it belongs to (design spec S5), so closing the handle is what
+  ;; frees the request block.
   (define (registry-snapshot-for-loop loop)
     (let-values (((keys entries) (hashtable-entries registry)))
       (let collect ((i 0) (acc '()))
@@ -316,7 +420,7 @@
             (let ((entry (vector-ref entries i)))
               (collect (+ i 1)
                        (if (and (eq? (registry-entry-loop entry) loop)
-                                (not (eq? (registry-entry-kind entry) 'loop)))
+                                (memq (registry-entry-kind entry) handle-kinds))
                            (cons (registry-entry-object entry) acc)
                            acc)))))))
 
@@ -403,6 +507,103 @@
                                   (lambda () (on-timeout handle))))))
           (record-orphan-callback! 'timer handle-ptr))))
 
+  ;; --- the Stage 4 dispatchers (design spec S5, S7) ----------------------
+  ;; A callback's `status` int is NOT an exception. Raising it would unwind
+  ;; into libuv (ADR-0008), and design spec S9 is explicit that these are
+  ;; "the same condition record types delivered as plain objects to
+  ;; asynchronous callbacks". So a nonzero status becomes a condition OBJECT
+  ;; and is passed as an argument; #f means success.
+  ;;
+  ;; `who` is the public procedure that STARTED the operation, so a caller
+  ;; reading the condition sees uv-write! rather than the name of an internal
+  ;; dispatcher.
+  (define (status->err status who)
+    (if (zero? status) #f (uv-errno-condition status who)))
+
+  ;; uv_connection_cb: void (*)(uv_stream_t *server, int status).
+  ;;
+  ;; No state check on the server, unlike timer-dispatch: a connection
+  ;; arriving for a 'closing listener is a real (if rare) race, and the
+  ;; callback is the caller's only chance to see it. What IS checked is that
+  ;; the pointer resolves to a TCP handle -- an incoming connection for
+  ;; anything else means the registry and libuv disagree.
+  (define (connection-dispatch server-ptr status)
+    (let ((server (registry-ref server-ptr)))
+      (if (uv-tcp-record? server)
+          (let ((on-connection (tcp-on-connection server)))
+            (when on-connection
+              (dispatch-guarded
+               (handle-loop server)
+               (lambda () (on-connection (status->err status 'uv-listen!))))))
+          (record-orphan-callback! 'connection server-ptr))))
+
+  ;; uv_write_cb / uv_shutdown_cb / uv_connect_cb, all
+  ;; void (*)(uv_*_t *req, int status). THE ONLY PLACE A REQUEST BLOCK IS
+  ;; FREED (design spec S7, S10).
+  ;;
+  ;; THE ORDER IS THE SPECIFICATION, exactly as it is for close-dispatch:
+  ;;   1. read what is needed off the record FIRST -- the owning loop and the
+  ;;      callback -- because steps 2-5 leave the record pointing at nothing
+  ;;   2. pop the registry entry   -- so nothing can dispatch on this pointer
+  ;;                                  again, and so the address is free to be
+  ;;                                  reused by a later foreign-alloc
+  ;;   3. free the whole block     -- request, uv_buf_t and payload together;
+  ;;                                  design spec S7 allocates them as one
+  ;;   4. bump the counter for this class, at the freeing site (S10)
+  ;;   5. zero the stored uptr     -- at the freeing site, so a use-after-free
+  ;;                                  is a structured condition rather than
+  ;;                                  the plausible wrong answer spike Q1
+  ;;                                  measured
+  ;;   6. THEN run the caller's on-complete, under the guard
+  ;; Step 6 last is design spec S7's "frees the block BEFORE invoking
+  ;; (on-complete err)", and it is what makes the memory bound on a stream
+  ;; with many queued writes a property of the code rather than of how long
+  ;; each callback happens to take.
+  ;;
+  ;; NO HANDLE STATE CHECK, deliberately: design spec S5 says request
+  ;; callbacks land on a 'closing handle (an in-flight write losing its race
+  ;; against uv_close completes with 'ECANCELED), and refusing to deliver
+  ;; there would drop the one notification that says the block is gone.
+  (define (complete-request! name who count-free! req-ptr status)
+    (let ((req (registry-ref req-ptr)))
+      (if (uv-req? req)
+          (let ((loop (handle-loop (req-handle req)))
+                (on-complete (req-on-complete req)))
+            (registry-deregister! req-ptr)
+            (free! req-ptr)
+            (count-free!)
+            (set-req-ptr! req 0)
+            (when on-complete
+              (dispatch-guarded
+               loop
+               (lambda () (on-complete (status->err status who))))))
+          (record-orphan-callback! name req-ptr))))
+
+  ;; The write payload lives INSIDE the write request's own block (design
+  ;; spec S7: "exactly one foreign-alloc, sized for
+  ;; [uv_write_t | pad | uv_buf_t | payload copy] in a single block"), so one
+  ;; allocation gets one counter. There is no second class to bump.
+  (define (write-done-dispatch req-ptr status)
+    (complete-request! 'write-done 'uv-write! count-write-req-free!
+                       req-ptr status))
+
+  (define (connect-dispatch req-ptr status)
+    (complete-request! 'connect 'uv-tcp-connect! count-connect-req-free!
+                       req-ptr status))
+
+  ;; Design spec S10 enumerates six debug-counter classes and a shutdown
+  ;; request is not one of them, so this one is deliberately uncounted rather
+  ;; than counted under someone else's class. What stands in for the counter
+  ;; is the REGISTRY: tests/test-tcp.sps asserts the shutdown request's entry
+  ;; is gone by the time on-shutdown runs, and the balance rows assert the
+  ;; registry returns to its baseline. The block's actual free is covered by
+  ;; Valgrind on Linux (ADR-0003) like every other allocation here.
+  (define (no-request-counter) #f)
+
+  (define (shutdown-dispatch req-ptr status)
+    (complete-request! 'shutdown 'uv-shutdown! no-request-counter
+                       req-ptr status))
+
   ;; uv_close_cb: void (*)(uv_handle_t *handle). THE ONLY PLACE A HANDLE
   ;; POINTER IS FREED (design spec S5, S10).
   ;;
@@ -411,8 +612,11 @@
   ;;                                  again, and so the address is free to be
   ;;                                  reused by a later foreign-alloc without
   ;;                                  colliding with a stale entry
-  ;;   2. free the read buffer     -- Stage 5's per-handle buffer; nothing to
-  ;;                                  free for a timer
+  ;;   2. free the read buffer     -- the per-handle buffer of design spec
+  ;;                                  S6, freed HERE and nowhere else and
+  ;;                                  never earlier; nothing to free for a
+  ;;                                  timer, or for a TCP handle that never
+  ;;                                  started reading
   ;;   3. free the handle pointer
   ;;   4. bump the counter for this kind, at the freeing site (S10)
   ;;   5. zero the stored uptr     -- immediately, at the freeing site, so a
@@ -429,6 +633,7 @@
       (if (uv-handle? handle)
           (begin
             (registry-deregister! handle-ptr)
+            (free-read-buffer! handle)
             (free! handle-ptr)
             (count-handle-free! (handle-kind handle))
             (set-handle-ptr! handle 0)
@@ -438,13 +643,29 @@
                 (dispatch-guarded (handle-loop handle) on-close))))
           (record-orphan-callback! 'close handle-ptr))))
 
-  ;; One counter class per handle kind (design spec S10). Stage 4 adds the
-  ;; 'tcp arm next to this one; a kind with no arm has no counter class yet,
-  ;; and since `kind` is set by the constructors in this file, that cannot
-  ;; be reached from outside it.
+  ;; Step 2 of the close order above. Design spec S6: the per-handle read
+  ;; buffer "is freed in exactly one place: the close dispatcher, never
+  ;; earlier, because Windows' overlapped-read model can still reference it
+  ;; after a read completion is queued but before the handle has fully
+  ;; stopped". A handle that never called uv-read-start! has 0 here, and
+  ;; free! refuses 0 by design -- so the test is on the pointer, not on the
+  ;; handle type.
+  (define (free-read-buffer! handle)
+    (when (uv-tcp-record? handle)
+      (let ((buf (tcp-read-buf handle)))
+        (when (valid-pointer? buf)
+          (free! buf)
+          (count-read-buffer-free!)
+          (set-tcp-read-buf! handle 0)
+          (set-tcp-read-buf-len! handle 0)))))
+
+  ;; One counter class per handle kind (design spec S10). A kind with no arm
+  ;; has no counter class, and since `kind` is set by the constructors in
+  ;; this file, that cannot be reached from outside it.
   (define (count-handle-free! kind)
     (case kind
       ((timer) (count-timer-free!))
+      ((tcp)   (count-tcp-free!))
       (else #f)))
 
   ;; --- the close protocol (design spec S5) -------------------------------
@@ -611,6 +832,18 @@
                 dispatcher-names)
       (hashtable-set! dispatch-table 'timer timer-dispatch)
       (hashtable-set! dispatch-table 'close close-dispatch)
+      ;; Stage 4's four go in through the SEAM rather than by writing the
+      ;; table directly, even though they live in this same file: that is the
+      ;; documented once-per-name path (ADR-0008, and
+      ;; .plans/stage-3-mutation-log.md's "the seam Stages 4 and 5 plug
+      ;; into"), and using it here means the path Stage 5 will take is the
+      ;; one already exercised rather than one nothing has run.
+      (for-each (lambda (entry)
+                  (install-dispatch-procedure! (car entry) (cdr entry)))
+                (list (cons 'connection connection-dispatch)
+                      (cons 'write-done write-done-dispatch)
+                      (cons 'shutdown   shutdown-dispatch)
+                      (cons 'connect    connect-dispatch)))
       ;; Looked up by name at fire time, never captured here: that
       ;; indirection is the whole seam. Guarded, because this closure is what
       ;; libuv actually calls.

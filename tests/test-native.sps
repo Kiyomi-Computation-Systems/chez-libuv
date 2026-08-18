@@ -26,7 +26,7 @@
         ;; by the resolve-shim-path matrix. None collides with an (rnrs)
         ;; export (unlike file-exists? and exit, which do).
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
-              current-directory))
+              foreign-sizeof current-directory))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -761,6 +761,78 @@
     payload (foreign-ref 'uptr buf (offsetof-uv-buf-t-base)))
   (free! payload)
   (free! buf))
+
+;; --- the C `int` out-parameter (uv_tcp_getsockname's namelen) -----------
+;; The width comes from the C ABI, so it is asserted as "what a raw `int`
+;; read at the same address sees", never against a literal 4: the point of
+;; c-int-size is that no caller has to know the platform's int.
+(let ((cell (alloc-zeroed (c-int-size))))
+  (c-int-set! cell 128)
+  (test-equal "c-int-set!/c-int-ref round-trip a value through a C int cell"
+    128 (c-int-ref cell))
+  (test-equal "the value is readable as a raw C int at the same address"
+    128 (foreign-ref 'int cell 0))
+  (free! cell))
+
+(test-equal "c-int-size is the width of the platform's C int, not a Scheme guess"
+  (foreign-sizeof 'int) (c-int-size))
+
+(test-equal "c-int-set! rejects a null destination, naming who"
+  'uv-c-int-set!
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (c-int-set! 0 1)
+    'no-raise))
+
+(test-equal "c-int-set! rejects an inexact value, naming who and why"
+  '(uv-c-int-set! value-not-an-exact-integer)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (let ((cell (alloc-zeroed (c-int-size))))
+      (guard (inner (#t (free! cell) (raise inner)))
+        (c-int-set! cell 1.5)))
+    'no-raise))
+
+(test-equal "c-int-ref rejects a null source, naming who"
+  'uv-c-int-ref
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (c-int-ref 0)
+    'no-raise))
+
+;; --- read-net-u16: ntohs, by hand (spike FINDINGS Q3) -------------------
+;; `sin_port` is stored big-endian whatever the host's order is, so this is
+;; the one decision in the getsockname path that a host-order read would get
+;; PLAUSIBLY wrong -- a different number, still in port range. The bytes are
+;; asymmetric on purpose: #xB4 #x39 decodes to 46137 big-endian and 14772
+;; host-endian, so the two answers cannot be confused. tests/test-tcp.sps
+;; makes the same check end to end against a real bound port; this one makes
+;; it without a socket, on bytes this suite chose.
+(let ((cell (alloc-zeroed 4)))
+  (copy-in! cell (u8-list->bytevector (list #xb4 #x39 #x00 #x50)) 0 4)
+  (test-equal "read-net-u16 decodes two bytes in NETWORK order, not host order"
+    #xb439 (read-net-u16 cell 0))
+  (test-equal "read-net-u16 reads at the offset it is given"
+    80 (read-net-u16 cell 2))
+  (free! cell))
+
+(test-equal "read-net-u16 rejects a null source, naming who"
+  'uv-read-net-u16
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (read-net-u16 0 0)
+    'no-raise))
+
+(test-equal "read-net-u16 rejects a negative offset, naming who and why"
+  '(uv-read-net-u16 offset-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (let ((cell (alloc-zeroed 4)))
+      (guard (inner (#t (free! cell) (raise inner)))
+        (read-net-u16 cell -1)))
+    'no-raise))
 
 ;; --- debug counters (design spec S10) -----------------------------------
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.

@@ -771,10 +771,18 @@
 
 ;; --- the dispatch seam Stages 4 and 5 plug into --------------------------
 ;; The eight slots in (libuv private native) are installed exactly once, by
-;; (libuv private handles), at library initialisation. The six callback
-;; types this stage does not implement are installed as raising stubs that
-;; the installed closure reaches THROUGH a mutable table -- so a later stage
+;; (libuv private handles), at library initialisation. The callback types no
+;; stage has implemented yet are installed as raising stubs that the
+;; installed closure reaches THROUGH a mutable table -- so a later stage
 ;; replaces one by name, with no second install-callback-dispatchers! call.
+;;
+;; STAGE 4 SPENT FOUR OF THE SIX. 'connection, 'write-done, 'shutdown and
+;; 'connect now hold real dispatchers, so they are no longer stubs and are
+;; not listed below; tests/test-tcp.sps asserts that they are real rather
+;; than stubbed (a stub and a real dispatcher on an unregistered pointer
+;; leave the SAME orphan record behind, so the discriminating call has to be
+;; made against a registered TCP pointer, which needs (libuv tcp)). What is
+;; left here is Stage 5's pair.
 ;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so. The
 ;; six stubs raise -- but the closure libuv actually calls is the seam's, and
 ;; `dispatch-guarded` cannot help here: it runs INSIDE timer-dispatch and
@@ -793,14 +801,13 @@
      (guard (e (#t (list 'escaped-into-the-caller e)))
        ((dispatcher-ref name) 909090 0 0)
        'contained)))
- '(alloc read connection write-done shutdown connect))
+ '(alloc read))
 
 ;; 909090 is registered to nothing, so there is no loop to record against and
 ;; the orphan list is where the containment has to show up. The pointer is
 ;; carried through, so a seam that recorded a placeholder is visible too.
 (test-equal "every contained stub raise was recorded, in order, naming its callback type"
-  '((alloc . 909090) (read . 909090) (connection . 909090)
-    (write-done . 909090) (shutdown . 909090) (connect . 909090))
+  '((alloc . 909090) (read . 909090))
   (list-tail (orphan-callback-events) stub-orphans-before))
 
 ;; The other half of the fork: when the pointer IS registered, the seam has
@@ -821,10 +828,15 @@
   'callback-error
   (if (uv-callback-error? seam-raise) 'callback-error 'not-callback-error))
 
+;; Pinned to the who-condition the ALLOC stub carries, not merely to
+;; "some &uv-error": every stub raises the same SHAPE, so a seam that
+;; contained the wrong callback type's raise -- or that manufactured a
+;; condition of its own -- would satisfy `uv-error?` just as well.
 (test-equal "...carrying the stub's own condition as its cause"
-  'uv-error
+  '(uv-error alloc)
   (let ((cause (uv-callback-error-cause seam-raise)))
-    (if (uv-error? cause) 'uv-error 'not-the-stub-condition)))
+    (list (if (uv-error? cause) 'uv-error 'not-the-stub-condition)
+          (if (who-condition? cause) (condition-who cause) 'no-who))))
 
 (uv-loop-teardown! seam-loop)
 
