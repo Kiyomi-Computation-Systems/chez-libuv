@@ -193,16 +193,42 @@
 (test-equal "uv-timer-repeat is re-exported and reads the interval back"
   7 (uv-timer-repeat ht))
 
+;; Stepped and capped, never a single blind 'once -- and never 'nowait.
+;; 'once blocks until the next due timer (or unrelated I/O) wakes the poll,
+;; and libuv re-checks due timers again right after that poll returns, so
+;; this does not depend on wall-clock scheduling the way a fixed sleep or a
+;; 'nowait poll loop would. It is not, however, guaranteed to fire on the
+;; FIRST 'once call: libuv only arms a BLOCKING poll timeout for a
+;; UV_RUN_ONCE iteration that ran no pending callbacks of its own that same
+;; iteration, so an iteration that raced past that check can return without
+;; the timer having come due yet. A bare single 'once call observed exactly
+;; that under load (CI run 5 -- flaked on the re-arm row below, five runs
+;; in): the assertion read stale not because the timer was late, but because
+;; that one iteration didn't wait for it. Stepping with a cap absorbs a miss
+;; like that for the cost of one more (still due-time-blocking) iteration
+;; instead of failing outright -- the same principle the tcp drain loop
+;; below already uses, applied here to a plain timer fire.
+(let step ((i 0))
+  (when (and (< i 32) (< ht-fires 1))
+    (uv-run hl 'once)
+    (step (+ i 1))))
+
 (test-equal "uv-timer-start! is re-exported and its callback fires"
-  1 (begin (uv-run hl 'once) ht-fires))
+  1 ht-fires)
 
 (uv-timer-stop! ht)
 
 (test-equal "uv-timer-stop! is re-exported and disarms the timer"
   1 (begin (uv-run hl 'nowait) ht-fires))
 
+(uv-timer-again! ht)
+(let step ((i 0))
+  (when (and (< i 32) (< ht-fires 2))
+    (uv-run hl 'once)
+    (step (+ i 1))))
+
 (test-equal "uv-timer-again! is re-exported and re-arms a stopped repeating timer"
-  2 (begin (uv-timer-again! ht) (uv-run hl 'once) ht-fires))
+  2 ht-fires)
 
 (uv-timer-stop! ht)
 (uv-timer-set-repeat! ht 0)
