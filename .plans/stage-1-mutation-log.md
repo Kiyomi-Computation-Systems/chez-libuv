@@ -641,3 +641,20 @@ method; baseline after the fixes is **136 assertions** in `test-native`.
   **not** in `native.sls` yet — design spec S4 places them here, but Task 5
   binds only what it tests. They arrive with Stage 3 (Task 7), along with the
   store-and-reraise mutations Task 4's log deferred.
+
+## Post-v0.1 cleanup round (chore/post-v0.1-cleanup)
+
+Final whole-branch review triage: `copy-in!`/`copy-out` tested `(exact? x)`
+before `(integer? x)` in their span/length checks — inconsistent with
+`zero-out!`'s safe order, and `exact?` on a non-number raises a bare Chez
+`&assertion` instead of the structured `&uv-invalid-argument`. Here the
+"mutation" IS the pre-cleanup code: the two new rows were added first and
+watched fail against it, then the order was swapped and both watched pass.
+
+| # | Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|---|
+| 56 | native.sls | `copy-in!`/`copy-out` span checks in the pre-cleanup order (`exact?` before `integer?`); probed with a symbol span argument | FAIL, exit 1 | "copy-in! rejects a non-numeric start as a structured condition, not a bare assertion"; "copy-out rejects a non-numeric length as a structured condition, not a bare assertion" |
+
+**Red evidence:** both rows answered `wrong-condition` (the escaping bare
+assertion) against the pre-swap code, 170 passes + 2 unexpected failures;
+after the swap, 172 passes, exit 0.

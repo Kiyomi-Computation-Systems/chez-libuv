@@ -765,6 +765,31 @@
     (copy-out 0 4)
     'no-raise))
 
+;; A NON-NUMBER span argument is the ordering case for copy-in!'s span check,
+;; exactly as an inexact length is for zero-out!'s: `exact?` is only defined
+;; on numbers, so testing it before `integer?` (which is total) turns the
+;; structured rejection into a bare Chez &assertion ("not a number") that
+;; nothing downstream can discriminate. zero-out! already tests integer?
+;; first; these two rows are what keep all three helpers agreeing on the
+;; safe order.
+(test-equal "copy-in! rejects a non-numeric start as a structured condition, not a bare assertion"
+  '(uv-copy-in! span-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (let ((addr (alloc-zeroed 8)))
+      (guard (inner (#t (free! addr) (raise inner)))
+        (copy-in! addr (u8-list->bytevector (list 1 2 3)) 'one 2)))
+    'no-raise))
+
+(test-equal "copy-out rejects a non-numeric length as a structured condition, not a bare assertion"
+  '(uv-copy-out length-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (copy-out 4096 'four)
+    'no-raise))
+
 ;; --- uv_buf_t ftype vs the shim's real layout (design spec S4 rule 4) ---
 ;; uv-buf-ftype-layout MEASURES the declared ftype -- offsets via
 ;; ftype-&ref address arithmetic, widths via the byte extent a real

@@ -490,8 +490,13 @@
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
     (unless (bytevector? bv)
       (raise (make-uv-invalid-argument 'uv-copy-in! 'source-not-a-bytevector)))
-    (unless (and (exact? start) (integer? start) (>= start 0)
-                 (exact? len) (integer? len) (>= len 0)
+    ;; integer? FIRST, exact? second -- the same safe order as zero-out!'s
+    ;; checks above: integer? is total, while exact? on a non-number raises
+    ;; a bare Chez &assertion, which would replace this structured rejection
+    ;; with an undiscriminable crash (tests/test-native.sps's non-numeric
+    ;; span rows).
+    (unless (and (integer? start) (exact? start) (>= start 0)
+                 (integer? len) (exact? len) (>= len 0)
                  (<= (+ start len) (bytevector-length bv)))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
     (let loop ((i 0))
@@ -538,7 +543,8 @@
   (define (copy-out src len)
     (unless (and (integer? src) (exact? src) (positive? src))
       (raise (make-uv-invalid-argument 'uv-copy-out 'null-or-invalid-source)))
-    (unless (and (exact? len) (integer? len) (>= len 0))
+    ;; integer? before exact?, for the same reason as copy-in!'s span check.
+    (unless (and (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-copy-out 'length-out-of-range)))
     (let ((bv (make-bytevector len)))
       (let loop ((i 0))
