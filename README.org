@@ -1,0 +1,24 @@
+* chez-libuv
+
+Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
+
+#+begin_quote
+✨ *AI Disclosure:* LLMs are used extensively the in the planning and development of this project.
+#+end_quote
+-----
+
+© [[https://kiyomicomputation.systems/][Kiyomi Computation Systems LLC]], all rights reserved.
+
+** Requirements
+
+- Chez Scheme 10.4.1+ and libuv 1.44.0+ (1.x)
+
+** Build and test
+
+#+begin_src sh
+make help
+#+end_src
+
+lists every available target, including ~make build~, ~make test~, and
+~make dev~. This stub expands as later stages land; see ~.plans/~ for the
+design spec and accepted ADRs.
