@@ -154,6 +154,21 @@ and still shows as a `TIMEOUT` under mutation 10. That is acceptable
 precisely because it is not the detector of record for anything: every
 mutation is caught by name in `test-tcp` first.
 
+> **Addendum (Task 10, Stage 6).** `run-until/ticking` as written above
+> disarmed its ticker only on the path where the wait **returned**. A wait
+> ended by a raise — which is every wait whose callback under test raised,
+> since uv-run's store-and-reraise policy turns that into an
+> `&uv-callback-error` out of the very `uv-run` this fixture drives — left the
+> 1 ms timer armed on the loop, and every assertion after it measured a loop
+> the fixture was still holding open. It is now unwind-safe: the disarm runs
+> on both paths, guarded on the unwind path only (a condition raised while
+> unwinding would replace the callback error the caller is trying to see) and
+> deliberately unguarded on the normal one. `tests/test-lifecycle.sps` gained
+> the row that watches it — **"the ticking fixture disarmed its own timer on
+> the unwind path"**, which reads 2 instead of 1 against the pre-fix fixture
+> (`.plans/stage-6-mutation-log.md`, mutation 11). Nothing above this line was
+> rewritten; this is the only change to the Stage 5 record.
+
 ## Uncovered, and why
 
 - **Mutation 4 — the `UV_EOF` literal is an equivalent mutant, everywhere.**
