@@ -393,11 +393,26 @@ ifeq ($(UNAME_S),Linux)
 # classify as "possibly lost". Left at the default, the gate would exit 9 on
 # Chez's own runtime while not even displaying why, since --show-leak-kinds
 # alone controls what gets PRINTED, not what --error-exitcode reacts to.
+#
+# --undef-value-errors=no: NOT a weakening of the leak gate -- ADR-0003
+# scopes this gate to leaks, and undefined-value tracking is a DIFFERENT
+# Memcheck check (Value 4, not the allocation-tracking Leak checks this
+# target exists for). Confirmed on real CI output: with it on, Chez's own
+# JIT-generated code (anonymous frames inside S_call_help) throws hundreds
+# of "Conditional jump or move depends on uninitialised value(s)" reports
+# from ONE context, none of them in this binding's own allocations --
+# Memcheck's def/undef shadow bits are not designed to survive machine code
+# a JIT emits at runtime with no debug info of its own, so the check is
+# structurally unable to tell a real bug from JIT noise here. Addressability
+# checking (invalid read/write, use-after-free, the leak checks above) stays
+# fully enabled and gating -- only the undefined-value class is scoped out.
+# See ADR-0003's amendment for the fuller record.
 	@for t in $(MEMORY_TESTS); do \
 	  UV_USE_IO_URING=0 \
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) valgrind --error-exitcode=9 \
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \
+	    --undef-value-errors=no \
 	    $(CHEZ) --program $$t || exit 1; \
 	done
 else

@@ -644,13 +644,42 @@
               (fill (+ j 1))))
           (loop (+ i 1) (cons a acc))))))
 
-(churn-dirty-blocks! 32)
+;; Self-dirtying, not hoping. This used to churn 32 blocks, free all of
+;; them, then allocate ONE fresh block and hope the allocator handed back
+;; one of the 32 just-freed ones. It doesn't always: Valgrind's own
+;; allocator quarantines freed blocks (to catch use-after-free) rather than
+;; recycling them straight back, so the "fresh" block it hands the next
+;; caller can be a genuinely fresh, zeroed one -- which is exactly what this
+;; seed is here to catch, and exactly what it caught under Valgrind.
+;;
+;; Freeing and immediately re-requesting the SAME size targets the
+;; allocator's own free-list/fastbin path directly instead of depending on
+;; what an unrelated batch of frees happened to leave behind. But a SINGLE
+;; alloc/free/alloc cycle is not enough either -- measured directly
+;; (scratchpad probe, macOS): the first ~3 cycles at a size class come back
+;; clean every time (a first-touch page, zero-filled on fault), and only
+;; from the 4th cycle onward does the allocator actually recycle the same
+;; bytes it was just handed. So this warms the SAME slot up across several
+;; cycles and only asserts on the last one, with margin over the observed
+;; threshold. Whether Valgrind's allocator needs the same warm-up is
+;; unverifiable here (no Valgrind on macOS/arm64); this is the best local
+;; evidence available; the next CI run is the real test.
+(define (alloc-fill-free-cycle! size)
+  (let ((a (foreign-alloc size)))
+    (let fill ((i 0))
+      (when (< i size)
+        (foreign-set! 'unsigned-8 a i #xff)
+        (fill (+ i 1))))
+    (foreign-free a)))
+
 (test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size"
   #t
-  (let* ((a (foreign-alloc churn-size))
-         (dirty (any-nonzero? a churn-size)))
-    (foreign-free a)
-    dirty))
+  (begin
+    (let loop ((i 0)) (when (< i 8) (alloc-fill-free-cycle! churn-size) (loop (+ i 1))))
+    (let* ((a (foreign-alloc churn-size))
+           (dirty (any-nonzero? a churn-size)))
+      (foreign-free a)
+      dirty)))
 
 (churn-dirty-blocks! 32)
 (test-equal "alloc-zeroed returns zeroed memory even when the allocator hands back a dirty block"

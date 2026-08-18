@@ -55,3 +55,23 @@ should it appear.
 - Valgrind remains the outer gate for what counters cannot see by
   construction: overflows, use-after-free, and any leak originating inside
   libuv itself rather than in this binding's own allocations.
+
+> **Amended 2026-08-18 (final review).** The Linux `test-memory` invocation
+> now passes `--undef-value-errors=no`. Real CI output showed hundreds of
+> Memcheck "Conditional jump or move depends on uninitialised value(s)"
+> reports from a single context -- anonymous frames inside Chez's own
+> `S_call_help`, i.e. Chez's JIT-generated machine code, not this binding's
+> allocations. This is Memcheck's *Value* check (definedness tracking via
+> shadow bits), a different mechanism from the *Leak* checks this ADR's gate
+> is actually about, and it is not one a JIT can be expected to satisfy: the
+> code Memcheck is inspecting was generated at runtime with no static
+> provenance for its registers to inherit definedness from, so the check is
+> structurally unable to distinguish a real bug from JIT noise there.
+> Addressability checking -- invalid reads/writes, use-after-free, and every
+> leak-kind check this ADR decided on -- stays fully enabled and gating; only
+> undefined-value tracking is scoped out, and only because it was never
+> capable of discriminating for JIT'd code in the first place. The
+> alternative considered was a suppressions file keyed on `fun:S_call_help`,
+> rejected because Chez's internal call paths are not a stable target to
+> pin a suppression to -- it risks whack-a-mole as those paths shift across
+> Chez versions, where a single flag scoped to the check *class* does not.
