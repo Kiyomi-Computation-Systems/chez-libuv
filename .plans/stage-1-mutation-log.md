@@ -246,3 +246,334 @@ repository.
   mutation of the actual store-and-reraise logic (e.g. re-raising the bare
   cause instead of the composed condition) will need its own test and its
   own entry in a later stage's log.
+
+---
+
+# Stage 1c (Task 5) — `(libuv private native)` + `(libuv private constants)`
+
+Appended per the "Carried into Stage 1c" note above. Covers
+`src/libuv/private/native.sls`, `src/libuv/private/constants.sls`, and the
+constant table in `src/libuv-shim.c`, against `tests/test-native.sps` and
+`tests/test-shim-loading.sps`.
+
+**Method**, unchanged from Task 4 except where the mutation target is C:
+
+1. `src/libuv/private/` was copied, once, to a scratch directory *outside*
+   this repository:
+   `/private/tmp/claude-501/-Users-yuzu-github-chez-libuv/22d84e17-d52b-4512-b1aa-5f906caef935/scratchpad/mut5/src/libuv/private/`
+   (pristine backup alongside in `.../mut5/pristine/`).
+2. Each mutation edits *only* the scratch copy, breaking exactly one decision.
+3. The suite runs against the mutated scratch library with the repo's own
+   unmutated tests, scratch first on the library path:
+   ```
+   CHEZSCHEMELIBDIRS="$SCRATCH/src:$REPO/tests:$REPO/build/scheme-libs" \
+     chez --program "$REPO/tests/test-native.sps"
+   ```
+4. Failing test names recorded verbatim; scratch restored from pristine;
+   `diff` confirms byte-identical before the next mutation.
+5. **C-side mutations** (M45, M46) cannot use that mechanism — the shim is a
+   compiled artifact, not a library on `CHEZSCHEMELIBDIRS`. `src/libuv-shim.c`
+   was copied to scratch, mutated, compiled with the Makefile's own
+   `CFLAGS_DEV` line into `$SCRATCH/lib/libchezlibuv-*.dylib`, and selected at
+   runtime via `CHEZ_LIBUV_SHIM`. The repo's own shim was never rebuilt from
+   mutated source.
+
+**Baseline** (before any mutation, reconfirmed after all of them):
+`test-native` 123 assertions, `test-shim-loading` 19, both exit 0.
+
+## Summary
+
+| # | Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|---|
+| 19 | constants.sls | Errno snapshot: `EACCES`'s symbol→value entry bound to the *next* index's value (a two-entry swap) | FAIL, exit 1 | "no two errno names share a value on this platform"; "every errno symbol round-trips symbol -> value -> symbol"; "the snapshot agrees with uv_err_name_r for every errno value" |
+| 20 | native.sls | Version ceiling `(<= v hi)` → `(< v hi)` | FAIL, exit 1 | "version-supported? accepts the ceiling of the configured range"; "version-compatible? accepts a compiled/runtime pair at the ceiling"; "…accepts a runtime ahead of the compiled version, both in range" |
+| 21 | native.sls | Version floor `(>= v lo)` → `(> v lo)` | FAIL, exit 1 | "version-supported? accepts the floor of the configured range"; "version-compatible? accepts a compiled/runtime pair at the floor"; "…accepts a runtime ahead of the compiled version, both in range" |
+| 22 | native.sls | Version ceiling widened by one: `(<= v hi)` → `(<= v (+ hi 1))` — the brief's `<=`-where-`<` off-by-one, in the permissive direction | FAIL, exit 1 | "version-supported? rejects one above the ceiling"; "version-compatible? rejects a runtime above the ceiling" |
+| 23 | native.sls | `version-compatible?` drops the `compiled` half, checking only `runtime` | FAIL, exit 1 | "version-compatible? rejects a compiled version below the floor" |
+| 24 | native.sls | **The 0-is-truthy trap**: `uv-check`'s `(if (zero? rc) …)` → `(if rc …)`, so it never raises at all | FAIL, exit 1 | "uv-check raises uv-errno-error on a negative return code"; "the raised condition carries the errno as a symbol"; "…preserves the raw return code"; "…carries uv_strerror_r's message"; "…names the calling procedure via &who"; "…is also a uv-error"; "uv-check raises with 'UV_UNKNOWN for an unmapped negative code" |
+| 25 | native.sls | `uv-check` inverted: raises on 0, passes everything else through | FAIL, exit 1 | "uv-check passes a zero return code straight through" + the seven from M24 |
+| 26 | native.sls | `uv_buf_t` ftype field order swapped to the Windows/WSABUF layout `(len base)` | FAIL CLOSED at init, exit 255 (see note) | uncaught `&uv-shim-unavailable: "…/libchezlibuv.dylib"` |
+| 26b | native.sls | M26 **plus** the layout validation removed from `ensure-native-loaded!` | FAIL, exit 1 | "the uv_buf_t ftype's base offset matches the shim's offsetof"; "…len offset matches the shim's offsetof"; "…base field fills the space before len"; "…len field fills the rest of the struct"; "the base pointer is readable at the shim's offsetof(uv_buf_t, base)" |
+| 27 | native.sls | `uv_buf_t` ftype `len` narrowed to `unsigned-32` + explicit `pad` (size and *both* offsets stay correct) | FAIL CLOSED at init, exit 255 | uncaught `&uv-shim-unavailable: "…/libchezlibuv.dylib"` |
+| 27b | native.sls | M27 **plus** the layout validation removed | FAIL, exit 1 | "the uv_buf_t ftype's len field fills the rest of the struct" — **the only** assertion of 123 that catches it |
+| 28 | native.sls | `(validate-uv-buf-layout!)` deleted from `ensure-native-loaded!`, ftype left correct | **PASS, 123/123 — UNCAUGHT** | (see coverage note) |
+| 29 | native.sls | `resolve-shim-path` drops the `absolute-path?` test | **First run: PASS, 93/93 — UNCAUGHT.** After the suite and the code were fixed: FAIL, exit 1 | "resolve-shim-path rejects a relative override even when it names an existing regular file"; "…rejects a relative default path even when it names an existing regular file" |
+| 30 | native.sls | `regular-file?` drops `file-regular?`, accepting directories | FAIL, exit 1 | "resolve-shim-path rejects a directory given as an override, naming it"; "…rejects a directory as the default path" |
+| 31 | native.sls | `load-shim`'s guard removed — a raw dlopen error escapes | FAIL, exit 1 | "load-shim wraps a real dlopen failure in uv-shim-unavailable, carrying the path" |
+| 32 | native.sls | `c-string->string` maps NULL to `""` instead of `#f` | FAIL, exit 1 | "c-string->string maps NULL to #f" |
+| 33 | native.sls | `zero-out!` body deleted (no-op) | FAIL, exit 1 | "zero-out! clears every byte it was given" |
+| 34 | native.sls | `zero-out!` off-by-one: `(< i len)` → `(<= i len)` | FAIL, exit 1 | "zero-out! does not write past the length it was given" |
+| 35 | native.sls | `alloc-zeroed` drops its `zero-out!` call | **First run: PASS, 96/96 — UNCAUGHT.** After the test was fixed: FAIL, exit 1 | "alloc-zeroed returns zeroed memory even when the allocator hands back a dirty block" |
+| 36 | native.sls | `free!` accepts a null pointer | FAIL, exit 1 | "free! rejects a null pointer instead of passing it to the allocator" |
+| 37 | native.sls | `copy-in!` ignores the `start` offset | FAIL, exit 1 | "copy-in! copies the requested span, honouring start"; "copy-out copies: mutating the foreign source afterwards leaves the result unchanged" |
+| 38 | native.sls | `copy-in!` span bounds check replaced with `#t` | FAIL, exit 1 | "copy-in! rejects a span that runs past the end of the bytevector" |
+| 39 | native.sls | `copy-out` null-source check removed | FAIL, exit 1 | "copy-out rejects a null source" |
+| 40 | constants.sls | `constants-init!`'s double-init guard removed | **First run: PASS, 97/97 — UNCAUGHT.** After the test was added: FAIL, exit 1 | "a direct second constants-init! is a no-op and never consults its lookups" |
+| 41 | native.sls | `ensure-native-loaded!`'s `unless initialized?` guard removed | FAIL, exit 1 | "further calls do not re-run the initialiser body" |
+| 42 | constants.sls | `errno-value->symbol`'s fallback returns `#f` instead of `'UV_UNKNOWN` | FAIL, exit 1 | "an unmapped errno value falls back to 'UV_UNKNOWN"; "uv-check raises with 'UV_UNKNOWN for an unmapped negative code" |
+| 43 | constants.sls | `constant-ref` returns `#f` for a missing name instead of raising | FAIL, exit 1 | "a constant name the shim does not define raises uv-constant-unavailable"; "the raised condition names the missing constant" |
+| 44 | native.sls | **Load ORDER broken**: the shim loaded *before* libuv | **PASS, 123/123 — UNCAUGHT ON macOS** (see the honest note below) | — |
+| 44b | native.sls | The explicit libuv load removed *entirely* | **PASS, 123/123 — UNCAUGHT ON macOS** | — |
+| 45 | **libuv-shim.c** | `SIZEOF_UV_TIMER_T` deleted from the shim's constant table, shim rebuilt | FAIL CLOSED at init, exit 255 | uncaught `&uv-constant-unavailable: SIZEOF_UV_TIMER_T` — **ADR-0005's mutation-testability claim, demonstrated** |
+| 46 | **libuv-shim.c** | `chez_uv_errno_count()` overreports by one, shim rebuilt | FAIL CLOSED at init, exit 255 | uncaught `&uv-constant-unavailable: UV_ERRNO_INDEX_85` |
+| 47 | native.sls | Counter cross-wiring: `count-timer-new!` bound to `chez_uv_count_tcp_new` | FAIL, exit 1 | "counter timer: increments are visible (seeded non-zero)"; "counter timer: no other class moved"; "counter timer: decrements return it to zero"; "counter write-req/connect-req/read-buffer: no other class moved"; "every counter is back at its baseline afterwards" |
+| 48 | native.sls | `live-counts`' `timer` slot reads `chez_uv_live_tcp` | FAIL, exit 1 | "counter tcp: no other class moved"; "counter timer: increments are visible (seeded non-zero)" |
+| 49 | native.sls | `uv-req-size` bound to `uv_handle_size` | FAIL, exit 1 | "uv_req_size(UV_WRITE) agrees with the shim's sizeof(uv_write_t)"; "…UV_CONNECT…"; "…UV_SHUTDOWN…" |
+| 50 | constants.sls | `uv-timer-type` accessor reads the `UV_TCP` key | FAIL, exit 1 | "uv_handle_size(UV_TIMER) agrees with the shim's sizeof(uv_timer_t)"; "the tcp and timer handle type tags are distinct" |
+
+**30 of 32 mutations caught** (M19–M50, counting 26b/27b/44b). Three were
+uncaught on the first attempt and are recorded as such above — each produced a
+real fix, described below. Two remain uncaught by design, both named and
+explained rather than left silent.
+
+## The three that were NOT caught on the first attempt
+
+AGENTS.md's point, in three concrete instances. None of these would have been
+discovered by reading the code.
+
+### M29 — `resolve-shim-path`'s absoluteness check was untested *and* half missing
+
+The suite asserted that `"relative/path.dylib"` is rejected. It is — but by
+the `regular-file?` check, since no such file exists. Deleting the
+`absolute-path?` test entirely left all 93 assertions passing. The genuinely
+discriminating input is a relative path that **does** resolve under the working
+directory, which is exactly design spec S4 rule 1's "the working directory is
+never consulted".
+
+Two changes followed:
+
+- `tests/test-native.sps` gained "resolve-shim-path rejects a relative override
+  even when it names an existing regular file", using `"Makefile"` — preceded
+  by a seed assertion that the probe really does name an existing file, so a
+  different working directory fails loudly instead of passing vacuously.
+- **`native.sls` was fixed, not just the test.** The original (inherited from
+  `chez-cmark-gfm`) applied `absolute-path?` only to the *override* branch; the
+  default path from generated `config.sls` was accepted on `regular-file?`
+  alone. The spec requires absoluteness of both, and the generated path only
+  satisfied it because the Makefile uses `$(abspath …)` — true by construction,
+  not by enforcement. `resolve-shim-path` now validates one `candidate`
+  uniformly, and a second assertion covers the default branch.
+
+### M35 — `alloc-zeroed`'s zeroing was untested because macOS zeroes small blocks
+
+The original test churned 64 dirty 128-byte blocks, freed them, then asserted
+`alloc-zeroed` returned clean memory. Dropping the zeroing entirely still
+passed. Direct measurement (`scratchpad/probe/dirty.ss`) explains why:
+
+```
+size 16:    dirty bytes across 64 reallocs = 0
+size 64:    dirty bytes across 64 reallocs = 0
+size 128:   dirty bytes across 64 reallocs = 0
+size 1072:  dirty bytes across 64 reallocs = 61248
+size 65536: dirty bytes across 64 reallocs = 3932160
+```
+
+macOS routes allocations up to ~256 bytes through the *nano* zone, which hands
+them back already zeroed — so the test could not fail. The churn size is now
+`(sizeof-uv-loop-t)` (1072 here): above the nano zone, and the size the binding
+actually allocates at. Crucially, a **seed assertion** was added — "seed: a
+plain foreign-alloc really does hand back dirty memory at this size" — so on
+any future platform whose allocator always zeroes, *that* assertion fails by
+name and announces the next one is non-discriminating, instead of the
+non-discrimination being silent. This is the "write down that the property is
+uncovered" rule turned into a runtime check.
+
+### M40 — `constants-init!`'s own guard was shadowed by `ensure-native-loaded!`'s
+
+Removing the double-init guard from `constants-init!` changed nothing
+observable: `ensure-native-loaded!`'s guard short-circuits first, so
+`constants-init!` is never called twice through the normal path. The fix
+exploits the deliberate dependency inversion in `constants.sls` (it takes its
+lookup procedures as *arguments* rather than importing the FFI): the new test
+calls `constants-init!` directly a second time, handing it four procedures that
+**raise if consulted**. With the guard present the call is a no-op; without it,
+the lookup fires and the assertion fails. The expected value is `1` (the init
+count), never `#f`, so SRFI-64's exception-to-`#f` behaviour cannot mask it.
+
+## The two that remain uncaught, and why
+
+### M44 / M44b — the load-order invariant is invisible on macOS
+
+**Recorded truthfully: on this machine, loading the shim before libuv passes
+123/123, and removing the explicit libuv load entirely also passes 123/123.**
+
+The cause is measurable rather than speculative:
+
+```
+$ otool -L build/lib/libchezlibuv.dylib
+	/opt/homebrew/opt/libuv/lib/libuv.1.dylib (compatibility version 1.0.0, …)
+```
+
+macOS's dyld resolves a dylib's own recorded dependencies transitively, so
+`uv_*` entry points are available to `foreign-procedure` as soon as the shim is
+loaded, whatever order the two `load-shared-object` calls happen in. On Linux a
+`dlopen`'d object's dependencies are **not** placed in the global symbol
+namespace, so the same mutation fails at *import* time with
+`Exception in foreign-procedure: no entry for "uv_version"` (spike
+`FINDINGS.md` Q0 records that exact text; `chez-cmark-gfm`'s CI hit the
+identical failure — green on macOS, red on Linux — which is why the explicit
+load exists at all).
+
+**Linux CI is the real guard for this invariant, and it is the only one.** No
+assertion in `tests/test-native.sps` can cover it on a Darwin runner; this is a
+property of the platform loader, not of the test suite. `.github/workflows/ci.yml`
+runs both platforms, so the invariant is enforced — but the enforcement lives
+there, not here, and a macOS-only development loop will not notice a
+regression. Re-verify on Linux before trusting any change to the ordering of
+`uv-loaded` / `shim-loaded` in `native.sls`.
+
+### M28 — deleting the layout validation is invisible while the layout is right
+
+Removing `(validate-uv-buf-layout!)` from `ensure-native-loaded!` passes
+123/123, because on this platform the declared ftype and the real `uv_buf_t`
+*do* agree — there is nothing for the check to catch. That is the nature of a
+fail-closed guard: it is unobservable exactly when the condition it guards
+against does not hold.
+
+It is not, however, an untested decision. M26 and M27 mutate the ftype so the
+condition *does* hold, and the pair of runs isolates the two properties
+cleanly:
+
+- **with** the validation in place, both mutations abort initialisation with
+  `&uv-shim-unavailable` carrying the shim path, exit 255, before a single
+  assertion runs — the guard fires;
+- **without** it (M26b/M27b), the suite proceeds and the layout assertions fail
+  by name — the suite notices.
+
+Together those establish both halves. M27b is worth singling out: the narrowed
+`len` field keeps `ftype-sizeof` at 16 and *both* offsets correct, and is caught
+by exactly one assertion out of 123 — "the uv_buf_t ftype's len field fills the
+rest of the struct". That is the field-width half of the layout check earning
+its place; the offset comparisons alone would have missed a `uv_buf_t.len`
+truncated to 32 bits, which is the write-side twin of the `ssize_t`/`size_t`
+corruption spike `FINDINGS.md` Q3 measured on the read side.
+
+## ADR-0005, demonstrated rather than asserted
+
+[ADR-0005](decisions/0005-constants-are-never-transcribed.md) claims its policy
+is "directly mutation-testable: deleting or corrupting a single table entry must
+make one specific, predictable test fail by name, not merely 'some test
+somewhere'." M45 and M46 are that demonstration, against the compiled C artifact
+rather than a Scheme stand-in:
+
+```
+$ perl -0pi -e 's/  \{ "SIZEOF_UV_TIMER_T",    \(long\)sizeof\(uv_timer_t\) \},\n//' $SCRATCH/libuv-shim.c
+$ cc -std=c99 -Wall -Wextra -Werror … -o $SCRATCH/lib/libchezlibuv-mutant.dylib $SCRATCH/libuv-shim.c -luv
+$ CHEZ_LIBUV_SHIM=$SCRATCH/lib/libchezlibuv-mutant.dylib chez --program tests/shim-load-probe.sps
+Exception occurred with condition components:
+  0. &uv-constant-unavailable: SIZEOF_UV_TIMER_T
+PROBE EXIT=255
+```
+
+```
+$ perl -0pi -e 's/  return \(int\)CHEZ_UV_ERRNO_COUNT;/  return (int)CHEZ_UV_ERRNO_COUNT + 1;/' $SCRATCH/libuv-shim.c
+$ CHEZ_LIBUV_SHIM=$SCRATCH/lib/libchezlibuv-count.dylib chez --program tests/shim-load-probe.sps
+Exception occurred with condition components:
+  0. &uv-constant-unavailable: UV_ERRNO_INDEX_85
+PROBE EXIT=255
+```
+
+Both name the exact missing thing — the constant, and the index at which the
+shim's own count and table came apart — and both fail *before* any handle can
+exist. The complementary Scheme-side assertion, "the raised condition names the
+missing constant", covers the same mechanism for a name that was never in the
+table (M43).
+
+## Coverage notes
+
+- **The version boundary is mutated in three directions**, not one: too strict
+  at the floor (M21), too strict at the ceiling (M20), too permissive at the
+  ceiling (M22). The brief asked for the `<=`-where-`<` off-by-one; M22 is that
+  mutation, and M20/M21 confirm the accept-side assertions are not vacuous.
+- **M24 is the `0`-is-truthy trap head on.** `(if rc rc (raise …))` makes
+  `uv-check` never raise, because every integer including `0` is true in
+  Scheme. It is caught by seven named assertions, all of which compare the
+  errno **symbol** against an expected value with `'no-raise` as the no-raise
+  sentinel. Had any of them expected `#f`, SRFI-64's
+  exception-to-`#f` behaviour would have made both the mutant and a correct
+  implementation pass.
+- **Cross-wiring gets its own mutations (M47–M50)** because this file binds
+  eighteen near-identically-named shim entry points and four near-identical
+  size accessors. A suite exercising one counter class would not have noticed
+  `count-timer-new!` wired to `chez_uv_count_tcp_new`; the six-class loop with
+  a "no other class moved" assertion per class does, from both sides (the
+  increment M47 and the read M48).
+- **The errno mapping is checked against two independent sources.** M19's
+  entry swap is caught not only by the round-trip over the whole enumeration
+  but by "the snapshot agrees with uv_err_name_r for every errno value" — the
+  shim's compiled `UV_ERRNO_MAP` snapshot versus the running library's own
+  `uv_err_name_r`. A self-consistent-but-wrong table fails the second even
+  where it would satisfy the first.
+- **An assertion caught a real mistake in the tests themselves.** "the probe
+  code used for the unknown-errno case really is unmapped" failed on the first
+  GREEN run: the obvious probe `UV_EOF + 1` is *not* unmapped — libuv reserves
+  `-4094` for its own `XX(UNKNOWN, …)` entry, which the shim exports under the
+  bare name `"UNKNOWN"`. The probe is now `UV_EOF - 1`, and libuv's own
+  `UNKNOWN` errno has its own assertion so it stays distinct from the
+  binding's `'UV_UNKNOWN` fallback. This is why the probe's absence is checked
+  rather than assumed.
+- **`shim-file`, `native-initialized?`, and `constants-initialized?` are
+  covered by seeded before/after pairs** rather than a bare after-the-fact
+  assertion: each flag is captured *before* the first `ensure-native-loaded!`
+  call and asserted false, then asserted true afterwards, so a predicate stuck
+  at either value fails.
+
+## Scope added during Task 5
+
+Two shim/API additions were made rather than leaving an untested binding:
+
+- `UV_WRITE`, `UV_CONNECT`, `UV_SHUTDOWN` were added to `src/libuv-shim.c`'s
+  constant table (ADR-0005's "adding a constant this binding needs later means
+  adding one table entry"). Without them `uv_req_size()` — which the brief
+  requires binding — had no argument to be called with, and would have shipped
+  as an exported, untested, unusable procedure. With them it is checked against
+  `sizeof(uv_write_t)`/`sizeof(uv_connect_t)`/`sizeof(uv_shutdown_t)` exactly
+  as `uv_handle_size()` is checked against the handle sizes (spike
+  `FINDINGS.md` Q-1 finding 1), and M49 confirms those assertions are live.
+- The Makefile's `PURE_TESTS` comment claimed a new pure suite would be picked
+  up automatically. It would not — the wildcard names one literal file. The
+  comment now states the real rule (adding a pure suite is a deliberate edit,
+  and "not pure" is the default for a new suite), which matters because
+  `test-native.sps` and `test-shim-loading.sps` must never appear there.
+  `make check-purity` confirmed unchanged behaviour on both acquisition legs.
+
+## Final clean-tree confirmation
+
+```
+$ diff -r $SCRATCH/pristine/libuv $SCRATCH/src/libuv
+IDENTICAL (no output)
+$ make test
+=== tests/test-conditions.sps ===   # of expected passes  89
+=== tests/test-native.sps ===       # of expected passes 123
+=== tests/test-shim-loading.sps === # of expected passes  19
+ALL SUITES PASSED
+$ make check-purity
+purity holds: tests/test-conditions.sps pulled in no native code
+$ make HAVE_PKG=no test
+=== tests/test-conditions.sps ===   # of expected passes  89
+=== tests/test-native.sps ===       # of expected passes 123
+=== tests/test-shim-loading.sps === # of expected passes  19
+ALL SUITES PASSED
+```
+
+The repo's own `src/libuv/private/*.sls` and `src/libuv-shim.c` were never
+edited during mutation testing — every mutation above was applied to, and
+reverted on, the scratch copies outside the repository. The three code changes
+this task made in the repo (`resolve-shim-path`'s uniform absoluteness check,
+the three `uv_req_type` shim constants, and the `PURE_TESTS` comment) were
+deliberate fixes, each covered above.
+
+## Carried into Stage 2 (Task 6)
+
+- The load-order invariant (M44) has **no macOS-observable test**. Any Task 6+
+  change touching the `uv-loaded` / `shim-loaded` definitions in `native.sls`
+  must be verified on Linux CI before it is trusted.
+- `uv-check` raises on **any** non-zero return code. `uv_run` legitimately
+  returns a positive value ("handles still active"), so Task 6's `uv-run`
+  must interpret its own result and call `uv-check` only where the C contract
+  is "0 or negative errno". A mutation confirming that distinction belongs in
+  Stage 2's log.
+- The eight callback trampolines, `lock-object`, and `foreign-callable` are
+  **not** in `native.sls` yet — design spec S4 places them here, but Task 5
+  binds only what it tests. They arrive with Stage 3 (Task 7), along with the
+  store-and-reraise mutations Task 4's log deferred.
