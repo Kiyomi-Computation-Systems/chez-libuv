@@ -23,6 +23,20 @@ CFLAGS_BASE := -std=c99 -Wall -Wextra -Werror -Wconversion -Wshadow -Wpointer-ar
 CFLAGS_DEV  := $(CFLAGS_BASE) -g -O0 -DCHEZ_LIBUV_DEBUG_COUNTERS
 CFLAGS_PROD := $(CFLAGS_BASE) -O2
 
+# Which flags link the shim. dev is the default, so `make build` and
+# `make test` behave exactly as they always have; `prod` re-enters make with
+# FLAVOR=prod so the whole graph -- shim, config.sls, stamps -- agrees on one
+# flavor. GUARDED, because this variable's one failure mode is a typo silently
+# falling back to dev and shipping a debug build under a release name.
+FLAVOR ?= dev
+ifeq ($(FLAVOR),dev)
+  CFLAGS_SHIM := $(CFLAGS_DEV)
+else ifeq ($(FLAVOR),prod)
+  CFLAGS_SHIM := $(CFLAGS_PROD)
+else
+  $(error FLAVOR must be dev or prod, got '$(FLAVOR)')
+endif
+
 # --- version floor / supported range (ADR-0001's "both must fall inside the
 # version range validated at init") ---------------------------------------
 # UV_RANGE_LO/HI are DERIVED from UV_FLOOR_MAJOR/MINOR below, in one place --
@@ -80,9 +94,16 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps)
 
-.PHONY: all build deps check-pins check-purity check-help help dev test test-memory vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-memory vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
+
+# relink-guard has to run BEFORE anything stats $(SHIM), and make is free to
+# run independent prerequisites in either order (or at once, under -j).
+# Nothing in this file is parallelisable anyway -- the one long build,
+# vendored libuv, parallelises inside `cmake --build -j` -- so the ordering
+# this file depends on is made real here instead of assumed.
+.NOTPARALLEL:
 
 # Self-documenting help: every target below carries a trailing `## `
 # description; this just collects them. Keeping the description ON the
@@ -114,7 +135,11 @@ deps-info: ## Report which libuv acquisition path and artifacts are active
 
 all: build ## Alias for build
 
-build: $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.sls
+# relink-guard FIRST, and the order is load-bearing: it deletes a shim whose
+# provenance no longer matches what was asked for, and make only stats
+# $(SHIM) when it reaches it -- after that recipe has run. See the guard's
+# own comment for why the stamps cannot do this on their own.
+build: relink-guard $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.sls
 
 # Scheme dependencies. chez-srfi is vendored as a submodule pinned to the SAME
 # commit Akku.lock names (7879b52). Keep them equal: bumping the Akku dependency
@@ -228,17 +253,55 @@ $(ACQ_STAMP): | $(LIB_DIR)
 	rm -f $(BUILD_DIR)/.acquisition-*
 	touch $@
 
-$(SHIM): src/libuv-shim.c src/libuv-shim.h $(ACQ_STAMP) | $(LIB_DIR)
-	$(CC) $(CFLAGS_DEV) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
+# The same mechanism for the build FLAVOR, and it is what makes `prod` and
+# `build` stop overwriting each other invisibly: flipping FLAVOR changes this
+# prerequisite's identity, so the shim relinks. Without it, `make prod &&
+# make test` would run the dev suites' counter rows against a counters-free
+# prod shim (they would rightly fail), and `make build` after `make prod`
+# would leave a release artifact in place for dev callers -- while `make prod
+# && package` shipped whatever the last link happened to be.
+FLAVOR_STAMP := $(BUILD_DIR)/.flavor-$(FLAVOR)
+
+$(FLAVOR_STAMP): | $(LIB_DIR)
+	rm -f $(BUILD_DIR)/.flavor-*
+	touch $@
+
+$(SHIM): src/libuv-shim.c src/libuv-shim.h $(ACQ_STAMP) $(FLAVOR_STAMP) | $(LIB_DIR)
+	$(CC) $(CFLAGS_SHIM) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
 	      -o $@ src/libuv-shim.c $(UV_LIBS)
 
+# THE STAMPS ABOVE RECORD THE PROVENANCE; THIS TARGET ENFORCES IT. Depending
+# on them was not enough, and that was MEASURED rather than assumed:
+#
+#   make 3.81 -- the make macOS ships, and therefore the one that runs
+#   `make prod && make test` here -- compares mtimes at ONE-SECOND
+#   granularity and treats "equal" as up to date. A flavor flip recreates the
+#   stamp in the same second as the previous link often enough to matter
+#   (`make prod && make test` is exactly that shape), and the shim is then
+#   NOT relinked: the dev suites run against the release artifact, or a
+#   release is packaged from a dev relink -- the failure the whole mechanism
+#   exists to prevent. Observed directly: `make prod` followed immediately by
+#   `make test` recreated build/.flavor-dev, skipped the link, and failed 45
+#   counter rows across five suites against the -O2 shim. make 4.x compares
+#   sub-second timestamps and gets it right, so the defect is invisible on
+#   Linux and live on macOS.
+#
+# Removing the artifact is not subject to any of that. A missing shim is
+# rebuilt whatever the clock said.
+relink-guard: ## Delete the shim when the build flavor or acquisition path changed
+	@if [ -f $(SHIM) ] && \
+	   { [ ! -f $(FLAVOR_STAMP) ] || [ ! -f $(ACQ_STAMP) ]; }; then \
+	  echo "relink-guard: shim provenance changed (flavor=$(FLAVOR), acquisition=$(ACQ_MODE)); relinking"; \
+	  rm -f $(SHIM); \
+	fi
+
 # config.sls carries the shim's ABSOLUTE path so the loader never searches.
-# Factored into a canned recipe (rather than living directly in the
-# $(CONFIG_SLS) rule below) so `prod` can invoke it directly too, without
-# recursing via `$(MAKE) $(CONFIG_SLS)` -- that recursion used to
-# re-evaluate $(SHIM)'s own rule, including its $(ACQ_STAMP) prerequisite,
-# and silently relink $(SHIM) with $(CFLAGS_DEV) after `prod`'s $(CFLAGS_PROD)
-# link had already produced the release artifact. See `prod`'s own comment.
+# Kept as a canned recipe from when `prod` linked the shim itself and had to
+# generate this file without recursing via `$(MAKE) $(CONFIG_SLS)` -- that
+# recursion re-evaluated $(SHIM)'s rule at the default flavor and relinked the
+# release artifact as a debug build. `prod` now re-enters `build` with
+# FLAVOR=prod instead, so the rule below is the only caller; see `prod`'s own
+# comment for why that history is worth keeping written down.
 define GEN_CONFIG_SLS
 	@mkdir -p $(dir $(CONFIG_SLS))
 	@printf '%s\n' \
@@ -330,34 +393,54 @@ else
 	  sh -c 'for t in $(MEMORY_TESTS); do $(CHEZ) --program $$t || exit 1; done'
 endif
 
-# prod compiles directly with $(CFLAGS_PROD) rather than reusing $(SHIM)'s
-# own rule -- that rule is gated by $(ACQ_STAMP) and always links with
-# $(CFLAGS_DEV), so depending on it here would silently produce a dev build
-# under a release name. It also does NOT recurse via `$(MAKE) $(CONFIG_SLS)`
-# after linking: that recursion re-evaluates $(SHIM)'s rule too, and since
-# `clean` had just deleted $(ACQ_STAMP), the sub-make recreates it fresher
-# than the shim `prod` just linked -- so $(SHIM) looked out of date and got
-# silently relinked with $(CFLAGS_DEV), overwriting the release build one
-# step after producing it. (Caught by comparing the shim's md5 immediately
-# after the -O2 link against its md5 once the target finished -- they must
-# be identical.) $(GEN_CONFIG_SLS) is invoked directly instead.
+# prod = the SAME graph as `build`, run at FLAVOR=prod after a clean, and
+# then judged by a program instead of by inspection. Each step is an explicit
+# recipe line, run by a sub-make, rather than a prerequisite list:
 #
-# `clean` and `vendor` (HAVE_PKG=no only) are explicit, ordered recipe
-# steps rather than ordinary prerequisites on this target: declaring them as
-# `prod: clean` plus a conditional `prod: vendor` used to merge into ONE
-# prerequisite list in the order the two rule stanzas appeared in this file
-# -- vendor built build/vendor, and THEN clean deleted it, out from under
-# the link line below that references it. Explicit steps make the order
-# unconditional instead of a function of where each stanza sits in the file.
-prod: ## Rebuild the shim with optimizations, for a release
+#   - it used to compile directly with $(CFLAGS_PROD), duplicating the link
+#     line, because $(SHIM)'s own rule hard-coded $(CFLAGS_DEV). The flavor
+#     stamp above removes that reason: one rule now links either flavor, and
+#     a flip forces the relink.
+#   - it must NOT recurse via `$(MAKE) $(CONFIG_SLS)` after linking. That
+#     recursion re-evaluated $(SHIM)'s rule at the DEFAULT flavor and
+#     silently relinked the release artifact with dev flags one step after
+#     producing it -- `make prod` exited 0 having shipped a debug build.
+#     (Caught by comparing the shim's md5 immediately after the -O2 link
+#     against its md5 once the target finished; they must be identical.)
+#     `build` in the sub-make below carries FLAVOR=prod through to
+#     config.sls, so there is nothing left to do afterwards.
+#   - `clean` is an explicit step rather than a prerequisite: as `prod: clean`
+#     plus a conditional `prod: vendor` the two merged into ONE prerequisite
+#     list ordered by where each stanza sat in this file -- vendor built
+#     build/vendor and clean then deleted it, out from under the link. The
+#     vendored gate now needs no prod-specific rule at all: $(SHIM) already
+#     depends on `vendor` when HAVE_PKG=no, inside the sub-make, after clean
+#     has finished.
+prod: ## Rebuild the shim with optimizations and verify the release artifact
 	$(MAKE) clean
-ifeq ($(HAVE_PKG),no)
-	$(MAKE) vendor
-endif
-	mkdir -p $(LIB_DIR)
-	$(CC) $(CFLAGS_PROD) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
-	      -o $(SHIM) src/libuv-shim.c $(UV_LIBS)
-	$(GEN_CONFIG_SLS)
+	$(MAKE) build FLAVOR=prod
+	$(MAKE) check-prod
+
+# Proves the artifact that survived to the end of `make prod` is the prod one
+# (a check beats a comment, AGENTS.md): a shim carrying
+# -DCHEZ_LIBUV_DEBUG_COUNTERS reports live allocation counts while a loop and
+# a bound tcp handle are alive, a prod shim's queries are a constant 0
+# (src/libuv-shim.c). tests/check-prod.sps establishes that the scope really
+# was live using two witnesses that do not go through the counters, so
+# all-zero cannot also mean "the probe allocated nothing".
+#
+# DELIBERATELY DEPENDS ON NOTHING. `build` here would relink the shim at the
+# default flavor and the check would then judge the artifact it had just
+# replaced; `deps` is unnecessary because the probe imports no SRFI. It reads
+# what the last build left, and says so when there is nothing there.
+#
+# `env -u` so an exported CHEZ_LIBUV_SHIM cannot point the probe at a
+# different shim from the one config.sls names.
+check-prod: ## Verify the built shim is a release (counters-free) build
+	@test -f $(SHIM) || { echo "check-prod: $(SHIM) is missing; run 'make prod' (or 'make build FLAVOR=prod') first" >&2; exit 1; }
+	@test -f $(CONFIG_SLS) || { echo "check-prod: $(CONFIG_SLS) is missing; run 'make prod' first" >&2; exit 1; }
+	env -u CHEZ_LIBUV_SHIM CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) \
+	  $(CHEZ) --program tests/check-prod.sps
 
 clean: ## Remove build/ and the generated config.sls
 	rm -rf $(BUILD_DIR) $(CONFIG_SLS)
