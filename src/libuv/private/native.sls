@@ -160,7 +160,10 @@
   ;; goes through the SAME resolve-shim-path validation as the shim's --
   ;; design spec S4 rule 2 says "by absolute path", and routing it through
   ;; the one validated, tested procedure is what makes that a rule rather
-  ;; than a property the generator happens to satisfy.
+  ;; than a property the generator happens to satisfy. A failure here raises
+  ;; the SAME &uv-shim-unavailable as the shim's own load below -- its `path`
+  ;; field is what tells a libuv-path failure apart from a shim failure
+  ;; (README.org's condition table; considered for a subtype in v0.2).
   (define uv-loaded
     (for-each (lambda (path) (load-shim (resolve-shim-path path #f)))
               uv-library-paths))

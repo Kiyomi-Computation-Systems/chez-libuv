@@ -3,7 +3,7 @@
 Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
 
 #+begin_quote
-✨ *AI Disclosure:* LLMs are used extensively the in the planning and development of this project.
+✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
 #+end_quote
 -----
 
@@ -309,7 +309,7 @@ the discriminant is a symbol).
 | ~&uv-error~ | — | The root; everything below derives from it |
 | ~&uv-errno-error~ | ~errno~ ~code~ ~message~ | libuv returned a negative code. ~errno~ is the portable symbol (~'ECONNRESET~) and the thing to branch on; ~code~ is the raw platform int, for logs |
 | ~&uv-handle-closed~ | ~kind~ | An operation on a handle or loop that is already closed |
-| ~&uv-shim-unavailable~ | ~path~ | The shim could not be found or loaded |
+| ~&uv-shim-unavailable~ | ~path~ | The shim could not be found or loaded — also raised, with ~path~ set to the offending path, when one of the libuv library paths fails to load (the ~path~ field is what disambiguates which); considered for a subtype in v0.2 |
 | ~&uv-version-incompatible~ | ~compiled~ ~runtime~ | Either libuv version is outside the supported range |
 | ~&uv-constant-unavailable~ | ~name~ | The shim has no constant under that name |
 | ~&uv-invalid-argument~ | ~who~ ~reason~ | A caller error, refused before anything was allocated |

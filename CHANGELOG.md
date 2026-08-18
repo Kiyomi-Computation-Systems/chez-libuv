@@ -92,9 +92,10 @@ Four decisions shape everything else, and each has its own record under
   `prod` and `build` write the same path, so `make prod && make test &&
   package` used to package a dev relink.
 - `tests/test-echo.sps`, the capstone: an echo server and eight concurrent
-  in-process clients on one loop, 512 KiB of loopback traffic compared byte
-  for byte, with a read-stop/read-start applied and released from inside
-  delivery callbacks, ending in seventeen closed handles and every counter at
+  in-process clients on one loop, 512 KiB of loopback traffic (256 KiB each
+  way) compared byte for byte, with a read-stop/read-start applied and
+  released from inside delivery callbacks, ending in seventeen closed
+  handles and every counter at
   zero. It imports the facade and nothing else from this project, which is
   how the public surface is checked for sufficiency.
 - Documentation: the design spec and ADRs 0001–0010 under `.plans/`, the

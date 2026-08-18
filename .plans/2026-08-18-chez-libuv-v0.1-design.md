@@ -140,10 +140,14 @@ never needed:
    constructs rather than merely receiving a pointer to.
 
 The eight callback trampolines (§8) are declared here as `foreign-callable`s,
-but their bodies are mechanical: look up the firing handle or request's `uptr`
-in the registry and call a dispatcher slot. The slots themselves are filled
-exactly once, by `handles.sls`, via `install-callback-dispatchers!` — a second
-call asserts. This keeps the one FFI-reviewed file free of dispatch policy.
+but their bodies are mechanical: look up the dispatcher slot for that
+callback's *type* — one of the eight fixed names, not the firing pointer —
+and call it. The slots themselves are filled exactly once, by `handles.sls`,
+via `install-callback-dispatchers!` — a second call asserts. The registry
+lookup that resolves the firing handle or request's `uptr` to its entry
+happens one step later, inside `handles.sls`' seam closure, once dispatch has
+already left this file. This keeps the one FFI-reviewed file free of both
+dispatch policy and the registry lookup itself.
 
 Initialization is gated: `ensure-native-loaded!` (mutex'd, idempotent)
 snapshots the shim's constant table into `(libuv private constants)` records,

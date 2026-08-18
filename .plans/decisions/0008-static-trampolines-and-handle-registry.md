@@ -29,14 +29,33 @@ per callback *instance*: alloc, read, connection, write-done, close, timer,
 shutdown, connect. Each is created and `lock-object`'d exactly once, at
 process initialization, and never unlocked, for the life of the process.
 
-Each trampoline's body is mechanical and uninstrumented: look up the firing
-handle or request's `uptr` in the global registry (design spec §5) and
-invoke a dispatcher slot found there. The slots themselves carry all
-callback policy — including the store-and-reraise error policy (design spec
-§8) — and are installed exactly once by `handles.sls`, via
+Each trampoline's body is mechanical and uninstrumented: look up the
+type-keyed dispatcher slot for that callback — one of the eight fixed names
+(alloc, read, connection, write-done, close, timer, shutdown, connect), never
+the firing pointer — and invoke it. The registry lookup that resolves the
+firing `uptr` to its handle or request entry (design spec §5) happens one
+step later, inside `handles.sls`' seam closure. The slots themselves carry
+all callback policy — including the store-and-reraise error policy (design
+spec §8) — and are installed exactly once by `handles.sls`, via
 `install-callback-dispatchers!`; a second call to that procedure asserts, so
 policy cannot be silently rebound after the fact. This keeps the one
-FFI-reviewed file (`native.sls`) free of dispatch logic entirely.
+FFI-reviewed file (`native.sls`) free of both dispatch logic and the registry
+lookup itself.
+
+> **Corrected 2026-08-18 (final review).** This paragraph originally read
+> "look up the firing handle or request's `uptr` in the global registry ...
+> and invoke a dispatcher slot found there," placing the registry lookup
+> inside the trampoline body itself. The implementation's final shape has it
+> the other way around: the trampoline body looks up a slot keyed by
+> callback *type* and invokes it; the `uptr` → entry registry lookup happens
+> one step later, inside `handles.sls`' seam closure (`seam-closure`, whose
+> installed closure is what native.sls's dispatcher slot actually holds) —
+> both to keep `native.sls` and `handles.sls` from importing each other
+> circularly (native.sls's own comment beside `dispatcher-names` explains
+> the cycle this avoids) and because the slot lookup has to be resolvable
+> before any handle exists, while the registry lookup does not. Only this
+> ADR's wording was wrong; the design spec (§4) carried the same error and is
+> corrected alongside this.
 
 The store-and-reraise error policy this trampoline design carries was
 originally justified by the assumption that a Scheme `raise` cannot cross
