@@ -103,7 +103,57 @@
 (test-equal "uv-loop-teardown! leaves the registry at its baseline"
   registry-count-at-start (registry-count))
 
-;; --- row 4: 100 iterations, with a full collection on each --------------
+;; --- row 4: the registry is the GC root (ADR-0007, design spec S5) ------
+;; "An open handle and its stored closures stay reachable through this table
+;; for as long as it is open, even if the caller drops every other reference
+;; to it -- closing is therefore never GC-timed." That is a claim about what
+;; survives a collection, and it is the one loop-lifecycle property in this
+;; stage that needs no handle type to test.
+;;
+;; The loop record is created inside a `let` whose binding dies with it, so
+;; after the collection below the ONLY strong reference left in the program
+;; is the registry's own entry. The pointer is kept (an integer, which holds
+;; nothing alive) purely as the key to ask the registry with.
+(define held-ptr
+  (let ((dropped (make-uv-loop)))
+    (loop-ptr dropped)))
+
+(collect)
+
+(test-equal "seed: the dropped loop is still allocated after a full collection"
+  1 (live-count 'loop))
+
+;; Resolved ONCE and guarded at each use below, so that a registry which
+;; stopped holding the record fails these assertions by name instead of
+;; aborting the suite on the first accessor that gets handed #f.
+(define recovered (registry-ref held-ptr))
+
+(test-equal "a loop the caller dropped is still resolvable through the registry"
+  'resolved
+  (if (uv-loop? recovered) 'resolved 'not-in-the-registry))
+
+(test-equal "the dropped loop is still open"
+  'open
+  (if (and (uv-loop? recovered) (uv-loop-open? recovered)) 'open 'not-open))
+
+;; Still FUNCTIONAL, not merely present: this drives the real uv_loop_t
+;; through libuv, so a loop whose pointer had been freed out from under the
+;; registry would fail here rather than pass on a stale record.
+(test-equal "the dropped loop still runs"
+  'no-work
+  (if (and (uv-loop? recovered) (not (uv-run recovered 'nowait)))
+      'no-work
+      'work-or-unrecoverable))
+
+(when (uv-loop? recovered) (uv-loop-close! recovered))
+
+(test-equal "closing it through the registry restores the counter balance"
+  0 (live-count 'loop))
+
+(test-equal "closing it through the registry restores the registry baseline"
+  registry-count-at-start (registry-count))
+
+;; --- row 5: 100 iterations, with a full collection on each --------------
 ;; (collect) on every iteration is the GC-pressure axis design spec S11 asks
 ;; for: the registry is the only GC root for an open loop (ADR-0007), so a
 ;; collection between make and close must not disturb it.

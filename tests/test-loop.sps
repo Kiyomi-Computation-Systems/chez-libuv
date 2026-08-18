@@ -394,7 +394,8 @@
   'same (if (eq? err-1 (uv-callback-error-cause raised-by-run)) 'same 'different))
 
 (test-equal "the pending error is consumed by the re-raise (the loop stays usable)"
-  'no-pending (if (loop-pending-error policy-loop) 'still-pending 'no-pending))
+  'no-pending
+  (if (loop-has-pending-error? policy-loop) 'still-pending 'no-pending))
 
 ;; WHAT THIS SEQUENCE CAN AND CANNOT SHOW. With real callbacks the order is:
 ;; the raises happen DURING run N, the caller reads them once run N has
@@ -427,6 +428,56 @@
 
 (test-equal "its cause is the raised object itself"
   'a-bare-symbol (uv-callback-error-cause raised-bare))
+
+;; ...and #f is one of those objects. This is the case that makes the loop
+;; record's empty-pending marker a private sentinel rather than #f: a
+;; callback's own (raise #f) must be recorded, must be re-raised, and must not
+;; make the NEXT error look like the first one. With #f as the marker all
+;; three go wrong silently -- the error is stored but read back as "none", so
+;; uv_stop fires with nothing to show for it and uv-run drops the error.
+(define false-loop (make-uv-loop))
+(define after-false (make-uv-errno-error 'EPIPE -32 "broken pipe"))
+
+(loop-record-error! false-loop #f)
+
+(test-equal "a callback that raised #f leaves the loop holding a pending error"
+  'has-pending
+  (if (loop-has-pending-error? false-loop) 'has-pending 'looks-empty))
+
+(test-equal "the pending slot holds the #f the callback raised"
+  'false-is-pending
+  (if (eq? #f (loop-pending-error false-loop)) 'false-is-pending 'something-else))
+
+(loop-record-error! false-loop after-false)
+
+(test-equal "the error after a #f is DEFERRED, not mistaken for the first one"
+  'deferred
+  (let ((d (uv-loop-deferred-errors false-loop)))
+    (if (and (= 1 (length d)) (eq? after-false (car d))) 'deferred 'unexpected)))
+
+(test-equal "the #f is still the pending error, not overwritten by the second"
+  'false-still-pending
+  (if (eq? #f (loop-pending-error false-loop))
+      'false-still-pending
+      'overwritten))
+
+(define raised-false
+  (guard (e (#t e))
+    (uv-run false-loop 'nowait)
+    'no-raise))
+
+(test-equal "uv-run re-raises a #f callback error instead of dropping it silently"
+  'callback-error
+  (if (uv-callback-error? raised-false) 'callback-error 'not-callback-error))
+
+(test-equal "the re-raised condition's cause is the #f the callback raised"
+  'cause-is-false
+  (if (eq? #f (uv-callback-error-cause raised-false))
+      'cause-is-false
+      'cause-is-something-else))
+
+(test-equal "the loop is usable again after a #f callback error"
+  'no-work (if (uv-run false-loop 'nowait) 'work 'no-work))
 
 ;; --- uv-stop! -----------------------------------------------------------
 ;; uv_stop's effect is only observable from inside a running loop, which
@@ -591,9 +642,12 @@
 (test-equal "the loop is torn down even when the body raises"
   cwl-live-before (live-count 'loop))
 
-;; ADR-0006's re-entry guard, in the shape cmark-gfm's test-lifecycle uses: a
-;; continuation captured INSIDE the extent is invoked after the extent has
-;; been left (and the loop torn down). dynamic-wind's before-thunk runs on
+;; The re-entry guard of design spec S5 ("dynamic-wind is valid here, unlike
+;; around an individual handle"), written in the shape the sibling
+;; chez-cmark-gfm project's test-lifecycle uses for its own re-entry ADR --
+;; this repo's ADR-0006 is about error codes being symbols and has nothing to
+;; do with it. A continuation captured INSIDE the extent is invoked after the
+;; extent has been left (and the loop torn down). dynamic-wind's before-thunk runs on
 ;; the way back in and must refuse, because the loop it would hand the body
 ;; is gone. `body-entries` is the sentinel: a re-entry that got past the
 ;; guard would run the body a second time.
@@ -629,11 +683,12 @@
   cwl-live-before (live-count 'loop))
 
 ;; --- balance ------------------------------------------------------------
-;; l0, other-loop and policy-loop are still open at this point; close them
-;; and confirm the whole suite balances.
+;; l0, other-loop, policy-loop and false-loop are still open at this point;
+;; close them and confirm the whole suite balances.
 (uv-loop-close! l0)
 (uv-loop-close! other-loop)
 (uv-loop-close! policy-loop)
+(uv-loop-close! false-loop)
 
 (test-equal "every loop this suite created has been freed"
   0 (live-count 'loop))

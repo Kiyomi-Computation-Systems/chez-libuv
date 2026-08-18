@@ -41,8 +41,8 @@ it fail":
 
 | Suite | Assertions | Exit |
 |---|---|---|
-| `tests/test-loop.sps` | 112 | 0 |
-| `tests/test-lifecycle.sps` | 19 | 0 |
+| `tests/test-loop.sps` | 119 | 0 |
+| `tests/test-lifecycle.sps` | 25 | 0 |
 | `tests/test-facade.sps` | 19 | 0 |
 
 Driver and raw output:
@@ -87,16 +87,21 @@ notes below the table.
 | 25 | `registry-register!` refuses a duplicate pointer | guard disabled | FAIL, exit 1 | "registering the same pointer twice is refused, naming who and why" — and *only* that one |
 | 26 | `registry-register!` refuses a null pointer | guard disabled | FAIL, exit 1 | "registry-register! rejects a null pointer, naming who and why"; (+2 rows: the null entry then stayed in the table) |
 | 27 | `registry-deregister!` refuses an unregistered pointer | guard disabled | FAIL, exit 1 | "deregistering an unregistered pointer is refused, naming who and why" — and *only* that one |
-| 28 | The facade's `uv-version` asks libuv rather than restating a version | returns `"9.9.9"` | FAIL, exit 1 | "uv-version's string agrees with uv-version-packed's major.minor" |
+| 28 | The facade's `uv-version` asks libuv rather than restating a version | returns `"9.9.9"` | FAIL, exit 1 | "uv-version's string agrees with uv_version()'s major.minor" |
 | 29 | `loop-record-error!` calls `uv_stop` on the first error (§8) | `uv_stop` call removed | **NOT CAUGHT** | none — see "Uncovered" below |
 | 30 | `uv-run` maps `'once` / `'nowait` to their own constants | both mapped to `UV_RUN_DEFAULT` | **NOT CAUGHT** | none — see "Uncovered" below |
 | 31 | `uv-loop-close!` routes `uv_loop_close`'s rc through `uv-check` | `uv-check` dropped | **NOT CAUGHT** | none — see "Uncovered" below |
 | 32 | `uv-loop-teardown!` drains before closing | drain loop deleted | **NOT CAUGHT** | none — see "Uncovered" below |
+| 33 | The loop's empty-pending marker is a private sentinel, not `#f` (so a callback's own `(raise #f)` survives) | reverted to `#f` as the marker, in all three places (field default, predicate, clear) | FAIL, exit 1 | "a callback that raised #f leaves the loop holding a pending error"; "the error after a #f is DEFERRED, not mistaken for the first one"; "the #f is still the pending error, not overwritten by the second"; "the re-raised condition's cause is the #f the callback raised" |
+| 34 | The registry holds its entries strongly (ADR-0007) | `make-eqv-hashtable` → `make-weak-eqv-hashtable` | **NOT CAUGHT** — and cannot be, see below | none |
+| 35 | …the same property, mutated where it can be observed | the registry entry stores `#f` in place of the object, so the table records the pointer but holds nothing | FAIL, exit 1 | "a loop the caller dropped is still resolvable through the registry"; "the dropped loop is still open"; "the dropped loop still runs"; "closing it through the registry restores the counter balance"; (+ 5 registry rows in `test-loop`) |
 
-**28 of 32 mutations caught.** The four that were not are each recorded below
-with the reason and with the task that will cover them — per AGENTS.md,
-"write down in the mutation log that the property is uncovered and why.
-Leaving it silently is the exact failure this rule exists to prevent."
+**31 of 37 mutations caught.** Of the six that were not, **five are uncovered
+properties** — each recorded below with the reason and the task that will
+cover it, per AGENTS.md's "write down in the mutation log that the property is
+uncovered and why; leaving it silently is the exact failure this rule exists to
+prevent" — and the sixth (34) is a mutation *form* that cannot discriminate for
+a structural reason, with the property it aimed at covered by 35 instead.
 
 ### Notes on the cascades
 
@@ -109,12 +114,62 @@ Leaving it silently is the exact failure this rule exists to prevent."
   abort is recorded here rather than smoothed over.
 - **Mutations 2, 6, 8, 11, 20, 25 and 27 each failed exactly one assertion.**
   Those seven are the sharpest evidence in this log: the assertion is
-  specific to the decision, and nothing else in 150 assertions depends on it
+  specific to the decision, and nothing else in 163 assertions depends on it
   by accident.
+- **Mutation 34 is recorded as attempted-and-not-discriminating**, not as an
+  uncovered property. Chez's weak hashtables are weak in the **key**, and the
+  registry's key is the loop's `uptr` — an integer the strong-hold test
+  necessarily holds itself, since it is what the test asks the registry
+  *with*. The entry therefore stays reachable and the mutation changes
+  nothing observable. Mutation 35 is the form that does discriminate: it
+  leaves the table, the key and the entry in place and removes only the
+  entry's hold on the object, which is precisely the "registry is the GC
+  root" role ADR-0007 assigns it.
 - Mutation 12's cascade is itself informative: with `running?` never cleared,
   every later `uv-run` raised `&uv-invalid-argument` with reason
   `'loop-running`. That is the re-entry rejection branch executing — see the
   deferral note below for why it still has no *positive* assertion.
+
+## Newly covered at review: two properties that were relying on nothing
+
+Both were found by the Task 6 review, and both are now assertions rather than
+assumptions. They are recorded here because each had been *invisible* — no
+failing mutation, and no row in the uncovered list either, which is the worse
+of the two failure modes AGENTS.md names.
+
+### The empty pending-error slot is a sentinel, not `#f` (Mutation 33)
+
+`#f` was the loop record's "no pending error" marker, and R6RS `raise` accepts
+any object — so a callback's own `(raise #f)` was stored, `uv_stop` fired with
+nothing to show for it, `uv-run`'s `(when pending …)` read the slot as empty
+and dropped the error **silently**, and the *next* error was then misclassified
+as the first and overwrote the slot instead of being deferred. The empty marker
+is now `no-pending`, a pair allocated inside `handles.sls` and `eq?` to nothing
+a callback can produce; `loop-has-pending-error?` and
+`clear-loop-pending-error!` are the operations, and `uv-run` tests the
+predicate rather than the value's truthiness. Four assertions guard it, all
+four named in the table under Mutation 33.
+
+This is the same rule AGENTS.md states for assertions ("prefer a sentinel no
+failure path produces", and "`#f` is worse: it is what a missing key returns")
+applied to a data structure instead of a test.
+
+### The registry actually holds the record (Mutations 34, 35)
+
+ADR-0007 and design spec §5 promise that "an open handle and its stored
+closures stay reachable through this table for as long as it is open, even if
+the caller drops every other reference to it". Nothing asserted it, and it is
+the one loop-lifecycle property in this stage that needs no handle type to
+test. `tests/test-lifecycle.sps` now creates a loop inside a `let` whose
+binding dies with it, keeps only the pointer (an integer, which holds nothing
+alive), forces a full `(collect)`, and then asserts through the registry that
+the loop is still resolvable, still open, and **still runs** — the last one
+driving the real `uv_loop_t` through libuv, so a record whose pointer had been
+freed underneath it could not pass. It is then closed through the recovered
+record, which restores both the counter and the registry baseline.
+
+See the note above on why Mutation 34 (a weak hashtable) cannot discriminate
+here and Mutation 35 is the form that does.
 
 ## Uncovered, and why
 
@@ -241,7 +296,7 @@ is readable *after* the run that produced it.
 
 | Check | Result |
 |---|---|
-| `make test` (`HAVE_PKG=yes`, pkg-config libuv 1.52.1) | ALL SUITES PASSED — conditions 89, facade 19, lifecycle 19, loop 112, native 136, shim-loading 19 |
+| `make test` (`HAVE_PKG=yes`, pkg-config libuv 1.52.1) | ALL SUITES PASSED — conditions 89, facade 19, lifecycle 25, loop 119, native 136, shim-loading 19 |
 | `make HAVE_PKG=no test` (vendored submodule libuv 1.52.1) | ALL SUITES PASSED — identical counts |
 | `make check-purity` | green; `PURE_TESTS` is an explicit per-suite list, so the three new suites are excluded by construction (all three import `(libuv loop)` or `(libuv)`, both of which reach `(libuv private native)`) |
 | `make check-pins`, `make check-help` | green |
@@ -256,4 +311,9 @@ Recorded observations (informational, not assertions):
   `>=` ("does not go backwards") rather than `>`: a strict-increase assertion
   would be asserting something libuv does not promise, and would fail on a
   fast machine rather than on a broken binding.
-- `(uv-version)` = `"1.52.1"`, `(uv-version-packed)` = `78849` = `#x013401`.
+- `(uv-version)` = `"1.52.1"`; `uv_version()`, read from
+  `(libuv private native)` for the facade's cross-check, = `78849` =
+  `#x013401`. The packed integer is deliberately **not** a facade export:
+  design spec §3 scopes `(libuv)` to "re-exports + `uv-version(-compatible?)`",
+  and `tests/test-facade.sps` reaches the second source through a renamed
+  private import so the cross-check cannot be mistaken for a public API.

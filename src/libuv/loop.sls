@@ -96,9 +96,13 @@
                     (lambda () (set-loop-running! loop #t))
                     (lambda () (uv-loop-run ptr mode-int))
                     (lambda () (set-loop-running! loop #f)))))
-           (let ((pending (loop-pending-error loop)))
-             (when pending
-               (set-loop-pending-error! loop #f)
+           ;; Tested with the predicate, never with the VALUE's truthiness: a
+           ;; callback may legitimately have raised #f, and `(when pending
+           ;; ...)` would drop exactly that error on the floor (handles.sls's
+           ;; `no-pending` note).
+           (when (loop-has-pending-error? loop)
+             (let ((pending (loop-pending-error loop)))
+               (clear-loop-pending-error! loop)
                ;; Composed with the cause when the cause is a condition, so a
                ;; guard written against the ORIGINAL type still matches -- the
                ;; load-bearing half of store-and-reraise (design spec S8).

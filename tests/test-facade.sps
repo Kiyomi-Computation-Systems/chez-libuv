@@ -2,12 +2,19 @@
 ;;; SRFI-64 suite for the (libuv) facade -- design spec S3's module layout
 ;;; ("src/libuv.sls  # (libuv) facade: re-exports + uv-version(-compatible?)").
 ;;;
-;;; This suite imports (libuv) AND NOTHING ELSE from this project, and that
-;;; is its whole point: every name it uses has to be re-exported by the
-;;; facade itself. A test that also imported (libuv loop) or
-;;; (libuv private conditions) would keep passing after an export was dropped
-;;; from src/libuv.sls, because Chez would resolve the name from the other
-;;; import -- so the export list would be guarded by nothing at all.
+;;; This suite imports (libuv) and NOTHING ELSE from this project that could
+;;; supply one of the facade's own names, and that is its whole point: every
+;;; name it uses has to be re-exported by the facade itself. A test that also
+;;; imported (libuv loop) or (libuv private conditions) would keep passing
+;;; after an export was dropped from src/libuv.sls, because Chez would
+;;; resolve the name from the other import -- so the export list would be
+;;; guarded by nothing at all.
+;;;
+;;; The ONE exception is renamed on the way in: `libuv-packed-version` is
+;;; (libuv private native)'s uv_version(), and it exists here only so the
+;;; facade's uv-version string can be checked against a SECOND source rather
+;;; than against itself. It is renamed precisely so it cannot stand in for a
+;;; facade export that went missing.
 ;;;
 ;;; The failure is at EXPAND time (an unbound identifier), which is a suite
 ;;; that fails outright rather than an assertion that fails by name. That is
@@ -19,7 +26,9 @@
 ;;; the Makefile's PURE_TESTS.
 (import (rnrs)
         (srfi :64)
-        (libuv))
+        (libuv)
+        (rename (only (libuv private native) uv-version)
+                (uv-version libuv-packed-version)))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -35,24 +44,25 @@
       'non-empty-string
       'not-a-version-string))
 
-;; Cross-check against the packed integer the same library reports, so this
-;; is two sources agreeing rather than one source restating itself: a facade
-;; that returned a hard-coded or stale string fails here. The comparison is
-;; on the "major.minor." prefix, because uv_version_string may carry a
-;; pre-release suffix that uv_version()'s patch byte does not describe.
-(define packed (uv-version-packed))
+;; Cross-check against uv_version()'s packed integer -- a different libuv
+;; entry point, reached without going through the facade -- so this is two
+;; sources agreeing rather than one source restating itself: a facade that
+;; returned a hard-coded or stale string fails here. The comparison is on the
+;; "major.minor." prefix, because uv_version_string may carry a pre-release
+;; suffix that uv_version()'s patch byte does not describe.
+(define packed (libuv-packed-version))
 
 (define expected-prefix
   (string-append (number->string (div packed 65536)) "."
                  (number->string (mod (div packed 256) 256)) "."))
 
-(test-equal "uv-version's string agrees with uv-version-packed's major.minor"
+(test-equal "uv-version's string agrees with uv_version()'s major.minor"
   expected-prefix
   (if (>= (string-length version) (string-length expected-prefix))
       (substring version 0 (string-length expected-prefix))
       'string-too-short))
 
-(test-equal "uv-version-packed reports a version inside libuv's 1.x series"
+(test-equal "uv_version() reports a version inside libuv's 1.x series"
   1 (div packed 65536))
 
 (test-equal "this shim and this libuv are reported compatible"

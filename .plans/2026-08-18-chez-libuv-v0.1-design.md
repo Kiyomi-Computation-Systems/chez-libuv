@@ -90,7 +90,13 @@ src/
 tests/
   uv-testing.sls  shim-load-probe.sps
   test-{conditions,native,shim-loading,loop,timer,tcp,lifecycle,echo}.sps
+  test-facade.sps               # guards src/libuv.sls's re-export list
 ```
+
+`test-facade.sps` imports `(libuv)` and nothing else that could supply one of
+the facade's own names, so a dropped re-export fails the suite at expand time
+— the export list is otherwise guarded by nothing, since every other suite
+imports the underlying library directly (added at Stage 2).
 
 The shim artifact is `build/lib/libchezlibuv.{dylib,so}`; `CHEZ_LIBUV_SHIM`
 overrides its path at runtime.
@@ -429,7 +435,12 @@ connection plumbing shared across suites.
   deferred-error re-raise leaves the loop usable afterward), `test-echo`
   (the capstone — 8 concurrent in-process clients, each sending 32 KiB of
   seeded-random payload across 3 chunks, compared byte-for-byte, followed
-  by graceful teardown with all counters at zero).
+  by graceful teardown with all counters at zero), `test-facade` (the
+  `(libuv)` re-export list — guarded at expand time by importing the facade
+  and nothing that could substitute for one of its names, since every other
+  suite imports the underlying library directly and would keep passing after
+  an export was dropped; plus `uv-version` cross-checked against
+  `uv_version()`, a second entry point rather than a restatement).
 - `check-purity` runs every suite that does not require native loading with
   `CHEZ_LIBUV_SHIM=/nonexistent`, proving those suites have no hidden native
   dependency.

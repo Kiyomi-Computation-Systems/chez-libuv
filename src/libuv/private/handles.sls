@@ -32,6 +32,7 @@
           loop-state set-loop-state!
           loop-running? set-loop-running!
           loop-pending-error set-loop-pending-error!
+          loop-has-pending-error? clear-loop-pending-error!
           loop-deferred-error-list set-loop-deferred-error-list!
           loop-open? require-open-loop require-loop loop-pointer
 
@@ -58,13 +59,30 @@
   ;;   running?        set for the dynamic extent of uv_run, so re-entrant
   ;;                   uv-run / uv-loop-close! / uv-loop-teardown! can be
   ;;                   refused (S8, "Illegal from inside a callback")
-  ;;   pending-error   the FIRST value a callback guard caught this run
+  ;;   pending-error   the FIRST value a callback guard caught this run, or
+  ;;                   the private `no-pending` sentinel when there is none
   ;;   deferred-errors every later one, newest first (reversed on read)
+  ;;
+  ;; WHY THE EMPTY PENDING SLOT IS NOT #f. R6RS `raise` takes ANY object, so
+  ;; a callback is entirely within its rights to `(raise #f)`. With #f as the
+  ;; empty marker, that value would be stored, uv_stop would fire with
+  ;; nothing to show for it, uv-run's re-raise test would read the slot as
+  ;; empty and drop the error silently, and the NEXT error would be
+  ;; misclassified as the first (overwriting the pending slot instead of
+  ;; deferring). `no-pending` is a freshly allocated pair, so it is `eq?` to
+  ;; nothing a callback can produce -- the sentinel rule AGENTS.md states for
+  ;; assertions, applied to a data structure.
   ;;
   ;; The constructor is private (%-prefixed) because a loop record whose ptr
   ;; did not come from a successful uv_loop_init is a segfault waiting to
   ;; happen; (libuv loop)'s make-uv-loop is the only sanctioned way to get
   ;; one.
+  ;; Allocated, not quoted: a quoted literal may be shared with an equal
+  ;; literal elsewhere in the program, and `eq?` on it would then be a
+  ;; coincidence rather than an identity. This pair is unique by
+  ;; construction and never escapes this library.
+  (define no-pending (list 'no-pending))
+
   (define-record-type (uv-loop-record %make-uv-loop-record uv-loop?)
     (fields (mutable ptr             loop-ptr             set-loop-ptr!)
             (mutable state           loop-state           set-loop-state!)
@@ -74,7 +92,17 @@
                                      set-loop-deferred-error-list!))
     (protocol
      (lambda (new)
-       (lambda (ptr) (new ptr 'open #f #f '())))))
+       (lambda (ptr) (new ptr 'open #f no-pending '())))))
+
+  ;; The two operations every caller outside this library should use instead
+  ;; of testing the pending slot's truthiness. `loop-pending-error` still
+  ;; reads the raw slot -- it is what uv-run re-raises, #f included -- but
+  ;; whether there IS one is this predicate's answer, never the value's.
+  (define (loop-has-pending-error? loop)
+    (not (eq? (loop-pending-error loop) no-pending)))
+
+  (define (clear-loop-pending-error! loop)
+    (set-loop-pending-error! loop no-pending))
 
   (define (loop-open? loop)
     (and (uv-loop? loop) (eq? (loop-state loop) 'open)))
@@ -184,7 +212,7 @@
   ;; already being torn down must not hand NULL to libuv.
   (define (loop-record-error! loop obj)
     (require-loop loop 'uv-loop-record-error!)
-    (if (loop-pending-error loop)
+    (if (loop-has-pending-error? loop)
         (set-loop-deferred-error-list!
          loop (cons obj (loop-deferred-error-list loop)))
         (begin

@@ -22,7 +22,12 @@
           uv-loop-close! uv-loop-teardown! call-with-uv-loop
 
           ;; --- version queries (this library's own) ---
-          uv-version uv-version-packed uv-version-compatible?
+          ;; Exactly the two design spec S3 scopes this facade to
+          ;; ("re-exports + uv-version(-compatible?)"). The packed integer
+          ;; uv_version() returns stays private: a public packed-version API
+          ;; is a deliberate addition to make when something asks for it, not
+          ;; a by-product of needing it for a test.
+          uv-version uv-version-compatible?
 
           ;; --- the condition hierarchy, from (libuv private conditions) ---
           ;; Callers need the predicates to discriminate, the accessors to
@@ -70,19 +75,13 @@
   ;; (design spec S4).
 
   ;; The running libuv's own version string, copied at the boundary
-  ;; (ADR-0009) -- "1.52.1". Distinct from uv-version-packed: the string is
-  ;; what a human-facing log wants, and it may carry a pre-release suffix
-  ;; that the packed integer has no room for.
+  ;; (ADR-0009) -- "1.52.1". The string, not libuv's packed integer, because
+  ;; this is the human-facing answer: it can carry a pre-release suffix the
+  ;; packed form has no room for. A caller comparing against a floor wants
+  ;; the integer instead, and can have it when something actually needs it.
   (define (uv-version)
     (ensure-native-loaded!)
     (uv-version-string))
-
-  ;; The same version as libuv's packed integer, (major << 16 | minor << 8 |
-  ;; patch) -- what a caller comparing against a floor wants, since string
-  ;; comparison on dotted versions is wrong at every ten-boundary.
-  (define (uv-version-packed)
-    (ensure-native-loaded!)
-    (raw-uv-version))
 
   ;; Whether the shim's compile-time libuv and the runtime libuv both fall
   ;; inside the range this build declares supported. Not an equality test:
