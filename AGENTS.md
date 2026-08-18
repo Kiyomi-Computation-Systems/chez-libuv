@@ -9,6 +9,7 @@
 * Project should be portable across macos (darwin), linux, and windows
 * Project should be portable across amd64 and arm64
 * Plans live in `/.plans`, decision records in `/.plans/decisions`
+* `/docs` is only for user facing documentation, not project plans or specs.
 * Add entries to `CHANGELOG.md` for each release
 * Makefile should have a `help` command which lists all of the make commands.
 * Library should be distributable with Akku.
