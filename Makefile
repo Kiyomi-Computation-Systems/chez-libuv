@@ -67,11 +67,12 @@ TESTS        := $(wildcard tests/test-*.sps)
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
-# stay free of native imports. Only test-conditions.sps qualifies (Task 4);
-# it does not exist yet, so this wildcard is empty today and the target
-# below succeeds vacuously over an empty loop -- not because of a hardcoded
-# list that would need editing when Task 4 lands, but because $(wildcard)
-# only ever names files that actually exist.
+# stay free of native imports. Only test-conditions.sps qualifies (Task 4,
+# landed): it imports (rnrs) and (libuv private conditions) only, and that
+# library imports (rnrs) only, so its whole chain never reaches
+# (libuv private native). $(wildcard) names exactly the pure suites that
+# exist on disk -- not a hardcoded list that would need editing as later
+# tasks add more of them (or would silently keep testing a deleted file).
 PURE_TESTS   := $(wildcard tests/test-conditions.sps)
 
 .PHONY: all build deps check-pins check-purity check-help help dev test test-memory vendor clean prod deps-info
@@ -183,9 +184,9 @@ check-pins: ## Verify chez-srfi submodule <-> Akku.lock, vendored libuv version,
 # does, native.sls's library body raises &uv-shim-unavailable at IMPORT
 # time, before a single test runs, and the suite fails outright.
 #
-# Runs over PURE_TESTS, which is empty until Task 4 adds
-# tests/test-conditions.sps -- see the wildcard's definition above for why
-# that makes this target pass vacuously rather than needing an edit later.
+# Runs over PURE_TESTS (see its definition above) -- currently just
+# tests/test-conditions.sps (Task 4); later tasks that add another pure
+# suite need no edit here, only a file on disk for $(wildcard) to pick up.
 check-purity: build deps ## Verify pure test suites import no native code (poisons CHEZ_LIBUV_SHIM)
 	@fail=0; \
 	for t in $(PURE_TESTS); do \
@@ -282,9 +283,9 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 
 # Each suite sets its own exit status. Keep going after a failure so one
 # broken suite cannot hide the others, then fail the target if any failed.
-# Zero suites exist before Task 4 lands -- $(TESTS) is then empty, the loop
-# body never runs, fail stays 0, and this reports ALL SUITES PASSED
-# vacuously rather than needing special-casing.
+# $(TESTS) is a $(wildcard), so a later task's new tests/test-*.sps file is
+# picked up automatically -- no edit needed here, same reasoning as
+# PURE_TESTS above.
 test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
 	@fail=0; \
 	for t in $(TESTS); do \
