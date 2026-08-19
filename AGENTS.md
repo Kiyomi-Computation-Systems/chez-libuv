@@ -80,3 +80,48 @@ None is obvious from reading the code.
   was in fact satisfied by the *last* argument's accessor raising.
 * **A struct tag first named in a prototype's parameter list has prototype scope
   only** (C99 6.2.1p7). Forward-declare it at file scope before the prototype.
+* **Apple make 3.81 compares mtimes at whole-second granularity, and deleting a
+  stale artifact from within the artifact rule's own evaluation makes it worse.**
+  A stamp-identity flip in the same wall-clock second does not force a relink
+  (GNU make 4.x sub-second mtimes mask this), and a delete performed by a recipe
+  attached to the artifact's own rule runs after make has cached the target's
+  stat — the build exits 0 with *no artifact at all*. Delete from a prerequisite
+  of a PHONY aggregate that runs strictly before the artifact rule is stat'd
+  (`relink-guard`, a prerequisite of `build`), or detect the flip at Makefile
+  read time via a phony always-remade prerequisite. Both shapes verified in
+  `.plans/stage-6-mutation-log.md` ("The guard's own failure mode, checked
+  rather than reasoned about"); the broken shapes were hit in both this repo
+  and chez-cmark-gfm on the same day.
+* **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
+  defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
+  "possible" ones — the gate exits 9 with nothing in the log explaining why.
+  Pass `--errors-for-leak-kinds=definite` explicitly. Separately, Chez's
+  JIT-generated code produces uninitialised-value false positives by the
+  hundreds from unstable call paths; the gate is scoped with
+  `--undef-value-errors=no` (leaks and addressability stay fully enabled —
+  ADR-0003's amendment records this).
+* **memcheck deliberately delays freed-block reuse, so "recycled memory is
+  dirty" is unobservable under valgrind by design.** Its freelist exists to
+  catch use-after-free; no alloc-after-free warm-up depth ever returns the
+  just-freed block. The dirty-memory seed in `test-native.sps` is
+  environment-aware (`CHEZ_LIBUV_UNDER_VALGRIND`, exported by `test-memory`);
+  its strong form runs in plain `make test`, which is where M35's mutation
+  detection lives.
+* **A single `uv-run 'once` is not guaranteed to fire an imminently-due
+  timer.** libuv only arms a blocking poll timeout for a `UV_RUN_ONCE`
+  iteration that ran no callbacks that same iteration, so one bare `'once`
+  after activity can return before the timer comes due. This flaked exactly
+  once in five CI runs. Always step with a capped `'once` loop
+  (`run-until`-style), never a single call and never wall-clock.
+* **glibc under strict `-std=c99` hides POSIX types that macOS exposes
+  unconditionally.** `uv/unix.h` needs `pthread_rwlock_t`; every local macOS
+  build passed and the first Linux compile failed. The Makefile adds
+  `-D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L` in the non-Darwin branch only
+  (defining `_POSIX_C_SOURCE` on macOS can hide BSD extensions).
+* **apt's `chezscheme` on ubuntu-latest is 9.5.x — below this project's floor —
+  and building pinned Chez has two of its own traps.** CI builds 10.4.1 from
+  the release tarball with `./configure --disable-x11 --disable-curses` (the
+  expeditor otherwise requires X11/ncurses headers absent on runners) and a
+  SERIAL `make` (parallel bootstrap raced: `nanopass.so` not created). A
+  version assertion beside "Report versions" keeps the floor from silently
+  drifting — the same check-not-comment logic as `check-pins`.
