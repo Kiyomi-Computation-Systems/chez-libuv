@@ -139,15 +139,29 @@
   ;; enforcement -- and a relative path that happens to exist under the
   ;; current working directory is exactly the "never searched" case this
   ;; procedure exists to refuse.
-  (define (resolve-shim-path default-path override)
-    (let ((candidate (or override default-path)))
-      (if (and (absolute-path? candidate) (regular-file? candidate))
-          candidate
-          (raise (make-uv-shim-unavailable candidate)))))
+  ;;
+  ;; The optional third/second argument is the condition MAKER, defaulting
+  ;; to the shim's own: the libuv leg below passes make-uv-libuv-unavailable
+  ;; so a libuv-path failure carries the subtype instead of being mislabeled
+  ;; as the shim's (final-review triage; both arities are asserted in
+  ;; tests/test-native.sps, the wiring end to end in
+  ;; tests/test-shim-loading.sps).
+  (define resolve-shim-path
+    (case-lambda
+      ((default-path override)
+       (resolve-shim-path default-path override make-uv-shim-unavailable))
+      ((default-path override make-unavailable)
+       (let ((candidate (or override default-path)))
+         (if (and (absolute-path? candidate) (regular-file? candidate))
+             candidate
+             (raise (make-unavailable candidate)))))))
 
-  (define (load-shim path)
-    (guard (e (#t (raise (make-uv-shim-unavailable path))))
-      (load-shared-object path)))
+  (define load-shim
+    (case-lambda
+      ((path) (load-shim path make-uv-shim-unavailable))
+      ((path make-unavailable)
+       (guard (e (#t (raise (make-unavailable path))))
+         (load-shared-object path)))))
 
   (define resolved-shim-path
     (resolve-shim-path shim-path (getenv "CHEZ_LIBUV_SHIM")))
@@ -161,11 +175,15 @@
   ;; design spec S4 rule 2 says "by absolute path", and routing it through
   ;; the one validated, tested procedure is what makes that a rule rather
   ;; than a property the generator happens to satisfy. A failure here raises
-  ;; the SAME &uv-shim-unavailable as the shim's own load below -- its `path`
-  ;; field is what tells a libuv-path failure apart from a shim failure
-  ;; (README.org's condition table; considered for a subtype in v0.2).
+  ;; &uv-libuv-unavailable -- a SUBTYPE of the shim's &uv-shim-unavailable,
+  ;; so guards on the parent keep matching while the sharper predicate now
+  ;; tells a libuv-path failure apart from a shim failure without reading
+  ;; the path field (README.org's condition table; the v0.2 subtype
+  ;; consideration, resolved post-v0.1).
   (define uv-loaded
-    (for-each (lambda (path) (load-shim (resolve-shim-path path #f)))
+    (for-each (lambda (path)
+                (load-shim (resolve-shim-path path #f make-uv-libuv-unavailable)
+                           make-uv-libuv-unavailable))
               uv-library-paths))
 
   (define shim-loaded (load-shim resolved-shim-path))
@@ -490,8 +508,13 @@
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
     (unless (bytevector? bv)
       (raise (make-uv-invalid-argument 'uv-copy-in! 'source-not-a-bytevector)))
-    (unless (and (exact? start) (integer? start) (>= start 0)
-                 (exact? len) (integer? len) (>= len 0)
+    ;; integer? FIRST, exact? second -- the same safe order as zero-out!'s
+    ;; checks above: integer? is total, while exact? on a non-number raises
+    ;; a bare Chez &assertion, which would replace this structured rejection
+    ;; with an undiscriminable crash (tests/test-native.sps's non-numeric
+    ;; span rows).
+    (unless (and (integer? start) (exact? start) (>= start 0)
+                 (integer? len) (exact? len) (>= len 0)
                  (<= (+ start len) (bytevector-length bv)))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
     (let loop ((i 0))
@@ -538,7 +561,8 @@
   (define (copy-out src len)
     (unless (and (integer? src) (exact? src) (positive? src))
       (raise (make-uv-invalid-argument 'uv-copy-out 'null-or-invalid-source)))
-    (unless (and (exact? len) (integer? len) (>= len 0))
+    ;; integer? before exact?, for the same reason as copy-in!'s span check.
+    (unless (and (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-copy-out 'length-out-of-range)))
     (let ((bv (make-bytevector len)))
       (let loop ((i 0))
@@ -682,6 +706,11 @@
   ;; install happens after this library's body has finished running, so a
   ;; trampoline that captured its slot's value up front would capture the
   ;; stub forever.
+  ;;
+  ;; The per-fire hashtable lookup was measured against a vector-slot
+  ;; replacement and kept: it costs ~6 ns of a >=26 microsecond fire, ~0.02%
+  ;; of the cheapest callback path this binding can execute
+  ;; (.plans/2026-08-18-dispatch-benchmark.md).
   (define (dispatcher-ref name)
     (let ((proc (hashtable-ref dispatchers name #f)))
       (or proc

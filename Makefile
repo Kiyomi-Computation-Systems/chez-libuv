@@ -378,6 +378,12 @@ test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, agg
 	else echo "SUITE FAILED"; fi; \
 	exit $$fail
 
+# Where the macOS arm of test-memory looks for clang's ASan runtime. A
+# variable (deferred, so xcrun never runs on Linux) rather than an inline
+# substitution, for one reason: it makes the empty-glob guard below testable.
+# `make test-memory ASAN_DYLIB_PATTERN=/nonexistent/x.dylib` must fail loudly.
+ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
+
 test-memory: build deps check-pins ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
 ifeq ($(UNAME_S),Linux)
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
@@ -433,8 +439,20 @@ else
 # gets a chance to run its check -- an unattributed crash (bare "Trace/BPT
 # trap") instead of the diagnostic this target exists to provide. Carried
 # over from chez-cmark-gfm, which observed this on this exact recipe.
+#
+# The dylib is resolved FIRST and required non-empty: if the clang resource
+# dir glob ever misses (a new Xcode layout, a renamed runtime), an empty
+# DYLD_INSERT_LIBRARIES would run every suite with no sanitizer at all and
+# still exit 0 -- this target staying green while checking nothing. `test -n`
+# turns that into a loud failure naming the pattern that missed.
+	@asan="$$(command ls $(ASAN_DYLIB_PATTERN) 2>/dev/null | head -1)"; \
+	test -n "$$asan" || { \
+	  echo "test-memory: no ASan runtime matched $(ASAN_DYLIB_PATTERN); refusing to run un-sanitized" >&2; \
+	  exit 1; \
+	}; \
+	echo "test-memory: ASan runtime $$asan"; \
 	CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) \
-	  DYLD_INSERT_LIBRARIES="$$(command ls $$(dirname $$(xcrun --find clang))/../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib | head -1)" \
+	  DYLD_INSERT_LIBRARIES="$$asan" \
 	  ASAN_OPTIONS=detect_leaks=0 \
 	  MallocNanoZone=0 \
 	  sh -c 'for t in $(MEMORY_TESTS); do $(CHEZ) --program $$t || exit 1; done'

@@ -300,3 +300,36 @@ All on macOS 25.5.0 / arm64, Chez 10.4.1, libuv 1.52.1, dev shim
 Per-suite assertion counts, identical across all four `make test` runs:
 `conditions` 89, `facade` 40, `lifecycle` 60, `loop` 106, `native` 170,
 `shim-loading` 19, `tcp` 166, `timer` 128.
+
+## Post-v0.1 cleanup round (chore/post-v0.1-cleanup)
+
+**`reading?` semantics decided and locked in.** The final review flagged the
+flag as stale after EOF/error (Task 9 deferred Minors: "bookkeeping drift,
+no production reader"). Decision: it records CALLER INTENT -- a successful
+`uv-read-start!` not yet followed by `uv-read-stop!` -- not libuv's live
+read state, which would need per-arm knowledge of stream.c that varies
+across the supported 1.x range (libuv clears UV_HANDLE_READING on EOF
+itself, stops the watcher on errors). The EOF and error dispatchers
+deliberately leave it set; the record comment in handles.sls now says so,
+and one test-tcp row locks it in at the point where the handle has been
+delivered BOTH a real EOF and an error. Mutation-watched (scratch copy,
+restored-green diff-identical):
+
+| Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|
+| handles.sls | `deliver-read-eof!` clears the flag (`set-tcp-reading! handle #f` ahead of delivery) — the rejected "mirror libuv" semantics | FAIL, exit 1 — the ONLY failure (167 other rows passed) | "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!" |
+
+**test-facade's hand-rolled drain: hangs-not-fails, fixed with a facade-only
+ticker.** The review flagged that `uv-run 'once` BLOCKS waiting for an
+event, so a mutation silencing the I/O chain left the facade suite hanging
+instead of failing — the iteration bound was never reached because
+iterations stopped arriving. A repeating facade-only timer (built from
+facade exports alone; (uv-testing) may not stand between that suite and the
+facade) guarantees every 'once returns. Demonstrated both ways under the
+same mutation (`connect-dispatch` delivery dropped, scratch copy,
+restored-green diff-identical):
+
+| Drain | Under the mutation |
+|---|---|
+| old (no ticker) | HANG — process still running after 15 s, killed by hand |
+| new (ticker) | exit 1 in seconds; "uv-tcp-connect! is re-exported and its callback reports success", "uv-write! …", "uv-shutdown! …", "uv-read-start! … delivered the payload" all failed BY NAME |

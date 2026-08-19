@@ -641,3 +641,33 @@ method; baseline after the fixes is **136 assertions** in `test-native`.
   **not** in `native.sls` yet — design spec S4 places them here, but Task 5
   binds only what it tests. They arrive with Stage 3 (Task 7), along with the
   store-and-reraise mutations Task 4's log deferred.
+
+## Post-v0.1 cleanup round (chore/post-v0.1-cleanup)
+
+Final whole-branch review triage: `copy-in!`/`copy-out` tested `(exact? x)`
+before `(integer? x)` in their span/length checks — inconsistent with
+`zero-out!`'s safe order, and `exact?` on a non-number raises a bare Chez
+`&assertion` instead of the structured `&uv-invalid-argument`. Here the
+"mutation" IS the pre-cleanup code: the two new rows were added first and
+watched fail against it, then the order was swapped and both watched pass.
+
+| # | Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|---|
+| 56 | native.sls | `copy-in!`/`copy-out` span checks in the pre-cleanup order (`exact?` before `integer?`); probed with a symbol span argument | FAIL, exit 1 | "copy-in! rejects a non-numeric start as a structured condition, not a bare assertion"; "copy-out rejects a non-numeric length as a structured condition, not a bare assertion" |
+
+**Red evidence:** both rows answered `wrong-condition` (the escaping bare
+assertion) against the pre-swap code, 170 passes + 2 unexpected failures;
+after the swap, 172 passes, exit 0.
+
+**`&uv-libuv-unavailable` (the libuv-leg subtype), same cleanup round.**
+Baseline after the change: 94 conditions / 175 native / 24 shim-loading / 41
+facade assertions, all green on both acquisition legs.
+
+| # | Target | Mutation | Result | Named test(s) that failed |
+|---|---|---|---|---|
+| 57 | conditions.sls | `&uv-libuv-unavailable` re-parented from `&uv-shim-unavailable` to `&uv-error` (a sibling with its own path field, i.e. the hierarchy decision reversed) | FAIL, exit 1 | "libuv-unavailable IS a shim-unavailable: existing guards keep matching"; "libuv-unavailable carries the attempted path through the inherited accessor" |
+| 58 | native.sls | `uv-loaded` wired with the parent maker (the pre-cleanup mislabeling — this IS the state the rows were watched red against before implementation) | FAIL, exit 1 | "a bad libuv path: raises uv-libuv-unavailable, the subtype, not the shim's own type" (tests/test-shim-loading.sps, via a synthetic config.sls shadowing the generated one; its two positive-control rows passed in the same run, so the failure is the label, not the machinery) |
+
+M57 ran against a scratch copy (restored-green confirmed, diff-identical to
+the repo file). M58's evidence is the watched-red run itself: the wiring
+mutation and the pre-implementation code are the same text.

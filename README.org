@@ -309,7 +309,8 @@ the discriminant is a symbol).
 | ~&uv-error~ | — | The root; everything below derives from it |
 | ~&uv-errno-error~ | ~errno~ ~code~ ~message~ | libuv returned a negative code. ~errno~ is the portable symbol (~'ECONNRESET~) and the thing to branch on; ~code~ is the raw platform int, for logs |
 | ~&uv-handle-closed~ | ~kind~ | An operation on a handle or loop that is already closed |
-| ~&uv-shim-unavailable~ | ~path~ | The shim could not be found or loaded — also raised, with ~path~ set to the offending path, when one of the libuv library paths fails to load (the ~path~ field is what disambiguates which); considered for a subtype in v0.2 |
+| ~&uv-shim-unavailable~ | ~path~ | The shim could not be found or loaded at ~path~ |
+| ~&uv-libuv-unavailable~ | ~path~ (inherited) | libuv's own shared object could not be found or loaded — a subtype of ~&uv-shim-unavailable~, so guards on the parent keep matching; the sharper predicate is ~uv-libuv-unavailable?~ |
 | ~&uv-version-incompatible~ | ~compiled~ ~runtime~ | Either libuv version is outside the supported range |
 | ~&uv-constant-unavailable~ | ~name~ | The shim has no constant under that name |
 | ~&uv-invalid-argument~ | ~who~ ~reason~ | A caller error, refused before anything was allocated |

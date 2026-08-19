@@ -69,12 +69,14 @@
 ;; Runs the probe in a fresh subprocess with CHEZ_LIBUV_SHIM bound to
 ;; shim-override, or explicitly unset when shim-override is #f -- never left
 ;; to whatever the ambient environment happens to hold. Returns three values:
-;; exit code, captured stdout, captured stderr.
-(define (run-probe shim-override)
+;; exit code, captured stdout, captured stderr. The libdirs are a parameter
+;; so the libuv-leg cases below can resolve a synthetic
+;; (libuv private config) AHEAD of the generated one.
+(define (run-probe-with-libdirs libdirs shim-override)
   (let* ((prefix
           (string-append
            "unset CHEZ_LIBUV_SHIM; "
-           "CHEZSCHEMELIBDIRS=" (shell-quote chez-libdirs) " "
+           "CHEZSCHEMELIBDIRS=" (shell-quote libdirs) " "
            (if shim-override
                (string-append "CHEZ_LIBUV_SHIM=" (shell-quote shim-override) " ")
                "")))
@@ -85,6 +87,9 @@
     (let ((code (system cmd)))
       (values code (read-whole-file stdout-capture)
                    (read-whole-file stderr-capture)))))
+
+(define (run-probe shim-override)
+  (run-probe-with-libdirs chez-libdirs shim-override))
 
 (test-begin "shim-loading")
 
@@ -126,6 +131,59 @@
 (check-rejected "a non-library regular-file override"
                 (string-append (current-directory) "/Makefile"))
 (check-rejected "an empty override" "")
+
+;; --- the libuv leg, distinguished from the shim leg ----------------------
+;; A synthetic (libuv private config), resolved AHEAD of the generated one
+;; via CHEZSCHEMELIBDIRS, is the only seam to uv-library-paths -- there is
+;; deliberately no environment override for the libuv paths. Writing one
+;; whose uv-library-paths names a path that cannot exist drives the REAL
+;; uv-loaded definition down its failure arm in a fresh process, which must
+;; fail closed with &uv-libuv-unavailable: the SUBTYPE, whose stderr name
+;; no shim-leg failure above can print (their name is the plain
+;; "uv-shim-unavailable", which is not a substring of it and vice versa).
+(define fake-config-dir "tests/tmp/libuv-leg-config")
+(define fake-config-path
+  (string-append fake-config-dir "/libuv/private/config.sls"))
+
+(system (string-append "mkdir -p "
+                       (shell-quote (string-append fake-config-dir
+                                                   "/libuv/private"))))
+
+(define (write-fake-config! libuv-paths)
+  (when (file-exists? fake-config-path) (delete-file fake-config-path))
+  (call-with-output-file fake-config-path
+    (lambda (p)
+      (write `(library (libuv private config)
+                (export shim-path uv-library-paths
+                        uv-supported-version-range)
+                (import (rnrs))
+                (define shim-path ,shim-path)
+                (define uv-library-paths (quote ,libuv-paths))
+                (define uv-supported-version-range
+                  (quote ,uv-supported-version-range)))
+             p))))
+
+(define fake-libdirs (string-append fake-config-dir ":" chez-libdirs))
+
+;; Positive control FIRST: the synthetic config carrying the REAL values
+;; must still load and initialise. Without this, the failure rows below
+;; could pass because the shadowing machinery itself is broken -- a
+;; malformed library also exits non-zero.
+(write-fake-config! uv-library-paths)
+(let-values (((code out err) (run-probe-with-libdirs fake-libdirs #f)))
+  (test-equal "control: a synthetic config with the real libuv paths still initialises (exit 0)"
+    0 code)
+  (test-equal "control: the probe reached the end of its body through the synthetic config"
+    #t (contains? out "PROBE-OK: native loaded and initialised")))
+
+(write-fake-config! '("/no/such/libuv-for-this-probe.so"))
+(let-values (((code out err) (run-probe-with-libdirs fake-libdirs #f)))
+  (test-equal "a bad libuv path: fails closed (non-zero exit)"
+    #t (not (zero? code)))
+  (test-equal "a bad libuv path: raises uv-libuv-unavailable, the subtype, not the shim's own type"
+    #t (contains? err "uv-libuv-unavailable"))
+  (test-equal "a bad libuv path: never reached the end of the probe body"
+    #t (not (contains? out "PROBE-OK: native loaded and initialised"))))
 
 (test-end "shim-loading")
 

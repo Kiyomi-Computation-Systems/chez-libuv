@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md)

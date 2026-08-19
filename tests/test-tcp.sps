@@ -584,6 +584,21 @@
   (let ((base (uv-buf-base span-buf)))
     (if (and (> base span-block) (> base span-buf)) 'inside (list 'outside base))))
 
+;; The UPPER bound, which the row above cannot see: a payload placed past
+;; the block's end still satisfies "after the block start, after the
+;; uv_buf_t" while copy-in! corrupts whatever the allocator put next
+;; (final-review triage, Task 8 Minors). The block's end is redone from the
+;; same constants uv-write! sizes it with -- span-buf is already
+;; block + aligned req size, so the end is that plus sizeof(uv_buf_t) plus
+;; the span's own 3 bytes -- not read back out of the binding.
+(test-equal "the payload's last byte lies inside the request's own block too"
+  'inside
+  (let ((base (uv-buf-base span-buf))
+        (block-end (+ span-buf (sizeof-uv-buf-t) 3)))
+    (if (<= (+ base 3) block-end)
+        'inside
+        (list 'past-the-end base block-end))))
+
 ;; The bytes themselves. A copy that read from offset 0 instead of `start`
 ;; would put "012" here -- same length, same completion, wrong payload, and
 ;; invisible to every other row in this suite until Stage 5 can read the
@@ -1320,6 +1335,17 @@
 (test-equal "...and reaches neither on-data nor on-eof"
   (list s-fires-before-direct s-eof-before-direct)
   (list s-data-fires s-eof-fires))
+
+;; reading? records CALLER INTENT -- started and not yet stopped -- not
+;; libuv's live read state (the handles.sls record comment; final-review
+;; triage decision). At this point s-peer has been delivered a real EOF
+;; (the shutdown section above) AND an error (the ENOBUFS arm just now),
+;; and the flag must have survived both: only uv-read-stop! clears it.
+(test-equal "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!"
+  '(reading not-reading)
+  (list (if (tcp-reading? s-peer) 'reading 'not-reading)
+        (begin (uv-read-stop! s-peer)
+               (if (tcp-reading? s-peer) 'reading 'not-reading))))
 
 ;; Design spec S5's tolerance rule, on the read path: a read completion can
 ;; be queued behind a uv_close, and the handle it names is 'closing by the

@@ -765,6 +765,31 @@
     (copy-out 0 4)
     'no-raise))
 
+;; A NON-NUMBER span argument is the ordering case for copy-in!'s span check,
+;; exactly as an inexact length is for zero-out!'s: `exact?` is only defined
+;; on numbers, so testing it before `integer?` (which is total) turns the
+;; structured rejection into a bare Chez &assertion ("not a number") that
+;; nothing downstream can discriminate. zero-out! already tests integer?
+;; first; these two rows are what keep all three helpers agreeing on the
+;; safe order.
+(test-equal "copy-in! rejects a non-numeric start as a structured condition, not a bare assertion"
+  '(uv-copy-in! span-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (let ((addr (alloc-zeroed 8)))
+      (guard (inner (#t (free! addr) (raise inner)))
+        (copy-in! addr (u8-list->bytevector (list 1 2 3)) 'one 2)))
+    'no-raise))
+
+(test-equal "copy-out rejects a non-numeric length as a structured condition, not a bare assertion"
+  '(uv-copy-out length-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (copy-out 4096 'four)
+    'no-raise))
+
 ;; --- uv_buf_t ftype vs the shim's real layout (design spec S4 rule 4) ---
 ;; uv-buf-ftype-layout MEASURES the declared ftype -- offsets via
 ;; ftype-&ref address arithmetic, widths via the byte extent a real
@@ -1035,6 +1060,46 @@
   (guard (e ((uv-shim-unavailable? e) (uv-shim-unavailable-path e))
             (#t 'wrong-condition))
     (load-shim a-real-non-library-file)
+    'no-raise))
+
+;; --- the libuv leg: the SUBTYPE, through the same two procedures ---------
+;; native.sls's uv-loaded definition routes libuv's own shared objects
+;; through resolve-shim-path and load-shim with make-uv-libuv-unavailable,
+;; so a libuv-path failure is no longer mislabeled as the shim's (the
+;; final-review triage item). The maker argument is asserted here directly;
+;; tests/test-shim-loading.sps drives the real uv-loaded wiring end to end
+;; in a subprocess and greps for the subtype's name.
+;;
+;; Each row asserts the SHARPER predicate. The plain rows above prove the
+;; default maker still answers the parent type, so the pair together is what
+;; shows the argument actually selects the condition.
+(test-equal "resolve-shim-path raises the caller-supplied maker: the libuv leg gets the subtype"
+  '(libuv-unavailable "/no/such/libuv.dylib")
+  (guard (e ((uv-libuv-unavailable? e)
+             (list 'libuv-unavailable (uv-shim-unavailable-path e)))
+            (#t 'wrong-condition))
+    (resolve-shim-path "/no/such/libuv.dylib" #f make-uv-libuv-unavailable)
+    'no-raise))
+
+(test-equal "load-shim raises the caller-supplied maker on a real dlopen failure"
+  '(libuv-unavailable #t)
+  (guard (e ((uv-libuv-unavailable? e)
+             (list 'libuv-unavailable
+                   (string=? (uv-shim-unavailable-path e)
+                             a-real-non-library-file)))
+            (#t 'wrong-condition))
+    (load-shim a-real-non-library-file make-uv-libuv-unavailable)
+    'no-raise))
+
+;; The two-argument resolve-shim-path and one-argument load-shim keep their
+;; old contract: without a maker they still raise the PARENT type and not
+;; the subtype, so no existing caller's discrimination changed underneath it.
+(test-equal "without a maker, resolve-shim-path still raises the plain parent type"
+  'parent-only
+  (guard (e ((uv-libuv-unavailable? e) 'subtype)
+            ((uv-shim-unavailable? e) 'parent-only)
+            (#t 'wrong-condition))
+    (resolve-shim-path "/no/such/path.dylib" #f)
     'no-raise))
 
 ;; The path this process actually resolved is the generated one, since the

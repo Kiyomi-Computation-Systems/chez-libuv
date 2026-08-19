@@ -162,6 +162,13 @@
               (uv-constant-unavailable-name cu)
               'not-a-constant-unavailable))))
 
+(test-equal "&uv-libuv-unavailable is re-exported and subtypes &uv-shim-unavailable"
+  '(libuv-unavailable also-shim-unavailable "/nope/libuv")
+  (let ((e (make-uv-libuv-unavailable "/nope/libuv")))
+    (list (if (uv-libuv-unavailable? e) 'libuv-unavailable 'not-libuv-unavailable)
+          (if (uv-shim-unavailable? e) 'also-shim-unavailable 'not-shim-unavailable)
+          (uv-shim-unavailable-path e))))
+
 ;; --- the re-exported handle and timer surfaces --------------------------
 ;; Driven through the facade alone, for the same reason as the loop rows
 ;; above: every name below has to come from src/libuv.sls or this file does
@@ -335,6 +342,20 @@
 ;; events, and libuv does not promise them in the same iteration. Draining
 ;; only until the shutdown completed left the accept unobserved on some runs
 ;; and passed on others -- measured, not theorised.
+;;
+;; THE TICKER IS WHAT MAKES THE BOUND REAL (final-review triage, Task 9
+;; Minors). Without it, `uv-run 'once` BLOCKS waiting for an event, so a
+;; mutation that silences the I/O chain -- a dropped connect delivery, a
+;; miswired dispatcher -- left this suite HANGING instead of failing: the
+;; iteration bound was never reached because iterations stopped arriving.
+;; A repeating facade-only timer guarantees every 'once returns, so a dead
+;; chain now burns through the 32 iterations and the rows below fail BY
+;; NAME. Built from facade exports alone -- (uv-testing)'s run-until/ticking
+;; is exactly this, but that library imports (libuv tcp) directly and may
+;; not stand between this suite and the facade.
+(define f-ticker (make-uv-timer fl))
+(uv-timer-start! f-ticker (lambda (t) (collect)) 1 1)
+
 (let drain ((i 0))
   (when (and (< i 32)
              (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
@@ -342,6 +363,8 @@
                  (eq? f-read 'on-data-never-fired)))
     (uv-run fl 'once)
     (drain (+ i 1))))
+
+(uv-timer-stop! f-ticker)
 
 (test-equal "uv-tcp-connect! is re-exported and its callback reports success"
   'no-error (facade-err->symbol f-connect-err))

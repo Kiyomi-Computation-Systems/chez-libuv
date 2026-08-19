@@ -70,6 +70,8 @@
 
           &uv-shim-unavailable make-uv-shim-unavailable uv-shim-unavailable?
           uv-shim-unavailable-path
+          &uv-libuv-unavailable make-uv-libuv-unavailable
+          uv-libuv-unavailable?
 
           &uv-version-incompatible make-uv-version-incompatible
           uv-version-incompatible? uv-version-incompatible-compiled

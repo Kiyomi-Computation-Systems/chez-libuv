@@ -267,7 +267,16 @@
   ;;     design spec's own record row, is not.
   ;;
   ;; `read-buf` is a uptr (0 when there is none), `read-buf-len` its size in
-  ;; bytes, and `reading?` mirrors whether uv_read_start is currently active.
+  ;; bytes.
+  ;;
+  ;; `reading?` RECORDS CALLER INTENT -- a successful uv-read-start! not yet
+  ;; followed by uv-read-stop! -- NOT libuv's live read state (final-review
+  ;; triage, Task 9 Minors; decided post-v0.1). libuv clears its own
+  ;; UV_HANDLE_READING on EOF and stops the watcher on read errors, so a
+  ;; field that mirrored libuv would need per-arm knowledge of stream.c that
+  ;; varies across the supported 1.x range; intent needs none. The EOF and
+  ;; error dispatchers therefore deliberately leave it set. No production
+  ;; code reads it today; tests/test-tcp.sps locks the semantics in by name.
   (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
     (parent uv-handle-record)
     (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!)
@@ -580,20 +589,24 @@
   ;; callbacks land on a 'closing handle (an in-flight write losing its race
   ;; against uv_close completes with 'ECANCELED), and refusing to deliver
   ;; there would drop the one notification that says the block is gone.
-  (define (complete-request! name who count-free! req-ptr status)
-    (let ((req (registry-ref req-ptr)))
+  ;; `block-ptr`, not `req-ptr`: the latter would shadow the record accessor
+  ;; of the same name (final-review triage, Task 8 Minors). The name also
+  ;; says what it is -- the address of the whole co-allocated block, which
+  ;; is what gets freed.
+  (define (complete-request! name who count-free! block-ptr status)
+    (let ((req (registry-ref block-ptr)))
       (if (uv-req? req)
           (let ((loop (handle-loop (req-handle req)))
                 (on-complete (req-on-complete req)))
-            (registry-deregister! req-ptr)
-            (free! req-ptr)
+            (registry-deregister! block-ptr)
+            (free! block-ptr)
             (count-free!)
             (set-req-ptr! req 0)
             (when on-complete
               (dispatch-guarded
                loop
                (lambda () (on-complete (status->err status who))))))
-          (record-orphan-callback! name req-ptr))))
+          (record-orphan-callback! name block-ptr))))
 
   ;; The write payload lives INSIDE the write request's own block (design
   ;; spec S7: "exactly one foreign-alloc, sized for
@@ -944,6 +957,13 @@
           (loop-record-error! loop obj)
           (record-orphan-callback! name ptr))))
 
+  ;; The rest-args list this closure conses per fire, and its second
+  ;; hashtable lookup (dispatch-procedure), were measured against an
+  ;; arity-specific case-lambda replacement and kept: together with
+  ;; dispatcher-ref's lookup they cost ~6 ns of a >=26 microsecond fire
+  ;; (.plans/2026-08-18-dispatch-benchmark.md) -- and the rest-args half of
+  ;; that is pure noise, since Chez compiles this shape as well as the fixed
+  ;; arities.
   (define (seam-closure name)
     (lambda args
       (let ((ptr (if (pair? args) (car args) 0)))

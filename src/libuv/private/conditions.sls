@@ -27,6 +27,9 @@
           &uv-shim-unavailable make-uv-shim-unavailable uv-shim-unavailable?
           uv-shim-unavailable-path
 
+          &uv-libuv-unavailable make-uv-libuv-unavailable
+          uv-libuv-unavailable?
+
           &uv-version-incompatible make-uv-version-incompatible
           uv-version-incompatible? uv-version-incompatible-compiled
           uv-version-incompatible-runtime
@@ -72,6 +75,17 @@
   (define-condition-type &uv-shim-unavailable &uv-error
     make-uv-shim-unavailable uv-shim-unavailable?
     (path uv-shim-unavailable-path))
+
+  ;; --- &uv-libuv-unavailable -----------------------------------------------
+  ;; Raised when libuv's OWN shared object cannot be resolved or loaded
+  ;; (config.sls's uv-library-paths) -- a different failure from the shim's,
+  ;; with a different fix (install/point at libuv vs rebuild the shim). A
+  ;; SUBTYPE of &uv-shim-unavailable, deliberately: v0.1 raised both as the
+  ;; parent with the path field as the only discriminant (README.org's
+  ;; condition table), so every guard written against uv-shim-unavailable?
+  ;; must keep matching. The path field is inherited; there is no new one.
+  (define-condition-type &uv-libuv-unavailable &uv-shim-unavailable
+    make-uv-libuv-unavailable uv-libuv-unavailable?)
 
   ;; --- &uv-version-incompatible ------------------------------------------
   ;; Raised at initialisation when the shim's compile-time version and the
