@@ -13,6 +13,7 @@
 * Add entries to `CHANGELOG.md` for each release
 * Makefile should have a `help` command which lists all of the make commands.
 * Library should be distributable with Akku.
+* Closing Ritual: Squash merge PR, catchup local main, cleanup branches, reflect on session
 * Use TDD / test-driven development
 * A test that passes whether the code is right or wrong is worse than no test.
   Every decision in a module gets a mutation that breaks it, and the owning
