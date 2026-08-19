@@ -1,0 +1,365 @@
+* chez-libuv
+
+Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
+
+#+begin_quote
+✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
+#+end_quote
+-----
+
+© [[https://kiyomicomputation.systems/][Kiyomi Computation Systems LLC]], all rights reserved.
+
+* What it is
+
+A legible, low-level mirror of libuv's event loop, TCP sockets and timers.
+"Legible mirror" is the design constraint: the public API follows libuv's own
+verb set — ~accept~, ~read-start~, ~read-stop~, ~write~, ~shutdown~, ~timer~,
+~close~ — closely enough that a caller who knows libuv recognises the Scheme
+surface immediately. It is *transport only*: it parses nothing, understands no
+protocol above raw bytes, and deliberately provides no connection-state or
+backpressure policy of its own, so that the HTTP layer above it
+(~chez-http1~, ~chez-http-server~) can implement those directly against these
+primitives rather than against an abstraction this binding would have to
+invent and justify. The full design, with its ten accepted decision records,
+is ~.plans/2026-08-18-chez-libuv-v0.1-design.md~.
+
+* Status
+
+*v0.1.0.* The event loop, TCP (bind, listen, accept, connect, read with
+backpressure, write, shutdown), and timers. No DNS, no processes, no
+filesystem, no zero-copy I/O
+([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]] copies at the
+boundary and reserves the API shape for a later zero-copy variant).
+
+CI covers macOS and Linux, on both native-dependency acquisition paths.
+Windows is *deferred, not designed out*
+([[file:.plans/decisions/0004-windows-deferred-design-clean.md][ADR-0004]]):
+nothing here assumes POSIX semantics silently — the one libuv struct this
+binding constructs, ~uv_buf_t~, has a different field order on Windows, and
+its layout is validated against the shim's own ~offsetof~/~sizeof~ at
+initialisation, so an unverified platform fails closed instead of writing a
+length into a pointer field.
+
+* Requirements and Build
+
+** Prerequisites
+
+- *Chez Scheme* 10.4.1 or later. The binary is ~chez~.
+- *libuv 1.44.0* or later in the 1.x series — the floor this build declares
+  supported, from which ~make build~ derives the packed version range written
+  into the generated ~src/libuv/private/config.sls~. libuv guarantees ABI
+  stability across 1.x, so this is a range check and not an equality test; a
+  runtime library outside it makes initialisation raise
+  ~&uv-version-incompatible~ rather than run. Satisfied either by a system
+  package ~pkg-config~ can see, or by the vendored submodule below.
+
+** Build
+
+#+begin_src sh
+make build
+#+end_src
+
+compiles the C shim and writes ~src/libuv/private/config.sls~ — the shim's
+absolute path, the absolute paths of the libuv shared libraries to load
+before it, and the version range above. *That file is generated and
+gitignored*, not part of the repository, so a fresh clone has to run
+~make build~ before ~(import (libuv))~ can resolve.
+
+Where libuv itself comes from depends on ~pkg-config --exists libuv~:
+
+- *Succeeds* (e.g. ~brew install libuv~ on macOS): the shim is compiled
+  directly against that installed copy. Nothing under ~vendor/~ is touched.
+- *Fails* (the common case on a bare Linux box): ~HAVE_PKG~ evaluates to
+  ~no~, which makes the shim depend on ~vendor~ — so the same ~make build~
+  first runs ~git submodule update --init --recursive~ and builds the pinned
+  ~vendor/libuv~ submodule with CMake (shared library only), then links the
+  shim against that. Force this path deliberately, even with a system package
+  present — this is what CI's vendored job does — with:
+
+  #+begin_src sh
+  make HAVE_PKG=no build
+  #+end_src
+
+Which path is active, and what it produced:
+
+#+begin_src sh
+make deps-info
+#+end_src
+
+~make help~ lists every target.
+
+** Running
+
+Chez has to be told where the library lives; ~CHEZSCHEMELIBDIRS~ must include
+~src~:
+
+#+begin_src sh
+CHEZSCHEMELIBDIRS=src chez --program your-script.sps
+#+end_src
+
+#+begin_src sh
+make dev
+#+end_src
+
+does this for interactive use. It runs ~build~ and ~deps~ first — the latter
+vendors ~chez-srfi~ into ~build/scheme-libs~ for the test suites; ~(libuv)~
+itself needs none of it — then starts a REPL with
+~CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs~.
+
+** ~CHEZ_LIBUV_SHIM~
+
+Environment override for the shim's absolute path, read once at
+initialisation — config in the environment is 12-factor. It is *validated,
+never searched*:
+
+- *Unset*: the default path ~make build~ recorded in ~config.sls~ is used,
+  and must itself exist as a regular file.
+- *Set*: must be an *absolute* path (leading ~/~) to an *existing regular
+  file*; that exact file is loaded.
+- Anything else — a relative path, a path that does not exist, a directory —
+  raises ~&uv-shim-unavailable~ immediately. There is no ~PATH~ search, no
+  falling back to the default, and the working directory is never consulted.
+
+** Release builds
+
+~make build~ links a *dev* shim: ~-O0 -g~, with ~-DCHEZ_LIBUV_DEBUG_COUNTERS~
+defined, which is what makes the allocation counters the test suites assert
+on report real numbers. A release build turns both off:
+
+#+begin_src sh
+make prod
+#+end_src
+
+cleans, relinks at ~-O2~ with the counters compiled out (~make build
+FLAVOR=prod~ does the link alone), and then runs ~make check-prod~ —
+~tests/check-prod.sps~, which allocates a loop and a bound TCP handle and
+fails unless every counter reads zero while they are demonstrably alive. That
+is a *behavioural* check on the artifact rather than a claim about the
+command that produced it, because ~prod~ and ~build~ write the same file:
+before this existed, ~make prod && make test && package~ shipped a debug
+build, since ~test~ depends on ~build~ and ~build~ relinked.
+
+What makes the flip take is ~relink-guard~, the first prerequisite of
+~build~: a ~build/.flavor-*~ stamp *records* which flavor the artifact was
+linked as, and the guard *deletes* the artifact when that no longer matches
+what was asked for. The deletion is the load-bearing part, not the stamp —
+make 3.81 (which macOS ships) compares mtimes at one-second granularity and
+treats equal as up to date, so a stamp recreated in the same second as the
+previous link — exactly what ~make prod && make test~ does — forces nothing at
+all, while a missing artifact is rebuilt whatever the clock said. So ~make
+test~ after ~make prod~ self-heals back to a dev shim, the suites' counter
+rows keep working, and the same guard covers a change of acquisition path.
+
+* Quickstart
+
+An echo server and one client, on one loop, in one process — the whole public
+API surface in miniature. ~tests/test-echo.sps~ is this program with eight
+concurrent clients, 32 KiB payloads and assertions.
+
+#+begin_src scheme
+(import (rnrs) (libuv))
+
+;; A span is [start, end), like every other R6RS range. on-data is handed a
+;; FRESH bytevector per delivery (ADR-0009), so this copy is only about
+;; taking the sub-range.
+(define (span->bytevector bv start end)
+  (let ((out (make-bytevector (- end start))))
+    (bytevector-copy! bv start out 0 (- end start))
+    out))
+
+(define loop (make-uv-loop))
+(define echoed #f)
+
+;; --- the server: echo the exact span back, close when the peer is done ---
+(define server (make-uv-tcp loop))
+(uv-tcp-bind! server "127.0.0.1" 0)
+(define port (uv-tcp-getsockname-port server))
+
+(uv-listen! server 128
+            (lambda (err)
+              (unless err
+                (let ((peer (uv-accept! server)))
+                  (uv-read-start!
+                   peer
+                   (lambda (bv start end)              ; on-data
+                     (uv-write! peer bv start end (lambda (err) #f)))
+                   (lambda ()                          ; on-eof: not an error
+                     (uv-shutdown! peer (lambda (err) (uv-close! peer))))
+                   (lambda (err)                       ; on-error: a condition
+                     (uv-close! peer)))))))
+
+;; --- one client, on the SAME loop ---------------------------------------
+(define client (make-uv-tcp loop))
+
+(uv-tcp-connect!
+ client "127.0.0.1" port
+ (lambda (err)
+   (unless err
+     (uv-read-start!
+      client
+      (lambda (bv start end)
+        (set! echoed (utf8->string (span->bytevector bv start end)))
+        (uv-shutdown! client (lambda (err) (uv-close! client)))
+        (uv-close! server))
+      (lambda () #f)
+      (lambda (err) (uv-close! client)))
+     (uv-write! client (string->utf8 "hello, libuv\n") (lambda (err) #f)))))
+
+;; Callbacks run here and nowhere else. uv-run answers #f when the loop has
+;; run dry; uv-loop-teardown! closes whatever is left, drains it, and closes
+;; the loop (there are no guardians -- ADR-0007).
+(uv-run loop 'default)
+(uv-loop-teardown! loop)
+
+(display echoed)
+#+end_src
+
+Three rules that program depends on, and that the design spec (§5–§9) states
+in full:
+
+- *A close is asynchronous.* ~uv-close!~ *starts* the close; the handle is
+  ~closing~ until the loop runs its close callback, which is the only place a
+  handle's memory is ever released. Nothing is freed by the garbage collector
+  ([[file:.plans/decisions/0007-no-guardians-explicit-close.md][ADR-0007]]).
+- *EOF is not an error.* It is its own callback, taking no arguments, and it
+  is never wrapped in a condition. A read *error* is delivered to ~on-error~
+  as a condition *object* — never raised across the callback boundary — and
+  does not close the handle: what to do about it is the caller's decision.
+- *A callback that raises does not cross into C.* The first raise of a run is
+  stored, the loop is stopped, and it is re-raised from ~uv-run~ wrapped in
+  ~&uv-callback-error~ and composed with the original condition, so a ~guard~
+  written against the original type still matches. Later raises in the same
+  run are readable through ~uv-loop-deferred-errors~.
+
+* API overview
+
+One line per export. Argument lists, span conventions, error behaviour and
+the lifecycle state machine are in the design spec, ~§5~–~§9~; these tables
+exist so you can see the whole surface at once, not to restate it.
+
+** The loop — ~(libuv loop)~
+
+| Export | |
+|--------------------------+--------------------------------------------------------------|
+| ~make-uv-loop~ | A new loop. Initialises the binding, including the version gate |
+| ~uv-loop?~ ~uv-loop-open?~ | Is this a loop; is it still open |
+| ~uv-run~ | Run it: ~'default~, ~'once~, or ~'nowait~. ~#t~ if work remains |
+| ~uv-stop!~ | Stop the loop; legal from inside a callback |
+| ~uv-loop-alive?~ | Whether the loop has anything left to do |
+| ~uv-now~ | libuv's cached "now", in ms, updated once per iteration |
+| ~uv-loop-live-handles~ | Fresh list of the handle records registered on this loop |
+| ~uv-loop-deferred-errors~ | Everything callbacks raised this run *after* the first |
+| ~uv-loop-close!~ | Close the loop. ~'EBUSY~ while handles are still open |
+| ~uv-loop-teardown!~ | Close every handle, drain, then close the loop |
+| ~call-with-uv-loop~ | The above as a scope; tears down on every exit path |
+
+** Handles — ~(libuv handle)~
+
+| Export | |
+|-------------------------------------+------------------------------------------------------|
+| ~uv-handle?~ ~uv-timer?~ ~uv-tcp?~ | Type predicates |
+| ~uv-handle-open?~ ~uv-handle-closing?~ | State predicates. Never raise, on anything |
+| ~uv-handle-state~ | ~'open~ \vert{} ~'closing~ \vert{} ~'closed~. There is no ~uv-handle-closed?~ — that name is the condition predicate |
+| ~uv-handle-loop~ | The owning loop; answers for a closed handle too |
+| ~uv-close!~ | Start the close, optionally with an ~on-close~ callback. Idempotent |
+
+** TCP — ~(libuv tcp)~
+
+| Export | |
+|----------------------------+------------------------------------------------------------|
+| ~make-uv-tcp~ | A new TCP handle on a loop |
+| ~uv-tcp-bind!~ | Bind to an address and port; IPv4 or IPv6 literal |
+| ~uv-tcp-getsockname-port~ | The real port the kernel chose, for a bind to port 0 |
+| ~uv-listen!~ | Listen; ~on-connection~ is called with the error or ~#f~ |
+| ~uv-accept!~ | A new open handle for the queued connection |
+| ~uv-tcp-connect!~ | Connect; answers the in-flight request record |
+| ~uv-write!~ | Write a bytevector or a span of one. The payload is copied |
+| ~uv-shutdown!~ | Shut the write side down; the read side stays open |
+| ~uv-read-start!~ | Start reading: ~on-data~ ~(bv start end)~, ~on-eof~ ~()~, ~on-error~ ~(condition)~. All three required |
+| ~uv-read-stop!~ | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
+| ~uv-tcp-nodelay!~ | ~TCP_NODELAY~. Takes a boolean, not an int |
+
+** Timers — ~(libuv timer)~
+
+| Export | |
+|--------------------------------------+----------------------------------------------|
+| ~make-uv-timer~ | A new timer on a loop |
+| ~uv-timer-start!~ | Arm it: timeout and repeat, in milliseconds |
+| ~uv-timer-stop!~ | Disarm it |
+| ~uv-timer-again!~ | Restart a repeating timer |
+| ~uv-timer-repeat~ ~uv-timer-set-repeat!~ | Read and set the repeat interval |
+
+** Versions — ~(libuv)~
+
+| Export | |
+|----------------------------+-------------------------------------------------------|
+| ~uv-version~ | The running libuv's version *string*, e.g. ~"1.52.1"~ |
+| ~uv-version-compatible?~ | Whether compile-time and runtime libuv both fall in the supported range |
+
+** Conditions — all re-exported from ~(libuv)~
+
+Every condition type comes with its predicate, its constructor and its field
+accessors; the constructors are public because a caller's own ~on-error~ may
+want to build or re-raise one
+([[file:.plans/decisions/0006-error-codes-are-symbols.md][ADR-0006]] is why
+the discriminant is a symbol).
+
+| Condition | Fields | Raised when |
+|------------------------------+-----------------------------+---------------------------------------------|
+| ~&uv-error~ | — | The root; everything below derives from it |
+| ~&uv-errno-error~ | ~errno~ ~code~ ~message~ | libuv returned a negative code. ~errno~ is the portable symbol (~'ECONNRESET~) and the thing to branch on; ~code~ is the raw platform int, for logs |
+| ~&uv-handle-closed~ | ~kind~ | An operation on a handle or loop that is already closed |
+| ~&uv-shim-unavailable~ | ~path~ | The shim could not be found or loaded — also raised, with ~path~ set to the offending path, when one of the libuv library paths fails to load (the ~path~ field is what disambiguates which); considered for a subtype in v0.2 |
+| ~&uv-version-incompatible~ | ~compiled~ ~runtime~ | Either libuv version is outside the supported range |
+| ~&uv-constant-unavailable~ | ~name~ | The shim has no constant under that name |
+| ~&uv-invalid-argument~ | ~who~ ~reason~ | A caller error, refused before anything was allocated |
+| ~&uv-callback-error~ | ~cause~ | A callback raised; composed with the original condition |
+
+* Tests
+
+#+begin_src sh
+make test
+#+end_src
+
+runs every ~tests/test-*.sps~ suite and fails if any of them do. It keeps
+going after a failure, so one broken suite cannot hide the others.
+
+#+begin_src sh
+make check-purity
+#+end_src
+
+runs the suites that must have *no* native dependency with
+~CHEZ_LIBUV_SHIM~ poisoned to a path that does not exist. If anything in
+such a suite's import chain reaches the shim, it fails at import time,
+before a single assertion runs.
+
+#+begin_src sh
+make check-pins
+#+end_src
+
+fails if the ~chez-srfi~ submodule and ~Akku.lock~ name different commits, if
+the vendored libuv is outside the supported range, or if this file stops
+stating the version floor.
+
+#+begin_src sh
+make test-memory
+#+end_src
+
+runs the suites again under Valgrind on Linux, or an AddressSanitizer
+preload on macOS. *Only the Linux run can support a leak claim* —
+LeakSanitizer does not exist on macOS/ARM64, so the macOS leg reports
+use-after-free and double-free and says nothing at all about leaks
+([[file:.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md][ADR-0003]]).
+The Linux leg sets ~UV_USE_IO_URING=0~: some CI kernels reject ~io_uring~
+setup calls that Valgrind's syscall emulation does not model, which produces
+failures that have nothing to do with this binding. That is an escape hatch
+for the Valgrind leg only — ~io_uring~ stays on for ~make test~.
+
+Every assertion in those suites has been watched to fail. Each stage's
+mutation log (~.plans/stage-N-mutation-log.md~) records the mutation that
+breaks each decision, the assertion that caught it *by name*, and — where
+nothing could catch one — why, rather than leaving the gap silent.
+
+* License
+
+BSD 3-Clause. See ~LICENSE~.
