@@ -5,9 +5,6 @@ Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
 #+begin_quote
 ✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
 #+end_quote
------
-
-© [[https://kiyomicomputation.systems/][Kiyomi Computation Systems LLC]], all rights reserved.
 
 * What it is
 
@@ -364,3 +361,7 @@ nothing could catch one — why, rather than leaving the gap silent.
 * License
 
 BSD 3-Clause. See ~LICENSE~.
+
+-----
+
+© [[https://kiyomicomputation.systems/][Kiyomi Computation Systems LLC]], all rights reserved.
