@@ -37,7 +37,13 @@
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
-          (libuv private native)
+          ;; require-callback is EXCEPTED: native.sls now exports its own
+          ;; (Task 4, v0.3), and this file keeps its own private copy below
+          ;; until Task 7 moves the verbs that use it -- a blanket import of
+          ;; both would be "multiple definitions for require-callback in
+          ;; body". The two copies are identical; excepting here is what
+          ;; keeps that true rather than merely asserted.
+          (except (libuv private native) require-callback)
           (libuv private handles))
 
   ;; --- argument predicates ------------------------------------------------

@@ -1182,18 +1182,17 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-;; Task 4 adds the three new rows to live-counts; until then this assertion
-;; stays RED and is skipped by the commented block below.
-;; (test-equal "live-counts reports all eleven allocation classes"
-;;   '(loop tcp timer write-req connect-req
-;;     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
-;;   (map car (live-counts)))
-
-;; For now, assert the eight existing classes:
-(test-equal "live-counts reports all eight allocation classes"
+;; Task 4 added the three new rows to live-counts.
+(test-equal "live-counts reports all eleven allocation classes"
   '(loop tcp timer write-req connect-req
-    getaddrinfo-req getnameinfo-req read-buffer)
+    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
   (map car (live-counts)))
+
+;; Superseded by the eleven-class row above, kept for provenance:
+;; (test-equal "live-counts reports all eight allocation classes"
+;;   '(loop tcp timer write-req connect-req
+;;     getaddrinfo-req getnameinfo-req read-buffer)
+;;   (map car (live-counts)))
 
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
@@ -1388,10 +1387,10 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
-;; --- the ten callback dispatcher slots, BEFORE anything installs them ---
+;; --- the twelve callback dispatcher slots, BEFORE anything installs them --
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
-;; installs the ten dispatchers in its own library body, at instantiation
+;; installs the twelve dispatchers in its own library body, at instantiation
 ;; (design spec S4: "the slots themselves are filled exactly once, by
 ;; handles.sls"). In every other suite's process the install has therefore
 ;; already happened before the first test line runs, so the uninstalled
@@ -1400,9 +1399,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the ten callback types the design commits to"
+(test-equal "dispatcher-names names the twelve callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo)
+    getaddrinfo getnameinfo exit walk)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1418,7 +1417,27 @@
        'no-raise)))
  dispatcher-names)
 
-(test-equal "dispatcher-ref rejects a name that is not one of the ten"
+;; The exit and walk slots, specifically: v0.3's two additions to the
+;; twelve, asserted with their own real arity (three args for exit, two for
+;; walk) and the exact uninstalled-stub message, beside the generic
+;; single-arg loop above (ADR-0015; test-native.sps never imports
+;; handles.sls, so both slots stay uninstalled for the life of this suite's
+;; process).
+(test-assert "the exit slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'exit) 0 0 0)
+    #f))
+
+(test-assert "the walk slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'walk) 0 0)
+    #f))
+
+(test-equal "dispatcher-ref rejects a name that is not one of the twelve"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1429,7 +1448,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the ten is refused, naming who and why"
+(test-equal "an install missing one of the twelve is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
