@@ -3,16 +3,75 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.2.0 — 2026-08-21
 
-- **Added** `&uv-libuv-unavailable`, raised when libuv's own shared object
+DNS: libuv's complete resolver surface — `uv_getaddrinfo`, `uv_getnameinfo`,
+`uv_cancel` — as `(libuv dns)`, in the established house style. What
+`getaddrinfo(3)` and `getnameinfo(3)` do on the host is what this binding
+does: no c-ares, no record types (MX/TXT/SRV), no caching, async only. This
+is the binding's first use of libuv's worker threads and its first
+handle-less, loop-scoped request kind; both firsts are governed by new
+decision records (ADRs 0011–0013 under `.plans/decisions/`, gated on the
+Stage 0 spike under `spike/dns/`), and the full design is
+`.plans/2026-08-21-chez-libuv-v0.2-dns-design.md`.
+
+### Added
+
+- `(libuv dns)`: `uv-getaddrinfo!` (node/service strings or `#f`, hints as
+  an alist over closed symbol sets — `family`/`socktype`/`protocol`/`flags`,
+  no raw ints), `uv-getnameinfo!` (the TCP address vocabulary on the way
+  in), `uv-cancel!` (`#t` only if the work was still queued; the callback
+  still fires, with `'EAI_CANCELED`), and `uv-dns-request?`. Results are
+  `uv-addrinfo` records — pure copied Scheme values with a public
+  constructor and six accessors; nothing here takes or returns a pointer.
+  All of it re-exported from `(libuv)`.
+- Resolver failures surface as ordinary `&uv-errno-error` conditions whose
+  `errno` is the `EAI_*` symbol (`'EAI_NONAME`, `'EAI_AGAIN`,
+  `'EAI_CANCELED`, …) — no DNS-specific condition types, and cancellation
+  is `'EAI_CANCELED` in exactly one spelling, because libuv itself rewrites
+  `UV_ECANCELED` before the callback runs.
+- `&uv-libuv-unavailable`, raised when libuv's own shared object
   cannot be resolved or loaded — a subtype of `&uv-shim-unavailable`, so
   guards on the parent keep matching (previously both failures were raised
   as the parent, with the `path` field as the only discriminant).
   Re-exported from `(libuv)`; sharper predicate `uv-libuv-unavailable?`.
-- **Fixed** `copy-in!`/`copy-out` (private FFI helpers): a non-numeric span
+
+### Changed
+
+- Callback dispatch grows from eight to ten static locked trampolines.
+  ADR-0008 is amended in place: the invariant is "one locked trampoline per
+  callback *type*, constant per process", which the literal eight was an
+  instance of.
+- `uv-loop-teardown!` is now cancel-then-drain: it best-effort-cancels the
+  loop's in-flight DNS requests before its close sweep, and every in-flight
+  `on-complete` runs before teardown returns — with `'EAI_CANCELED` if the
+  cancel won, with the real result if the work was already running. A
+  running `getaddrinfo(3)` is uninterruptible, so that drain iteration
+  waits it out, up to the OS resolver's own timeout.
+- **Behaviour change:** `uv-loop-close!` now re-raises a stored pending
+  callback error after a *successful* close, composed as
+  `&uv-callback-error` with the original condition — the exact composition
+  `uv-run`'s exit path uses. Previously a caller who skipped the next
+  `uv-run` and went straight to close lost the error silently; code that
+  relied on that discard will now see the raise (the loop is closed when it
+  escapes). A close refused with `'EBUSY` is unchanged: nothing is
+  delivered, and the error stays pending for a later `uv-run` or close.
+
+### Fixed
+
+- `copy-in!`/`copy-out` (private FFI helpers): a non-numeric span
   argument now raises the structured `&uv-invalid-argument` instead of a
   bare Chez assertion escaping from `exact?`.
+
+### Notes
+
+- IPv6 scope IDs are dropped (ADR-0012): a link-local result renders as
+  `"fe80::1"` with its zone silently absent. The fix path (a shim offset
+  for `sin6_scope_id` plus `uv_if_indextoname`) is recorded in the ADR.
+- Threadpool workers run pure C — no Scheme ever runs off the loop thread —
+  and completions are delivered on the loop thread like every other
+  callback. `UV_THREADPOOL_SIZE` is read by libuv once, at first use.
+- The libuv version floor is unchanged: 1.44.0 or later in the 1.x series.
 
 ## 0.1.0 — 2026-08-18
 

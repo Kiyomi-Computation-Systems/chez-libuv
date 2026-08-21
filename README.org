@@ -8,23 +8,28 @@ Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
 
 * What it is
 
-A legible, low-level mirror of libuv's event loop, TCP sockets and timers.
-"Legible mirror" is the design constraint: the public API follows libuv's own
-verb set — ~accept~, ~read-start~, ~read-stop~, ~write~, ~shutdown~, ~timer~,
-~close~ — closely enough that a caller who knows libuv recognises the Scheme
+A legible, low-level mirror of libuv's event loop, TCP sockets, timers and
+DNS. "Legible mirror" is the design constraint: the public API follows
+libuv's own verb set — ~accept~, ~read-start~, ~read-stop~, ~write~,
+~shutdown~, ~timer~, ~getaddrinfo~, ~getnameinfo~, ~cancel~, ~close~ —
+closely enough that a caller who knows libuv recognises the Scheme
 surface immediately. It is *transport only*: it parses nothing, understands no
 protocol above raw bytes, and deliberately provides no connection-state or
 backpressure policy of its own, so that the HTTP layer above it
 (~chez-http1~, ~chez-http-server~) can implement those directly against these
 primitives rather than against an abstraction this binding would have to
 invent and justify. The full design, with its ten accepted decision records,
-is ~.plans/2026-08-18-chez-libuv-v0.1-design.md~.
+is ~.plans/2026-08-18-chez-libuv-v0.1-design.md~; the v0.2 DNS addition has
+its own spec, ~.plans/2026-08-21-chez-libuv-v0.2-dns-design.md~, with ADRs
+0011–0013.
 
 * Status
 
-*v0.1.0.* The event loop, TCP (bind, listen, accept, connect, read with
-backpressure, write, shutdown), and timers. No DNS, no processes, no
-filesystem, no zero-copy I/O
+*v0.2.0.* The event loop, TCP (bind, listen, accept, connect, read with
+backpressure, write, shutdown), timers, and DNS (~getaddrinfo~,
+~getnameinfo~, ~cancel~ — whatever the host's resolver does, asynchronously;
+no c-ares, no record types, no caching). No processes, no
+filesystem, no UDP, no zero-copy I/O
 ([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]] copies at the
 boundary and reserves the API shape for a later zero-copy variant).
 
@@ -275,6 +280,58 @@ exist so you can see the whole surface at once, not to restate it.
 | ~uv-read-start!~ | Start reading: ~on-data~ ~(bv start end)~, ~on-eof~ ~()~, ~on-error~ ~(condition)~. All three required |
 | ~uv-read-stop!~ | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
 | ~uv-tcp-nodelay!~ | ~TCP_NODELAY~. Takes a boolean, not an int |
+
+** DNS — ~(libuv dns)~
+
+| Export | |
+|----------------------------+------------------------------------------------------------|
+| ~uv-getaddrinfo!~ | Resolve: ~(loop node service [hints] on-complete)~; ~on-complete~ gets ~(err results)~, ~results~ a fresh list of ~uv-addrinfo~ records in resolver order |
+| ~uv-getnameinfo!~ | Reverse: ~(loop ip port [flags] on-complete)~; ~on-complete~ gets ~(err host service)~, both strings on success, both ~#f~ on failure |
+| ~uv-cancel!~ | Best-effort cancel. ~#t~ only if the work was still queued — the callback still fires, with ~'EAI_CANCELED~; ~#f~ means too late, the real result is (or was) delivered |
+| ~uv-dns-request?~ | Whether this is a request ~uv-cancel!~ accepts |
+| ~make-uv-addrinfo~ | Public constructor — the record is pure data, and a caller's test double is legitimate |
+| ~uv-addrinfo?~ | Type predicate |
+| ~uv-addrinfo-family~ | ~'inet~ \vert{} ~'inet6~. Other families are skipped during the chain walk, so a success can answer ~'()~ |
+| ~uv-addrinfo-socktype~ | ~'stream~ \vert{} ~'dgram~ \vert{} ~'raw~, or the raw int when unmapped |
+| ~uv-addrinfo-protocol~ | ~'tcp~ \vert{} ~'udp~, or the raw int (0 = unspecified) |
+| ~uv-addrinfo-address~ | Presentation string, rendered by libuv's own formatter |
+| ~uv-addrinfo-port~ | Exact integer 0..65535 |
+| ~uv-addrinfo-canonname~ | ~#f~ except on the first entry under the ~canonname~ flag |
+
+~hints~ is an alist over closed symbol sets — ~'((family . inet6)
+(socktype . stream) (protocol . tcp) (flags . (canonname numeric-host)))~ —
+and errors reach the callback as ordinary ~&uv-errno-error~ conditions whose
+~errno~ is the ~EAI_*~ symbol (~'EAI_NONAME~, ~'EAI_AGAIN~,
+~'EAI_CANCELED~, …); there are no DNS-specific condition types. Five
+behaviours worth knowing before the design spec:
+
+- *This is the binding's first threadpool-backed feature.* The resolver
+  calls run on libuv's worker threads — pure C; no Scheme ever runs off the
+  loop thread — and completions are delivered on the loop thread like every
+  other callback. The pool is sized by ~UV_THREADPOOL_SIZE~, which libuv
+  reads once, at first use.
+- *Omitted, ~#f~ and ~'()~ hints all mean NULL hints* — the platform's own
+  documented default, which typically answers one entry per (address ×
+  socktype): ~stream~, ~dgram~, and on Linux ~raw~ too.
+  ~'((socktype . stream))~ is the one-liner for one entry per address.
+- *IPv6 scope IDs are dropped*
+  ([[file:.plans/decisions/0012-address-vocabulary.md][ADR-0012]]): a
+  link-local result renders as ~"fe80::1"~ with its zone silently absent.
+- *Teardown cancels, then drains.* ~uv-loop-teardown!~ best-effort-cancels
+  the loop's in-flight DNS requests before its close sweep, and every
+  in-flight ~on-complete~ runs before teardown returns — with
+  ~'EAI_CANCELED~ if the cancel won, with the real result if the work was
+  already running. A ~getaddrinfo(3)~ already running in a worker cannot be
+  interrupted, so that drain iteration waits it out, up to the OS
+  resolver's own timeout.
+- *~uv-loop-close!~ now delivers a pending callback error* (a v0.2
+  behaviour change, not DNS-specific): after a successful close it
+  re-raises a stored pending callback error composed as
+  ~&uv-callback-error~, exactly as ~uv-run~'s exit does — previously a
+  caller who skipped the next ~uv-run~ and went straight to close lost the
+  error silently. The loop is closed when the raise escapes; a close
+  refused with ~'EBUSY~ still delivers nothing, and the error stays
+  pending.
 
 ** Timers — ~(libuv timer)~
 
