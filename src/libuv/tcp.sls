@@ -53,22 +53,6 @@
     (require-open-handle tcp who)
     tcp)
 
-  ;; A port as libuv takes it: an exact integer in 0..65535, where 0 means
-  ;; "let the kernel choose" for bind. Checked explicitly because the FFI
-  ;; declares `int`, so a bignum or an inexact number is either a Chez
-  ;; marshalling error from deep inside the call or a silently truncated
-  ;; port number.
-  (define (valid-port? n)
-    (and (integer? n) (exact? n) (>= n 0) (<= n 65535)))
-
-  (define (require-port port who)
-    (unless (valid-port? port)
-      (raise (make-uv-invalid-argument who 'port-out-of-range))))
-
-  (define (require-address ip who)
-    (unless (string? ip)
-      (raise (make-uv-invalid-argument who 'address-not-a-string))))
-
   (define (require-callback proc who reason)
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
@@ -80,6 +64,9 @@
   ;; handles) beside complete-request! (design spec v0.2 S5.3, ADR-0011),
   ;; imported above, for the same reason -- dns.sls's start calls need the
   ;; identical sync-failure undo the three request verbs below guard with.
+  ;; require-address and require-port went the same way post-v0.2 (the
+  ;; whole-branch review's duplication finding): dns.sls had restated them
+  ;; verbatim, so ADR-0012's vocabulary now lives beside fill-sockaddr!.
 
   ;; --- construction (design spec S5) --------------------------------------
   ;; The size comes from uv_handle_size(UV_TCP) -- the RUNNING library's own

@@ -1,6 +1,6 @@
 # ADR-0012: An address is a presentation-form string; a port is a separate exact integer
 
-- **Status:** Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4
+- **Status:** Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4. Amended 2026-08-21 (post-v0.2): the validators moved — see the dated note inline.
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.2
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.2-dns-design.md), [ADR-0005](0005-constants-are-never-transcribed.md), [ADR-0009](0009-copy-at-the-boundary.md)
@@ -53,6 +53,13 @@ The vocabulary is symmetric across the API: `uv-getnameinfo!` accepts
 `(ip, port)` in exactly the terms `uv-tcp-bind!`/`uv-tcp-connect!` already
 use (`require-address`/`require-port`, tcp.sls:61-70), and `uv-addrinfo`
 results speak the same terms back.
+
+> **Amended 2026-08-21 (post-v0.2, whole-branch review).** The validators
+> moved: `require-address`/`require-port` now live in `(libuv private
+> native)` beside `fill-sockaddr!` — one copy, imported by tcp.sls and
+> dns.sls, after the review flagged the dns.sls restatement as
+> duplication. The vocabulary itself is unchanged; the citation above is
+> where the definitions sat when this was accepted.
 
 ## Consequences
 
