@@ -113,7 +113,10 @@
           count-connect-req-new! count-connect-req-free!
           count-getaddrinfo-req-new! count-getaddrinfo-req-free!
           count-getnameinfo-req-new! count-getnameinfo-req-free!
-          count-read-buffer-new! count-read-buffer-free!)
+          count-read-buffer-new! count-read-buffer-free!
+          count-pipe-new!        count-pipe-free!
+          count-process-new!     count-process-free!
+          count-spawn-options-new! count-spawn-options-free!)
   ;; file-exists? is deliberately absent from the (chezscheme) import below:
   ;; (rnrs) already exports it via (rnrs files), and importing it from both
   ;; raises "multiple definitions for file-exists? in body". The same is true
@@ -278,6 +281,23 @@
     (foreign-procedure "chez_uv_count_read_buffer_free" () void))
   (define live-read-buffer
     (foreign-procedure "chez_uv_live_read_buffer" () long))
+
+  (define count-pipe-new!  (foreign-procedure "chez_uv_count_pipe_new" () void))
+  (define count-pipe-free! (foreign-procedure "chez_uv_count_pipe_free" () void))
+  (define live-pipe        (foreign-procedure "chez_uv_live_pipe" () long))
+
+  (define count-process-new!
+    (foreign-procedure "chez_uv_count_process_new" () void))
+  (define count-process-free!
+    (foreign-procedure "chez_uv_count_process_free" () void))
+  (define live-process (foreign-procedure "chez_uv_live_process" () long))
+
+  (define count-spawn-options-new!
+    (foreign-procedure "chez_uv_count_spawn_options_new" () void))
+  (define count-spawn-options-free!
+    (foreign-procedure "chez_uv_count_spawn_options_free" () void))
+  (define live-spawn-options
+    (foreign-procedure "chez_uv_live_spawn_options" () long))
 
   ;; --- libuv bindings ---------------------------------------------------
   ;; v0.1 binds only what the version gate, the error translation, and the

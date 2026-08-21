@@ -73,4 +73,16 @@ void chez_uv_count_read_buffer_new(void);
 void chez_uv_count_read_buffer_free(void);
 long chez_uv_live_read_buffer(void);
 
+void chez_uv_count_pipe_new(void);
+void chez_uv_count_pipe_free(void);
+long chez_uv_live_pipe(void);
+
+void chez_uv_count_process_new(void);
+void chez_uv_count_process_free(void);
+long chez_uv_live_process(void);
+
+void chez_uv_count_spawn_options_new(void);
+void chez_uv_count_spawn_options_free(void);
+long chez_uv_live_spawn_options(void);
+
 #endif /* CHEZ_LIBUV_SHIM_H */

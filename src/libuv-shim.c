@@ -4,6 +4,7 @@
 
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -105,6 +106,54 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "NI_NUMERICSERV", NI_NUMERICSERV },
   { "NI_NAMEREQD",    NI_NAMEREQD },
   { "NI_DGRAM",       NI_DGRAM },
+
+  /* v0.3 process + pipe (THE SPEC §5.3; ADR-0005). */
+  { "UV_PROCESS",    UV_PROCESS },
+  { "UV_NAMED_PIPE", UV_NAMED_PIPE },
+  { "SIZEOF_UV_PROCESS_OPTIONS_T", (long)sizeof(uv_process_options_t) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_EXIT_CB",
+    (long)offsetof(uv_process_options_t, exit_cb) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_FILE",
+    (long)offsetof(uv_process_options_t, file) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_ARGS",
+    (long)offsetof(uv_process_options_t, args) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_ENV",
+    (long)offsetof(uv_process_options_t, env) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_CWD",
+    (long)offsetof(uv_process_options_t, cwd) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_FLAGS",
+    (long)offsetof(uv_process_options_t, flags) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO_COUNT",
+    (long)offsetof(uv_process_options_t, stdio_count) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO",
+    (long)offsetof(uv_process_options_t, stdio) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_UID",
+    (long)offsetof(uv_process_options_t, uid) },
+  { "OFFSETOF_UV_PROCESS_OPTIONS_T_GID",
+    (long)offsetof(uv_process_options_t, gid) },
+  { "SIZEOF_UV_STDIO_CONTAINER_T", (long)sizeof(uv_stdio_container_t) },
+  { "OFFSETOF_UV_STDIO_CONTAINER_T_FLAGS",
+    (long)offsetof(uv_stdio_container_t, flags) },
+  { "OFFSETOF_UV_STDIO_CONTAINER_T_DATA",
+    (long)offsetof(uv_stdio_container_t, data) },
+  { "UV_PROCESS_SETUID",   UV_PROCESS_SETUID },
+  { "UV_PROCESS_SETGID",   UV_PROCESS_SETGID },
+  { "UV_PROCESS_DETACHED", UV_PROCESS_DETACHED },
+  { "UV_IGNORE",         UV_IGNORE },
+  { "UV_CREATE_PIPE",    UV_CREATE_PIPE },
+  { "UV_INHERIT_FD",     UV_INHERIT_FD },
+  { "UV_INHERIT_STREAM", UV_INHERIT_STREAM },
+  { "UV_READABLE_PIPE",  UV_READABLE_PIPE },
+  { "UV_WRITABLE_PIPE",  UV_WRITABLE_PIPE },
+  { "SIGTERM", SIGTERM },
+  { "SIGKILL", SIGKILL },
+  { "SIGINT",  SIGINT },
+  { "SIGHUP",  SIGHUP },
+  { "SIGQUIT", SIGQUIT },
+  { "SIGUSR1", SIGUSR1 },
+  { "SIGUSR2", SIGUSR2 },
+  { "SIGCONT", SIGCONT },
+  { "SIGSTOP", SIGSTOP },
 };
 
 #define CHEZ_UV_CONSTANT_COUNT \
@@ -169,6 +218,9 @@ static long live_connect_req     = 0;
 static long live_getaddrinfo_req = 0;
 static long live_getnameinfo_req = 0;
 static long live_read_buffer     = 0;
+static long live_pipe            = 0;
+static long live_process         = 0;
+static long live_spawn_options   = 0;
 
 void chez_uv_count_loop_new(void)  { live_loop += 1; }
 void chez_uv_count_loop_free(void) { live_loop -= 1; }
@@ -201,6 +253,18 @@ long chez_uv_live_getnameinfo_req(void)       { return live_getnameinfo_req; }
 void chez_uv_count_read_buffer_new(void)  { live_read_buffer += 1; }
 void chez_uv_count_read_buffer_free(void) { live_read_buffer -= 1; }
 long chez_uv_live_read_buffer(void)       { return live_read_buffer; }
+
+void chez_uv_count_pipe_new(void)  { live_pipe += 1; }
+void chez_uv_count_pipe_free(void) { live_pipe -= 1; }
+long chez_uv_live_pipe(void)       { return live_pipe; }
+
+void chez_uv_count_process_new(void)  { live_process += 1; }
+void chez_uv_count_process_free(void) { live_process -= 1; }
+long chez_uv_live_process(void)       { return live_process; }
+
+void chez_uv_count_spawn_options_new(void)  { live_spawn_options += 1; }
+void chez_uv_count_spawn_options_free(void) { live_spawn_options -= 1; }
+long chez_uv_live_spawn_options(void)       { return live_spawn_options; }
 
 #else
 
@@ -235,5 +299,17 @@ long chez_uv_live_getnameinfo_req(void)       { return 0; }
 void chez_uv_count_read_buffer_new(void)  { }
 void chez_uv_count_read_buffer_free(void) { }
 long chez_uv_live_read_buffer(void)       { return 0; }
+
+void chez_uv_count_pipe_new(void)  { }
+void chez_uv_count_pipe_free(void) { }
+long chez_uv_live_pipe(void)       { return 0; }
+
+void chez_uv_count_process_new(void)  { }
+void chez_uv_count_process_free(void) { }
+long chez_uv_live_process(void)       { return 0; }
+
+void chez_uv_count_spawn_options_new(void)  { }
+void chez_uv_count_spawn_options_free(void) { }
+long chez_uv_live_spawn_options(void)       { return 0; }
 
 #endif /* CHEZ_LIBUV_DEBUG_COUNTERS */

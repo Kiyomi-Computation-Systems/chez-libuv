@@ -427,6 +427,57 @@
 (display (sizeof-addrinfo))
 (newline)
 
+;; --- v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005) --------------
+;; Structural sanity only: values are platform truths, so the assertions
+;; are relations, never literals.
+(test-assert "process options struct has positive size"
+  (positive? (sizeof-uv-process-options-t)))
+(test-assert "every options offset lies inside the struct"
+  (for-all (lambda (off) (and (>= off 0) (< off (sizeof-uv-process-options-t))))
+           (list (offsetof-uv-process-options-t-exit-cb)
+                 (offsetof-uv-process-options-t-file)
+                 (offsetof-uv-process-options-t-args)
+                 (offsetof-uv-process-options-t-env)
+                 (offsetof-uv-process-options-t-cwd)
+                 (offsetof-uv-process-options-t-flags)
+                 (offsetof-uv-process-options-t-stdio-count)
+                 (offsetof-uv-process-options-t-stdio)
+                 (offsetof-uv-process-options-t-uid)
+                 (offsetof-uv-process-options-t-gid))))
+(test-assert "stdio container: flags precede data, both inside"
+  (and (>= (offsetof-uv-stdio-container-t-flags) 0)
+       (> (offsetof-uv-stdio-container-t-data)
+          (offsetof-uv-stdio-container-t-flags))
+       (< (offsetof-uv-stdio-container-t-data)
+          (sizeof-uv-stdio-container-t))))
+(test-assert "the three process flags are distinct nonzero bits"
+  (let ((flags (list (uv-process-setuid-flag) (uv-process-setgid-flag)
+                     (uv-process-detached-flag))))
+    (and (for-all positive? flags)
+         (= 3 (length flags))
+         (zero? (bitwise-and (car flags) (cadr flags)))
+         (zero? (bitwise-and (car flags) (caddr flags)))
+         (zero? (bitwise-and (cadr flags) (caddr flags))))))
+(test-equal "UV_IGNORE is zero (the header's own definition)"
+  0 (uv-stdio-ignore))
+(test-assert "the stdio modes and direction bits are distinct"
+  (let ((bits (list (uv-stdio-create-pipe) (uv-stdio-inherit-fd)
+                    (uv-stdio-inherit-stream) (uv-stdio-readable-pipe)
+                    (uv-stdio-writable-pipe))))
+    (and (for-all positive? bits)
+         (= (length bits)
+            (length (filter (lambda (b) (= 1 (length (filter (lambda (c) (= b c)) bits)))) bits))))))
+(test-assert "nine signals, all positive and distinct"
+  (let ((sigs (list (sig-term) (sig-kill) (sig-int) (sig-hup) (sig-quit)
+                    (sig-usr1) (sig-usr2) (sig-cont) (sig-stop))))
+    (and (for-all positive? sigs)
+         (= 9 (length sigs))
+         (let loop ((s sigs))
+           (or (null? s)
+               (and (not (memv (car s) (cdr s))) (loop (cdr s))))))))
+(test-assert "process/pipe type tags resolve"
+  (and (integer? (uv-process-type)) (integer? (uv-named-pipe-type))))
+
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
 ;; The failure must be structured and must NAME the missing constant. A
 ;; default value, a zero, or a bare #f here is the exact silent-transcription
@@ -1131,6 +1182,14 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
+;; Task 4 adds the three new rows to live-counts; until then this assertion
+;; stays RED and is skipped by the commented block below.
+;; (test-equal "live-counts reports all eleven allocation classes"
+;;   '(loop tcp timer write-req connect-req
+;;     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
+;;   (map car (live-counts)))
+
+;; For now, assert the eight existing classes:
 (test-equal "live-counts reports all eight allocation classes"
   '(loop tcp timer write-req connect-req
     getaddrinfo-req getnameinfo-req read-buffer)

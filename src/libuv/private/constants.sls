@@ -52,6 +52,29 @@
           ai-passive ai-canonname ai-numerichost ai-numericserv
           ni-numerichost ni-numericserv ni-namereqd ni-dgram
 
+          uv-process-type uv-named-pipe-type
+          sizeof-uv-process-options-t
+          offsetof-uv-process-options-t-exit-cb
+          offsetof-uv-process-options-t-file
+          offsetof-uv-process-options-t-args
+          offsetof-uv-process-options-t-env
+          offsetof-uv-process-options-t-cwd
+          offsetof-uv-process-options-t-flags
+          offsetof-uv-process-options-t-stdio-count
+          offsetof-uv-process-options-t-stdio
+          offsetof-uv-process-options-t-uid
+          offsetof-uv-process-options-t-gid
+          sizeof-uv-stdio-container-t
+          offsetof-uv-stdio-container-t-flags
+          offsetof-uv-stdio-container-t-data
+          uv-process-setuid-flag uv-process-setgid-flag uv-process-detached-flag
+          uv-stdio-ignore
+          uv-stdio-create-pipe uv-stdio-inherit-fd
+          uv-stdio-inherit-stream
+          uv-stdio-readable-pipe uv-stdio-writable-pipe
+          sig-term sig-kill sig-int sig-hup sig-quit
+          sig-usr1 sig-usr2 sig-cont sig-stop
+
           errno-count errno-symbols errno-value->symbol errno-symbol->value)
   (import (rnrs)
           (libuv private conditions))
@@ -93,7 +116,28 @@
       SOCK_STREAM SOCK_DGRAM SOCK_RAW
       IPPROTO_TCP IPPROTO_UDP
       AI_PASSIVE AI_CANONNAME AI_NUMERICHOST AI_NUMERICSERV
-      NI_NUMERICHOST NI_NUMERICSERV NI_NAMEREQD NI_DGRAM))
+      NI_NUMERICHOST NI_NUMERICSERV NI_NAMEREQD NI_DGRAM
+      UV_PROCESS UV_NAMED_PIPE
+      SIZEOF_UV_PROCESS_OPTIONS_T
+      OFFSETOF_UV_PROCESS_OPTIONS_T_EXIT_CB
+      OFFSETOF_UV_PROCESS_OPTIONS_T_FILE
+      OFFSETOF_UV_PROCESS_OPTIONS_T_ARGS
+      OFFSETOF_UV_PROCESS_OPTIONS_T_ENV
+      OFFSETOF_UV_PROCESS_OPTIONS_T_CWD
+      OFFSETOF_UV_PROCESS_OPTIONS_T_FLAGS
+      OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO_COUNT
+      OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO
+      OFFSETOF_UV_PROCESS_OPTIONS_T_UID
+      OFFSETOF_UV_PROCESS_OPTIONS_T_GID
+      SIZEOF_UV_STDIO_CONTAINER_T
+      OFFSETOF_UV_STDIO_CONTAINER_T_FLAGS
+      OFFSETOF_UV_STDIO_CONTAINER_T_DATA
+      UV_PROCESS_SETUID UV_PROCESS_SETGID UV_PROCESS_DETACHED
+      UV_IGNORE
+      UV_CREATE_PIPE UV_INHERIT_FD UV_INHERIT_STREAM
+      UV_READABLE_PIPE UV_WRITABLE_PIPE
+      SIGTERM SIGKILL SIGINT SIGHUP SIGQUIT
+      SIGUSR1 SIGUSR2 SIGCONT SIGSTOP))
 
   ;; The fallback errno symbol. It cannot collide with a real name: libuv's
   ;; UV_ERRNO_MAP tokens are the bare codes ("EOF", "ECONNRESET"), never
@@ -308,4 +352,59 @@
   (define (ni-numerichost) (snapshot-ref 'NI_NUMERICHOST))
   (define (ni-numericserv) (snapshot-ref 'NI_NUMERICSERV))
   (define (ni-namereqd)    (snapshot-ref 'NI_NAMEREQD))
-  (define (ni-dgram)       (snapshot-ref 'NI_DGRAM)))
+  (define (ni-dgram)       (snapshot-ref 'NI_DGRAM))
+
+  ;; v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005)
+  (define (uv-process-type)    (snapshot-ref 'UV_PROCESS))
+  (define (uv-named-pipe-type) (snapshot-ref 'UV_NAMED_PIPE))
+
+  (define (sizeof-uv-process-options-t) (snapshot-ref 'SIZEOF_UV_PROCESS_OPTIONS_T))
+
+  (define (offsetof-uv-process-options-t-exit-cb)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_EXIT_CB))
+  (define (offsetof-uv-process-options-t-file)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_FILE))
+  (define (offsetof-uv-process-options-t-args)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_ARGS))
+  (define (offsetof-uv-process-options-t-env)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_ENV))
+  (define (offsetof-uv-process-options-t-cwd)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_CWD))
+  (define (offsetof-uv-process-options-t-flags)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_FLAGS))
+  (define (offsetof-uv-process-options-t-stdio-count)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO_COUNT))
+  (define (offsetof-uv-process-options-t-stdio)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_STDIO))
+  (define (offsetof-uv-process-options-t-uid)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_UID))
+  (define (offsetof-uv-process-options-t-gid)
+    (snapshot-ref 'OFFSETOF_UV_PROCESS_OPTIONS_T_GID))
+
+  (define (sizeof-uv-stdio-container-t) (snapshot-ref 'SIZEOF_UV_STDIO_CONTAINER_T))
+
+  (define (offsetof-uv-stdio-container-t-flags)
+    (snapshot-ref 'OFFSETOF_UV_STDIO_CONTAINER_T_FLAGS))
+  (define (offsetof-uv-stdio-container-t-data)
+    (snapshot-ref 'OFFSETOF_UV_STDIO_CONTAINER_T_DATA))
+
+  (define (uv-process-setuid-flag)   (snapshot-ref 'UV_PROCESS_SETUID))
+  (define (uv-process-setgid-flag)   (snapshot-ref 'UV_PROCESS_SETGID))
+  (define (uv-process-detached-flag) (snapshot-ref 'UV_PROCESS_DETACHED))
+
+  (define (uv-stdio-ignore)        (snapshot-ref 'UV_IGNORE))
+  (define (uv-stdio-create-pipe)   (snapshot-ref 'UV_CREATE_PIPE))
+  (define (uv-stdio-inherit-fd)    (snapshot-ref 'UV_INHERIT_FD))
+  (define (uv-stdio-inherit-stream) (snapshot-ref 'UV_INHERIT_STREAM))
+  (define (uv-stdio-readable-pipe) (snapshot-ref 'UV_READABLE_PIPE))
+  (define (uv-stdio-writable-pipe) (snapshot-ref 'UV_WRITABLE_PIPE))
+
+  (define (sig-term) (snapshot-ref 'SIGTERM))
+  (define (sig-kill) (snapshot-ref 'SIGKILL))
+  (define (sig-int)  (snapshot-ref 'SIGINT))
+  (define (sig-hup)  (snapshot-ref 'SIGHUP))
+  (define (sig-quit) (snapshot-ref 'SIGQUIT))
+  (define (sig-usr1) (snapshot-ref 'SIGUSR1))
+  (define (sig-usr2) (snapshot-ref 'SIGUSR2))
+  (define (sig-cont) (snapshot-ref 'SIGCONT))
+  (define (sig-stop) (snapshot-ref 'SIGSTOP)))
