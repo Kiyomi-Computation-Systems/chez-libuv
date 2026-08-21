@@ -1067,6 +1067,63 @@
     (or (sockaddr->address-string addr) 'refused-family))
   (free! addr))
 
+;; --- require-address / require-port (post-v0.2 lift) --------------------
+;; The ADR-0012 input vocabulary's validators, asserted at their shared
+;; home: tcp.sls and dns.sls both import THIS copy, so these rows pin the
+;; semantics every verb boundary observes. `who` is a symbol no real
+;; caller passes: each raise must name the caller handed in, not the
+;; helper or a baked-in verb name.
+(test-equal "require-address refuses a non-string, naming its caller and why"
+  '(test-lift address-not-a-string)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (require-address 42 'test-lift)
+    'no-raise))
+
+;; Address-ness here is string?-ness BY DESIGN: parse refusal is
+;; fill-sockaddr!'s job (spike FINDINGS Q3), so a validator tightened to
+;; pre-parse would fail this row by name.
+(test-equal "require-address accepts a string it cannot parse (parsing is fill-sockaddr!'s job)"
+  'accepted
+  (begin (require-address "not-an-ip" 'test-lift) 'accepted))
+
+(test-equal "require-port refuses 65536, naming its caller and why"
+  '(test-lift port-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (require-port 65536 'test-lift)
+    'no-raise))
+
+(test-equal "require-port refuses a negative port, naming its caller and why"
+  '(test-lift port-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (require-port -1 'test-lift)
+    'no-raise))
+
+;; The FFI declares `int`: an inexact 8080.0 is either a Chez marshalling
+;; error from deep inside the call or a silently truncated port, so
+;; exactness is part of port-ness. 8080.0 satisfies integer? -- this row
+;; fails through the exact? clause specifically.
+(test-equal "require-port refuses an inexact port even inside the range"
+  '(test-lift port-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (require-port 8080.0 'test-lift)
+    'no-raise))
+
+;; Both ends inclusive: 0 is "let the kernel choose" for uv-tcp-bind!, and
+;; 65535 is a real port. A boundary nudged either way fails here.
+(test-equal "require-port accepts both ends of 0..65535"
+  'accepted
+  (begin (require-port 0 'test-lift)
+         (require-port 65535 'test-lift)
+         'accepted))
+
 ;; --- debug counters (design spec S10) -----------------------------------
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.
 ;; Seeded: the counter is driven to a non-zero value and asserted there

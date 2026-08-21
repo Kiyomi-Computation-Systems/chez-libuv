@@ -95,6 +95,10 @@
           ;; dispatch policy, so this file's mechanical/policy-free review
           ;; property survives the lift.
           fill-sockaddr! align-16
+          ;; ADR-0012's argument validators followed post-v0.2 (the
+          ;; whole-branch review's duplication finding): one copy for the
+          ;; tcp.sls and dns.sls verbs that had each restated them.
+          require-address require-port
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
@@ -722,6 +726,25 @@
   ;; assumed. 16 rather than 8: it is the strictest fundamental alignment on
   ;; every target this binding supports, so one rule covers both structs.
   (define (align-16 n) (* 16 (div (+ n 15) 16)))
+
+  ;; require-address / require-port followed post-v0.2 (the whole-branch
+  ;; review's duplication finding): ADR-0012's input vocabulary, restated
+  ;; verbatim in tcp.sls and dns.sls through v0.2, now one copy beside the
+  ;; fill-sockaddr! both feed. Address-ness here is string?-ness only --
+  ;; parse refusal is fill-sockaddr!'s job (spike FINDINGS Q3), which is
+  ;; why an unparseable string passes this gate.
+  (define (require-address ip who)
+    (unless (string? ip)
+      (raise (make-uv-invalid-argument who 'address-not-a-string))))
+
+  ;; A port as libuv takes it: an exact integer in 0..65535, where 0 means
+  ;; "let the kernel choose" for bind. Checked explicitly because the FFI
+  ;; declares `int`, so a bignum or an inexact number is either a Chez
+  ;; marshalling error from deep inside the call or a silently truncated
+  ;; port number.
+  (define (require-port port who)
+    (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
+      (raise (make-uv-invalid-argument who 'port-out-of-range))))
 
   ;; --- error translation (ADR-0006) -------------------------------------
   ;; Both _r calls get a FRESH scratch bytevector rather than sharing one:

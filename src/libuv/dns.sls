@@ -198,18 +198,11 @@
 
   ;; --- the TCP input vocabulary, on the way in (S4.5, ADR-0012) -----------
   ;; uv-getnameinfo! takes ip/port exactly as uv-tcp-connect! does: a
-  ;; presentation-form string and a separate exact integer. The predicates
-  ;; are tcp.sls's verbatim (tcp.sls:61-70) -- private there, so restated
-  ;; here rather than a cross-module import of another library's internals;
-  ;; the sockaddr both feed is filled by the SAME lifted fill-sockaddr!, so
-  ;; the two callers cannot drift on what an address IS.
-  (define (require-address ip who)
-    (unless (string? ip)
-      (raise (make-uv-invalid-argument who 'address-not-a-string))))
-
-  (define (require-port port who)
-    (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
-      (raise (make-uv-invalid-argument who 'port-out-of-range))))
+  ;; presentation-form string and a separate exact integer. require-address
+  ;; and require-port come from (libuv private native), imported above --
+  ;; restated verbatim here through v0.2, then lifted beside fill-sockaddr!
+  ;; when the whole-branch review flagged the duplication -- so this verb
+  ;; and the TCP verbs cannot drift on what an address or a port IS.
 
   ;; The nameinfo flags mapper IS the validation (unlike the getaddrinfo
   ;; mappers above, whose else arms sit unreachable behind validate-hints):
