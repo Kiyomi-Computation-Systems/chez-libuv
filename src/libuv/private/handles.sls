@@ -6,11 +6,14 @@
 ;;; Stage 2 delivered the registry and the loop record. Stage 3 added the
 ;;; handle records, the full 'open -> 'closing -> 'closed state machine, the
 ;;; callback guard, and the timer and close dispatchers -- and filled both
-;;; seams: (libuv private native)'s eight dispatcher slots and this library's
-;;; own `close-handle!`. The remaining six callback types were installed as
-;;; raising stubs that Stages 4 and 5 replaced by name through
-;;; `install-dispatch-procedure!`, with no second slot install. As of Stage 5
-;;; there are no stubs left: all eight names hold a real dispatcher.
+;;; seams: (libuv private native)'s dispatcher slots (eight through v0.1,
+;;; ten as of v0.2 Stage 2) and this library's own `close-handle!`. The
+;;; remaining six v0.1 callback types were installed as raising stubs that
+;;; Stages 4 and 5 replaced by name through `install-dispatch-procedure!`,
+;;; with no second slot install; by v0.1's Stage 5 all eight of its names
+;;; held a real dispatcher. v0.2's two DNS names (getaddrinfo, getnameinfo)
+;;; hold the raising stub again, BY DESIGN, until (libuv dns) installs the
+;;; real dispatchers through the same seam at its library-body time.
 ;;;
 ;;; THIS LIBRARY'S BODY HAS EFFECTS. Instantiating it fills the process-global
 ;;; dispatcher slots, so any suite whose import chain reaches this file finds
@@ -78,6 +81,14 @@
           req-ptr set-req-ptr! req-kind req-handle
           req-on-complete set-req-on-complete!
 
+          ;; the request-completion machinery (ADR-0011). complete-request!
+          ;; and abandon-request! are exported for (libuv dns) -- Stage 4's
+          ;; dispatchers complete through the one freeing site, and its
+          ;; start calls need the identical sync-failure undo tcp.sls uses.
+          ;; cancel-requests-for-loop! is uv-loop-teardown!'s cancel sweep,
+          ;; here so loop.sls never has to import (libuv dns).
+          complete-request! abandon-request! cancel-requests-for-loop!
+
           ;; the callback error policy (design spec S8)
           loop-record-error! dispatch-guarded orphan-callback-events
 
@@ -104,7 +115,13 @@
           ;;   copy-out          the read dispatcher's whole job (ADR-0009):
           ;;                     a FRESH copy per delivery, so nothing the
           ;;                     caller keeps points into foreign memory.
+          ;;   uv-cancel         the teardown cancel sweep (ADR-0011):
+          ;;                     best-effort uv_cancel over this loop's
+          ;;                     handle-less DNS requests, return codes
+          ;;                     ignored. The raw binding's only other
+          ;;                     caller is (libuv dns)'s uv-cancel! policy.
           (only (libuv private native)
+                uv-cancel
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
                 count-write-req-free! count-connect-req-free!
@@ -305,10 +322,17 @@
   ;;               connect). ZEROED the moment the block is freed, for the
   ;;               same reason a handle's is.
   ;;   kind        'write | 'shutdown | 'connect
-  ;;   handle      the stream the request runs on. IMMUTABLE, and the only
-  ;;               route from a completion back to the owning loop -- the
-  ;;               handle may already be 'closing by then (S5), but its loop
-  ;;               backpointer outlives everything.
+  ;;   handle      the stream the request runs on, or #f for a handle-less
+  ;;               request -- v0.2's DNS kinds, whose uv_getaddrinfo_t /
+  ;;               uv_getnameinfo_t take the loop directly and belong to no
+  ;;               handle at all (ADR-0011). IMMUTABLE either way. For the
+  ;;               handle-owned kinds this field was v0.1's only route from
+  ;;               a completion back to the owning loop (the handle may
+  ;;               already be 'closing by then (S5), but its loop
+  ;;               backpointer outlives everything); since ADR-0011 the
+  ;;               completion path reads the loop off the REGISTRY ENTRY
+  ;;               instead (complete-request! below), which answers for
+  ;;               both shapes.
   ;;   on-complete the caller's completion callback, or #f
   (define-record-type (uv-req-record %make-uv-req-record uv-req?)
     (fields (mutable ptr        req-ptr         set-req-ptr!)
@@ -370,6 +394,14 @@
   ;; uv-loop-teardown! sweeps: every element of that snapshot is handed to
   ;; close-handle!, which refuses anything that is not a handle record.
   (define handle-kinds '(timer tcp))
+
+  ;; The kinds that name a HANDLE-LESS request -- one registered against
+  ;; the loop directly because no owning handle exists (ADR-0011; Stage 4's
+  ;; DNS start calls register these). This is what cancel-requests-for-loop!
+  ;; filters on, and DELIBERATELY not what registry-snapshot-for-loop
+  ;; filters on: handle-kinds is untouched, so these entries stay out of
+  ;; the close sweep automatically.
+  (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
   ;; kind:   'loop | 'timer | 'tcp | 'write-req | 'connect-req | 'shutdown-req
   ;; loop:   the owning loop record (a loop owns itself). A request registers
@@ -433,10 +465,13 @@
   ;; reason: uv-loop-teardown! hands each element to close-handle!, which
   ;; refuses anything that is not a handle record. A snapshot that excluded
   ;; only 'loop would make teardown raise 'not-a-uv-handle the moment a write
-  ;; or a connect was in flight -- and an in-flight request needs no sweeping
-  ;; anyway: libuv fires every request callback before the close callback of
-  ;; the handle it belongs to (design spec S5), so closing the handle is what
-  ;; frees the request block.
+  ;; or a connect was in flight -- and an in-flight HANDLE-OWNED request
+  ;; needs no sweeping anyway: libuv fires every request callback before the
+  ;; close callback of the handle it belongs to (design spec S5), so closing
+  ;; the handle is what frees the request block. A HANDLE-LESS request
+  ;; (dns-request-kinds, ADR-0011) has no close to ride on; those are
+  ;; covered by cancel-requests-for-loop! below, which uv-loop-teardown!
+  ;; runs BEFORE this close sweep.
   (define (registry-snapshot-for-loop loop)
     (let-values (((keys entries) (hashtable-entries registry)))
       (let collect ((i 0) (acc '()))
@@ -448,6 +483,38 @@
                                 (memq (registry-entry-kind entry) handle-kinds))
                            (cons (registry-entry-object entry) acc)
                            acc)))))))
+
+  ;; uv-loop-teardown!'s CANCEL SWEEP (ADR-0011): best-effort uv_cancel on
+  ;; every handle-less DNS request registered against this loop, run before
+  ;; the close sweep so the teardown drain then delivers every in-flight
+  ;; on-complete before teardown returns -- 'EAI_CANCELED where the cancel
+  ;; won, the real result where the work was already running.
+  ;;
+  ;; SNAPSHOT-FIRST, the same R6RS iterating-while-mutating rationale as the
+  ;; close sweep's snapshot (loop.sls:210-214): uv_cancel mutates no
+  ;; registry state, but the snapshot (hashtable-entries answers fresh
+  ;; vectors) costs nothing and removes the question.
+  ;;
+  ;; RETURN CODES ARE IGNORED, by decision rather than omission: 0 means
+  ;; the queued work completes on the next drain iteration with
+  ;; 'EAI_CANCELED; UV_EBUSY means it is running or finished and the drain
+  ;; waits out its real completion (uv__work_cancel,
+  ;; vendor/libuv/src/threadpool.c:292-307). Exactly one callback fires in
+  ;; every outcome, so there is nothing here to act on. Cancellation POLICY
+  ;; -- which codes a caller should care about -- lives with (libuv dns)'s
+  ;; uv-cancel!, not in this sweep.
+  ;;
+  ;; The keys vector is the live pointers: a registered entry's block has
+  ;; not been freed (every freeing site deregisters first), and
+  ;; registry-register! refused anything that was not a valid pointer.
+  (define (cancel-requests-for-loop! loop)
+    (let-values (((keys entries) (hashtable-entries registry)))
+      (do ((i 0 (+ i 1)))
+          ((= i (vector-length entries)))
+        (let ((entry (vector-ref entries i)))
+          (when (and (eq? (registry-entry-loop entry) loop)
+                     (memq (registry-entry-kind entry) dns-request-kinds))
+            (uv-cancel (vector-ref keys i)))))))
 
   ;; --- the callback error policy (design spec S8) ------------------------
   ;; Store-and-reraise. The FIRST value a trampoline's guard catches is
@@ -567,8 +634,19 @@
   ;; FREED (design spec S7, S10).
   ;;
   ;; THE ORDER IS THE SPECIFICATION, exactly as it is for close-dispatch:
-  ;;   1. read what is needed off the record FIRST -- the owning loop and the
-  ;;      callback -- because steps 2-5 leave the record pointing at nothing
+  ;;   1. read what is needed FIRST -- the owning loop off the REGISTRY
+  ;;      ENTRY (registry-loop-of, which must run before step 2 pops the
+  ;;      entry; it provably answers here, because the registry-ref above
+  ;;      just succeeded on the same key and the entry's loop was validated
+  ;;      uv-loop? at its single write site) and the callback off the
+  ;;      record -- because steps 2-5 leave both pointing at nothing.
+  ;;      The entry, not the record's handle field, is the authority on
+  ;;      ownership (ADR-0011): a handle-less DNS request has handle = #f,
+  ;;      so there is no (handle-loop (req-handle req)) route at all, while
+  ;;      for the handle-owned kinds the entry's loop IS the handle's loop
+  ;;      by construction (every TCP start call registers it) -- one code
+  ;;      path for all five request kinds, the TCP suites guarding the
+  ;;      equivalence.
   ;;   2. pop the registry entry   -- so nothing can dispatch on this pointer
   ;;                                  again, and so the address is free to be
   ;;                                  reused by a later foreign-alloc
@@ -585,6 +663,14 @@
   ;; with many queued writes a property of the code rather than of how long
   ;; each callback happens to take.
   ;;
+  ;; DELIVERY IS (apply on-complete err extras) as of ADR-0011. The rest-arg
+  ;; extras are the completion's payload beyond the err -- getaddrinfo's
+  ;; converted record list, getnameinfo's two copied strings -- and they
+  ;; must always be already-copied Scheme values computed BEFORE this
+  ;; procedure is called, because step 6 runs after everything foreign is
+  ;; freed (ADR-0009's boundary). The v0.1 dispatchers below pass none, so
+  ;; their callbacks still receive exactly (err).
+  ;;
   ;; NO HANDLE STATE CHECK, deliberately: design spec S5 says request
   ;; callbacks land on a 'closing handle (an in-flight write losing its race
   ;; against uv_close completes with 'ECANCELED), and refusing to deliver
@@ -593,10 +679,10 @@
   ;; of the same name (final-review triage, Task 8 Minors). The name also
   ;; says what it is -- the address of the whole co-allocated block, which
   ;; is what gets freed.
-  (define (complete-request! name who count-free! block-ptr status)
+  (define (complete-request! name who count-free! block-ptr status . extras)
     (let ((req (registry-ref block-ptr)))
       (if (uv-req? req)
-          (let ((loop (handle-loop (req-handle req)))
+          (let ((loop (registry-loop-of block-ptr))
                 (on-complete (req-on-complete req)))
             (registry-deregister! block-ptr)
             (free! block-ptr)
@@ -605,8 +691,24 @@
             (when on-complete
               (dispatch-guarded
                loop
-               (lambda () (on-complete (status->err status who))))))
+               (lambda ()
+                 (apply on-complete (status->err status who) extras)))))
           (record-orphan-callback! name block-ptr))))
+
+  ;; Undo a registration that a synchronous native failure has just made
+  ;; pointless: pop the entry, free the block, zero the record's pointer.
+  ;; This is the SAME order complete-request! uses, minus the callback --
+  ;; there is nothing to report to, since the caller is about to receive
+  ;; the condition itself. The counter, where there is one, is bumped by
+  ;; the caller so that each site names its own class. Private to tcp.sls
+  ;; through v0.1; lifted here in v0.2 Stage 3 (design spec v0.2 S5.3),
+  ;; exported, because (libuv dns)'s start calls need the identical
+  ;; sync-failure undo.
+  (define (abandon-request! req)
+    (let ((ptr (req-ptr req)))
+      (registry-deregister! ptr)
+      (free! ptr)
+      (set-req-ptr! req 0)))
 
   ;; The write payload lives INSIDE the write request's own block (design
   ;; spec S7: "exactly one foreign-alloc, sized for
@@ -858,12 +960,13 @@
     (set! close-handle-proc proc)
     (set! close-handle-installed #t))
 
-  ;; --- filling the eight dispatcher slots (ADR-0008) ---------------------
+  ;; --- filling the ten dispatcher slots (ADR-0008) -----------------------
   ;; The slots in (libuv private native) take one procedure each, exactly
-  ;; once, for the life of the process. Stage 3 can only implement two of the
-  ;; eight, and a second install-callback-dispatchers! call is (rightly)
-  ;; refused -- so the eight procedures installed below are thin closures
-  ;; that look their real implementation up in this table AT FIRE TIME.
+  ;; once, for the life of the process. v0.1's Stage 3 could only implement
+  ;; two of its eight, and a second install-callback-dispatchers! call is
+  ;; (rightly) refused -- so the procedures installed below (one per name
+  ;; in dispatcher-names, ten as of v0.2) are thin closures that look their
+  ;; real implementation up in this table AT FIRE TIME.
   ;;
   ;; THE SEAM FOR STAGES 4 AND 5: a later stage calls
   ;; install-dispatch-procedure! with one of the six names still stubbed
@@ -883,13 +986,16 @@
   ;; it is invoked inside a dispatcher, i.e. only once one has already been
   ;; entered successfully.
   ;;
-  ;; AS OF STAGE 5 NOTHING REACHES THIS. Every name in `dispatcher-names` is
-  ;; seeded with it below and then replaced, so it survives as the default
-  ;; for a callback type ADDED to that list later -- which is exactly when
-  ;; the stub's own property (a name with no implementation fails loudly and
-  ;; contained, rather than silently doing nothing) starts mattering again.
-  ;; It is kept for that, and because deleting it would make the seeding loop
-  ;; below need a different kind of placeholder anyway.
+  ;; Through v0.1's Stage 5 every name in `dispatcher-names` was seeded with
+  ;; this stub and then replaced, so nothing reached it. As of v0.2 Stage 2
+  ;; the two DNS names (getaddrinfo, getnameinfo) hold it AGAIN, by design
+  ;; -- exactly the added-callback-type case anticipated here: their real
+  ;; dispatchers are installed through install-dispatch-procedure! at
+  ;; (libuv dns)'s library-body time, so a process that never imports that
+  ;; library keeps the contained raising stub, and nothing can start a DNS
+  ;; request without the import. The stub's own property (a name with no
+  ;; implementation fails loudly and contained, rather than silently doing
+  ;; nothing) is precisely what such a process needs.
   (define (unimplemented-dispatcher name)
     (lambda args
       (raise (condition
@@ -949,7 +1055,7 @@
   ;;     dispatcher that raised on a known-bad one. It is a bug reporter of
   ;;     last resort; both readings are bugs, and neither is recoverable.
   ;;
-  ;; The first argument of all eight callback signatures is the handle or
+  ;; The first argument of all ten callback signatures is the handle or
   ;; request pointer, which is why `(car args)` is the key to look up.
   (define (contain-dispatcher-raise! name ptr obj)
     (let ((loop (registry-loop-of ptr)))
@@ -987,10 +1093,15 @@
       ;; the documented once-per-name path (ADR-0008, and
       ;; .plans/stage-3-mutation-log.md's "the seam Stages 4 and 5 plug
       ;; into"), and using it here means the path is the one already
-      ;; exercised rather than one nothing has run. With these six there are
-      ;; no stubs left: every callback type this binding declares now has an
-      ;; implementation, and every name is spoken for against a later
-      ;; install.
+      ;; exercised rather than one nothing has run. With these six every
+      ;; v0.1 callback type has an implementation and its name is spoken
+      ;; for against a later install. The two v0.2 DNS names (getaddrinfo,
+      ;; getnameinfo) are NOT installed here: they keep the raising stub
+      ;; seeded above, BY DESIGN, until (libuv dns) installs the real
+      ;; dispatchers through this same install-dispatch-procedure! seam at
+      ;; its library-body time -- a process that never imports (libuv dns)
+      ;; keeps the contained stub, and nothing can start a DNS request
+      ;; without the import (ADR-0011; design spec v0.2 S5.4).
       (for-each (lambda (entry)
                   (install-dispatch-procedure! (car entry) (cdr entry)))
                 (list (cons 'connection connection-dispatch)

@@ -2,7 +2,8 @@
 ;;; SRFI-64 suite for (libuv loop) and the registry core of
 ;;; (libuv private handles) -- design spec S5 (loop operations, the registry
 ;;; as GC root), S8 (the store-and-reraise callback error policy), S10 (debug
-;;; counters), S11 (testing strategy), and ADR-0008 (eight dispatcher slots).
+;;; counters), S11 (testing strategy), and ADR-0008 (ten dispatcher slots,
+;;; as amended for v0.2).
 ;;;
 ;;; This suite is NOT pure: (libuv loop) reaches (libuv private native),
 ;;; which loads libuv and the shim at library instantiation. It must never
@@ -37,7 +38,12 @@
         (only (libuv private native)
               native-initialized? live-counts uv-loop-size
               dispatcher-names dispatcher-ref dispatchers-installed?
-              install-callback-dispatchers!)
+              install-callback-dispatchers!
+              ;; v0.2 Stage 3: the synthetic handle-less request blocks the
+              ;; ADR-0011 rows below build are real foreign allocations, so
+              ;; complete-request!'s free! sees the same kind of pointer the
+              ;; Stage 4 dispatchers will hand it.
+              alloc-zeroed)
         (only (chezscheme) collect))
 
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
@@ -178,10 +184,10 @@
 (test-equal "uv-now does not go backwards across a run"
   'monotone (if (>= now-after now-before) 'monotone 'went-backwards))
 
-;; --- the eight callback dispatcher slots and the close hook (ADR-0008) --
+;; --- the ten callback dispatcher slots and the close hook (ADR-0008) ----
 ;; Both are process-global and install-once, and as of Stage 3 both are
 ;; already filled before this suite's first line runs: (libuv private
-;; handles) installs the eight dispatchers and the real close-handle! in its
+;; handles) installs the ten dispatchers and the real close-handle! in its
 ;; own library body, and this suite imports it. So what is assertable HERE
 ;; is the installed state and the refusal of a second install.
 ;;
@@ -575,6 +581,128 @@
        (cons "uv-now"                  (lambda () (uv-now dead-loop)))
        (cons "uv-loop-live-handles"    (lambda () (uv-loop-live-handles dead-loop)))
        (cons "uv-loop-deferred-errors" (lambda () (uv-loop-deferred-errors dead-loop)))))
+
+;; --- the cancel sweep and the completion machinery (ADR-0011) -----------
+;; v0.2 Stage 3: uv-loop-teardown! runs cancel-requests-for-loop! before
+;; its close sweep, and complete-request! resolves the owning loop from the
+;; REGISTRY ENTRY rather than through the record's handle field, delivering
+;; any extras behind the err argument. No DNS request can exist yet --
+;; (libuv dns) is Stage 4 -- so what is assertable HERE is:
+;;
+;;   * the sweep's no-op contract on a loop with no DNS request entries:
+;;     nothing deregistered, handle entries untouched, the loop and its
+;;     counters exactly as they were;
+;;   * the generalized complete-request!, driven synthetically the same way
+;;     the registry rows above drive registry-register!: a plain
+;;     alloc-zeroed block, a handle-less req record (handle = #f, the shape
+;;     ADR-0011 documents), Stage 4's registry kinds, and a direct call --
+;;     which is exactly how the Stage 4 dispatchers will call it.
+;;
+;; The sweep's positive arm -- a real in-flight DNS request cancelled at
+;; teardown -- is Stage 5's teardown-with-in-flight row (design spec v0.2
+;; S9); until then the TCP suites guard the substitution's equivalence for
+;; the handle-owned kinds.
+(define sweep-loop (make-uv-loop))
+(define sweep-timer (make-uv-timer sweep-loop))
+(define registry-before-sweep (registry-count))
+(define timers-before-sweep (live-count 'timer))
+
+(test-equal "seed: the sweep loop has a live handle entry for the kind filter to skip"
+  'listed
+  (if (memq sweep-timer (uv-loop-live-handles sweep-loop)) 'listed 'missing))
+
+(test-equal "cancel-requests-for-loop! with no DNS entries returns without raising"
+  'swept
+  (guard (e (#t (list 'raised e)))
+    (cancel-requests-for-loop! sweep-loop)
+    'swept))
+
+(test-equal "the no-op sweep deregistered nothing"
+  registry-before-sweep (registry-count))
+
+(test-equal "the no-op sweep left the timer open and its counter untouched"
+  (list 'open timers-before-sweep)
+  (list (uv-handle-state sweep-timer) (live-count 'timer)))
+
+(test-equal "the swept loop is still usable"
+  'still-usable
+  (begin (uv-run sweep-loop 'nowait) 'still-usable))
+
+;; The happy path: loop resolved from the entry, extras delivered via
+;; apply, block freed and counted through the caller's thunk, pointer
+;; zeroed. The sentinel is a value no failure path produces: an escaped
+;; raise becomes ('raised ...) in the first row and #f in the others
+;; (SRFI-64's catch), and an undelivered callback leaves 'not-delivered.
+(define synth-block (alloc-zeroed 64))
+(define synth-delivered 'not-delivered)
+(define synth-freed 0)
+(define synth-req
+  (%make-uv-req-record synth-block 'getaddrinfo #f
+                       (lambda (err . extras)
+                         (set! synth-delivered (cons err extras)))))
+(registry-register! synth-block 'getaddrinfo-req sweep-loop synth-req)
+
+(test-equal "seed: the handle-less request entry is in the registry"
+  'same (if (eq? synth-req (registry-ref synth-block)) 'same 'different))
+
+(test-equal "complete-request! completes a handle-less request without raising"
+  'completed
+  (guard (e (#t (list 'raised e)))
+    (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+                       (lambda () (set! synth-freed (+ synth-freed 1)))
+                       synth-block 0 'record-a 'record-b)
+    'completed))
+
+(test-equal "the handle-less completion delivered err then the extras, via apply"
+  '(#f record-a record-b) synth-delivered)
+
+(test-equal "the handle-less completion deregistered, counted, and zeroed the block"
+  (list 'deregistered 1 0)
+  (list (if (registry-ref synth-block) 'still-registered 'deregistered)
+        synth-freed
+        (req-ptr synth-req)))
+
+;; The loop read must happen BEFORE the deregister pops the entry, and its
+;; answer is where a raising on-complete lands. A completion whose callback
+;; raises is the one observable consumer of that loop this stage: the raise
+;; must be contained by dispatch-guarded and recorded on the loop the
+;; REGISTRY ENTRY named -- a loop no (handle-loop (req-handle req)) read
+;; could have found, since the handle field is #f.
+(define synth-raise-block (alloc-zeroed 64))
+(define synth-raise-req
+  (%make-uv-req-record synth-raise-block 'getnameinfo #f
+                       (lambda (err . extras)
+                         (raise 'synthetic-on-complete-raise))))
+(registry-register! synth-raise-block 'getnameinfo-req sweep-loop
+                    synth-raise-req)
+
+(test-equal "a raising handle-less on-complete is contained, not escaped"
+  'contained
+  (guard (e (#t (list 'escaped e)))
+    (complete-request! 'getnameinfo 'uv-getnameinfo! (lambda () #f)
+                       synth-raise-block 0)
+    'contained))
+
+(test-equal "the raise was recorded on the loop the registry entry named"
+  'synthetic-on-complete-raise
+  (if (loop-has-pending-error? sweep-loop)
+      (loop-pending-error sweep-loop)
+      'no-pending-error))
+
+(clear-loop-pending-error! sweep-loop)
+
+;; Teardown over this loop is the integration row for the new ordering:
+;; the cancel sweep runs first (a no-op here), then the close sweep takes
+;; the timer down exactly as it did in v0.1.
+(test-equal "teardown still tears down a loop with a live handle after the cancel sweep"
+  'torn-down
+  (guard (e (#t (list 'raised e)))
+    (uv-loop-teardown! sweep-loop)
+    'torn-down))
+
+(test-equal "the swept loop's timer was closed and freed by the teardown"
+  (list 'closed (- timers-before-sweep 1))
+  (list (uv-handle-state sweep-timer) (live-count 'timer)))
 
 ;; --- uv-loop-teardown! --------------------------------------------------
 ;; The sweep is exercised with a REGISTERED handle rather than over an empty

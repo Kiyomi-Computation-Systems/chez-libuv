@@ -438,11 +438,12 @@
 
   ;; uv_cancel: 0 only while the work is still queued -- the callback STILL
   ;; fires, with UV_ECANCELED rewritten to UV_EAI_CANCELED for both DNS req
-  ;; kinds; running or completed work answers UV_EBUSY; non-threadpool req
-  ;; kinds answer UV_EINVAL; exactly one callback in every outcome
-  ;; (vendor/libuv/src/threadpool.c:399-441,
-  ;; vendor/libuv/src/unix/getaddrinfo.c:128-133). The int is an errno, but
-  ;; a nonzero here is an ANSWER, not a failure: which codes matter is
+  ;; kinds; running or completed work answers UV_EBUSY (uv__work_cancel,
+  ;; vendor/libuv/src/threadpool.c:292-307 -- uv_cancel itself, :399-429,
+  ;; only maps req->type to its work item and delegates there, answering
+  ;; UV_EINVAL for non-threadpool req kinds); exactly one callback in every
+  ;; outcome (vendor/libuv/src/unix/getaddrinfo.c:128-133). The int is an
+  ;; errno, but a nonzero here is an ANSWER, not a failure: which codes matter is
   ;; cancellation policy, and policy lives with the callers (design spec
   ;; v0.2 S5.3), so this is exported raw and never routed through uv-check
   ;; unconditionally.

@@ -76,6 +76,10 @@
   ;; fill-sockaddr! and align-16 were private here through v0.1; as of v0.2
   ;; Stage 2 both live in (libuv private native) (design spec v0.2 S5.1),
   ;; imported above, so dns.sls can share them without a second copy.
+  ;; abandon-request! followed in v0.2 Stage 3: it lives in (libuv private
+  ;; handles) beside complete-request! (design spec v0.2 S5.3, ADR-0011),
+  ;; imported above, for the same reason -- dns.sls's start calls need the
+  ;; identical sync-failure undo the three request verbs below guard with.
 
   ;; --- construction (design spec S5) --------------------------------------
   ;; The size comes from uv_handle_size(UV_TCP) -- the RUNNING library's own
@@ -424,17 +428,4 @@
       (raise (make-uv-invalid-argument 'uv-tcp-nodelay! 'enable-not-a-boolean)))
     (uv-check (uv-tcp-nodelay (handle-pointer tcp 'uv-tcp-nodelay!)
                               (if enable? 1 0))
-              'uv-tcp-nodelay!))
-
-  ;; --- shared helpers -----------------------------------------------------
-  ;; Undo a registration that a synchronous native failure has just made
-  ;; pointless: pop the entry, free the block, zero the record's pointer.
-  ;; This is the SAME order the completion dispatcher uses, minus the
-  ;; callback -- there is nothing to report to, since the caller is about to
-  ;; receive the condition itself. The counter, where there is one, is bumped
-  ;; by the caller so that each site names its own class.
-  (define (abandon-request! req)
-    (let ((ptr (req-ptr req)))
-      (registry-deregister! ptr)
-      (free! ptr)
-      (set-req-ptr! req 0))))
+              'uv-tcp-nodelay!)))

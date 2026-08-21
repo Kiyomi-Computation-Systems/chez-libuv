@@ -1272,10 +1272,10 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
-;; --- the eight callback dispatcher slots, BEFORE anything installs them --
+;; --- the ten callback dispatcher slots, BEFORE anything installs them ---
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
-;; installs the eight dispatchers in its own library body, at instantiation
+;; installs the ten dispatchers in its own library body, at instantiation
 ;; (design spec S4: "the slots themselves are filled exactly once, by
 ;; handles.sls"). In every other suite's process the install has therefore
 ;; already happened before the first test line runs, so the uninstalled
@@ -1302,7 +1302,7 @@
        'no-raise)))
  dispatcher-names)
 
-(test-equal "dispatcher-ref rejects a name that is not one of the eight"
+(test-equal "dispatcher-ref rejects a name that is not one of the ten"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1313,7 +1313,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the eight is refused, naming who and why"
+(test-equal "an install missing one of the ten is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

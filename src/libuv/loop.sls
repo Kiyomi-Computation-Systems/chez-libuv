@@ -250,6 +250,10 @@
     (when (loop-running? loop)
       (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
     (when (eq? (loop-state loop) 'open)
+      ;; Cancel-then-drain: best-effort-cancel this loop's handle-less DNS
+      ;; requests BEFORE the close sweep, so the drain below delivers every
+      ;; in-flight on-complete before teardown returns (ADR-0011).
+      (cancel-requests-for-loop! loop)
       (for-each close-handle! (registry-snapshot-for-loop loop))
       (let drain ((i 0) (stored teardown-no-error))
         (let ((outcome (drain-step loop)))
