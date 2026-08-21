@@ -1217,6 +1217,7 @@
 (define counter-classes
   (list (list 'loop        count-loop-new!        count-loop-free!)
         (list 'tcp         count-tcp-new!         count-tcp-free!)
+        (list 'pipe        count-pipe-new!        count-pipe-free!)
         (list 'timer       count-timer-new!       count-timer-free!)
         (list 'write-req   count-write-req-new!   count-write-req-free!)
         (list 'connect-req count-connect-req-new! count-connect-req-free!)

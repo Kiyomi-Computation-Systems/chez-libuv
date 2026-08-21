@@ -15,7 +15,7 @@
 ;;; S10) rather than being swept up at some later GC on some other thread
 ;;; (ADR-0007).
 (library (libuv handle)
-  (export uv-handle? uv-timer? uv-tcp?
+  (export uv-handle? uv-timer? uv-tcp? uv-pipe?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop
           uv-close!)
@@ -65,6 +65,12 @@
   ;; the record predicate itself, from handles.sls.)
   (define (uv-tcp? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'tcp)))
+
+  ;; Kind-keyed like uv-tcp?, and for the same reason (THE SPEC §3): the
+  ;; predicate lives with the kind vocabulary, not with the module that
+  ;; constructs the handle.
+  (define (uv-pipe? handle)
+    (and (uv-handle? handle) (eq? (handle-kind handle) 'pipe)))
 
   ;; (uv-close! handle [on-close]) -- idempotent, asynchronous, and the only
   ;; way a handle is ever freed.
