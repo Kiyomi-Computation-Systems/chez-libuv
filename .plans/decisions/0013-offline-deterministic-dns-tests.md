@@ -1,6 +1,6 @@
 # ADR-0013: DNS suites are hermetic — numeric-only lookups; the resolver is never consulted
 
-- **Status:** Proposed (2026-08-21) — pending Stage 0 DNS spike evidence (spike/dns/FINDINGS.md)
+- **Status:** Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.2
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.2-dns-design.md), [ADR-0010](0010-loopback-integration-tests-replace-differential-oracle.md), [ADR-0003](0003-linux-valgrind-is-the-sole-memory-gate.md)

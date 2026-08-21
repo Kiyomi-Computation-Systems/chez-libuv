@@ -13,13 +13,18 @@ The scripts are committed beside this file: `spike/dns/probe-dns.c`,
 `spike/dns/06-hermetic-matrix.ss`. Every number quoted in this document is
 reproducible by re-running them.
 
-**This document is the macOS leg.** The Linux legs (Q1 ubuntu run, the whole
-of Q2's valgrind question, Q4's glibc run) are `PENDING CI` and are marked as
-such below — nothing in those subsections is projected or assumed, because
-nothing there has been run. valgrind does not exist on this Darwin/arm64
-machine.
+**This document now carries both legs.** The macOS legs were run first, on a
+Darwin/arm64 dev machine that has no valgrind. The Linux legs (Q1 ubuntu run,
+the whole of Q2's valgrind question, Q4's glibc run) were run second, in CI —
+GitHub Actions run **32491363796**, workflow **"DNS spike (Linux legs)
+[TEMPORARY]"**, job "dns spike (ubuntu, Q1/Q2/Q4 Linux legs)", runner
+**ubuntu-24.04 (`ubuntu-latest`), x86_64**, conclusion **success**. Every
+number quoted in the Linux subsections below is copied verbatim from that
+run's log.
 
 ## Toolchain
+
+### macOS leg (dev machine)
 
 | Item | Value | How determined |
 |---|---|---|
@@ -34,17 +39,33 @@ machine.
 | Arch | arm64 | `uname -m` |
 | ASan runtime (Q2 macOS arm) | `libclang_rt.asan_osx_dynamic.dylib`, clang 21.0.0, resolved by the `Makefile` `ASAN_DYLIB_PATTERN` glob | see Q2 |
 
+### Linux leg (CI)
+
+| Item | Value | How determined |
+|---|---|---|
+| CI run | 32491363796, workflow "DNS spike (Linux legs) [TEMPORARY]" | GitHub Actions run log |
+| Job | "dns spike (ubuntu, Q1/Q2/Q4 Linux legs)" | run log |
+| Runner | `ubuntu-latest` = Ubuntu 24.04.4 LTS, image `ubuntu-24.04` (20260816.277.1), x86_64 | run log job-setup groups |
+| Chez Scheme | 10.4.1 | `$CHEZ --version` (`echo "chez: $($CHEZ --version 2>&1)"`) |
+| libuv | 1.48.0 (`apt` `libuv1-dev` 1.48.0-1.1build1) | `pkg-config --modversion libuv` |
+| libuv shared object | `/usr/lib/x86_64-linux-gnu/libuv.so` | `pkg-config --variable=libdir libuv` |
+| C compiler | `cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` | `cc --version \| head -1` |
+| valgrind | valgrind-3.22.0 | `valgrind --version` |
+| Arch | x86_64 | runner image |
+
 ## Summary of verdicts
 
 | Q | Verdict |
 |---|---|
-| Q1 — threadpool × GC × re-entrancy × loop-liveness | **PASS (macOS leg).** 10,000/10,000 threadpool completions delivered into a locked callable, `(collect)` + result verification + resubmission on every fire, exit 0, twice, stdout byte-identical. Both new trampoline shapes' entry points stable across all collections. ubuntu leg **PENDING CI**. |
-| Q2 — sanitizers' view of unjoined workers | **macOS ASan arm PASS** (exit 0 twice, no reports, sanitizer proven live; no leak claim — LeakSanitizer is unsupported on arm64 macOS, ADR-0003). The valgrind question — the one Q2 actually gates on — is **PENDING CI** in its entirety. |
+| Q1 — threadpool × GC × re-entrancy × loop-liveness | **PASS (overall, both legs).** macOS: 10,000/10,000 threadpool completions delivered into a locked callable, `(collect)` + result verification + resubmission on every fire, exit 0 twice, stdout byte-identical. ubuntu (CI run 32491363796): 10,000/10,000 both runs, exit 0 both runs, stdout byte-identical **outside** the three probe-a race lines — the CI's own gated diff (race lines excluded) was empty. The race lines differ *by which legal branch of the NOWAIT/pending race each run measured*, not by defect; see the ubuntu subsection. |
+| Q2 — sanitizers' view of unjoined workers | **PASS (overall, both legs).** macOS ASan arm: exit 0 twice, no reports, sanitizer proven live; no leak claim — LeakSanitizer is unsupported on arm64 macOS (ADR-0003). Linux valgrind (CI run 32491363796): exit 0 both runs under `--error-exitcode=9` with the definite-only gate; LEAK SUMMARY identical both runs — definitely/indirectly/possibly lost all 0, still reachable 1,913 bytes in 6 blocks, suppressed 0; ERROR SUMMARY 0 errors both runs. The §8 prediction held as measurement; no suppression file is needed, and that is the suppression decision. |
 | Q3 — cancel race histogram | **PASS.** Both branches observed, every trial in a legal branch, exactly-one-callback held in all recorded trials. Cancelled branch dominates at pool 1 (1000/1000, twice) **and** at the default pool (996/4 twice, 993/7 in a third run). The tolerant cancel test is licensed; the 32-blocker fallback is not needed. |
-| Q4 — hermetic determinism matrix | **PASS (macOS leg).** Every cell byte-identical across two runs. Darwin unpinned chain measured: 2 entries, dgram-first, no raw — §9's prediction confirmed. Scoped-literal rows measured end-to-end for ADR-0012. glibc leg **PENDING CI**. |
+| Q4 — hermetic determinism matrix | **PASS (overall, both legs).** macOS: every cell byte-identical across two runs; Darwin unpinned chain measured: 2 entries, dgram-first, no raw — §9's prediction confirmed. glibc (CI run 32491363796): every cell byte-identical across two runs (in-job `diff` empty); unpinned chain measured: 3 entries, **stream-first**, **includes a `raw` entry** — confirming §9's "possibly a different order" prediction and the 3-entry-incl.-raw prediction exactly. Scoped-literal rows measured end-to-end on both OSes for ADR-0012. |
 
-Spike exit (ADRs flip to Accepted) requires the PENDING CI legs; this
-document records the macOS half of the evidence.
+**Spike exit reached 2026-08-21.** All four questions have run on both
+required legs (Q3 is dev-machine-only by the design spec's own venue rule);
+this document records the full evidence, and the DNS ADRs (0011, 0012, 0013,
+and the ADR-0008 amendment) are flipped to Accepted on it.
 
 ---
 
@@ -206,7 +227,14 @@ trampoline arities are exercised, not just address-stable.
 ```
 
 **Actual observed output — stdout** (verbatim; **byte-identical across two
-runs**, exit `0` both times; wall time `real 0.18` both runs):
+runs**, exit `0` both times; wall time `real 0.18` both runs). *Revisited
+after the ubuntu leg (below): the ubuntu leg's two runs landed on the two
+different legal branches of the same probe-a race and printed different
+`uv_run(NOWAIT)`/`'once`/`uv_run(ONCE)` lines for it, which proves those
+three lines are race-dependent, not deterministic — so this macOS pair's
+identical probe-a block was this machine happening to land on the same
+branch twice, not evidence of determinism. The macOS transcript below is
+unaltered; this note only revises what the byte-identity is evidence of.*
 
 ```
 --- (c) putenv -> uv_os_getenv propagation (before any threadpool touch) ---
@@ -419,19 +447,121 @@ non-default value.
   their latency, their NSS module loading, their memory — is exercised
   anywhere in this spike, deliberately.
 
-### PENDING CI (Linux): Q1 ubuntu leg
+### Linux (ubuntu) leg — CI run 32491363796
 
-Not run — nothing to record. The design spec requires one run per CI OS
-(workers × signal masks is per-OS). The CI leg must: run
-`spike/dns/probe-dns` on the runner and substitute its printed values for
-the Darwin constants block in `04-threadpool-gc.ss` (at minimum
-`AI_NUMERICHOST`, `AI_NUMERICSERV`, `AF_INET6`, and all `OFFSETOF_*` /
-`SIZEOF_*` values — glibc reverses `ai_canonname`/`ai_addr` and shifts
-`sin_family` to a two-byte field at offset 0, so the Darwin numbers are
-known-wrong there); then run the script twice at 10,000 against the CI
-libuv `.so` and paste both stdouts and exit codes here.
+**Constants substitution (before either run).** The CI job built and ran
+`spike/dns/probe-dns` on the runner (glibc/x86_64, libuv 1.48.0), then ran
+`spike/dns/apply-probe-constants.sh` against `04-threadpool-gc.ss` and
+`06-hermetic-matrix.ss` to substitute the runner's own probe values for the
+Darwin constants block — never a transcribed or remembered number
+(ADR-0005's rule, applied to the spike). The job's own `git diff --stat`
+after the rewrite, verbatim:
 
-**Q1 verdict (macOS leg): PASS.** The ubuntu leg gates the final verdict.
+```
+=== git diff --stat spike/dns/ (post-rewrite; shows what changed on the runner) ===
+ spike/dns/04-threadpool-gc.ss   | 10 +++++-----
+ spike/dns/06-hermetic-matrix.ss | 10 +++++-----
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+```
+
+The glibc probe values that went into that substitution (from the same job's
+`./spike/dns/probe-dns` step; the layout-defining ones the design spec
+flagged as known-different from Darwin): `AF_INET6 = 10` (Darwin: 30),
+`AI_NUMERICSERV = 1024` (Darwin: 4096), `NI_NUMERICHOST = 1` /
+`NI_NUMERICSERV = 2` / `NI_NAMEREQD = 8` (Darwin: 2 / 8 / 4),
+`offsetof(struct addrinfo, ai_canonname) = 32`, `offsetof(struct addrinfo,
+ai_addr) = 24` (Darwin: 24 and 32 — reversed, exactly as predicted),
+`offsetof(struct sockaddr_in, sin_family) = 0` with
+`sizeof(sin_family) = 2` (Darwin: offset 1, size 1),
+`UV_ECANCELED = -125` (Darwin: -89 — both host-`errno`-derived, per ADR
+context), `uv_loop_size() = 848` (Darwin: 1072), `uv_version_string() =
+1.48.0` (Darwin: 1.52.1).
+
+**Command run (verbatim, twice), from the job's own script step:**
+
+```bash
+$CHEZ --script spike/dns/04-threadpool-gc.ss "$LIBUV_SO" 10000 | tee /tmp/q1-run1.out
+# rc1=${PIPESTATUS[0]}
+$CHEZ --script spike/dns/04-threadpool-gc.ss "$LIBUV_SO" 10000 | tee /tmp/q1-run2.out
+# rc2=${PIPESTATUS[0]}
+```
+
+with `$CHEZ` = `scheme` (10.4.1) and `$LIBUV_SO` =
+`/usr/lib/x86_64-linux-gnu/libuv.so`. **Both runs exited 0**, `fire count
+after uv_run = 10000` both times, every `--- checks ---` line `OK` both
+times, `RESULT: PASS` both times — the full engine transcript (10,000-fire
+section, marshalling probes (b), `putenv` propagation (c), the getnameinfo
+arity check) is byte-identical to the macOS transcript above line-for-line
+except for the three lines below and the (expected, ASLR-dependent)
+trampoline addresses in stderr.
+
+**Run 1's probe-a block** (§"uv_run modes with a request in flight"),
+verbatim:
+
+```
+--- (a) uv_run modes with a request in flight ---
+submit rc                     = 0
+uv_run(NOWAIT) immediately    = 0 (callback fired by then: 1)
+'once calls until delivery    = 0
+uv_run(ONCE) rc at delivery   = not-run
+probe-a callback fired        = 1
+```
+
+**Run 2's probe-a block**, verbatim:
+
+```
+--- (a) uv_run modes with a request in flight ---
+submit rc                     = 0
+uv_run(NOWAIT) immediately    = 1 (callback fired by then: 0)
+'once calls until delivery    = 1
+uv_run(ONCE) rc at delivery   = 0
+probe-a callback fired        = 1
+```
+
+**The three differing lines** are `uv_run(NOWAIT) immediately`, `'once calls
+until delivery`, and `uv_run(ONCE) rc at delivery` — the job's own
+`diff /tmp/q1-run1.out /tmp/q1-run2.out` names exactly these three (`14,16c14,16`)
+and nothing else. **This is the important finding**: run 1 and run 2 landed
+on the two *different legal branches* of the same probe-a race, not on a
+defect. In run 1, `uv_run(NOWAIT)` returned `0` (loop not alive) with
+`callback fired by then: 1` — the getaddrinfo completion had already been
+posted and delivered by the time NOWAIT ran, so there was nothing left to
+wait for, and the follow-up `'once` was never called (`not-run`). In run 2,
+`uv_run(NOWAIT)` returned `1` (loop still alive) with `callback fired by
+then: 0` — the completion was still pending — and the follow-up
+`uv_run(ONCE)` then blocked until delivery, returning `0` after exactly one
+call. Both are legal, mutually exclusive outcomes of the same race between
+the threadpool worker posting `wq_async` and the loop thread reaching
+`uv_run(NOWAIT)`; libuv gives no guarantee of which wins. The CI job proves
+this explicitly: it computes a **gated diff** with those exact three lines
+filtered out —
+
+```
+filter='uv_run\(NOWAIT\) immediately|'\''once calls until delivery|uv_run\(ONCE\) rc at delivery'
+grep -Ev "$filter" /tmp/q1-run1.out > /tmp/q1-run1.filtered
+grep -Ev "$filter" /tmp/q1-run2.out > /tmp/q1-run2.filtered
+diff /tmp/q1-run1.filtered /tmp/q1-run2.filtered
+```
+
+— and that gated diff's output was **empty**: `Q1: exit 0 both runs, stdout
+identical outside the probe-a race lines`. So stdout was byte-identical
+**outside** the three race lines, and the three race lines are exactly the
+ones the design predicted could legally vary.
+
+**Consequence for the plan, made explicit by this measurement**: a DNS test
+suite must never assert *which* legal branch a bare `uv_run(NOWAIT)` (or the
+`'once` that follows a pending completion) takes immediately after a DNS
+submit — both branches are observed on the same OS, same binary, same CI
+runner, back-to-back. Only `run-until/ticking`'s tolerant wait (already the
+house rule per the macOS-leg "What Q1 establishes" §3 above) is licensed;
+a test hard-coding either branch's outcome is flaky by construction, not by
+accident.
+
+**Q1 verdict: overall PASS.** Both OS legs: exit 0 both runs, 10,000/10,000
+fire count both runs, every check `OK`, stdout identical outside the
+race-dependent probe-a lines (gated diff empty on the ubuntu leg; the
+macOS leg's own two runs happened to land on the same branch twice, see the
+revisit note above).
 
 ---
 
@@ -443,7 +573,8 @@ still-reachable-or-possibly-lost under valgrind — **outside** the
 `--errors-for-leak-kinds=definite` gate — and invisible to the macOS ASan
 arm, which makes no leak claim at all (`detect_leaks=0`; LeakSanitizer is
 unsupported on arm64 macOS — ADR-0003). Q2 is the evidence that this is
-measurement, not hope. **Only the macOS arm exists in this document.**
+measurement, not hope. Both the macOS ASan arm and the Linux valgrind leg
+are recorded below.
 
 ### macOS ASan arm (the `test-memory` recipe, adapted verbatim)
 
@@ -493,29 +624,105 @@ completions (chain copy-out after `uv_freeaddrinfo` would be a heap-use-
 after-free; the req free/resubmit cycle would trip any double-free), ASan
 found nothing to report. **No leak claim is made or possible on this arm.**
 
-### PENDING CI (Linux): the valgrind question — the whole of it
+### Linux valgrind leg — CI run 32491363796
 
-Not run; valgrind does not exist on this Darwin/arm64 machine, and no
-valgrind output appears anywhere in this document. The CI spike branch must
-run the *exact* `test-memory` Linux invocation shape against
-`04-threadpool-gc.ss` (reduced target), i.e.:
+valgrind does not exist on the Darwin/arm64 dev machine, so this question
+runs only on the ubuntu leg. The CI job ran the *exact* `test-memory` Linux
+invocation shape against `04-threadpool-gc.ss` (reduced target 100), twice.
+**Command run (verbatim, from the job's own script step)**, `$CHEZ` =
+`scheme` (10.4.1), `$LIBUV_SO` = `/usr/lib/x86_64-linux-gnu/libuv.so`:
 
 ```bash
 UV_USE_IO_URING=0 CHEZ_LIBUV_UNDER_VALGRIND=1 \
-valgrind --error-exitcode=9 --leak-check=full --show-leak-kinds=definite \
-  --errors-for-leak-kinds=definite --undef-value-errors=no \
-  chez --script spike/dns/04-threadpool-gc.ss <ci-libuv.so> 100
+  valgrind --error-exitcode=9 --leak-check=full --show-leak-kinds=definite \
+    --errors-for-leak-kinds=definite --undef-value-errors=no \
+    $CHEZ --script spike/dns/04-threadpool-gc.ss "$LIBUV_SO" 100
 ```
 
-Exit criteria (design spec §10): exit 0 under the definite-only gate,
-**twice**; every definite block in the log attributed (glibc-internal vs
-ours) before the ADRs flip; the suppression decision — targeted file or
-none — made there, in the spike, not in red CI. The §8 prediction to
-check against the log: worker stacks/TLS/nss classify as still-reachable
-or possibly-lost, never definite.
+Both runs' `04-threadpool-gc.ss` transcripts (under valgrind, target 100)
+matched the un-instrumented ubuntu-leg transcript: `fire count after uv_run
+= 100`, every check `OK`, `RESULT: PASS`, both times. valgrind's own
+`Command:` line confirms the exact invocation instrumented, run 1:
+`==2953== Command: scheme --script spike/dns/04-threadpool-gc.ss
+/usr/lib/x86_64-linux-gnu/libuv.so 100`.
 
-**Q2 verdict: macOS arm PASS; no overall verdict until the valgrind leg
-runs.**
+**Run 1 — HEAP SUMMARY / LEAK SUMMARY / ERROR SUMMARY**, verbatim:
+
+```
+==2953== HEAP SUMMARY:
+==2953==     in use at exit: 1,913 bytes in 6 blocks
+==2953==   total heap usage: 834 allocs, 828 frees, 162,044 bytes allocated
+==2953==
+==2953== LEAK SUMMARY:
+==2953==    definitely lost: 0 bytes in 0 blocks
+==2953==    indirectly lost: 0 bytes in 0 blocks
+==2953==      possibly lost: 0 bytes in 0 blocks
+==2953==    still reachable: 1,913 bytes in 6 blocks
+==2953==         suppressed: 0 bytes in 0 blocks
+==2953== Reachable blocks (those to which a pointer was found) are not shown.
+==2953== To see them, rerun with: --leak-check=full --show-leak-kinds=all
+==2953==
+==2953== For lists of detected and suppressed errors, rerun with: -s
+==2953== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+```
+
+Exit code: `0` (`=== end Q2 run 1 (exit 0) ===`).
+
+**Run 2 — HEAP SUMMARY / LEAK SUMMARY / ERROR SUMMARY**, verbatim:
+
+```
+==2958== HEAP SUMMARY:
+==2958==     in use at exit: 1,913 bytes in 6 blocks
+==2958==   total heap usage: 834 allocs, 828 frees, 162,044 bytes allocated
+==2958==
+==2958== LEAK SUMMARY:
+==2958==    definitely lost: 0 bytes in 0 blocks
+==2958==    indirectly lost: 0 bytes in 0 blocks
+==2958==      possibly lost: 0 bytes in 0 blocks
+==2958==    still reachable: 1,913 bytes in 6 blocks
+==2958==         suppressed: 0 bytes in 0 blocks
+==2958== Reachable blocks (those to which a pointer was found) are not shown.
+==2958== To see them, rerun with: --leak-check=full --show-leak-kinds=all
+==2958==
+==2958== For lists of detected and suppressed errors, rerun with: -s
+==2958== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+```
+
+Exit code: `0` (`=== end Q2 run 2 (exit 0) ===`). The job's own gate agreed:
+`Q2: exit 0 both valgrind runs`.
+
+**The two runs' LEAK SUMMARY and ERROR SUMMARY blocks are identical**:
+`1,913 bytes in 6 blocks` still-reachable, `0` everywhere else (definite,
+indirect, possible, suppressed), `0 errors from 0 contexts` both times —
+only the valgrind PID prefix (`==2953==` vs `==2958==`) differs, which is
+process-identity noise, not data.
+
+**No per-block record appears in the log for the worker stacks/TLS.** The
+invocation used `--show-leak-kinds=definite` (the `test-memory` gate's own
+shape), and valgrind's own text says why nothing is itemized: "Reachable
+blocks (those to which a pointer was found) are not shown. To see them,
+rerun with: --leak-check=full --show-leak-kinds=all." So the log has no
+per-allocation attribution of the 1,913 still-reachable bytes to worker
+stacks vs pthread TLS vs anything else — only the aggregate LEAK SUMMARY
+line. This document records that absence rather than inventing an
+attribution: the measurement is that the 1,913 bytes sit entirely in the
+still-reachable bucket, outside the `--errors-for-leak-kinds=definite`
+gate, on both runs, which is exactly what the definite-only gate is built to
+tolerate.
+
+**Outcome.** The §8 prediction (worker stacks/TLS classify as
+still-reachable, never definite or possible) held **as measurement, not
+hope**: `definitely lost = 0` and `possibly lost = 0` both runs, with the
+entire non-zero total sitting in `still reachable`. Because nothing landed
+in `definite` or `possible`, there is nothing to attribute or suppress:
+**no valgrind suppression file is needed for the DNS suite, and that
+absence is the suppression decision** — targeted-file-vs-none was decided
+here, in the spike, as "none."
+
+**Q2 verdict: overall PASS.** macOS ASan arm PASS (no leak claim possible on
+that arm) plus Linux valgrind PASS (exit 0 both runs, definite/possible both
+zero both runs, identical LEAK SUMMARY and ERROR SUMMARY) together satisfy
+the design spec §10 exit criteria for Q2 in full.
 
 ---
 
@@ -820,37 +1027,271 @@ RESULT: PASS
 
 - No non-numeric **success** path, no canonname row, no named services —
   the accepted cost ADR-0013 records; nothing here exercises NSS.
-- The chain-shape cells are one OS's answer. The set-containment rule is
-  justified by the Darwin order alone, but the glibc cells (3 entries
-  including raw, per §9's expectation) are unmeasured until the CI leg runs.
+- The chain-shape cells above are one OS's answer alone. The set-containment
+  rule is justified by the Darwin order here; the glibc cells (3 entries
+  including raw, per §9's expectation) are measured in the Linux (glibc) leg
+  subsection below, not in this macOS-only section.
 
-### PENDING CI (Linux): Q4 glibc leg
+### Linux (glibc) leg — CI run 32491363796
 
-Not run — nothing to record. The CI leg must: run `spike/dns/probe-dns` on
-the runner and substitute its values for the Darwin constants block in
-`06-hermetic-matrix.ss` (the script's header names the groups known to
-differ: `AF_INET6`, the `AI_*` flag values, and the
-`addrinfo`/`sockaddr_in6` offsets); invoke with the runner's loopback
-interface name for the s-rows:
+**The runner's probe-dns output for the glibc layout numbers** — the values
+`apply-probe-constants.sh` substituted into `06-hermetic-matrix.ss` before
+either run — verbatim from the same job's `./spike/dns/probe-dns` step:
 
-```bash
-chez --script spike/dns/06-hermetic-matrix.ss <ci-libuv.so> lo
+```
+== struct addrinfo layout ==
+sizeof(struct addrinfo)                48
+offsetof(struct addrinfo, ai_flags)    0
+offsetof(struct addrinfo, ai_family)   4
+offsetof(struct addrinfo, ai_socktype) 8
+offsetof(struct addrinfo, ai_protocol) 12
+offsetof(struct addrinfo, ai_addrlen)  16
+offsetof(struct addrinfo, ai_canonname) 32
+offsetof(struct addrinfo, ai_addr)     24
+offsetof(struct addrinfo, ai_next)     40
+
+== address families ==
+AF_UNSPEC                              0
+AF_INET                                2
+AF_INET6                               10
 ```
 
-twice; paste both outputs; and enumerate every cell that differs from the
-macOS output above (expected differences, to be confirmed or refuted there:
-3-entry unpinned chains including a raw entry, and possibly a different
-entry order). Cells the script asserts (f1–f3 shapes, r1/r2 strings, s2/s3
-invariants) must hold identically or the run exits 1.
+`ai_addr` at offset 24 sits **before** `ai_canonname` at offset 32 on
+glibc — the reverse of Darwin's layout (`ai_canonname` 24, `ai_addr` 32,
+Q-1 above), confirming the design spec §5.2 claim the shim exists to guard
+against. `AF_INET6 = 10` on glibc vs `30` on Darwin, likewise substituted
+mechanically, never transcribed.
 
-**Q4 verdict (macOS leg): PASS.** The glibc leg gates the final verdict.
+**Post-rewrite `git diff --stat`** (same job step, covering both scripts the
+substitution touched), verbatim:
+
+```
+=== git diff --stat spike/dns/ (post-rewrite; shows what changed on the runner) ===
+ spike/dns/04-threadpool-gc.ss   | 10 +++++-----
+ spike/dns/06-hermetic-matrix.ss | 10 +++++-----
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+```
+
+**Command run (verbatim, twice)**, `$CHEZ` = `scheme` (10.4.1), `$LIBUV_SO`
+= `/usr/lib/x86_64-linux-gnu/libuv.so`, invoked with the runner's own
+loopback interface name:
+
+```bash
+$CHEZ --script spike/dns/06-hermetic-matrix.ss "$LIBUV_SO" lo | tee /tmp/q4-run1.out
+$CHEZ --script spike/dns/06-hermetic-matrix.ss "$LIBUV_SO" lo | tee /tmp/q4-run2.out
+diff /tmp/q4-run1.out /tmp/q4-run2.out
+```
+
+**Run 1 — full matrix output**, verbatim, exit `0`:
+
+```
+uv_loop_init = 0
+scope interface for s-rows = "lo"
+
+== forward lookups (uv_getaddrinfo) ==
+case f1: node="127.0.0.1" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet)
+    [0] family=inet socktype=stream proto=6 addr="127.0.0.1" port=80 scope=n/a
+case f2: node="::1" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="::1" port=80 scope=0
+case f3: node="chez-libuv-not-numeric.invalid" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = EAI_NONAME   fired = 1
+  entries = ()
+case f4: node="127.0.0.1" service="80" family=unspec socktype=unpinned flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 3   families = (inet)
+    [0] family=inet socktype=stream proto=6 addr="127.0.0.1" port=80 scope=n/a
+    [1] family=inet socktype=dgram proto=17 addr="127.0.0.1" port=80 scope=n/a
+    [2] family=inet socktype=raw proto=0 addr="127.0.0.1" port=80 scope=n/a
+case f5: node="::1" service="80" family=unspec socktype=unpinned flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 3   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="::1" port=80 scope=0
+    [1] family=inet6 socktype=dgram proto=17 addr="::1" port=80 scope=0
+    [2] family=inet6 socktype=raw proto=0 addr="::1" port=80 scope=0
+
+== reverse lookups (uv_getnameinfo, NI_NUMERICHOST|NI_NUMERICSERV) ==
+case r1 (127.0.0.1:80): flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  host = "127.0.0.1"   service = "80"
+case r2 (::1:443): flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  host = "::1"   service = "443"
+
+== scoped literal (ADR-0012 documented-drop row) ==
+case s1: node="fe80::1%lo" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="fe80::1" port=80 scope=1
+case s2: uv_ip6_addr("fe80::1%lo") rc = 0   sin6_scope_id = 1   uv_ip_name -> "fe80::1"
+case s3: uv_ip6_addr("fe80::1") rc = 0   sin6_scope_id = 0   uv_ip_name -> "fe80::1"
+
+uv_loop_close = 0
+
+--- checks ---
+every case fired exactly once: expected=0 actual=0 OK
+f1 status: expected=0 actual=0 OK
+f1 single entry: expected=1 actual=1 OK
+f1 entries all inet 127.0.0.1:80: expected=#t actual=#t OK
+f2 status: expected=0 actual=0 OK
+f2 single entry: expected=1 actual=1 OK
+f2 entries all inet6 ::1:80: expected=#t actual=#t OK
+f3 errno symbol: expected="EAI_NONAME" actual="EAI_NONAME" OK
+f3 empty chain: expected=() actual=() OK
+f4 status: expected=0 actual=0 OK
+f4 nonempty, single family (unspec + v4 literal): expected=#t actual=#t OK
+f5 status: expected=0 actual=0 OK
+f5 nonempty, single family (unspec + v6 literal): expected=#t actual=#t OK
+r1 host: expected="127.0.0.1" actual="127.0.0.1" OK
+r1 service: expected="80" actual="80" OK
+r2 host: expected="::1" actual="::1" OK
+r2 service: expected="443" actual="443" OK
+sa4/sa6 fills: expected=(0 0) actual=(0 0) OK
+s2 scoped literal parses inbound: expected=0 actual=0 OK
+s2 scope id nonzero inbound: expected=#t actual=#t OK
+s2 render drops the zone: expected="fe80::1" actual="fe80::1" OK
+s3 descoped round-trip scope: expected=0 actual=0 OK
+s3 render: expected="fe80::1" actual="fe80::1" OK
+uv_loop_close rc: expected=0 actual=0 OK
+
+RESULT: PASS
+```
+
+**Run 2 — full matrix output**, verbatim, exit `0`:
+
+```
+uv_loop_init = 0
+scope interface for s-rows = "lo"
+
+== forward lookups (uv_getaddrinfo) ==
+case f1: node="127.0.0.1" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet)
+    [0] family=inet socktype=stream proto=6 addr="127.0.0.1" port=80 scope=n/a
+case f2: node="::1" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="::1" port=80 scope=0
+case f3: node="chez-libuv-not-numeric.invalid" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = EAI_NONAME   fired = 1
+  entries = ()
+case f4: node="127.0.0.1" service="80" family=unspec socktype=unpinned flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 3   families = (inet)
+    [0] family=inet socktype=stream proto=6 addr="127.0.0.1" port=80 scope=n/a
+    [1] family=inet socktype=dgram proto=17 addr="127.0.0.1" port=80 scope=n/a
+    [2] family=inet socktype=raw proto=0 addr="127.0.0.1" port=80 scope=n/a
+case f5: node="::1" service="80" family=unspec socktype=unpinned flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 3   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="::1" port=80 scope=0
+    [1] family=inet6 socktype=dgram proto=17 addr="::1" port=80 scope=0
+    [2] family=inet6 socktype=raw proto=0 addr="::1" port=80 scope=0
+
+== reverse lookups (uv_getnameinfo, NI_NUMERICHOST|NI_NUMERICSERV) ==
+case r1 (127.0.0.1:80): flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  host = "127.0.0.1"   service = "80"
+case r2 (::1:443): flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  host = "::1"   service = "443"
+
+== scoped literal (ADR-0012 documented-drop row) ==
+case s1: node="fe80::1%lo" service="80" family=unspec socktype=stream flags=numerichost|numericserv
+  submit rc = 0   status = 0   fired = 1
+  entries = 1   families = (inet6)
+    [0] family=inet6 socktype=stream proto=6 addr="fe80::1" port=80 scope=1
+case s2: uv_ip6_addr("fe80::1%lo") rc = 0   sin6_scope_id = 1   uv_ip_name -> "fe80::1"
+case s3: uv_ip6_addr("fe80::1") rc = 0   sin6_scope_id = 0   uv_ip_name -> "fe80::1"
+
+uv_loop_close = 0
+
+--- checks ---
+every case fired exactly once: expected=0 actual=0 OK
+f1 status: expected=0 actual=0 OK
+f1 single entry: expected=1 actual=1 OK
+f1 entries all inet 127.0.0.1:80: expected=#t actual=#t OK
+f2 status: expected=0 actual=0 OK
+f2 single entry: expected=1 actual=1 OK
+f2 entries all inet6 ::1:80: expected=#t actual=#t OK
+f3 errno symbol: expected="EAI_NONAME" actual="EAI_NONAME" OK
+f3 empty chain: expected=() actual=() OK
+f4 status: expected=0 actual=0 OK
+f4 nonempty, single family (unspec + v4 literal): expected=#t actual=#t OK
+f5 status: expected=0 actual=0 OK
+f5 nonempty, single family (unspec + v6 literal): expected=#t actual=#t OK
+r1 host: expected="127.0.0.1" actual="127.0.0.1" OK
+r1 service: expected="80" actual="80" OK
+r2 host: expected="::1" actual="::1" OK
+r2 service: expected="443" actual="443" OK
+sa4/sa6 fills: expected=(0 0) actual=(0 0) OK
+s2 scoped literal parses inbound: expected=0 actual=0 OK
+s2 scope id nonzero inbound: expected=#t actual=#t OK
+s2 render drops the zone: expected="fe80::1" actual="fe80::1" OK
+s3 descoped round-trip scope: expected=0 actual=0 OK
+s3 render: expected="fe80::1" actual="fe80::1" OK
+uv_loop_close rc: expected=0 actual=0 OK
+
+RESULT: PASS
+```
+
+The job's own `diff /tmp/q4-run1.out /tmp/q4-run2.out` produced **no
+output** — byte-identical, confirmed by the in-job diff, not just eyeballed
+here — and the job printed `Q4: exit 0 both runs, stdout byte-identical`.
+
+**Every cell that differs from the macOS matrix, enumerated by case id**
+(all other cases — f1, f2, f3, r1, r2, s1's family/socktype/proto/addr/port,
+s2, s3 — are identical in value to the macOS transcript above; only the two
+below differ, and only in the unpinned-socktype chain shape):
+
+- **f4** (`node="127.0.0.1"`, `socktype=unpinned`): macOS has **2 entries**,
+  `[0] dgram proto=17`, `[1] stream proto=6` (dgram first, no raw entry).
+  glibc has **3 entries**, `[0] stream proto=6`, `[1] dgram proto=17`,
+  `[2] raw proto=0` (stream first, **includes a raw entry** glibc's own
+  chain adds). Three independent differences in one cell: entry count (2 vs
+  3), leading member (dgram vs stream), and set membership (no-raw vs
+  incl.-raw).
+- **f5** (`node="::1"`, `socktype=unpinned`): the identical shape of
+  difference, one family over — macOS **2 entries** (`[0] dgram`,
+  `[1] stream`, no raw); glibc **3 entries** (`[0] stream`, `[1] dgram`,
+  `[2] raw`).
+
+Both differences confirm the design spec §9 prediction exactly as stated
+there: "3-entry unpinned chains incl. raw, possibly different order." The
+order is different (glibc leads with `stream`, Darwin with `dgram`), and
+glibc's chain does include the `raw`/`proto=0` entry Darwin's omits. No
+other cell in the matrix — f1/f2/f3's shapes, r1/r2's strings, s1's
+scope-carrying resolve, s2/s3's inbound-parse/render invariants — differs
+between the two OSes; those are exactly the cells ADR-0013 asserts as
+equal-by-design (numeric literals, `AI_NUMERICHOST` failure mode,
+`AF_UNSPEC` singling one family), and they held. (The `s1`/`s2` loopback
+interface **name** is `"lo0"` on macOS vs `"lo"` on glibc — an expected,
+intentional difference in the script's own invocation argument, not a
+libuv/libc behavioral cell; the interfaces' numeric `sin6_scope_id`, `1` on
+both runners, is not asserted equal by the script and happens to agree here
+incidentally.)
+
+This is exactly the evidence ADR-0013's set-containment rule was written
+for: f4/f5 must be asserted as set-containment, never order or exact count,
+because order and count are now measured to differ legitimately between the
+two libcs the gating suites must run under.
+
+**Q4 verdict: overall PASS.** Both OS legs: exit 0 both runs, every
+asserted cell (f1–f3, r1–r2, s1–s3) `OK` on both runs, stdout byte-identical
+within each OS (macOS gated by the plain `diff`, glibc gated by the in-job
+`diff`), and the two OSes' unpinned-chain cells differ in exactly the way
+§9 predicted before either leg ran.
 
 ---
 
 ## Consequences for the plan
 
-What the implementation stages should absorb from the macOS legs (the CI
-legs may add to this list; they should not subtract from it):
+What the implementation stages should absorb from the macOS legs, plus what
+the Linux CI legs added on top (numbered 11–12 below; nothing the macOS legs
+established was subtracted):
 
 1. **`run-until/ticking` for every DNS wait is confirmed necessary in the
    measured sense**: a pending getaddrinfo leaves `uv_run 'once` parked in
@@ -890,3 +1331,21 @@ legs may add to this list; they should not subtract from it):
    structural. (Probe fact, carried so nobody "optimizes" the copy away.)
 10. **Runtime cost is a non-issue**: 10,000 lookup round-trips with a full
     `(collect)` each took 0.18 s. The spec's 10k target stays as written.
+11. **A suite must never assert which branch a `uv_run(NOWAIT)` (or the
+    `'once` that follows) takes immediately after a DNS submit.** The ubuntu
+    CI leg's own two runs, same binary, same runner, back-to-back, landed on
+    the two different legal outcomes of the probe-a race: run 1 measured
+    "already delivered by NOWAIT" (`immediately = 0`, `callback fired by
+    then: 1`, the follow-up `'once` never called); run 2 measured "still
+    pending at NOWAIT" (`immediately = 1`, `callback fired by then: 0`, one
+    blocking `'once` then delivered it). Item 1 above already prescribes
+    `run-until/ticking`; this item is the direct measurement that makes it
+    non-negotiable rather than merely cautious — hard-coding either NOWAIT
+    outcome is flaky by construction, confirmed on CI, not just in theory.
+12. **glibc's unpinned-socktype chain is 3 entries, stream-first, including
+    `raw`** — `[0] stream, [1] dgram, [2] raw` — measured identically on two
+    CI runs, against Darwin's 2 entries, dgram-first, no raw (item 7 above).
+    Both the entry count and the leading member differ by OS, confirming
+    item 7's set-containment rule was necessary, not merely cautious: a
+    suite asserting order or exact count for the unpinned-socktype rows
+    would pass on one CI OS and fail on the other.

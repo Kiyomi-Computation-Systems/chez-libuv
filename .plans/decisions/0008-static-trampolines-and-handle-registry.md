@@ -29,7 +29,7 @@ per callback *instance*: alloc, read, connection, write-done, close, timer,
 shutdown, connect. Each is created and `lock-object`'d exactly once, at
 process initialization, and never unlocked, for the life of the process.
 
-> **Amended 2026-08-21 (v0.2 DNS, proposed — pending spike/dns/FINDINGS.md).**
+> **Amended 2026-08-21 (v0.2 DNS, accepted 2026-08-21 — evidence: spike/dns/FINDINGS.md).**
 > v0.2 grows the set from eight to **ten**: getaddrinfo
 > (`(uptr int uptr) -> void`) and getnameinfo (`(uptr int uptr uptr) -> void`),
 > libuv's two DNS completion signatures (uv.h:345-352) — neither matches any

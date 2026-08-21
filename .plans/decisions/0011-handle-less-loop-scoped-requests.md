@@ -1,6 +1,6 @@
 # ADR-0011: DNS requests are handle-less, loop-scoped registry entries; teardown cancels then drains them
 
-- **Status:** Proposed (2026-08-21) — pending Stage 0 DNS spike evidence (spike/dns/FINDINGS.md)
+- **Status:** Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.2
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.2-dns-design.md),

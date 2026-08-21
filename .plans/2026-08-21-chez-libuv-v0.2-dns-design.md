@@ -1,7 +1,7 @@
 # Design Spec: chez-libuv v0.2 — DNS
 
 - **Date:** 2026-08-21
-- **Status:** Draft (2026-08-21) — pending Stage 0 DNS spike evidence
+- **Status:** Accepted (2026-08-21) — Stage 0 DNS spike complete
   (`spike/dns/FINDINGS.md`); see [decisions summary](#2-decisions-summary)
 - **Supersedes:** nothing. Refines the
   [v0.1 design spec](2026-08-18-chez-libuv-v0.1-design.md) and
@@ -58,11 +58,14 @@ gated on a Stage 0 spike (§10).
 
 ## 2. Decisions summary
 
-The three new ADRs carry
+The three new ADRs carried
 `Status: Proposed (2026-08-21) — pending Stage 0 DNS spike evidence
-(spike/dns/FINDINGS.md)` and flip to Accepted at spike exit, exactly as
-v0.1's ten did. ADR-0008 is amended **in place** (the dated-amendment style
-its 2026-08-18 correction block established), not superseded.
+(spike/dns/FINDINGS.md)` and have now flipped to
+`Status: Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4` at
+spike exit, exactly as v0.1's ten did. ADR-0008 is amended **in place** (the
+dated-amendment style its 2026-08-18 correction block established), not
+superseded; its amendment blockquote now reads accepted, evidence
+`spike/dns/FINDINGS.md`, on the same date.
 
 | ADR | Decision |
 |---|---|

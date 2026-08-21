@@ -1,6 +1,6 @@
 # ADR-0012: An address is a presentation-form string; a port is a separate exact integer
 
-- **Status:** Proposed (2026-08-21) — pending Stage 0 DNS spike evidence (spike/dns/FINDINGS.md)
+- **Status:** Accepted (2026-08-21) — evidence: spike/dns/FINDINGS.md Q1–Q4
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.2
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.2-dns-design.md), [ADR-0005](0005-constants-are-never-transcribed.md), [ADR-0009](0009-copy-at-the-boundary.md)
