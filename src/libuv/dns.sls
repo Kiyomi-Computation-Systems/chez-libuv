@@ -1,10 +1,11 @@
 #!r6rs
 ;;; (libuv dns) -- libuv's DNS verbs, as a legible mirror (design spec v0.2
-;;; S1): uv_getaddrinfo now; uv_getnameinfo and uv_cancel arrive with Stage
-;;; 5 of the v0.2 milestone. This is the binding's first use of libuv's
-;;; worker threads and its first handle-less, loop-scoped request kind
-;;; (ADR-0011); the resolver itself is whatever getaddrinfo(3) does on the
-;;; host -- no c-ares, no record types, no caching (S1 non-goals).
+;;; S1): uv_getaddrinfo, uv_getnameinfo, and uv_cancel -- the complete DNS
+;;; surface as of Stage 5 of the v0.2 milestone. This is the binding's
+;;; first use of libuv's worker threads and its first handle-less,
+;;; loop-scoped request kind (ADR-0011); the resolver itself is whatever
+;;; getaddrinfo(3)/getnameinfo(3) do on the host -- no c-ares, no record
+;;; types, no caching (S1 non-goals).
 ;;;
 ;;; NO PROCEDURE HERE TAKES OR RETURNS A POINTER. Results are uv-addrinfo
 ;;; records -- pure copied Scheme values (ADR-0009) -- and the start call
@@ -33,7 +34,8 @@
   ;; from (libuv private addrinfo): the record is this library's public
   ;; result vocabulary (S4.3), and the facade re-exports it from here by
   ;; name in Stage 6 (S4.6).
-  (export uv-getaddrinfo! uv-dns-request? addrinfo-chain->list
+  (export uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-dns-request?
+          addrinfo-chain->list
           make-uv-addrinfo uv-addrinfo?
           uv-addrinfo-family uv-addrinfo-socktype uv-addrinfo-protocol
           uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname)
@@ -194,6 +196,161 @@
          (memq (req-kind x) '(getaddrinfo getnameinfo))
          #t))
 
+  ;; --- the TCP input vocabulary, on the way in (S4.5, ADR-0012) -----------
+  ;; uv-getnameinfo! takes ip/port exactly as uv-tcp-connect! does: a
+  ;; presentation-form string and a separate exact integer. The predicates
+  ;; are tcp.sls's verbatim (tcp.sls:61-70) -- private there, so restated
+  ;; here rather than a cross-module import of another library's internals;
+  ;; the sockaddr both feed is filled by the SAME lifted fill-sockaddr!, so
+  ;; the two callers cannot drift on what an address IS.
+  (define (require-address ip who)
+    (unless (string? ip)
+      (raise (make-uv-invalid-argument who 'address-not-a-string))))
+
+  (define (require-port port who)
+    (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
+      (raise (make-uv-invalid-argument who 'port-out-of-range))))
+
+  ;; The nameinfo flags mapper IS the validation (unlike the getaddrinfo
+  ;; mappers above, whose else arms sit unreachable behind validate-hints):
+  ;; a closed set -- numeric-host, numeric-serv, name-required, dgram --
+  ;; with anything else refused by name, and no raw ints accepted (S4.5:
+  ;; v0.2 binds what it tests). Pure arithmetic over the shim's snapshot
+  ;; (ADR-0005), so it runs BEFORE the first allocation.
+  (define (nameinfo-flag-symbols->int flags)
+    (unless (list? flags)
+      (raise (make-uv-invalid-argument 'uv-getnameinfo!
+                                       'nameinfo-flags-not-a-list)))
+    (fold-left (lambda (acc flag)
+                 (bitwise-ior acc
+                              (case flag
+                                ((numeric-host)  (ni-numerichost))
+                                ((numeric-serv)  (ni-numericserv))
+                                ((name-required) (ni-namereqd))
+                                ((dgram)         (ni-dgram))
+                                (else (raise (make-uv-invalid-argument
+                                              'uv-getnameinfo!
+                                              'unknown-nameinfo-flag))))))
+               0 flags))
+
+  ;; --- uv-getnameinfo! (S4.5, S5.5) ---------------------------------------
+  ;; (uv-getnameinfo! loop ip port on-complete)           flags omitted => '()
+  ;; (uv-getnameinfo! loop ip port flags on-complete)
+  ;;   => opaque dns request
+  ;;
+  ;; on-complete is (err host service): err #f or a condition OBJECT; on
+  ;; success host and service are both fresh STRINGS, on every failure --
+  ;; cancellation included, as 'EAI_CANCELED -- both are #f, mechanically:
+  ;; libuv passes NULL for both on every nonzero status and
+  ;; c-string->string maps NULL to #f (S4.4). The callback fires exactly
+  ;; once in every outcome.
+  (define uv-getnameinfo!
+    (case-lambda
+      ((loop ip port on-complete)
+       (start-getnameinfo! loop ip port '() on-complete))
+      ((loop ip port flags on-complete)
+       (start-getnameinfo! loop ip port flags on-complete))))
+
+  ;; EVERY CHECK FIRST, THE ALLOCATION AFTER THEM, the native call under
+  ;; the abandon guard -- the start-call shape a third time (S5.5).
+  ;;
+  ;; ONE foreign-alloc: [uv_getnameinfo_t | pad to 16 | sockaddr_storage].
+  ;; The sockaddr is scratch to libuv -- uv_getnameinfo memcpys it into
+  ;; req->storage before returning (vendor/libuv/src/unix/getnameinfo.c:
+  ;; 89-99) -- but co-allocation settles the lifetime by construction, the
+  ;; connect-sockaddr rule verbatim, and it dies in the block's single
+  ;; free.
+  ;;
+  ;; fill-sockaddr! runs AFTER the allocation (it writes into the tail) and
+  ;; BEFORE registration: a garbage address unwinds with exactly one free
+  ;; and no other bookkeeping (tcp.sls:235-237 verbatim). This is the
+  ;; PRE-registration guard; the POST-registration abandon guard below is a
+  ;; different animal:
+  ;;
+  ;; UNREACHABLE BY CONSTRUCTION, KEPT HONEST: getnameinfo has no reachable
+  ;; post-registration sync failure -- both EINVAL paths in
+  ;; vendor/libuv/src/unix/getnameinfo.c:86-98 precede the uv__req_init at
+  ;; :101, and with a non-NULL callback the call then returns 0
+  ;; unconditionally (:109-115) -- so
+  ;; the abandon arm below can never run (S5.5; contrast getaddrinfo's,
+  ;; which idna makes testable). It is kept because deleting it would make
+  ;; this start call the only one whose native rc is unguarded, and
+  ;; recorded raising-through per the house convention for unreachable arms
+  ;; (tcp.sls:150-156 precedent).
+  (define (start-getnameinfo! loop ip port flags on-complete)
+    (require-open-loop loop 'uv-getnameinfo!)
+    (require-address ip 'uv-getnameinfo!)
+    (require-port port 'uv-getnameinfo!)
+    (let ((flags-int (nameinfo-flag-symbols->int flags)))
+      (unless (procedure? on-complete)
+        (raise (make-uv-invalid-argument 'uv-getnameinfo!
+                                         'on-complete-not-a-procedure)))
+      (let* ((addr-offset (align-16 (uv-req-size (uv-getnameinfo-req-type))))
+             (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
+             (addr (+ block addr-offset)))
+        (guard (e (#t (free! block) (raise e)))
+          (fill-sockaddr! addr ip port 'uv-getnameinfo!))
+        ;; handle = #f, loop carried by the registry entry -- ADR-0011,
+        ;; exactly as the getaddrinfo start call above.
+        (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete)))
+          (registry-register! block 'getnameinfo-req loop req)
+          (count-getnameinfo-req-new!)
+          (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
+                        (raise e)))
+            (uv-check (uv-getnameinfo-native
+                       (loop-pointer loop 'uv-getnameinfo!)
+                       block addr flags-int)
+                      'uv-getnameinfo!))
+          req))))
+
+  ;; --- uv-cancel! (S4.5) --------------------------------------------------
+  ;; (uv-cancel! req) => #t | #f
+  ;;
+  ;; #t  -- the native cancel won (rc 0: the work was still queued); the
+  ;;        callback WILL still fire, with 'EAI_CANCELED, through the
+  ;;        normal freeing site. #t is a value only success produces.
+  ;; #f  -- too late, uniformly: running or completed (rc UV_EBUSY), or
+  ;;        already freed (the stored ptr is zeroed at the freeing site) --
+  ;;        in the freed case NO NATIVE CALL IS MADE, since uv_cancel reads
+  ;;        req->type through whatever pointer it is handed
+  ;;        (vendor/libuv/src/threadpool.c:399-441) and this one is stale.
+  ;;        Either way the callback delivers (or delivered) the real
+  ;;        result.
+  ;;
+  ;; BOOLEAN, NOT RAISE: loop-close's 'EBUSY names a state the caller must
+  ;; fix; cancel's EBUSY is the unavoidable outcome of a race the caller
+  ;; cannot influence -- information, not an error (S4.5).
+  ;;
+  ;; DOUBLE-CANCEL before the callback fires answers #t twice -- harmless:
+  ;; libuv unlinks and re-inserts the same queue node, rc 0 again
+  ;; (threadpool.c:399-441; verified vendor fact, design spec S7).
+  ;; Documented, not defended.
+  ;;
+  ;; DOMAIN: dns requests only, checked FIRST -- a v0.1 write/connect/
+  ;; shutdown request record RAISES 'not-a-cancellable-request rather than
+  ;; answering #f (libuv would answer UV_EINVAL for the non-threadpool
+  ;; kinds; refusing in Scheme names the mistake as static, not racy). A
+  ;; future uv_work/uv_fs binding widens uv-dns-request?'s kind list
+  ;; without a rename (tcp.sls:16-18 reserved exactly this shape).
+  ;;
+  ;; The else arm is UNREACHABLE BY CONSTRUCTION, kept honest through
+  ;; uv-check: a live registered DNS request's pointer names a genuine
+  ;; uv_getaddrinfo_t/uv_getnameinfo_t, for which uv_cancel answers only 0
+  ;; or UV_EBUSY (UV_EINVAL is the non-threadpool-kind answer the domain
+  ;; check already excluded). If libuv ever grows a third answer it raises
+  ;; here by name instead of becoming a silent #f.
+  (define (uv-cancel! req)
+    (unless (uv-dns-request? req)
+      (raise (make-uv-invalid-argument 'uv-cancel!
+                                       'not-a-cancellable-request)))
+    (let ((ptr (req-ptr req)))
+      (if (zero? ptr)
+          #f
+          (let ((rc (uv-cancel ptr)))
+            (cond ((zero? rc) #t)
+                  ((eq? 'EBUSY (errno-value->symbol rc)) #f)
+                  (else (uv-check rc 'uv-cancel!)))))))
+
   ;; --- the chain walk (S4.3, S5.4) ----------------------------------------
   ;; (addrinfo-chain->list chain-head) -> list of uv-addrinfo, chain order.
   ;;
@@ -339,8 +496,59 @@
                    (count-getaddrinfo-req-free!)
                    (loop-record-error! loop payload)))))))))
 
+  ;; --- the getnameinfo dispatcher (S5.4) ----------------------------------
+  ;; uv_getnameinfo_cb: void (*)(uv_getnameinfo_t *req, int status,
+  ;; const char *hostname, const char *service). Runs inside handles.sls's
+  ;; seam guard, like its sibling above.
+  ;;
+  ;; THE COPY COMES FIRST, and its position is the whole dispatcher:
+  ;; hostname and service point INTO the request block itself -- req->host
+  ;; and req->service are char arrays inside uv_getnameinfo_t
+  ;; (vendor/libuv/include/uv/unix.h:353-354) -- and complete-request!
+  ;; frees that block before delivery. Copying after the free would read
+  ;; freed memory; passing the pointers through would hand the callback
+  ;; dangling foreign addresses (ADR-0009). c-string->string copies, and
+  ;; maps NULL to #f -- libuv passes NULL for both on every nonzero status,
+  ;; so the S4.4 failure contract (err set, host #f, service #f, cancel
+  ;; included) falls out with no branch here.
+  ;;
+  ;; The step-1 arms mirror the getaddrinfo dispatcher's, minus any
+  ;; freeing question -- there is no libuv-owned chain on this path,
+  ;; nothing to free but the block itself, and that only through the one
+  ;; freeing site:
+  ;;   * ORPHAN (no entry): nothing is copied and nothing is freed -- the
+  ;;     strings would point into a block whose provenance is unknown;
+  ;;     complete-request!'s no-entry arm records the orphan.
+  ;;   * KIND MISMATCH: raise into the seam's containment BEFORE touching
+  ;;     hostname/service. A cross-paired trampoline means those registers
+  ;;     hold garbage (the 3-argument getaddrinfo callback shape read as
+  ;;     4), and a uv_getaddrinfo_t walked as a getnameinfo block would
+  ;;     deliver interior bytes as strings -- fabricated data, refused
+  ;;     (S5.4). The entry itself is left untouched.
+  (define (getnameinfo-dispatch block-ptr status hostname-ptr service-ptr)
+    (let ((req (registry-ref block-ptr)))
+      (cond
+        ((not req)
+         (complete-request! 'getnameinfo 'uv-getnameinfo!
+                            count-getnameinfo-req-free! block-ptr status))
+        ((not (and (uv-req? req) (eq? (req-kind req) 'getnameinfo)))
+         (raise (condition
+                 (make-uv-error)
+                 (make-who-condition 'uv-getnameinfo-dispatch)
+                 (make-message-condition
+                  "getnameinfo completion for a request of another kind"))))
+        (else
+         (let ((hostname (c-string->string hostname-ptr))
+               (service  (c-string->string service-ptr)))
+           (complete-request! 'getnameinfo 'uv-getnameinfo!
+                              count-getnameinfo-req-free!
+                              block-ptr status hostname service))))))
+
   ;; Installed at library-body time, through the once-per-name seam
-  ;; (S5.4): the 'getaddrinfo slot held handles.sls's contained raising
-  ;; stub until this instant, and can never be rebound after it.
+  ;; (S5.4): each slot held handles.sls's contained raising stub until
+  ;; this instant, and can never be rebound after it.
   (define getaddrinfo-dispatch-installed
-    (install-dispatch-procedure! 'getaddrinfo getaddrinfo-dispatch)))
+    (install-dispatch-procedure! 'getaddrinfo getaddrinfo-dispatch))
+
+  (define getnameinfo-dispatch-installed
+    (install-dispatch-procedure! 'getnameinfo getnameinfo-dispatch)))

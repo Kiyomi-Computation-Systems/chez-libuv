@@ -1,7 +1,14 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv dns) -- the getaddrinfo half (design spec v0.2
-;;; S4.1-S4.4, S5.4, S5.5, S9). getnameinfo, uv-cancel!, and the teardown
-;;; rows are Stage 5's.
+;;; SRFI-64 suite for (libuv dns) -- the full DNS surface (design spec v0.2
+;;; S4.1-S4.5, S5.4, S5.5, S6, S9): the getaddrinfo half (Stage 4), and
+;;; Stage 5's getnameinfo, uv-cancel!, cancel-race, and teardown rows.
+;;;
+;;; BRANCH DISCIPLINE for the cancel rows (FINDINGS Q3): where the race is
+;;; real (a same-turn cancel, a teardown sweep racing a worker pickup) the
+;;; row is TOLERANT -- the outcome is asserted boolean and each branch is
+;;; asserted with its PAIRED consequence, never the boolean alone. Where
+;;; the design forces the branch (a queued tail behind a blocker at pool 1)
+;;; the row is FORCED and must not be weakened to tolerant.
 ;;;
 ;;; HERMETIC BY POLICY (ADR-0013): every lookup below is numeric --
 ;;; AI_NUMERICHOST literals, numeric services -- so the resolver's
@@ -815,6 +822,604 @@
       'still-registered
       'entry-disturbed))
 
+;; ========================================================================
+;; STAGE 5: uv-getnameinfo!, uv-cancel!, cancel/teardown rows (S4.5, S5.4,
+;; S5.5, S6, S9)
+;; ========================================================================
+
+;; --- seed: the second counter class starts at zero -----------------------
+(test-equal "seed: no getnameinfo request is live before this suite starts one"
+  0 (live-count 'getnameinfo-req))
+
+;; --- row m: numeric reverse v4 (S9; FINDINGS Q4 f6) ----------------------
+;; NI_NUMERICHOST|NI_NUMERICSERV makes the reverse pure formatting: the
+;; hostname IS the literal rendered back and the service IS the port
+;; printed in decimal -- both STRINGS (getnameinfo(3)'s output vocabulary,
+;; S4.4), no resolver, no /etc/services (ADR-0013).
+(define m-err 'callback-never-fired)
+(define m-host 'callback-never-fired)
+(define m-serv 'callback-never-fired)
+
+(uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                 (lambda (err host service)
+                   (collect)
+                   (set! m-err (err->symbol err))
+                   (set! m-host host)
+                   (set! m-serv service)))
+
+(run-until/ticking l (lambda () (not (eq? m-err 'callback-never-fired))) cap)
+
+(test-equal "reverse v4: err is #f on success" 'no-error m-err)
+
+(test-equal "reverse v4: hostname is the literal rendered back"
+  "127.0.0.1" m-host)
+
+(test-equal "reverse v4: service is the port as a decimal STRING"
+  "8080" m-serv)
+
+;; --- row m2: numeric reverse v6 ------------------------------------------
+;; The v6 reverse crosses fill-sockaddr!'s AF_INET6 arm into the request's
+;; co-allocated sockaddr_storage tail and formats back out of it.
+(define m2-err 'callback-never-fired)
+(define m2-host 'callback-never-fired)
+(define m2-serv 'callback-never-fired)
+
+(uv-getnameinfo! l "::1" 8080 '(numeric-host numeric-serv)
+                 (lambda (err host service)
+                   (collect)
+                   (set! m2-err (err->symbol err))
+                   (set! m2-host host)
+                   (set! m2-serv service)))
+
+(run-until/ticking l (lambda () (not (eq? m2-err 'callback-never-fired))) cap)
+
+(test-equal "reverse v6: err is #f on success" 'no-error m2-err)
+
+(test-equal "reverse v6: hostname is the v6 literal rendered back"
+  "::1" m2-host)
+
+(test-equal "reverse v6: service is the port as a decimal STRING"
+  "8080" m2-serv)
+
+;; --- row n: getnameinfo request lifecycle, mirroring row g ---------------
+;; The S4.4 lifetime contract for the second request kind: deregistered,
+;; freed, counted, ptr-zeroed all BEFORE on-complete runs -- observed from
+;; inside the callback, the only vantage point that can tell "freed
+;; before" from "freed after". The two strings the callback received were
+;; copied out of the request block BEFORE that free (unix.h:353-354: they
+;; point INTO it), which is what row m already proved by value.
+(define n-live-in-callback 'callback-never-fired)
+(define n-ptr-in-callback 'callback-never-fired)
+(define n-registry-in-callback 'callback-never-fired)
+(define n-registry-before-submit (registry-count))
+
+(define n-req
+  (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                   (lambda (err host service)
+                     (collect)
+                     (set! n-live-in-callback (live-count 'getnameinfo-req))
+                     (set! n-ptr-in-callback (req-ptr n-req))
+                     (set! n-registry-in-callback (registry-count)))))
+
+(test-equal "getnameinfo in flight: the live counter reads 1 after submit, before stepping"
+  1 (live-count 'getnameinfo-req))
+
+(test-equal "getnameinfo in flight: the request block is registered"
+  (+ n-registry-before-submit 1) (registry-count))
+
+(test-equal "getnameinfo in flight: the start call answered an opaque request record"
+  'a-req (if (uv-req? n-req) 'a-req 'not-a-req))
+
+;; The second kind in uv-dns-request?'s kind list becomes watchable now
+;; that a getnameinfo request exists (Stage 4's deferred-coverage note).
+(test-equal "uv-dns-request? accepts a getnameinfo request record"
+  'dns-request (if (uv-dns-request? n-req) 'dns-request 'not-dns))
+
+(run-until/ticking l (lambda () (not (eq? n-live-in-callback
+                                          'callback-never-fired)))
+                   cap)
+
+(test-equal "getnameinfo freed before on-complete: the live counter reads 0 inside the callback"
+  0 n-live-in-callback)
+
+(test-equal "getnameinfo freed before on-complete: the record's ptr is zeroed inside the callback"
+  0 n-ptr-in-callback)
+
+(test-equal "getnameinfo freed before on-complete: the registry entry is popped inside the callback"
+  (+ n-registry-before-submit 1) n-registry-in-callback)
+
+;; --- cancel after completion: the zeroed-ptr guard (S4.5) ----------------
+;; n-req's block was freed and its stored ptr zeroed at the freeing site;
+;; uv-cancel! must answer #f WITHOUT calling native -- uv_cancel reads
+;; req->type through whatever pointer it is handed
+;; (vendor/libuv/src/threadpool.c:399-441), and this one is stale. Both
+;; observable halves are asserted: the #f, and that nothing raised. (That
+;; the native call really is skipped is the valgrind-backstopped mutation
+;; in .plans/dns-stage-5-mutation-log.md -- no Scheme assertion can see a
+;; call that faults.)
+(test-equal "cancel after completion: answers #f, and nothing raises"
+  'cancelled-too-late
+  (guard (e (#t (list 'raised e)))
+    (case (uv-cancel! n-req)
+      ((#f) 'cancelled-too-late)
+      ((#t) 'cancel-claimed-success)
+      (else 'not-a-boolean))))
+
+;; --- uv-cancel! domain rows (S4.5) ---------------------------------------
+;; DNS requests ONLY. A v0.1-kind request record is REFUSED, not answered
+;; #f: libuv would answer UV_EINVAL for the non-threadpool kinds, and
+;; refusing in Scheme names the mistake as static, not racy. The record is
+;; constructed bare (ptr never dereferenced) -- the Stage 4 precedent.
+(define (cancel-rejection thunk)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e)
+                   (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (thunk)
+    'no-raise))
+
+(test-equal "uv-cancel! refuses a non-record"
+  '(uv-cancel! not-a-cancellable-request)
+  (cancel-rejection (lambda () (uv-cancel! "127.0.0.1"))))
+
+(test-equal "uv-cancel! refuses a v0.1-kind request record, by kind"
+  '(uv-cancel! not-a-cancellable-request)
+  (cancel-rejection
+   (lambda () (uv-cancel! (%make-uv-req-record 1 'write #f #f)))))
+
+;; --- the tolerant tail-cancel (S4.5, S9; FINDINGS Q3) --------------------
+;; Q3's measured regime exactly: pool pinned to 1 (prologue), four numeric
+;; blockers occupying the single worker's queue, a tail behind them,
+;; uv-cancel! on the tail in the SAME turn -- no loop step between submit
+;; and cancel. Q3 recorded the cancelled branch at 1000/1000 twice here,
+;; but the race is real, so the outcome is asserted BOOLEAN and each
+;; branch carries its PAIRED consequence -- never the boolean alone.
+(define tc-blocker-fires (make-vector 4 0))
+(define tc-tail-fires 0)
+(define tc-tail-err 'callback-never-fired)
+(define tc-tail-results 'callback-never-fired)
+
+(let submit ((i 0))
+  (when (< i 4)
+    (let ((idx i))
+      (uv-getaddrinfo! l "127.0.0.1" "80"
+                       (suite-hints #t '(family . inet) '(socktype . stream))
+                       (lambda (err results)
+                         (collect)
+                         (vector-set! tc-blocker-fires idx
+                                      (+ 1 (vector-ref tc-blocker-fires idx))))))
+    (submit (+ i 1))))
+
+(define tc-tail-req
+  (uv-getaddrinfo! l "127.0.0.1" "80"
+                   (suite-hints #t '(family . inet) '(socktype . stream))
+                   (lambda (err results)
+                     (collect)
+                     (set! tc-tail-fires (+ tc-tail-fires 1))
+                     (set! tc-tail-err (err->symbol err))
+                     (set! tc-tail-results results))))
+
+;; SAME TURN: nothing has stepped the loop since the five submits.
+(define tc-outcome (uv-cancel! tc-tail-req))
+
+(test-equal "tolerant cancel: the outcome is a boolean"
+  'boolean-outcome
+  (if (boolean? tc-outcome) 'boolean-outcome (list 'not-boolean tc-outcome)))
+
+(run-until/ticking l
+                   (lambda ()
+                     (and (>= tc-tail-fires 1)
+                          (>= (vector-ref tc-blocker-fires 0) 1)
+                          (>= (vector-ref tc-blocker-fires 1) 1)
+                          (>= (vector-ref tc-blocker-fires 2) 1)
+                          (>= (vector-ref tc-blocker-fires 3) 1)))
+                   cap)
+
+;; BRANCH-INVARIANT: holds whichever way the race went.
+(test-equal "tolerant cancel: every one of the five callbacks fired EXACTLY once"
+  '(1 1 1 1 1)
+  (list (vector-ref tc-blocker-fires 0) (vector-ref tc-blocker-fires 1)
+        (vector-ref tc-blocker-fires 2) (vector-ref tc-blocker-fires 3)
+        tc-tail-fires))
+
+(test-equal "tolerant cancel: the branch taken carries its paired consequence"
+  'branch-consistent
+  (cond ((eq? tc-outcome #t)
+         ;; Cancel won while queued. libuv REWRITES UV_ECANCELED to
+         ;; UV_EAI_CANCELED before the callback (getaddrinfo.c:128-133) --
+         ;; one spelling, never 'ECANCELED -- and results are '(), never #f.
+         (if (and (eq? tc-tail-err 'EAI_CANCELED) (null? tc-tail-results))
+             'branch-consistent
+             (list 'cancel-won-but tc-tail-err tc-tail-results)))
+        ((eq? tc-outcome #f)
+         ;; Too late: the real result was delivered.
+         (if (and (eq? tc-tail-err 'no-error) (pair? tc-tail-results))
+             'branch-consistent
+             (list 'cancel-lost-but tc-tail-err tc-tail-results)))
+        (else (list 'not-a-boolean tc-outcome))))
+
+(test-equal "tolerant cancel: counters and registry are back to baseline"
+  (list 0 0 (+ registry-with-loop 1))   ; loop + probe-timer
+  (list (live-count 'getaddrinfo-req) (live-count 'getnameinfo-req)
+        (registry-count)))
+
+;; --- double-cancel before the drain (S4.5) -------------------------------
+;; The target is a getnameinfo request, covering the second kind's cancel
+;; path and its 'EAI_CANCELED delivery (host and service #f through the
+;; NULL->#f rule, S4.4). Both cancels land in the same turn, before any
+;; drain: the vendor unlinks and re-inserts the same queue node, rc 0
+;; twice (vendor/libuv/src/threadpool.c:399-441; design spec S7's
+;; verified-facts row) -- #t twice, documented not defended, and the
+;; callback still fires EXACTLY once.
+;;
+;; BOUNDED RETRY, NOT A TOLERANT ROW. The first cancel's #t is a race with
+;; a measured heavy favorite (FINDINGS Q3: 1000/1000 at pool 1), but a GC
+;; or scheduler pause landing between the tail submit and the cancel lets
+;; the single worker drain the whole queue -- MEASURED under the ASan arm:
+;; a forced (collect) inside that window lost the race 52/100, and even
+;; with the collect moved ahead of the submits ~1% of 500 trials lost
+;; (.plans/dns-stage-5-mutation-log.md records the probe histograms). So
+;; each attempt resets the allocation clock FIRST, and the scenario
+;; retries -- bounded by attempts, never wall-clock -- until the first
+;; cancel wins; the vendor property under test (second cancel also #t,
+;; exactly one delivery, 'EAI_CANCELED) is then asserted on that attempt,
+;; and the exactly-once/balance invariants are asserted on EVERY attempt,
+;; the losing draws included.
+(define dc-max-attempts 16)
+
+(define (double-cancel-attempt!)
+  (collect)   ; no organic collection pause inside the submit-to-cancel window
+  (let ((blocker-fires 0)
+        (tail-fires 0)
+        (tail-err 'callback-never-fired)
+        (tail-host 'callback-never-fired)
+        (tail-serv 'callback-never-fired))
+    (let submit ((i 0))
+      (when (< i 4)
+        (uv-getaddrinfo! l "127.0.0.1" "80"
+                         (suite-hints #t '(family . inet) '(socktype . stream))
+                         (lambda (err results)
+                           (collect)
+                           (set! blocker-fires (+ blocker-fires 1))))
+        (submit (+ i 1))))
+    (let* ((req (uv-getnameinfo!
+                 l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                 (lambda (err host service)
+                   (collect)
+                   (set! tail-fires (+ tail-fires 1))
+                   (set! tail-err (err->symbol err))
+                   (set! tail-host (if host (list 'host host) 'host-absent))
+                   (set! tail-serv (if service
+                                       (list 'service service)
+                                       'service-absent)))))
+           ;; SAME TURN: no loop step since the submits.
+           (first (uv-cancel! req))
+           (second (if (eq? first #t)
+                       (uv-cancel! req)
+                       'not-attempted)))
+      (run-until/ticking l
+                         (lambda () (and (>= tail-fires 1)
+                                         (>= blocker-fires 4)))
+                         cap)
+      (list (cons 'first first)
+            (cons 'second second)
+            (cons 'blocker-fires blocker-fires)
+            (cons 'tail-fires tail-fires)
+            (cons 'tail-err tail-err)
+            (cons 'tail-host tail-host)
+            (cons 'tail-serv tail-serv)
+            (cons 'balance (list (live-count 'getaddrinfo-req)
+                                 (live-count 'getnameinfo-req)
+                                 (registry-count)))))))
+
+(define dc-attempts '())   ; most recent first
+
+(let attempt ((n 1))
+  (let ((obs (double-cancel-attempt!)))
+    (set! dc-attempts (cons obs dc-attempts))
+    (when (and (< n dc-max-attempts)
+               (not (eq? #t (cdr (assq 'first obs)))))
+      (attempt (+ n 1)))))
+
+(display (string-append "  [informational] double-cancel: first cancel won on attempt "
+                        (number->string (length dc-attempts))
+                        " of max " (number->string dc-max-attempts)))
+(newline)
+
+(test-equal "double-cancel: every attempt fired every callback exactly once and balanced"
+  'invariants-held
+  (let check ((atts dc-attempts))
+    (cond ((null? atts) 'invariants-held)
+          ((let ((a (car atts)))
+             (and (= 4 (cdr (assq 'blocker-fires a)))
+                  (= 1 (cdr (assq 'tail-fires a)))
+                  (equal? (list 0 0 (+ registry-with-loop 1)) ; loop + probe-timer
+                          (cdr (assq 'balance a)))))
+           (check (cdr atts)))
+          (else (list 'invariant-violated (car atts))))))
+
+(test-equal "double-cancel: a same-turn first cancel won within the attempt bound"
+  'first-cancel-won
+  (let ((final (car dc-attempts)))
+    (if (eq? #t (cdr (assq 'first final)))
+        'first-cancel-won
+        (list 'never-won-in (length dc-attempts) 'attempts))))
+
+(test-equal "double-cancel: the second cancel on the same queued node also answers #t"
+  'second-cancel-true
+  (let ((final (car dc-attempts)))
+    (case (cdr (assq 'second final))
+      ((#t) 'second-cancel-true)
+      ((#f) 'second-cancel-false)
+      (else (list 'second-was (cdr (assq 'second final)))))))
+
+(test-equal "double-cancel: the callback fired exactly once, cancelled, host and service #f"
+  '(1 EAI_CANCELED host-absent service-absent)
+  (let ((final (car dc-attempts)))
+    (list (cdr (assq 'tail-fires final))
+          (cdr (assq 'tail-err final))
+          (cdr (assq 'tail-host final))
+          (cdr (assq 'tail-serv final)))))
+
+;; --- boundary: uv-getnameinfo! validation, before the first allocation ---
+;; The TCP input vocabulary on the way in (S4.5, ADR-0012), each refusal
+;; before anything is allocated, registered, or counted -- asserted by the
+;; balance row after the block.
+(define (getnameinfo-rejection thunk)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e)
+                   (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (thunk)
+    'no-raise))
+
+(test-equal "boundary: a non-loop first argument is refused"
+  '(uv-getnameinfo! not-a-uv-loop)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! 'not-a-loop "127.0.0.1" 8080 '(numeric-host)
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: a non-string address is refused"
+  '(uv-getnameinfo! address-not-a-string)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l 2130706433 8080 '(numeric-host)
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: an out-of-range port is refused"
+  '(uv-getnameinfo! port-out-of-range)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l "127.0.0.1" 65536 '(numeric-host)
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: a flag outside the closed nameinfo set is refused"
+  '(uv-getnameinfo! unknown-nameinfo-flag)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host addrconfig)
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: a non-list flags argument is refused"
+  '(uv-getnameinfo! nameinfo-flags-not-a-list)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l "127.0.0.1" 8080 'numeric-host
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: a non-procedure on-complete is refused"
+  '(uv-getnameinfo! on-complete-not-a-procedure)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host)
+                               'not-a-procedure))))
+
+;; The PRE-REGISTRATION guard (S5.5; S9's relabeled garbage-address row):
+;; "not-an-ip" passes require-address (it IS a string) and fails inside
+;; fill-sockaddr! AFTER the block is allocated, BEFORE anything is
+;; registered or counted -- the guard's undo is exactly one free. Driven
+;; through the THREE-argument arity, so the flags-omitted => '() spelling
+;; reaches the native boundary logic without any resolver consultation.
+(test-equal "boundary: a garbage address fails in fill-sockaddr!, through the 3-arity"
+  '(uv-getnameinfo! bad-address)
+  (getnameinfo-rejection
+   (lambda () (uv-getnameinfo! l "not-an-ip" 8080
+                               (lambda (err host service) #f)))))
+
+(test-equal "boundary: every rejection above allocated and registered nothing"
+  (list 0 (+ registry-with-loop 1))   ; loop + probe-timer
+  (list (live-count 'getnameinfo-req) (registry-count)))
+
+;; --- the getnameinfo dispatcher's step-1 arms, driven directly (S5.4) ----
+;; Same seam technique as the getaddrinfo arms above. The ORPHAN arm is
+;; driven with NULL hostname/service: for a pointer this binding has
+;; forgotten there is nothing to copy and nothing to free -- the strings
+;; would point INTO the unknown block anyway (unix.h:353-354).
+(define ni-orphan-probe-ptr 123456789)
+
+((dispatcher-ref 'getnameinfo) ni-orphan-probe-ptr 0 0 0)
+
+(test-equal "getnameinfo orphan arm: the event is recorded with the dispatcher's name and pointer"
+  (list 'getnameinfo ni-orphan-probe-ptr)
+  (let ((events (orphan-callback-events)))
+    (if (= (length events) (+ orphans-at-start 2))
+        (let ((last (car (reverse events))))
+          (list (car last) (cdr last)))
+        (list 'orphan-count (length events)))))
+
+;; The KIND-MISMATCH arm: probe-timer stands in for the cross-paired-
+;; trampoline bug state again. The dispatcher must raise BEFORE touching
+;; hostname/service (their provenance is unknown in that bug state); the
+;; seam contains the raise and uv-run re-raises it by name.
+((dispatcher-ref 'getnameinfo) (handle-ptr probe-timer) 0 0 0)
+
+(test-equal "getnameinfo kind-mismatch arm: contained, and re-raised from uv-run by name"
+  '(callback-error uv-getnameinfo-dispatch)
+  (guard (e ((uv-callback-error? e) (list 'callback-error (condition-who e)))
+            (#t (list 'wrong-condition e)))
+    (uv-run l 'nowait)
+    'no-raise))
+
+(test-equal "getnameinfo kind-mismatch arm: the wrong-kind registry entry is untouched"
+  'still-registered
+  (if (eq? probe-timer (registry-ref (handle-ptr probe-timer)))
+      'still-registered
+      'entry-disturbed))
+
+;; --- pool-pinned queued-tail teardown (S6; ADR-0011; Stage 3's M3 caveat)
+;; A second loop per attempt: four numeric blockers head the single
+;; worker's queue (Q3's exactly-measured same-turn regime -- 1000/1000
+;; cancelled, twice), a getnameinfo tail behind them, then
+;; uv-loop-teardown! in the SAME turn -- the cancel sweep must reach the
+;; still-queued tail, which then drains as 'EAI_CANCELED before teardown
+;; returns (S6's contract: every in-flight on-complete runs before
+;; teardown returns).
+;;
+;; THE CANCELLED-TAIL ROW IS THE NAMED CATCHER for a kind-narrowed
+;; cancel-requests-for-loop! (the Stage 3 caveat): a sweep that misses
+;; getnameinfo-req never cancels the tail on ANY attempt -- the drain
+;; waits the real result out instead -- so the observed-within-bound row
+;; below fails by name, deterministically.
+;;
+;; BOUNDED RETRY, same physics as the double-cancel row above: "pool=1
+;; guarantees the tail is queued" holds only while the worker is still
+;; behind the blockers, and a GC/scheduler pause inside the
+;; submit-to-sweep window lets it drain everything (measured: a forced
+;; (collect) in the window lost 52/100; collect-first still lost ~1% of
+;; 500 ASan trials, and the very first 1-blocker suite shape lost a real
+;; test-memory run -- .plans/dns-stage-5-mutation-log.md). Each attempt
+;; collects FIRST, and the branch-independent invariants -- teardown
+;; returned with the loop closed, all five callbacks fired exactly once
+;; BEFORE it returned, every blocker in a legal branch, counters and
+;; registry balanced -- are asserted over EVERY attempt, losing draws
+;; included. Only the branch draw itself retries; wall-clock never
+;; decides.
+(define td-registry-before (registry-count))
+(define td-max-attempts 16)
+
+(define (teardown-attempt!)
+  (collect)   ; no organic collection pause inside the submit-to-sweep window
+  (let ((l2 (make-uv-loop))
+        (blocker-fires (make-vector 4 0))
+        (blocker-errs (make-vector 4 'callback-never-fired))
+        (tail-fires 0)
+        (tail-err 'callback-never-fired)
+        (tail-host 'callback-never-fired)
+        (tail-serv 'callback-never-fired))
+    (let submit ((i 0))
+      (when (< i 4)
+        (let ((idx i))
+          (uv-getaddrinfo! l2 "127.0.0.1" "80"
+                           (suite-hints #t '(family . inet)
+                                        '(socktype . stream))
+                           (lambda (err results)
+                             (collect)
+                             (vector-set! blocker-fires idx
+                                          (+ 1 (vector-ref blocker-fires idx)))
+                             (vector-set! blocker-errs idx
+                                          (err->symbol err)))))
+        (submit (+ i 1))))
+    (uv-getnameinfo! l2 "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                     (lambda (err host service)
+                       (collect)
+                       (set! tail-fires (+ tail-fires 1))
+                       (set! tail-err (err->symbol err))
+                       (set! tail-host (if host (list 'host host) 'host-absent))
+                       (set! tail-serv (if service
+                                           (list 'service service)
+                                           'service-absent))))
+    ;; Teardown IMMEDIATELY: no loop step between the submits and the sweep.
+    (uv-loop-teardown! l2)
+    (list (cons 'loop-state (if (uv-loop-open? l2) 'still-open 'closed))
+          (cons 'fires (list (vector-ref blocker-fires 0)
+                             (vector-ref blocker-fires 1)
+                             (vector-ref blocker-fires 2)
+                             (vector-ref blocker-fires 3)
+                             tail-fires))
+          (cons 'blocker-errs (vector->list blocker-errs))
+          (cons 'tail-err tail-err)
+          (cons 'tail-host tail-host)
+          (cons 'tail-serv tail-serv)
+          (cons 'balance (list (live-count 'getaddrinfo-req)
+                               (live-count 'getnameinfo-req)
+                               (registry-count))))))
+
+(define td-attempts '())   ; most recent first
+
+(let attempt ((n 1))
+  (let ((obs (teardown-attempt!)))
+    (set! td-attempts (cons obs td-attempts))
+    (when (and (< n td-max-attempts)
+               (not (eq? 'EAI_CANCELED (cdr (assq 'tail-err obs)))))
+      (attempt (+ n 1)))))
+
+(display (string-append "  [informational] queued-tail teardown: cancel won on attempt "
+                        (number->string (length td-attempts))
+                        " of max " (number->string td-max-attempts)))
+(newline)
+
+(test-equal "queued-tail teardown: every attempt closed the loop, fired all five exactly once, and balanced"
+  'invariants-held
+  (let check ((atts td-attempts))
+    (cond ((null? atts) 'invariants-held)
+          ((let ((a (car atts)))
+             (and (eq? 'closed (cdr (assq 'loop-state a)))
+                  (equal? '(1 1 1 1 1) (cdr (assq 'fires a)))
+                  (for-all (lambda (e) (memq e '(no-error EAI_CANCELED)))
+                           (cdr (assq 'blocker-errs a)))
+                  (equal? (list 0 0 td-registry-before)
+                          (cdr (assq 'balance a)))))
+           (check (cdr atts)))
+          (else (list 'invariant-violated (car atts))))))
+
+(test-equal "queued-tail teardown: the sweep cancelled the queued tail within the attempt bound"
+  'cancel-won-observed
+  (let ((final (car td-attempts)))
+    (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
+        'cancel-won-observed
+        (list 'never-cancelled-in (length td-attempts) 'attempts
+              'final-tail-err (cdr (assq 'tail-err final))))))
+
+(test-equal "queued-tail teardown: the cancelled tail delivered EAI_CANCELED with host and service #f"
+  '(EAI_CANCELED host-absent service-absent)
+  (let ((final (car td-attempts)))
+    (list (cdr (assq 'tail-err final))
+          (cdr (assq 'tail-host final))
+          (cdr (assq 'tail-serv final)))))
+
+;; --- uv-loop-close! with an in-flight request => 'EBUSY (S6; ADR-0011) ---
+;; libuv's own guard is the check (vendor/libuv/src/uv-common.c:885): an
+;; active request keeps the loop alive, so uv_loop_close answers EBUSY --
+;; surfacing as the SYMBOL through &uv-errno-error (ADR-0006) -- with the
+;; loop untouched and usable. Deterministic without a step: whatever the
+;; worker has done meanwhile, the req stays active until its completion
+;; callback runs inside uv-run, which has not happened yet.
+(define l3 (make-uv-loop))
+(define eb-err 'callback-never-fired)
+(define eb-host 'callback-never-fired)
+
+(uv-getnameinfo! l3 "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                 (lambda (err host service)
+                   (collect)
+                   (set! eb-err (err->symbol err))
+                   (set! eb-host host)))
+
+(test-equal "close with in-flight request: EBUSY, as a symbol"
+  'EBUSY
+  (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+            (#t (list 'wrong-condition e)))
+    (uv-loop-close! l3)
+    'no-raise))
+
+(test-equal "close with in-flight request: the loop is untouched and still open"
+  'still-open (if (uv-loop-open? l3) 'still-open 'closed))
+
+;; ... and still USABLE: the same loop drains the request normally.
+(run-until/ticking l3 (lambda () (not (eq? eb-err 'callback-never-fired))) cap)
+
+(test-equal "close with in-flight request: the drained lookup delivered normally"
+  '(no-error "127.0.0.1") (list eb-err eb-host))
+
+(test-equal "close with in-flight request: the loop closes cleanly after the drain"
+  'closed-clean
+  (begin (uv-loop-close! l3)
+         (if (uv-loop-open? l3) 'still-open 'closed-clean)))
+
 ;; --- balance epilogue ----------------------------------------------------
 (uv-close! probe-timer)
 (run-until l (lambda () (eq? (uv-handle-state probe-timer) 'closed)) 8)
@@ -822,11 +1427,14 @@
 (test-equal "epilogue: no getaddrinfo request is live"
   0 (live-count 'getaddrinfo-req))
 
+(test-equal "epilogue: no getnameinfo request is live"
+  0 (live-count 'getnameinfo-req))
+
 (test-equal "epilogue: the registry is back to its with-loop baseline"
   registry-with-loop (registry-count))
 
-(test-equal "epilogue: exactly the one deliberate orphan event, no strays"
-  (+ orphans-at-start 1) (length (orphan-callback-events)))
+(test-equal "epilogue: exactly the two deliberate orphan events, no strays"
+  (+ orphans-at-start 2) (length (orphan-callback-events)))
 
 (uv-loop-teardown! l)
 
