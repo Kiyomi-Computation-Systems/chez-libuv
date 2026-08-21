@@ -40,7 +40,7 @@
           ;; boundary copying (ADR-0009)
           c-string->string
           alloc-zeroed zero-out! free! copy-in! copy-out
-          c-int-size c-int-ref c-int-set! read-net-u16
+          c-int-size c-int-ref c-int-set! c-uptr-ref read-net-u16
 
           ;; uv_buf_t, the one struct this binding constructs
           uv-buf-set! uv-buf-base uv-buf-len uv-buf-ftype-layout
@@ -77,6 +77,24 @@
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop
           uv-ip4-addr uv-ip6-addr
+
+          ;; the DNS entry points (design spec v0.2 S5.1). The two that take
+          ;; a C function pointer -- uv_getaddrinfo and uv_getnameinfo -- are
+          ;; NOT exported raw, for the same reason as the timer and stream
+          ;; wrappers above: their wrappers bake in this library's own
+          ;; trampoline entry points. uv_ip_name is not exported raw either
+          ;; -- it dereferences its argument unconditionally, so its whole
+          ;; public face is the zero-refusing sockaddr->address-string.
+          uv-getaddrinfo-native uv-getnameinfo-native
+          uv-cancel uv-freeaddrinfo
+          sockaddr->address-string
+
+          ;; helpers lifted from (libuv tcp) (design spec v0.2 S5.1):
+          ;; boundary-writing mechanics and allocation-layout arithmetic,
+          ;; shared by tcp.sls and (v0.2 Stage 4) dns.sls. Neither carries
+          ;; dispatch policy, so this file's mechanical/policy-free review
+          ;; property survives the lift.
+          fill-sockaddr! align-16
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
@@ -393,6 +411,86 @@
   (define uv-read-stop
     (foreign-procedure "uv_read_stop" (uptr) int))
 
+  ;; --- the DNS entry points (design spec v0.2 S5.1) ---------------------
+  ;; Every pointer is `uptr` (design spec S4 rule 4), including the two
+  ;; CALLBACK pointers -- uv_getaddrinfo's uv_getaddrinfo_cb and
+  ;; uv_getnameinfo's uv_getnameinfo_cb -- which is why those two are bound
+  ;; with a `raw-` prefix and reached only through the wrappers further
+  ;; down, exactly like uv_timer_start and uv_tcp_connect.
+  ;;
+  ;; uv_getaddrinfo's node and service are `const char *` that libuv memcpys
+  ;; into one req-owned block BEFORE returning, and frees itself
+  ;; (vendor/libuv/src/unix/getaddrinfo.c:174-208 copies, :114-126 frees).
+  ;; So `string` is safe here specifically: Chez's marshalled copy lives for
+  ;; the duration of the call, and libuv retains its own copy rather than
+  ;; the text -- the same reasoning as uv_ip4_addr above, extended across
+  ;; the request's threadpool flight by libuv's own copy. Chez marshals #f
+  ;; as NULL, which uv_getaddrinfo permits for either argument (not both).
+  (define raw-getaddrinfo
+    (foreign-procedure "uv_getaddrinfo"
+                       (uptr uptr uptr string string uptr) int))
+
+  ;; uv_getnameinfo memcpys the caller's sockaddr into req->storage before
+  ;; returning (vendor/libuv/src/unix/getnameinfo.c:89-99), so the addr
+  ;; argument is scratch the caller may free as soon as the call returns.
+  (define raw-getnameinfo
+    (foreign-procedure "uv_getnameinfo" (uptr uptr uptr uptr int) int))
+
+  ;; uv_cancel: 0 only while the work is still queued -- the callback STILL
+  ;; fires, with UV_ECANCELED rewritten to UV_EAI_CANCELED for both DNS req
+  ;; kinds; running or completed work answers UV_EBUSY; non-threadpool req
+  ;; kinds answer UV_EINVAL; exactly one callback in every outcome
+  ;; (vendor/libuv/src/threadpool.c:399-441,
+  ;; vendor/libuv/src/unix/getaddrinfo.c:128-133). The int is an errno, but
+  ;; a nonzero here is an ANSWER, not a failure: which codes matter is
+  ;; cancellation policy, and policy lives with the callers (design spec
+  ;; v0.2 S5.3), so this is exported raw and never routed through uv-check
+  ;; unconditionally.
+  (define uv-cancel (foreign-procedure "uv_cancel" (uptr) int))
+
+  ;; Legal ONLY on a getaddrinfo-owned chain. `res` is NULL on every
+  ;; getaddrinfo failure and cancellation, and uv_freeaddrinfo(NULL) is a
+  ;; no-op, so an unconditional free in the getaddrinfo dispatcher is
+  ;; correct on every path (vendor/libuv/src/unix/getaddrinfo.c:188,
+  ;; :225-228). Synthetic test chains are foreign-alloc'd and freed with
+  ;; free!, never with this.
+  (define uv-freeaddrinfo
+    (foreign-procedure "uv_freeaddrinfo" (uptr) void))
+
+  ;; NOT exported raw: uv_ip_name dereferences sa_family through its pointer
+  ;; unconditionally (vendor/libuv/src/uv-common.c:311), so the exported
+  ;; face is the zero-refusing wrapper sockaddr->address-string below. In
+  ;; libuv since 1.43, below this binding's declared floor of 1.44.0
+  ;; (vendor/libuv/src/uv-common.c:305-321; Makefile:57-59). It does not
+  ;; render IPv6 scope IDs.
+  (define raw-ip-name
+    (foreign-procedure "uv_ip_name" (uptr u8* size_t) int))
+
+  ;; (sockaddr->address-string addr) -> string | #f
+  ;;
+  ;; The uv_strerror_r caller-buffer pattern (see scratch-size below): a
+  ;; FRESH scratch bytevector per call, because this runs inside completion
+  ;; dispatchers and a shared buffer would be a re-entrancy bug that only
+  ;; shows up under load. 64 bytes: INET6_ADDRSTRLEN is 46, and scratch
+  ;; sizes are not protocol constants (design spec v0.2 S5.1), so this is a
+  ;; local margin rather than a shim lookup.
+  ;;
+  ;; A ZERO pointer answers #f WITHOUT calling native -- see the uv_ip_name
+  ;; note above. That refusal is what lets synthetic addrinfo chains carry
+  ;; NULL ai_addr safely, and what makes the ai_addr/ai_canonname
+  ;; offset-swap mutation fail BY NAME instead of by SIGSEGV (design spec
+  ;; v0.2 S9). A nonzero rc -- an address family uv_ip_name does not render
+  ;; -- is also #f: "this sockaddr has no text" is an answer, not an error.
+  (define address-scratch-size 64)
+
+  (define (sockaddr->address-string addr)
+    (if (zero? addr)
+        #f
+        (let ((bv (make-bytevector address-scratch-size 0)))
+          (if (zero? (raw-ip-name addr bv address-scratch-size))
+              (scratch->string bv address-scratch-size)
+              #f))))
+
   ;; --- uv_buf_t (design spec S4 rule 4) ---------------------------------
   ;; The one libuv struct this binding CONSTRUCTS rather than merely holding
   ;; a pointer to. The declaration below is the POSIX layout; on Windows
@@ -550,6 +648,16 @@
       (raise (make-uv-invalid-argument 'uv-c-int-ref 'null-or-invalid-source)))
     (foreign-ref 'int addr 0))
 
+  ;; The pointer-wide sibling of c-int-ref, with the same validation shape.
+  ;; It exists for the addrinfo chain walk (design spec v0.2 S5.1): ai_next,
+  ;; ai_addr, and ai_canonname are pointer fields read at shim-reported
+  ;; offsets, and only this library may call foreign-ref -- so the reader
+  ;; has to live here, not beside the walk.
+  (define (c-uptr-ref addr)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-c-uptr-ref 'null-or-invalid-source)))
+    (foreign-ref 'uptr addr 0))
+
   (define (c-int-set! addr value)
     (unless (and (integer? addr) (exact? addr) (positive? addr))
       (raise (make-uv-invalid-argument 'uv-c-int-set! 'null-or-invalid-destination)))
@@ -588,6 +696,32 @@
               (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 src i))
               (loop (+ i 1)))))))
 
+  ;; --- helpers lifted from (libuv tcp) (design spec v0.2 S5.1) ----------
+  ;; Boundary-writing mechanics and allocation-layout arithmetic, shared by
+  ;; tcp.sls and (v0.2 Stage 4) dns.sls. Neither carries dispatch policy, so
+  ;; this file's mechanical/policy-free review property (ADR-0008) survives
+  ;; the lift; both arrived with their validation intact.
+  ;;
+  ;; Filling a sockaddr (spike FINDINGS Q3): IPv4 first, IPv6 second, and a
+  ;; failure of both is a CALLER error rather than an errno: uv_ip4_addr's
+  ;; UV_EINVAL says "this text is not a dotted quad", which is only
+  ;; interesting once the IPv6 reading has also been refused. Reporting the
+  ;; first attempt's errno would name a family the caller never mentioned.
+  ;;
+  ;; The scratch is written in place; the caller owns it and frees it.
+  (define (fill-sockaddr! addr ip port who)
+    (unless (or (zero? (uv-ip4-addr ip port addr))
+                (zero? (uv-ip6-addr ip port addr)))
+      (raise (make-uv-invalid-argument who 'bad-address))))
+
+  ;; Round up to a 16-byte boundary. The uv_buf_t and sockaddr_storage that
+  ;; follow a request inside its block contain pointers and (on some
+  ;; targets) 16-byte-aligned members, and uv_req_size answers the request's
+  ;; size, not a padded stride -- so the offset is aligned here rather than
+  ;; assumed. 16 rather than 8: it is the strictest fundamental alignment on
+  ;; every target this binding supports, so one rule covers both structs.
+  (define (align-16 n) (* 16 (div (+ n 15) 16)))
+
   ;; --- error translation (ADR-0006) -------------------------------------
   ;; Both _r calls get a FRESH scratch bytevector rather than sharing one:
   ;; uv-check is reachable from inside a callback (design spec S8), and a
@@ -596,15 +730,22 @@
   ;; truncates rather than overruns either way, since the length is passed.
   (define scratch-size 256)
 
+  ;; The NUL-terminated prefix of a scratch bytevector, as a fresh Scheme
+  ;; string. Shared by r-call and sockaddr->address-string -- factored
+  ;; rather than duplicated so the two scans can never disagree about what
+  ;; "the written prefix" means (the uv-check/uv-errno-condition reasoning).
+  (define (scratch->string bv limit)
+    (let scan ((i 0))
+      (if (or (= i limit) (zero? (bytevector-u8-ref bv i)))
+          (let ((out (make-bytevector i)))
+            (bytevector-copy! bv 0 out 0 i)
+            (utf8->string out))
+          (scan (+ i 1)))))
+
   (define (r-call proc code)
     (let ((bv (make-bytevector scratch-size 0)))
       (proc code bv scratch-size)
-      (let scan ((i 0))
-        (if (or (= i scratch-size) (zero? (bytevector-u8-ref bv i)))
-            (let ((out (make-bytevector i)))
-              (bytevector-copy! bv 0 out 0 i)
-              (utf8->string out))
-            (scan (+ i 1))))))
+      (scratch->string bv scratch-size)))
 
   ;; libuv's own name for a code, as a symbol. Distinct from
   ;; (errno-value->symbol code): that one reads the shim's snapshot of
@@ -665,7 +806,7 @@
           (cons 'read-buffer (live-read-buffer))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
-  ;; The eight trampolines declared below as `foreign-callable`s have
+  ;; The ten trampolines declared below as `foreign-callable`s have
   ;; mechanical bodies: they call the slot named for their callback type.
   ;; The slots' CONTENTS -- all dispatch policy, including the
   ;; store-and-reraise guard of design spec S8 -- are installed exactly once
@@ -680,8 +821,15 @@
   ;; design spec describes in the trampoline body therefore happens one step
   ;; later, inside the installed dispatcher itself -- same two steps, same
   ;; file boundary, no cycle.
+  ;; APPEND-ONLY, and the order is part of the contract: the two literal
+  ;; rows in tests/test-loop.sps and tests/test-native.sps freeze exactly
+  ;; this list (ADR-0008 as amended 2026-08-21 -- one locked trampoline per
+  ;; callback TYPE, a constant small set per process; the set moves only
+  ;; when libuv's callback typology does, never with handle or request
+  ;; volume).
   (define dispatcher-names
-    '(alloc read connection write-done close timer shutdown connect))
+    '(alloc read connection write-done close timer shutdown connect
+      getaddrinfo getnameinfo))
 
   (define dispatchers (make-eq-hashtable))
   (define dispatchers-installed #f)
@@ -735,7 +883,7 @@
           (raise (make-uv-invalid-argument 'uv-dispatcher-ref
                                            'unknown-dispatcher)))))
 
-  ;; alist: (name . procedure) for all eight names, in any order.
+  ;; alist: (name . procedure) for all ten names, in any order.
   ;;
   ;; All-or-nothing, and once only. A partial install would leave some slots
   ;; holding the raising stub while libuv already had their addresses; a
@@ -760,7 +908,7 @@
               dispatcher-names)
     (set! dispatchers-installed #t))
 
-  ;; --- the eight static trampolines (ADR-0008, design spec S4/S10) ------
+  ;; --- the ten static trampolines (ADR-0008, design spec S4/S10) --------
   ;; ONE `foreign-callable` per callback TYPE, never per callback instance,
   ;; each `lock-object`'d exactly once here and never unlocked, for the life
   ;; of the process. That bound is the whole point of ADR-0008: libuv retains
@@ -768,13 +916,16 @@
   ;; handle or per request would leave the collector permanently unable to
   ;; move an ever-growing set of code objects -- a leak by another name.
   ;;
-  ;; ALL EIGHT ARE CREATED NOW, in Stage 3, even though only the timer and
-  ;; close callbacks can fire yet. Creating them together is what keeps
-  ;; `lock-object` in exactly one place, evaluated once; the later stages add
-  ;; dispatch policy behind the slots, not new locked objects. Spike
-  ;; FINDINGS Q1 measured the property this depends on: a locked callable's
-  ;; `foreign-callable-entry-point` was identical before and after both a
-  ;; default `(collect)` and a maximum-generation collection.
+  ;; ALL TEN ARE CREATED HERE, together -- the original eight in v0.1 Stage
+  ;; 3, the two DNS trampolines in v0.2 Stage 2 (ADR-0008 as amended:
+  ;; neither DNS callback typedef matches an existing trampoline's arity,
+  ;; vendor/libuv/include/uv.h:345-352) -- even when a callback type cannot
+  ;; fire yet. Creating them together is what keeps `lock-object` in exactly
+  ;; one place, evaluated once; the stages add dispatch policy behind the
+  ;; slots, not new locked objects. Spike FINDINGS Q1 measured the property
+  ;; this depends on: a locked callable's `foreign-callable-entry-point` was
+  ;; identical before and after both a default `(collect)` and a
+  ;; maximum-generation collection.
   ;;
   ;; Each body is mechanical and carries NO policy: look up the slot by name
   ;; at FIRE time and call it. The lookup is deliberately not hoisted out of
@@ -824,6 +975,26 @@
                         ((dispatcher-ref 'connect) req status))
                       (uptr int) void))
 
+  ;; The two DNS completion signatures (vendor/libuv/include/uv.h:345-352):
+  ;; uv_getaddrinfo_cb is (uv_getaddrinfo_t*, int, struct addrinfo*),
+  ;; uv_getnameinfo_cb is (uv_getnameinfo_t*, int, const char*, const
+  ;; char*). Neither matches any of the eight arities above, which is why
+  ;; these exist (ADR-0008 as amended). The two borrowed `const char *`s
+  ;; arrive as uptr, never `string`: they point INTO the request's own block
+  ;; and are NULL on every failure (vendor/libuv/include/uv/unix.h:353-354),
+  ;; so the copy-or-#f decision belongs to the installed dispatcher, one
+  ;; step later.
+  (define getaddrinfo-callable
+    (foreign-callable (lambda (req status res)
+                        ((dispatcher-ref 'getaddrinfo) req status res))
+                      (uptr int uptr) void))
+
+  (define getnameinfo-callable
+    (foreign-callable (lambda (req status hostname service)
+                        ((dispatcher-ref 'getnameinfo)
+                         req status hostname service))
+                      (uptr int uptr uptr) void))
+
   ;; A definition, not a bare expression, for the same reason as `uv-loaded`
   ;; and `dispatchers-seeded` above: R6RS library bodies take all their
   ;; definitions before any expression, and every lock has to be in place
@@ -832,7 +1003,8 @@
     (for-each lock-object
               (list alloc-callable read-callable connection-callable
                     write-done-callable close-callable timer-callable
-                    shutdown-callable connect-callable)))
+                    shutdown-callable connect-callable
+                    getaddrinfo-callable getnameinfo-callable)))
 
   ;; The entry points are module-private ON PURPOSE (design spec S3: nothing
   ;; outside private/ sees a pointer -- and these are the pointers whose
@@ -847,6 +1019,10 @@
   (define shutdown-cb-entry   (foreign-callable-entry-point shutdown-callable))
   (define alloc-cb-entry      (foreign-callable-entry-point alloc-callable))
   (define read-cb-entry       (foreign-callable-entry-point read-callable))
+  (define getaddrinfo-cb-entry
+    (foreign-callable-entry-point getaddrinfo-callable))
+  (define getnameinfo-cb-entry
+    (foreign-callable-entry-point getnameinfo-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -901,6 +1077,24 @@
   ;; arrives.
   (define (uv-read-start-native stream-ptr)
     (raw-read-start stream-ptr alloc-cb-entry read-cb-entry))
+
+  ;; The two DNS wrappers, each baking in ITS OWN trampoline, mirroring
+  ;; uv-tcp-connect-native above: every entry point is a bare address, so a
+  ;; cross-pairing here would be libuv calling the wrong dispatcher with a
+  ;; plausible argument shape, not a type error in any language involved.
+  ;;
+  ;; (uv-getaddrinfo-native loop-ptr req-ptr node service hints-ptr) -> int
+  ;; (an errno). node/service are Scheme strings or #f (marshalled NULL);
+  ;; hints-ptr is a caller-owned struct addrinfo, or 0 for no hints.
+  (define (uv-getaddrinfo-native loop-ptr req-ptr node service hints-ptr)
+    (raw-getaddrinfo loop-ptr req-ptr getaddrinfo-cb-entry
+                     node service hints-ptr))
+
+  ;; (uv-getnameinfo-native loop-ptr req-ptr addr-ptr flags) -> int (an
+  ;; errno). addr-ptr is scratch: libuv copies the sockaddr into the
+  ;; request's own storage before returning (see raw-getnameinfo above).
+  (define (uv-getnameinfo-native loop-ptr req-ptr addr-ptr flags)
+    (raw-getnameinfo loop-ptr req-ptr getnameinfo-cb-entry addr-ptr flags))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

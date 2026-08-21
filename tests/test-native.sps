@@ -982,6 +982,24 @@
     (c-int-ref 0)
     'no-raise))
 
+;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
+;; The probe value deliberately does NOT fit in 32 bits: on every supported
+;; target a c-uptr-ref accidentally narrowed to a 32-bit read would answer a
+;; truncated number that is still a plausible pointer, so a value whose high
+;; bits are load-bearing is what makes the width assertion discriminating.
+(let ((cell (alloc-zeroed (foreign-sizeof 'uptr))))
+  (foreign-set! 'uptr cell 0 #x123456789A)
+  (test-equal "c-uptr-ref reads the full pointer width a raw uptr write stored"
+    #x123456789A (c-uptr-ref cell))
+  (free! cell))
+
+(test-equal "c-uptr-ref rejects a null source, naming who"
+  'uv-c-uptr-ref
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (c-uptr-ref 0)
+    'no-raise))
+
 ;; --- read-net-u16: ntohs, by hand (spike FINDINGS Q3) -------------------
 ;; `sin_port` is stored big-endian whatever the host's order is, so this is
 ;; the one decision in the getsockname path that a host-order read would get
@@ -1015,6 +1033,40 @@
         (read-net-u16 cell -1)))
     'no-raise))
 
+;; --- sockaddr->address-string (design spec v0.2 S5.1) -------------------
+;; Both refusal rows expect a SENTINEL reached through `or`, never a bare
+;; #f: SRFI-64 turns any raise in the actual expression into #f (AGENTS.md's
+;; named trap), so a row expecting #f would pass identically against a
+;; wrapper that raises.
+;;
+;; The zero-pointer refusal must not reach native at all: uv_ip_name
+;; dereferences sa_family unconditionally (vendor/libuv/src/uv-common.c:311),
+;; so the arm under test here is the one that keeps synthetic addrinfo
+;; chains with NULL ai_addr safe and makes the v0.2 offset-swap mutation
+;; fail by name instead of by SIGSEGV.
+(test-equal "sockaddr->address-string refuses a zero pointer with #f, without calling native"
+  'refused-null
+  (or (sockaddr->address-string 0) 'refused-null))
+
+;; Round trip, hermetic (no resolver): uv_ip4_addr parses the text into a
+;; real sockaddr_in, uv_ip_name renders it back. Expecting the dotted quad
+;; itself means only the genuine parse-then-render path can pass.
+(let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+  (fill-sockaddr! addr "127.0.0.1" 8080 'test-sockaddr-round-trip)
+  (test-equal "sockaddr->address-string renders back the dotted quad uv_ip4_addr parsed"
+    "127.0.0.1" (sockaddr->address-string addr))
+  (free! addr))
+
+;; The nonzero-rc arm: a zeroed sockaddr_storage carries sa_family 0
+;; (AF_UNSPEC), which uv_ip_name's switch refuses with UV_EAFNOSUPPORT
+;; (vendor/libuv/src/uv-common.c:305-321) -- deterministic, no network, no
+;; resolver configuration consulted.
+(let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+  (test-equal "sockaddr->address-string answers #f for a family uv_ip_name refuses"
+    'refused-family
+    (or (sockaddr->address-string addr) 'refused-family))
+  (free! addr))
+
 ;; --- debug counters (design spec S10) -----------------------------------
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.
 ;; Seeded: the counter is driven to a non-zero value and asserted there
@@ -1030,11 +1082,11 @@
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the six-class matrix below. Every
+;; SEED / PRECONDITION, asserted before the eight-class matrix below. Every
 ;; assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all six "increments are visible" assertions would
+;; always return 0, so all eight "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -1232,8 +1284,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the eight callback types the design commits to"
-  '(alloc read connection write-done close timer shutdown connect)
+(test-equal "dispatcher-names names the ten callback types the design commits to"
+  '(alloc read connection write-done close timer shutdown connect
+    getaddrinfo getnameinfo)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
