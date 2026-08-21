@@ -10,7 +10,8 @@
 ;;; they need are taken from them.
 ;;;
 ;;; (libuv handle) and (libuv timer) landed with Stage 3; (libuv tcp)'s write
-;;; path landed with Stage 4 and its read path with Stage 5. The list is
+;;; path landed with Stage 4 and its read path with Stage 5; (libuv dns)
+;;; landed with the v0.2 milestone. The list is
 ;;; deliberately written out by name rather than re-exported wholesale: a
 ;;; facade that exported whatever its imports happened to have would leak a
 ;;; private binding the day someone added one.
@@ -46,6 +47,21 @@
           uv-listen! uv-accept! uv-tcp-connect!
           uv-write! uv-shutdown! uv-tcp-nodelay!
           uv-read-start! uv-read-stop!
+
+          ;; --- DNS, from (libuv dns) ---
+          ;; The v0.2 surface (design spec v0.2 S4.6): both start calls,
+          ;; the cancel verb, its domain predicate, and the uv-addrinfo
+          ;; record -- constructor included, for the same reason the
+          ;; condition constructors below are public: the record is pure
+          ;; data, and a caller's test double is legitimate. (libuv dns)
+          ;; already re-exports the record API from (libuv private
+          ;; addrinfo), so no private library is imported for this block.
+          ;; addrinfo-chain->list is (libuv dns)'s test seam and
+          ;; deliberately does NOT cross this line.
+          uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-dns-request?
+          make-uv-addrinfo uv-addrinfo?
+          uv-addrinfo-family uv-addrinfo-socktype uv-addrinfo-protocol
+          uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname
 
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to
@@ -90,6 +106,7 @@
           (libuv handle)
           (libuv timer)
           (libuv tcp)
+          (libuv dns)
           (libuv private conditions)
           ;; uv-version is renamed on the way in purely to resolve a name
           ;; clash: this library exports a procedure of the same name with a
