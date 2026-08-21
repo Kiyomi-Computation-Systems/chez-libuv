@@ -73,18 +73,13 @@
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
 
-  ;; --- filling a sockaddr (spike FINDINGS Q3) -----------------------------
-  ;; IPv4 first, IPv6 second, and a failure of both is a CALLER error rather
-  ;; than an errno: uv_ip4_addr's UV_EINVAL says "this text is not a dotted
-  ;; quad", which is only interesting once the IPv6 reading has also been
-  ;; refused. Reporting the first attempt's errno would name a family the
-  ;; caller never mentioned.
-  ;;
-  ;; The scratch is written in place; the caller owns it and frees it.
-  (define (fill-sockaddr! addr ip port who)
-    (unless (or (zero? (uv-ip4-addr ip port addr))
-                (zero? (uv-ip6-addr ip port addr)))
-      (raise (make-uv-invalid-argument who 'bad-address))))
+  ;; fill-sockaddr! and align-16 were private here through v0.1; as of v0.2
+  ;; Stage 2 both live in (libuv private native) (design spec v0.2 S5.1),
+  ;; imported above, so dns.sls can share them without a second copy.
+  ;; abandon-request! followed in v0.2 Stage 3: it lives in (libuv private
+  ;; handles) beside complete-request! (design spec v0.2 S5.3, ADR-0011),
+  ;; imported above, for the same reason -- dns.sls's start calls need the
+  ;; identical sync-failure undo the three request verbs below guard with.
 
   ;; --- construction (design spec S5) --------------------------------------
   ;; The size comes from uv_handle_size(UV_TCP) -- the RUNNING library's own
@@ -433,25 +428,4 @@
       (raise (make-uv-invalid-argument 'uv-tcp-nodelay! 'enable-not-a-boolean)))
     (uv-check (uv-tcp-nodelay (handle-pointer tcp 'uv-tcp-nodelay!)
                               (if enable? 1 0))
-              'uv-tcp-nodelay!))
-
-  ;; --- shared helpers -----------------------------------------------------
-  ;; Undo a registration that a synchronous native failure has just made
-  ;; pointless: pop the entry, free the block, zero the record's pointer.
-  ;; This is the SAME order the completion dispatcher uses, minus the
-  ;; callback -- there is nothing to report to, since the caller is about to
-  ;; receive the condition itself. The counter, where there is one, is bumped
-  ;; by the caller so that each site names its own class.
-  (define (abandon-request! req)
-    (let ((ptr (req-ptr req)))
-      (registry-deregister! ptr)
-      (free! ptr)
-      (set-req-ptr! req 0)))
-
-  ;; Round up to a 16-byte boundary. The uv_buf_t and sockaddr_storage that
-  ;; follow a request inside its block contain pointers and (on some targets)
-  ;; 16-byte-aligned members, and uv_req_size answers the request's size, not
-  ;; a padded stride -- so the offset is aligned here rather than assumed.
-  ;; 16 rather than 8: it is the strictest fundamental alignment on every
-  ;; target this binding supports, so one rule covers both structs.
-  (define (align-16 n) (* 16 (div (+ n 15) 16))))
+              'uv-tcp-nodelay!)))

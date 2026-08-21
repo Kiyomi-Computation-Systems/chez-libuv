@@ -773,46 +773,45 @@
   '((timer . 424242) (close . 424243))
   (list-tail (orphan-callback-events) orphans-before))
 
-;; --- the dispatch seam, now that every slot holds a real dispatcher ------
-;; The eight slots in (libuv private native) are installed exactly once, by
+;; --- the dispatch seam, and the two stubs v0.2 brings back ---------------
+;; The ten slots in (libuv private native) are installed exactly once, by
 ;; (libuv private handles), at library initialisation. The callback types no
 ;; stage had implemented yet were installed as raising stubs that the
 ;; installed closure reaches THROUGH a mutable table -- so a later stage
 ;; replaces one by name, with no second install-callback-dispatchers! call.
 ;;
-;; THE STUBS ARE GONE. Stage 4 spent four of the six ('connection,
-;; 'write-done, 'shutdown, 'connect) and Stage 5 spent the last two ('alloc,
-;; 'read), so every name now holds a real dispatcher and the rows that used
-;; to fire a stub and watch the seam contain its raise cannot be written that
-;; way any more. This is what replaced them, and the property under test is
-;; unchanged.
+;; v0.1's Stage 4 spent four of its six stubs ('connection, 'write-done,
+;; 'shutdown, 'connect) and Stage 5 the last two ('alloc, 'read); v0.2
+;; Stage 2 widened the list to ten, and the two DNS names ('getaddrinfo,
+;; 'getnameinfo) hold the raising stub until (libuv dns) installs the real
+;; dispatchers through the seam. So the ORIGINAL formulation of these rows
+;; -- fire a stub and watch the seam contain its raise -- is available
+;; again, and it is once more the one pre-guard raise reachable through
+;; shipped code: v0.1's replacement route (a req record whose handle field
+;; is not a handle, making complete-request!'s record-accessor read raise
+;; before any dispatch-guarded) no longer raises at all, because ADR-0011's
+;; complete-request! resolves the owning loop from the REGISTRY ENTRY and
+;; never touches the handle field -- that record now completes normally,
+;; the entry being the authority on ownership. This suite keeps no row on
+;; that shape; the handle-less completion itself is pinned in
+;; tests/test-loop.sps's ADR-0011 section.
 ;;
 ;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so.
 ;; `dispatch-guarded` protects the USER's callback but runs INSIDE a
-;; dispatcher, so anything raised before a dispatcher gets that far -- a bug
-;; in its own registry lookup, or a registry entry whose contents are not the
-;; shape it expects -- is covered by the guard around the installed closure
-;; and by nothing else. Unguarded, spike FINDINGS Q2 applies: exit 255, no
-;; teardown, no foreign-free.
-;;
-;; With no stubs left, the way to make a dispatcher raise before its own
-;; guard is a request record whose `handle` field is not a handle:
-;; complete-request! reads the owning loop off that field FIRST (it has to --
-;; the steps after it leave the record pointing at nothing), so the record
-;; accessor raises there, outside every dispatch-guarded. That is a shipped
-;; code path reached through exported constructors, not a test-only hook;
-;; this binding has no test-only hooks in its production libraries.
+;; dispatcher, so anything raised before a dispatcher gets that far -- a
+;; stub, or a bug in a dispatcher's own registry lookup -- is covered by
+;; the guard around the installed closure and by nothing else. Unguarded,
+;; spike FINDINGS Q2 applies: exit 255, no teardown, no foreign-free.
 (define seam-loop (make-uv-loop))
 (define seam-block (alloc-zeroed 64))
-(define seam-req (%make-uv-req-record seam-block 'write 'not-a-handle #f))
 (define seam-orphans-before (length (orphan-callback-events)))
 
-(registry-register! seam-block 'write-req seam-loop seam-req)
+(registry-register! seam-block 'getaddrinfo-req seam-loop 'stub-target)
 
-(test-equal "a dispatcher raising before its own guard does not escape into its caller"
+(test-equal "a stub raising before any dispatch-guarded does not escape into its caller"
   'contained
   (guard (e (#t (list 'escaped-into-the-caller e)))
-    ((dispatcher-ref 'write-done) seam-block 0)
+    ((dispatcher-ref 'getaddrinfo) seam-block 0 0)
     'contained))
 
 ;; The registered fork of the seam's guard: the entry knows its loop, so the
@@ -827,20 +826,22 @@
   'callback-error
   (if (uv-callback-error? seam-raise) 'callback-error 'not-callback-error))
 
-;; Pinned to WHAT was contained, not merely to "something was". The cause has
-;; to be the condition the dispatcher itself raised -- an assertion from a
-;; record accessor, which is emphatically not one of this binding's own
-;; condition types -- so a seam that manufactured a &uv-error of its own
-;; instead of carrying the original through fails here.
-(test-equal "...carrying the raise the dispatcher actually made, not one of the seam's own"
-  '(assertion not-a-uv-error)
+;; Pinned to WHAT was contained, not merely to "something was". The cause
+;; has to be the stub's own raise -- &uv-error, who naming the callback
+;; type, the not-implemented message -- so a seam that manufactured a
+;; condition of its own instead of carrying the original through fails
+;; here.
+(test-equal "...carrying the stub's own raise, not one the seam manufactured"
+  '(uv-error getaddrinfo
+    "this callback type is not implemented in this version")
   (let ((cause (uv-callback-error-cause seam-raise)))
-    (list (if (assertion-violation? cause) 'assertion 'not-an-assertion)
-          (if (uv-error? cause) 'a-uv-error 'not-a-uv-error))))
+    (list (if (uv-error? cause) 'uv-error 'not-a-uv-error)
+          (and (who-condition? cause) (condition-who cause))
+          (and (message-condition? cause) (condition-message cause)))))
 
-;; The dispatcher raised before it could pop or free anything, so this suite
-;; owns the cleanup -- and the balance rows at the end of the file are what
-;; would notice if it did not happen.
+;; The stub raised before anything could pop or free the block, so this
+;; suite owns the cleanup -- and the balance rows at the end of the file
+;; are what would notice if it did not happen.
 (registry-deregister! seam-block)
 (free! seam-block)
 

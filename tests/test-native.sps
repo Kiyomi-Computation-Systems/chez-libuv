@@ -254,7 +254,11 @@
         (cons 'SIZEOF_UV_SHUTDOWN_T sizeof-uv-shutdown-t)
         (cons 'SIZEOF_UV_BUF_T      sizeof-uv-buf-t)
         (cons 'SIZEOF_SOCKADDR_IN   sizeof-sockaddr-in)
-        (cons 'SIZEOF_SOCKADDR_STORAGE sizeof-sockaddr-storage)))
+        (cons 'SIZEOF_SOCKADDR_STORAGE sizeof-sockaddr-storage)
+        (cons 'SIZEOF_UV_GETADDRINFO_T sizeof-uv-getaddrinfo-t)
+        (cons 'SIZEOF_UV_GETNAMEINFO_T sizeof-uv-getnameinfo-t)
+        (cons 'SIZEOF_ADDRINFO      sizeof-addrinfo)
+        (cons 'SIZEOF_SOCKADDR_IN6  sizeof-sockaddr-in6)))
 
 (for-each
  (lambda (entry)
@@ -286,14 +290,22 @@
 (test-equal "uv_req_size(UV_SHUTDOWN) agrees with the shim's sizeof(uv_shutdown_t)"
   (sizeof-uv-shutdown-t) (uv-req-size (uv-shutdown-req-type)))
 
-;; The three request tags are distinct members of uv_req_type, exactly as
+(test-equal "uv_req_size(UV_GETADDRINFO) agrees with the shim's sizeof(uv_getaddrinfo_t)"
+  (sizeof-uv-getaddrinfo-t) (uv-req-size (uv-getaddrinfo-req-type)))
+
+(test-equal "uv_req_size(UV_GETNAMEINFO) agrees with the shim's sizeof(uv_getnameinfo_t)"
+  (sizeof-uv-getnameinfo-t) (uv-req-size (uv-getnameinfo-req-type)))
+
+;; The five request tags are distinct members of uv_req_type, exactly as
 ;; UV_TCP/UV_TIMER are of uv_handle_type. Without this, a snapshot that
-;; collapsed them would still satisfy the three assertions above only if the
+;; collapsed them would still satisfy the five assertions above only if the
 ;; sizes happened to coincide -- which two of them nearly do.
-(test-equal "the write, connect, and shutdown request tags are pairwise distinct"
+(test-equal "the write, connect, shutdown, getaddrinfo, and getnameinfo request tags are pairwise distinct"
   #t
   (pairwise-distinct? (list (uv-write-req-type) (uv-connect-req-type)
-                            (uv-shutdown-req-type))))
+                            (uv-shutdown-req-type)
+                            (uv-getaddrinfo-req-type)
+                            (uv-getnameinfo-req-type))))
 
 ;; UV_TCP and UV_TIMER are different members of uv_handle_type; a snapshot
 ;; that collapsed them would make the two handle families indistinguishable.
@@ -302,6 +314,90 @@
 
 (test-equal "AF_INET and AF_UNSPEC are distinct"
   #t (not (= (af-inet) (af-unspec))))
+
+;; --- constants: the DNS additions (design spec v0.2 S5.2) ---------------
+;; Presence is enforced at init (a snapshot name the shim lacks raises
+;; &uv-constant-unavailable before any row here runs); what these rows add
+;; is INTERNAL consistency -- distinctness, bounds -- never a
+;; platform-specific value. glibc and Darwin genuinely disagree on the
+;; addrinfo layout (ai_addr/ai_canonname swap order), which is exactly why
+;; a value assertion here would be wrong on one platform.
+(test-equal "the three address families are pairwise distinct"
+  #t (pairwise-distinct? (list (af-unspec) (af-inet) (af-inet6))))
+
+(test-equal "the three socket types are pairwise distinct"
+  #t (pairwise-distinct? (list (sock-stream) (sock-dgram) (sock-raw))))
+
+(test-equal "IPPROTO_TCP and IPPROTO_UDP are distinct"
+  #t (not (= (ipproto-tcp) (ipproto-udp))))
+
+;; The AI_/NI_ constants are OR-combinable bit flags: a zero would be a
+;; no-op that silently drops the caller's request, and two equal values
+;; would make two spellings of the hints vocabulary indistinguishable.
+(define ai-flag-accessors
+  (list (cons 'AI_PASSIVE     ai-passive)
+        (cons 'AI_CANONNAME   ai-canonname)
+        (cons 'AI_NUMERICHOST ai-numerichost)
+        (cons 'AI_NUMERICSERV ai-numericserv)))
+
+(define ni-flag-accessors
+  (list (cons 'NI_NUMERICHOST ni-numerichost)
+        (cons 'NI_NUMERICSERV ni-numericserv)
+        (cons 'NI_NAMEREQD    ni-namereqd)
+        (cons 'NI_DGRAM       ni-dgram)))
+
+(for-each
+ (lambda (entry)
+   (test-equal (string-append "snapshot: " (symbol->string (car entry))
+                              " is a nonzero flag")
+     #t
+     (positive? ((cdr entry)))))
+ (append ai-flag-accessors ni-flag-accessors))
+
+(test-equal "the four AI_ flags are pairwise distinct"
+  #t (pairwise-distinct? (map (lambda (e) ((cdr e))) ai-flag-accessors)))
+
+(test-equal "the four NI_ flags are pairwise distinct"
+  #t (pairwise-distinct? (map (lambda (e) ((cdr e))) ni-flag-accessors)))
+
+;; The eight addrinfo field offsets. ai_flags sits at offset 0 on both
+;; glibc and Darwin, so positivity is NOT asserted -- zero is a legal
+;; offset. What cannot legally happen: two fields at the same offset, or a
+;; field starting outside the struct the same shim measured.
+(define addrinfo-offset-accessors
+  (list (cons 'OFFSETOF_ADDRINFO_AI_FLAGS     offsetof-addrinfo-ai-flags)
+        (cons 'OFFSETOF_ADDRINFO_AI_FAMILY    offsetof-addrinfo-ai-family)
+        (cons 'OFFSETOF_ADDRINFO_AI_SOCKTYPE  offsetof-addrinfo-ai-socktype)
+        (cons 'OFFSETOF_ADDRINFO_AI_PROTOCOL  offsetof-addrinfo-ai-protocol)
+        (cons 'OFFSETOF_ADDRINFO_AI_ADDRLEN   offsetof-addrinfo-ai-addrlen)
+        (cons 'OFFSETOF_ADDRINFO_AI_ADDR      offsetof-addrinfo-ai-addr)
+        (cons 'OFFSETOF_ADDRINFO_AI_CANONNAME offsetof-addrinfo-ai-canonname)
+        (cons 'OFFSETOF_ADDRINFO_AI_NEXT      offsetof-addrinfo-ai-next)))
+
+(test-equal "the eight addrinfo field offsets are pairwise distinct"
+  #t
+  (pairwise-distinct?
+   (map (lambda (e) ((cdr e))) addrinfo-offset-accessors)))
+
+(for-each
+ (lambda (entry)
+   (test-equal (string-append "snapshot: " (symbol->string (car entry))
+                              " lies inside sizeof(struct addrinfo)")
+     #t
+     (let ((off ((cdr entry))))
+       (and (>= off 0) (< off (sizeof-addrinfo))))))
+ addrinfo-offset-accessors)
+
+;; sin6_port is read with read-net-u16, so its two bytes must fit inside
+;; the struct the same shim measured. And sockaddr_storage exists to hold
+;; ANY sockaddr, sockaddr_in6 included -- a snapshot violating that would
+;; make every storage-sized allocation too small for an IPv6 peer.
+(test-equal "sin6_port's two network-order bytes fit inside sockaddr_in6"
+  #t
+  (<= (+ (offsetof-sockaddr-in6-sin6-port) 2) (sizeof-sockaddr-in6)))
+
+(test-equal "sockaddr_storage can hold a sockaddr_in6"
+  #t (<= (sizeof-sockaddr-in6) (sizeof-sockaddr-storage)))
 
 ;; Informational, deliberately NOT asserted: uv_buf_t is {base,len} on POSIX
 ;; but {len,base} on Windows (WSABUF order), so an assertion here would
@@ -319,6 +415,16 @@
 (display (offsetof-sockaddr-in-sin-family))
 (display " sin_port=")
 (display (offsetof-sockaddr-in-sin-port))
+(newline)
+;; Informational for the same reason as the two above: glibc orders ai_addr
+;; before ai_canonname, Darwin the reverse, so the ORDER of these two is a
+;; platform fact no assertion should encode (design spec v0.2 S5.2).
+(display "  [informational] addrinfo offsets: ai_addr=")
+(display (offsetof-addrinfo-ai-addr))
+(display " ai_canonname=")
+(display (offsetof-addrinfo-ai-canonname))
+(display " sizeof=")
+(display (sizeof-addrinfo))
 (newline)
 
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
@@ -876,6 +982,24 @@
     (c-int-ref 0)
     'no-raise))
 
+;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
+;; The probe value deliberately does NOT fit in 32 bits: on every supported
+;; target a c-uptr-ref accidentally narrowed to a 32-bit read would answer a
+;; truncated number that is still a plausible pointer, so a value whose high
+;; bits are load-bearing is what makes the width assertion discriminating.
+(let ((cell (alloc-zeroed (foreign-sizeof 'uptr))))
+  (foreign-set! 'uptr cell 0 #x123456789A)
+  (test-equal "c-uptr-ref reads the full pointer width a raw uptr write stored"
+    #x123456789A (c-uptr-ref cell))
+  (free! cell))
+
+(test-equal "c-uptr-ref rejects a null source, naming who"
+  'uv-c-uptr-ref
+  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+            (#t 'wrong-condition))
+    (c-uptr-ref 0)
+    'no-raise))
+
 ;; --- read-net-u16: ntohs, by hand (spike FINDINGS Q3) -------------------
 ;; `sin_port` is stored big-endian whatever the host's order is, so this is
 ;; the one decision in the getsockname path that a host-order read would get
@@ -909,6 +1033,40 @@
         (read-net-u16 cell -1)))
     'no-raise))
 
+;; --- sockaddr->address-string (design spec v0.2 S5.1) -------------------
+;; Both refusal rows expect a SENTINEL reached through `or`, never a bare
+;; #f: SRFI-64 turns any raise in the actual expression into #f (AGENTS.md's
+;; named trap), so a row expecting #f would pass identically against a
+;; wrapper that raises.
+;;
+;; The zero-pointer refusal must not reach native at all: uv_ip_name
+;; dereferences sa_family unconditionally (vendor/libuv/src/uv-common.c:311),
+;; so the arm under test here is the one that keeps synthetic addrinfo
+;; chains with NULL ai_addr safe and makes the v0.2 offset-swap mutation
+;; fail by name instead of by SIGSEGV.
+(test-equal "sockaddr->address-string refuses a zero pointer with #f, without calling native"
+  'refused-null
+  (or (sockaddr->address-string 0) 'refused-null))
+
+;; Round trip, hermetic (no resolver): uv_ip4_addr parses the text into a
+;; real sockaddr_in, uv_ip_name renders it back. Expecting the dotted quad
+;; itself means only the genuine parse-then-render path can pass.
+(let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+  (fill-sockaddr! addr "127.0.0.1" 8080 'test-sockaddr-round-trip)
+  (test-equal "sockaddr->address-string renders back the dotted quad uv_ip4_addr parsed"
+    "127.0.0.1" (sockaddr->address-string addr))
+  (free! addr))
+
+;; The nonzero-rc arm: a zeroed sockaddr_storage carries sa_family 0
+;; (AF_UNSPEC), which uv_ip_name's switch refuses with UV_EAFNOSUPPORT
+;; (vendor/libuv/src/uv-common.c:305-321) -- deterministic, no network, no
+;; resolver configuration consulted.
+(let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+  (test-equal "sockaddr->address-string answers #f for a family uv_ip_name refuses"
+    'refused-family
+    (or (sockaddr->address-string addr) 'refused-family))
+  (free! addr))
+
 ;; --- debug counters (design spec S10) -----------------------------------
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.
 ;; Seeded: the counter is driven to a non-zero value and asserted there
@@ -916,18 +1074,19 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-(test-equal "live-counts reports all six allocation classes"
-  '(loop tcp timer write-req connect-req read-buffer)
+(test-equal "live-counts reports all eight allocation classes"
+  '(loop tcp timer write-req connect-req
+    getaddrinfo-req getnameinfo-req read-buffer)
   (map car (live-counts)))
 
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the six-class matrix below. Every
+;; SEED / PRECONDITION, asserted before the eight-class matrix below. Every
 ;; assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all six "increments are visible" assertions would
+;; always return 0, so all eight "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -935,8 +1094,8 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All six classes, not just one. There are eighteen near-identical entry
-;; point names in the shim, and binding count-timer-new! to
+;; All eight classes, not just one. There are twenty-four near-identical
+;; entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
 ;; checked to be the ONLY one that moved, then returned to zero.
@@ -946,6 +1105,10 @@
         (list 'timer       count-timer-new!       count-timer-free!)
         (list 'write-req   count-write-req-new!   count-write-req-free!)
         (list 'connect-req count-connect-req-new! count-connect-req-free!)
+        (list 'getaddrinfo-req
+              count-getaddrinfo-req-new! count-getaddrinfo-req-free!)
+        (list 'getnameinfo-req
+              count-getnameinfo-req-new! count-getnameinfo-req-free!)
         (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)))
 
 (for-each
@@ -1109,10 +1272,10 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
-;; --- the eight callback dispatcher slots, BEFORE anything installs them --
+;; --- the ten callback dispatcher slots, BEFORE anything installs them ---
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
-;; installs the eight dispatchers in its own library body, at instantiation
+;; installs the ten dispatchers in its own library body, at instantiation
 ;; (design spec S4: "the slots themselves are filled exactly once, by
 ;; handles.sls"). In every other suite's process the install has therefore
 ;; already happened before the first test line runs, so the uninstalled
@@ -1121,8 +1284,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the eight callback types the design commits to"
-  '(alloc read connection write-done close timer shutdown connect)
+(test-equal "dispatcher-names names the ten callback types the design commits to"
+  '(alloc read connection write-done close timer shutdown connect
+    getaddrinfo getnameinfo)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1138,7 +1302,7 @@
        'no-raise)))
  dispatcher-names)
 
-(test-equal "dispatcher-ref rejects a name that is not one of the eight"
+(test-equal "dispatcher-ref rejects a name that is not one of the ten"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1149,7 +1313,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the eight is refused, naming who and why"
+(test-equal "an install missing one of the ten is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

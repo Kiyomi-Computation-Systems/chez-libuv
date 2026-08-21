@@ -91,18 +91,20 @@ TESTS        := $(wildcard tests/test-*.sps)
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
-# stay free of native imports. As of Task 5 only test-conditions.sps
-# qualifies: it imports (rnrs), (srfi :64), and (libuv private conditions)
-# only, and that library imports (rnrs) only, so its whole chain never
-# reaches (libuv private native). test-native.sps and test-shim-loading.sps
-# are deliberately NOT here -- both import native code by design, and
-# test-shim-loading.sps sets CHEZ_LIBUV_SHIM itself in its children.
+# stay free of native imports. Two suites qualify: test-conditions.sps
+# (v0.1 Task 5) and test-addrinfo.sps (v0.2 Stage 4). Each imports (rnrs),
+# (srfi :64), and pure private libraries only -- (libuv private conditions)
+# imports (rnrs) alone, (libuv private addrinfo) imports (rnrs) plus
+# conditions -- so neither chain ever reaches (libuv private native).
+# test-native.sps and test-shim-loading.sps are deliberately NOT here --
+# both import native code by design, and test-shim-loading.sps sets
+# CHEZ_LIBUV_SHIM itself in its children.
 #
 # This is an explicit, per-suite list, NOT a tests/test-*.sps wildcard: the
 # default for a new suite must be "not claimed pure", so adding a genuinely
 # pure suite is a deliberate edit here. $(wildcard) is kept only so a
 # DELETED file drops out silently instead of failing the target.
-PURE_TESTS   := $(wildcard tests/test-conditions.sps)
+PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
 
 .PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-memory vendor clean prod deps-info
 
@@ -224,9 +226,8 @@ check-pins: ## Verify chez-srfi submodule <-> Akku.lock, vendored libuv version,
 # does, native.sls's library body raises &uv-shim-unavailable at IMPORT
 # time, before a single test runs, and the suite fails outright.
 #
-# Runs over PURE_TESTS (see its definition above) -- currently just
-# tests/test-conditions.sps (Task 4); later tasks that add another pure
-# suite need no edit here, only a file on disk for $(wildcard) to pick up.
+# Runs over PURE_TESTS (see its definition above); adding a pure suite is
+# an edit to that list, never here -- this recipe only iterates it.
 check-purity: build deps ## Verify pure test suites import no native code (poisons CHEZ_LIBUV_SHIM)
 	@fail=0; \
 	for t in $(PURE_TESTS); do \

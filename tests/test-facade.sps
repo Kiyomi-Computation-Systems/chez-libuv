@@ -395,6 +395,211 @@
 (test-equal "the facade's tcp loop tore down and closed every handle"
   '(closed closed) (list (uv-handle-state fserver) (uv-handle-state fclient)))
 
+;; --- the re-exported dns surface ----------------------------------------
+;; Same rule as every block above: each name here has to come from
+;; src/libuv.sls or this file does not expand. One driven numeric forward
+;; lookup exercises the re-export end to end -- hermetic per ADR-0013:
+;; numeric-only, so no resolver configuration, no network, no /etc/hosts
+;; policy can decide the answer -- and the remaining names are exercised
+;; directly. addrinfo-chain->list is a test seam of (libuv dns) and
+;; deliberately NOT a facade export, so it must not appear here.
+(define dl (make-uv-loop))
+(define d-err 'callback-never-fired)
+(define d-results 'callback-never-fired)
+
+(define d-req
+  (uv-getaddrinfo! dl "127.0.0.1" "80"
+                   '((family . inet) (socktype . stream) (protocol . tcp)
+                     (flags . (numeric-host numeric-serv)))
+                   (lambda (err results)
+                     (collect)
+                     (set! d-err (facade-err->symbol err))
+                     (set! d-results results))))
+
+(test-equal "uv-dns-request? is re-exported and accepts the in-flight request"
+  'a-dns-request
+  (if (uv-dns-request? d-req) 'a-dns-request 'not-a-dns-request))
+
+;; The ticker keeps the iteration bound real, exactly as the tcp drain
+;; above: an active dns request keeps the loop alive, so a miswired
+;; delivery would otherwise BLOCK a bare 'once instead of failing by name.
+(define d-ticker (make-uv-timer dl))
+(uv-timer-start! d-ticker (lambda (t) (collect)) 1 1)
+
+(let drain ((i 0))
+  (when (and (< i 32) (eq? d-err 'callback-never-fired))
+    (uv-run dl 'once)
+    (drain (+ i 1))))
+
+(test-equal "uv-getaddrinfo! is re-exported and the numeric lookup succeeded"
+  'no-error d-err)
+
+(test-equal "the driven lookup answered exactly one 'inet record, the literal rendered back"
+  '(1 an-addrinfo inet "127.0.0.1" 80 stream tcp canonname-absent)
+  (list (length d-results)
+        (if (uv-addrinfo? (car d-results)) 'an-addrinfo 'not-a-record)
+        (uv-addrinfo-family (car d-results))
+        (uv-addrinfo-address (car d-results))
+        (uv-addrinfo-port (car d-results))
+        (uv-addrinfo-socktype (car d-results))
+        (uv-addrinfo-protocol (car d-results))
+        (if (uv-addrinfo-canonname (car d-results))
+            'canonname-present
+            'canonname-absent)))
+
+;; uv-getnameinfo! and uv-cancel!, driven together. The cancel's answer is
+;; a RACE (this suite does not pin the threadpool), so the row asserts the
+;; branch-paired consequence, never the boolean alone -- the tolerant
+;; shape design spec v0.2 S9 prescribes: cancel won => 'EAI_CANCELED with
+;; host and service absent; cancel lost => the real numeric reverse.
+(define n-err 'callback-never-fired)
+(define n-host 'callback-never-fired)
+(define n-serv 'callback-never-fired)
+
+(define n-req
+  (uv-getnameinfo! dl "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                   (lambda (err host service)
+                     (collect)
+                     (set! n-err (facade-err->symbol err))
+                     (set! n-host (if host (list 'host host) 'host-absent))
+                     (set! n-serv (if service
+                                      (list 'service service)
+                                      'service-absent)))))
+
+(define n-cancel-answer (uv-cancel! n-req))
+
+(let drain ((i 0))
+  (when (and (< i 32) (eq? n-err 'callback-never-fired))
+    (uv-run dl 'once)
+    (drain (+ i 1))))
+
+(uv-timer-stop! d-ticker)
+
+(test-equal "uv-cancel! is re-exported and answers a boolean"
+  'boolean
+  (if (boolean? n-cancel-answer) 'boolean (list 'not-a-boolean n-cancel-answer)))
+
+(test-equal "uv-getnameinfo! is re-exported and delivered a branch-paired outcome"
+  'paired-outcome
+  (cond ((and (eq? n-err 'no-error)
+              (equal? n-host '(host "127.0.0.1"))
+              (equal? n-serv '(service "8080")))
+         'paired-outcome)
+        ((and (eq? n-err 'EAI_CANCELED)
+              (eq? n-host 'host-absent)
+              (eq? n-serv 'service-absent))
+         'paired-outcome)
+        (else (list 'unpaired n-err n-host n-serv))))
+
+;; The record constructor and every accessor, round-tripped directly --
+;; make-uv-addrinfo is public for the same reason the condition
+;; constructors are: pure data, and a caller's test double is legitimate.
+(test-equal "the re-exported uv-addrinfo constructor and accessors round-trip"
+  '(inet6 stream tcp "::1" 443 canonname-absent)
+  (let ((ai (make-uv-addrinfo 'inet6 'stream 'tcp "::1" 443 #f)))
+    (list (uv-addrinfo-family ai)
+          (uv-addrinfo-socktype ai)
+          (uv-addrinfo-protocol ai)
+          (uv-addrinfo-address ai)
+          (uv-addrinfo-port ai)
+          (if (uv-addrinfo-canonname ai) 'canonname-present 'canonname-absent))))
+
+(uv-loop-teardown! dl)
+
+(test-equal "the facade's dns loop tore down cleanly"
+  'not-open (if (uv-loop-open? dl) 'open 'not-open))
+
+;; --- resolve -> connect: the composition ADR-0012 promises --------------
+;; ADR-0012's first consequence -- "uv-addrinfo-address/uv-addrinfo-port
+;; compose directly with uv-tcp-connect!'s existing parameters:
+;; resolution-to-connection needs no adapter" -- asserted end to end, on
+;; the record's OWN accessor answers, never on the literals they came
+;; from: a loopback listener binds port 0, the kernel's real port is
+;; resolved back hermetically (numeric-host/numeric-serv, ADR-0013 -- no
+;; resolver configuration in the oracle), and the FIRST 'inet record's
+;; address and port feed uv-tcp-connect! verbatim. The accept firing is
+;; what proves the composed connect reached THIS listener: a record port
+;; one off would ECONNREFUSED on loopback and the accept would never come
+;; (watched to fail exactly so -- dns-stage-6 mutation log, MC), and a
+;; literal-for-accessor swap is invisible to this row by construction
+;; (recorded honestly there as MA, not claimed covered).
+(define cl (make-uv-loop))
+(define cserver (make-uv-tcp cl))
+
+(uv-tcp-bind! cserver "127.0.0.1" 0)
+
+(define cport (uv-tcp-getsockname-port cserver))
+(define c-accepted 'never-accepted)
+
+(uv-listen! cserver 128
+            (lambda (err)
+              (collect)
+              (when (not err)
+                (set! c-accepted (uv-accept! cserver)))))
+
+(define c-resolve-err 'resolve-cb-never-fired)
+(define c-records 'resolve-cb-never-fired)
+
+(uv-getaddrinfo! cl "127.0.0.1" (number->string cport)
+                 '((family . inet) (socktype . stream) (protocol . tcp)
+                   (flags . (numeric-host numeric-serv)))
+                 (lambda (err results)
+                   (collect)
+                   (set! c-resolve-err (facade-err->symbol err))
+                   (set! c-records results)))
+
+;; The ticker keeps both drains' iteration bounds real, exactly as the tcp
+;; and dns blocks above.
+(define c-ticker (make-uv-timer cl))
+(uv-timer-start! c-ticker (lambda (t) (collect)) 1 1)
+
+(let drain ((i 0))
+  (when (and (< i 32) (eq? c-resolve-err 'resolve-cb-never-fired))
+    (uv-run cl 'once)
+    (drain (+ i 1))))
+
+;; FIRST 'inet record by search rather than car, so the row's contract
+;; survives a future multi-record answer unchanged. `find` is (rnrs
+;; lists), not a project name, so it cannot mask a dropped re-export.
+(define c-rec
+  (or (and (pair? c-records)
+           (find (lambda (r) (and (uv-addrinfo? r)
+                                  (eq? (uv-addrinfo-family r) 'inet)))
+                 c-records))
+      'no-inet-record))
+
+(define cclient (make-uv-tcp cl))
+(define c-connect-err 'connect-cb-never-fired)
+
+(when (uv-addrinfo? c-rec)
+  (uv-tcp-connect! cclient
+                   (uv-addrinfo-address c-rec)
+                   (uv-addrinfo-port c-rec)
+                   (lambda (err)
+                     (collect)
+                     (set! c-connect-err (facade-err->symbol err)))))
+
+;; Both ends waited for, as the tcp block above records: the accept and
+;; the connect completion are separate poll events.
+(let drain ((i 0))
+  (when (and (< i 32)
+             (or (eq? c-connect-err 'connect-cb-never-fired)
+                 (eq? c-accepted 'never-accepted)))
+    (uv-run cl 'once)
+    (drain (+ i 1))))
+
+(uv-timer-stop! c-ticker)
+(uv-loop-teardown! cl)
+
+(test-equal "resolve->connect: the record's own address and port drive uv-tcp-connect! to the listener (ADR-0012)"
+  '(no-error an-inet-record no-error a-tcp closed closed)
+  (list c-resolve-err
+        (if (uv-addrinfo? c-rec) 'an-inet-record c-rec)
+        c-connect-err
+        (if (uv-tcp? c-accepted) 'a-tcp (list 'not-a-tcp c-accepted))
+        (uv-handle-state cserver)
+        (uv-handle-state cclient)))
+
 ;; --- call-with-uv-loop, through the facade ------------------------------
 (test-equal "call-with-uv-loop is re-exported and returns the body's value"
   'body-value

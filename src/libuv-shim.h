@@ -61,6 +61,14 @@ void chez_uv_count_connect_req_new(void);
 void chez_uv_count_connect_req_free(void);
 long chez_uv_live_connect_req(void);
 
+void chez_uv_count_getaddrinfo_req_new(void);
+void chez_uv_count_getaddrinfo_req_free(void);
+long chez_uv_live_getaddrinfo_req(void);
+
+void chez_uv_count_getnameinfo_req_new(void);
+void chez_uv_count_getnameinfo_req_free(void);
+long chez_uv_live_getnameinfo_req(void);
+
 void chez_uv_count_read_buffer_new(void);
 void chez_uv_count_read_buffer_free(void);
 long chez_uv_live_read_buffer(void);

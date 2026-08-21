@@ -29,15 +29,28 @@
           constant-ref
 
           uv-run-default uv-run-once uv-run-nowait
-          uv-eof af-inet af-unspec uv-tcp-type uv-timer-type
+          uv-eof af-inet af-unspec af-inet6 uv-tcp-type uv-timer-type
           uv-write-req-type uv-connect-req-type uv-shutdown-req-type
+          uv-getaddrinfo-req-type uv-getnameinfo-req-type
 
           sizeof-uv-loop-t sizeof-uv-tcp-t sizeof-uv-timer-t
           sizeof-uv-write-t sizeof-uv-connect-t sizeof-uv-shutdown-t
           sizeof-uv-buf-t sizeof-sockaddr-in sizeof-sockaddr-storage
+          sizeof-uv-getaddrinfo-t sizeof-uv-getnameinfo-t
+          sizeof-addrinfo sizeof-sockaddr-in6
 
           offsetof-uv-buf-t-base offsetof-uv-buf-t-len
           offsetof-sockaddr-in-sin-port offsetof-sockaddr-in-sin-family
+          offsetof-addrinfo-ai-flags offsetof-addrinfo-ai-family
+          offsetof-addrinfo-ai-socktype offsetof-addrinfo-ai-protocol
+          offsetof-addrinfo-ai-addrlen offsetof-addrinfo-ai-addr
+          offsetof-addrinfo-ai-canonname offsetof-addrinfo-ai-next
+          offsetof-sockaddr-in6-sin6-port
+
+          sock-stream sock-dgram sock-raw
+          ipproto-tcp ipproto-udp
+          ai-passive ai-canonname ai-numerichost ai-numericserv
+          ni-numerichost ni-numericserv ni-namereqd ni-dgram
 
           errno-count errno-symbols errno-value->symbol errno-symbol->value)
   (import (rnrs)
@@ -63,13 +76,24 @@
   ;; change on the Scheme side (the C side gets one table entry).
   (define snapshot-names
     '(UV_RUN_DEFAULT UV_RUN_ONCE UV_RUN_NOWAIT
-      UV_EOF AF_INET AF_UNSPEC UV_TCP UV_TIMER
-      UV_WRITE UV_CONNECT UV_SHUTDOWN
+      UV_EOF AF_INET AF_UNSPEC AF_INET6 UV_TCP UV_TIMER
+      UV_WRITE UV_CONNECT UV_SHUTDOWN UV_GETADDRINFO UV_GETNAMEINFO
       SIZEOF_UV_LOOP_T SIZEOF_UV_TCP_T SIZEOF_UV_TIMER_T
       SIZEOF_UV_WRITE_T SIZEOF_UV_CONNECT_T SIZEOF_UV_SHUTDOWN_T
+      SIZEOF_UV_GETADDRINFO_T SIZEOF_UV_GETNAMEINFO_T
       SIZEOF_UV_BUF_T SIZEOF_SOCKADDR_IN SIZEOF_SOCKADDR_STORAGE
+      SIZEOF_ADDRINFO SIZEOF_SOCKADDR_IN6
       OFFSETOF_UV_BUF_T_BASE OFFSETOF_UV_BUF_T_LEN
-      OFFSETOF_SOCKADDR_IN_SIN_PORT OFFSETOF_SOCKADDR_IN_SIN_FAMILY))
+      OFFSETOF_SOCKADDR_IN_SIN_PORT OFFSETOF_SOCKADDR_IN_SIN_FAMILY
+      OFFSETOF_ADDRINFO_AI_FLAGS OFFSETOF_ADDRINFO_AI_FAMILY
+      OFFSETOF_ADDRINFO_AI_SOCKTYPE OFFSETOF_ADDRINFO_AI_PROTOCOL
+      OFFSETOF_ADDRINFO_AI_ADDRLEN OFFSETOF_ADDRINFO_AI_ADDR
+      OFFSETOF_ADDRINFO_AI_CANONNAME OFFSETOF_ADDRINFO_AI_NEXT
+      OFFSETOF_SOCKADDR_IN6_SIN6_PORT
+      SOCK_STREAM SOCK_DGRAM SOCK_RAW
+      IPPROTO_TCP IPPROTO_UDP
+      AI_PASSIVE AI_CANONNAME AI_NUMERICHOST AI_NUMERICSERV
+      NI_NUMERICHOST NI_NUMERICSERV NI_NAMEREQD NI_DGRAM))
 
   ;; The fallback errno symbol. It cannot collide with a real name: libuv's
   ;; UV_ERRNO_MAP tokens are the bare codes ("EOF", "ECONNRESET"), never
@@ -208,6 +232,7 @@
   (define (uv-eof)         (snapshot-ref 'UV_EOF))
   (define (af-inet)        (snapshot-ref 'AF_INET))
   (define (af-unspec)      (snapshot-ref 'AF_UNSPEC))
+  (define (af-inet6)       (snapshot-ref 'AF_INET6))
   (define (uv-tcp-type)    (snapshot-ref 'UV_TCP))
   (define (uv-timer-type)  (snapshot-ref 'UV_TIMER))
 
@@ -217,6 +242,8 @@
   (define (uv-write-req-type)    (snapshot-ref 'UV_WRITE))
   (define (uv-connect-req-type)  (snapshot-ref 'UV_CONNECT))
   (define (uv-shutdown-req-type) (snapshot-ref 'UV_SHUTDOWN))
+  (define (uv-getaddrinfo-req-type) (snapshot-ref 'UV_GETADDRINFO))
+  (define (uv-getnameinfo-req-type) (snapshot-ref 'UV_GETNAMEINFO))
 
   (define (sizeof-uv-loop-t)     (snapshot-ref 'SIZEOF_UV_LOOP_T))
   (define (sizeof-uv-tcp-t)      (snapshot-ref 'SIZEOF_UV_TCP_T))
@@ -227,10 +254,58 @@
   (define (sizeof-uv-buf-t)      (snapshot-ref 'SIZEOF_UV_BUF_T))
   (define (sizeof-sockaddr-in)      (snapshot-ref 'SIZEOF_SOCKADDR_IN))
   (define (sizeof-sockaddr-storage) (snapshot-ref 'SIZEOF_SOCKADDR_STORAGE))
+  (define (sizeof-uv-getaddrinfo-t) (snapshot-ref 'SIZEOF_UV_GETADDRINFO_T))
+  (define (sizeof-uv-getnameinfo-t) (snapshot-ref 'SIZEOF_UV_GETNAMEINFO_T))
+  (define (sizeof-addrinfo)         (snapshot-ref 'SIZEOF_ADDRINFO))
+  (define (sizeof-sockaddr-in6)     (snapshot-ref 'SIZEOF_SOCKADDR_IN6))
 
   (define (offsetof-uv-buf-t-base) (snapshot-ref 'OFFSETOF_UV_BUF_T_BASE))
   (define (offsetof-uv-buf-t-len)  (snapshot-ref 'OFFSETOF_UV_BUF_T_LEN))
   (define (offsetof-sockaddr-in-sin-port)
     (snapshot-ref 'OFFSETOF_SOCKADDR_IN_SIN_PORT))
   (define (offsetof-sockaddr-in-sin-family)
-    (snapshot-ref 'OFFSETOF_SOCKADDR_IN_SIN_FAMILY)))
+    (snapshot-ref 'OFFSETOF_SOCKADDR_IN_SIN_FAMILY))
+
+  ;; struct addrinfo field offsets, the portability trap's antidote (design
+  ;; spec v0.2 S5.2): glibc orders ai_addr before ai_canonname, Darwin the
+  ;; reverse, so any ftype guess is wrong on one platform. Chain walking
+  ;; reads fields through these, never through a declared layout.
+  (define (offsetof-addrinfo-ai-flags)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_FLAGS))
+  (define (offsetof-addrinfo-ai-family)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_FAMILY))
+  (define (offsetof-addrinfo-ai-socktype)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_SOCKTYPE))
+  (define (offsetof-addrinfo-ai-protocol)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_PROTOCOL))
+  (define (offsetof-addrinfo-ai-addrlen)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_ADDRLEN))
+  (define (offsetof-addrinfo-ai-addr)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_ADDR))
+  (define (offsetof-addrinfo-ai-canonname)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_CANONNAME))
+  (define (offsetof-addrinfo-ai-next)
+    (snapshot-ref 'OFFSETOF_ADDRINFO_AI_NEXT))
+  (define (offsetof-sockaddr-in6-sin6-port)
+    (snapshot-ref 'OFFSETOF_SOCKADDR_IN6_SIN6_PORT))
+
+  ;; getaddrinfo hint vocabulary (design spec v0.2 S4.2): socket types,
+  ;; protocols, and the OR-combinable AI_/NI_ flag bits. AI_ADDRCONFIG and
+  ;; AI_V4MAPPED are deliberately absent -- outside the closed validation
+  ;; sets they would be unreachable dead weight (S1 non-goal).
+  (define (sock-stream) (snapshot-ref 'SOCK_STREAM))
+  (define (sock-dgram)  (snapshot-ref 'SOCK_DGRAM))
+  (define (sock-raw)    (snapshot-ref 'SOCK_RAW))
+
+  (define (ipproto-tcp) (snapshot-ref 'IPPROTO_TCP))
+  (define (ipproto-udp) (snapshot-ref 'IPPROTO_UDP))
+
+  (define (ai-passive)     (snapshot-ref 'AI_PASSIVE))
+  (define (ai-canonname)   (snapshot-ref 'AI_CANONNAME))
+  (define (ai-numerichost) (snapshot-ref 'AI_NUMERICHOST))
+  (define (ai-numericserv) (snapshot-ref 'AI_NUMERICSERV))
+
+  (define (ni-numerichost) (snapshot-ref 'NI_NUMERICHOST))
+  (define (ni-numericserv) (snapshot-ref 'NI_NUMERICSERV))
+  (define (ni-namereqd)    (snapshot-ref 'NI_NAMEREQD))
+  (define (ni-dgram)       (snapshot-ref 'NI_DGRAM)))

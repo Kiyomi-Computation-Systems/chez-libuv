@@ -2,6 +2,7 @@
 
 #include <uv.h>
 
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <string.h>
@@ -29,6 +30,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "UV_EOF",         UV_EOF },
   { "AF_INET",        AF_INET },
   { "AF_UNSPEC",      AF_UNSPEC },
+  { "AF_INET6",       AF_INET6 },
   { "UV_TCP",         UV_TCP },
   { "UV_TIMER",       UV_TIMER },
 
@@ -38,6 +40,8 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "UV_WRITE",       UV_WRITE },
   { "UV_CONNECT",     UV_CONNECT },
   { "UV_SHUTDOWN",    UV_SHUTDOWN },
+  { "UV_GETADDRINFO", UV_GETADDRINFO },
+  { "UV_GETNAMEINFO", UV_GETNAMEINFO },
 
   { "SIZEOF_UV_LOOP_T",     (long)sizeof(uv_loop_t) },
   { "SIZEOF_UV_TCP_T",      (long)sizeof(uv_tcp_t) },
@@ -45,9 +49,13 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIZEOF_UV_WRITE_T",    (long)sizeof(uv_write_t) },
   { "SIZEOF_UV_CONNECT_T",  (long)sizeof(uv_connect_t) },
   { "SIZEOF_UV_SHUTDOWN_T", (long)sizeof(uv_shutdown_t) },
+  { "SIZEOF_UV_GETADDRINFO_T", (long)sizeof(uv_getaddrinfo_t) },
+  { "SIZEOF_UV_GETNAMEINFO_T", (long)sizeof(uv_getnameinfo_t) },
   { "SIZEOF_UV_BUF_T",      (long)sizeof(uv_buf_t) },
   { "SIZEOF_SOCKADDR_IN",      (long)sizeof(struct sockaddr_in) },
   { "SIZEOF_SOCKADDR_STORAGE", (long)sizeof(struct sockaddr_storage) },
+  { "SIZEOF_ADDRINFO",         (long)sizeof(struct addrinfo) },
+  { "SIZEOF_SOCKADDR_IN6",     (long)sizeof(struct sockaddr_in6) },
 
   { "OFFSETOF_UV_BUF_T_BASE", (long)offsetof(uv_buf_t, base) },
   { "OFFSETOF_UV_BUF_T_LEN",  (long)offsetof(uv_buf_t, len) },
@@ -55,6 +63,48 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
     (long)offsetof(struct sockaddr_in, sin_port) },
   { "OFFSETOF_SOCKADDR_IN_SIN_FAMILY",
     (long)offsetof(struct sockaddr_in, sin_family) },
+
+  /* struct addrinfo field offsets (design spec v0.2 S5.2). glibc orders
+   * ai_addr before ai_canonname; Darwin reverses them. Any declared-layout
+   * guess is therefore wrong on one platform, which is why chain walking
+   * on the Scheme side reads every field through these offsets and never
+   * through an ftype. */
+  { "OFFSETOF_ADDRINFO_AI_FLAGS",
+    (long)offsetof(struct addrinfo, ai_flags) },
+  { "OFFSETOF_ADDRINFO_AI_FAMILY",
+    (long)offsetof(struct addrinfo, ai_family) },
+  { "OFFSETOF_ADDRINFO_AI_SOCKTYPE",
+    (long)offsetof(struct addrinfo, ai_socktype) },
+  { "OFFSETOF_ADDRINFO_AI_PROTOCOL",
+    (long)offsetof(struct addrinfo, ai_protocol) },
+  { "OFFSETOF_ADDRINFO_AI_ADDRLEN",
+    (long)offsetof(struct addrinfo, ai_addrlen) },
+  { "OFFSETOF_ADDRINFO_AI_ADDR",
+    (long)offsetof(struct addrinfo, ai_addr) },
+  { "OFFSETOF_ADDRINFO_AI_CANONNAME",
+    (long)offsetof(struct addrinfo, ai_canonname) },
+  { "OFFSETOF_ADDRINFO_AI_NEXT",
+    (long)offsetof(struct addrinfo, ai_next) },
+  { "OFFSETOF_SOCKADDR_IN6_SIN6_PORT",
+    (long)offsetof(struct sockaddr_in6, sin6_port) },
+
+  /* getaddrinfo hint vocabulary (design spec v0.2 S5.2): socket types,
+   * protocols, and the OR-combinable AI_/NI_ flag bits from <netdb.h>.
+   * AI_ADDRCONFIG and AI_V4MAPPED are deliberately absent -- outside the
+   * closed validation sets they would be unreachable dead weight. */
+  { "SOCK_STREAM", SOCK_STREAM },
+  { "SOCK_DGRAM",  SOCK_DGRAM },
+  { "SOCK_RAW",    SOCK_RAW },
+  { "IPPROTO_TCP", IPPROTO_TCP },
+  { "IPPROTO_UDP", IPPROTO_UDP },
+  { "AI_PASSIVE",     AI_PASSIVE },
+  { "AI_CANONNAME",   AI_CANONNAME },
+  { "AI_NUMERICHOST", AI_NUMERICHOST },
+  { "AI_NUMERICSERV", AI_NUMERICSERV },
+  { "NI_NUMERICHOST", NI_NUMERICHOST },
+  { "NI_NUMERICSERV", NI_NUMERICSERV },
+  { "NI_NAMEREQD",    NI_NAMEREQD },
+  { "NI_DGRAM",       NI_DGRAM },
 };
 
 #define CHEZ_UV_CONSTANT_COUNT \
@@ -111,12 +161,14 @@ int chez_uv_errno_value(int i) {
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
-static long live_loop        = 0;
-static long live_tcp         = 0;
-static long live_timer       = 0;
-static long live_write_req   = 0;
-static long live_connect_req = 0;
-static long live_read_buffer = 0;
+static long live_loop            = 0;
+static long live_tcp             = 0;
+static long live_timer           = 0;
+static long live_write_req       = 0;
+static long live_connect_req     = 0;
+static long live_getaddrinfo_req = 0;
+static long live_getnameinfo_req = 0;
+static long live_read_buffer     = 0;
 
 void chez_uv_count_loop_new(void)  { live_loop += 1; }
 void chez_uv_count_loop_free(void) { live_loop -= 1; }
@@ -137,6 +189,14 @@ long chez_uv_live_write_req(void)       { return live_write_req; }
 void chez_uv_count_connect_req_new(void)  { live_connect_req += 1; }
 void chez_uv_count_connect_req_free(void) { live_connect_req -= 1; }
 long chez_uv_live_connect_req(void)       { return live_connect_req; }
+
+void chez_uv_count_getaddrinfo_req_new(void)  { live_getaddrinfo_req += 1; }
+void chez_uv_count_getaddrinfo_req_free(void) { live_getaddrinfo_req -= 1; }
+long chez_uv_live_getaddrinfo_req(void)       { return live_getaddrinfo_req; }
+
+void chez_uv_count_getnameinfo_req_new(void)  { live_getnameinfo_req += 1; }
+void chez_uv_count_getnameinfo_req_free(void) { live_getnameinfo_req -= 1; }
+long chez_uv_live_getnameinfo_req(void)       { return live_getnameinfo_req; }
 
 void chez_uv_count_read_buffer_new(void)  { live_read_buffer += 1; }
 void chez_uv_count_read_buffer_free(void) { live_read_buffer -= 1; }
@@ -163,6 +223,14 @@ long chez_uv_live_write_req(void)       { return 0; }
 void chez_uv_count_connect_req_new(void)  { }
 void chez_uv_count_connect_req_free(void) { }
 long chez_uv_live_connect_req(void)       { return 0; }
+
+void chez_uv_count_getaddrinfo_req_new(void)  { }
+void chez_uv_count_getaddrinfo_req_free(void) { }
+long chez_uv_live_getaddrinfo_req(void)       { return 0; }
+
+void chez_uv_count_getnameinfo_req_new(void)  { }
+void chez_uv_count_getnameinfo_req_free(void) { }
+long chez_uv_live_getnameinfo_req(void)       { return 0; }
 
 void chez_uv_count_read_buffer_new(void)  { }
 void chez_uv_count_read_buffer_free(void) { }

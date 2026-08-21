@@ -63,6 +63,33 @@
       ((nowait)  (uv-run-nowait))
       (else (raise (make-uv-invalid-argument who 'unknown-run-mode)))))
 
+  ;; THE ONE DELIVERY SHAPE for a stored pending callback error, shared by
+  ;; uv-run's exit path and uv-loop-close!'s post-close re-raise (v0.2) so
+  ;; the two cannot drift apart:
+  ;;
+  ;;   * Tested with the predicate, never with the VALUE's truthiness: a
+  ;;     callback may legitimately have raised #f, and `(when pending ...)`
+  ;;     would drop exactly that error on the floor (handles.sls's
+  ;;     `no-pending` note).
+  ;;   * The slot is consumed BEFORE the raise -- delivery is what empties
+  ;;     it, and delivering twice would turn one callback error into two.
+  ;;   * Composed with the cause when the cause is a condition, so a guard
+  ;;     written against the ORIGINAL type still matches -- the
+  ;;     load-bearing half of store-and-reraise (design spec S8). R6RS
+  ;;     `raise` accepts any object, so a callback may also have raised a
+  ;;     non-condition; that one is wrapped alone, since `condition` only
+  ;;     composes conditions.
+  ;;
+  ;; A no-op when nothing is pending, which is what lets both callers
+  ;; invoke it unconditionally.
+  (define (deliver-pending-callback-error! loop)
+    (when (loop-has-pending-error? loop)
+      (let ((pending (loop-pending-error loop)))
+        (clear-loop-pending-error! loop)
+        (raise (if (condition? pending)
+                   (condition (make-uv-callback-error pending) pending)
+                   (make-uv-callback-error pending))))))
+
   ;; (uv-run loop [mode]) -> #t if work remains, #f if the loop ran dry.
   ;;
   ;; The return value is a BOOLEAN, deliberately, even though uv_run returns
@@ -96,22 +123,10 @@
                     (lambda () (set-loop-running! loop #t))
                     (lambda () (uv-loop-run ptr mode-int))
                     (lambda () (set-loop-running! loop #f)))))
-           ;; Tested with the predicate, never with the VALUE's truthiness: a
-           ;; callback may legitimately have raised #f, and `(when pending
-           ;; ...)` would drop exactly that error on the floor (handles.sls's
-           ;; `no-pending` note).
-           (when (loop-has-pending-error? loop)
-             (let ((pending (loop-pending-error loop)))
-               (clear-loop-pending-error! loop)
-               ;; Composed with the cause when the cause is a condition, so a
-               ;; guard written against the ORIGINAL type still matches -- the
-               ;; load-bearing half of store-and-reraise (design spec S8).
-               ;; R6RS `raise` accepts any object, so a callback may also have
-               ;; raised a non-condition; that one is wrapped alone, since
-               ;; `condition` only composes conditions.
-               (raise (if (condition? pending)
-                          (condition (make-uv-callback-error pending) pending)
-                          (make-uv-callback-error pending)))))
+           ;; The composition, the #f discipline and the consume-first order
+           ;; live in deliver-pending-callback-error! above, shared with
+           ;; uv-loop-close!'s post-close re-raise.
+           (deliver-pending-callback-error! loop)
            ;; uv_run's int is "handles or requests still active", NOT an
            ;; errno: it must not go through uv-check, whose contract is that
            ;; any nonzero is a failure (native.sls).
@@ -163,18 +178,26 @@
   ;; still open and still usable, which is exactly what a caller who needs to
   ;; close their handles first requires.
   ;;
-  ;; V0.2 DECISION (final review, Task 6 triage): a pending callback error is
-  ;; silently discarded when the caller skips the next uv-run and goes
-  ;; straight here -- the error cell lives on the record, nothing in this
-  ;; procedure reads it, and closing makes it unreachable. v0.1 ships that
-  ;; as-is: inventing a delivery channel at close time would change this
-  ;; procedure's contract (today it raises only for a running loop, a bad
-  ;; argument, or libuv's own errno). v0.2 must pick one deliberately --
-  ;; either re-raise the composed &uv-callback-error from here, exactly as
-  ;; uv-run's exit does, or document the discard as the contract. Until
-  ;; then: the error is only ever lost by calling THIS procedure directly;
-  ;; uv-run re-raises it, and uv-loop-teardown!'s drain delivers it after
-  ;; the close.
+  ;; PENDING-ERROR DELIVERY AT CLOSE (decided 2026-08-21, v0.2, closing the
+  ;; obligation v0.1 recorded here): after a SUCCESSFUL close -- native
+  ;; close returned 0, state flipped, registry popped, block freed, pointer
+  ;; zeroed, counter bumped -- a stored pending callback error is
+  ;; RE-RAISED, composed as &uv-callback-error with the original condition,
+  ;; through the same deliver-pending-callback-error! as uv-run's exit
+  ;; path. The discard alternative was rejected because a caller who skips
+  ;; the next uv-run and goes straight here would silently lose the error;
+  ;; this was previously the one path on which it could be lost.
+  ;;
+  ;; The loop IS closed when the raise escapes: the error is a message from
+  ;; a callback, not a reason to abandon the close (the same reasoning as
+  ;; teardown's finish-then-re-raise). On the EBUSY path nothing is
+  ;; delivered -- that close FAILED, the loop is still open, and the error
+  ;; stays pending for a later uv-run or close. The DEFERRED list is left
+  ;; alone, mirroring uv-run's exit: it was readable until this call, and
+  ;; closing makes the query raise &uv-handle-closed, exactly as v0.1's
+  ;; close did. uv-loop-teardown!'s own close never has anything to
+  ;; deliver here: its drain's last uv-run already consumed the pending
+  ;; slot (caught and re-raised after the close by teardown itself).
   (define (uv-loop-close! loop)
     (require-loop loop 'uv-loop-close!)
     (when (loop-running? loop)
@@ -198,7 +221,10 @@
         ;; wrongly (spike FINDINGS Q1), so the stored pointer is the only
         ;; thing that can make a use-after-free detectable.
         (set-loop-ptr! loop 0)
-        (count-loop-free!))))
+        (count-loop-free!)
+        ;; Last, after every step of the close has completed: see the
+        ;; delivery decision above.
+        (deliver-pending-callback-error! loop))))
 
   ;; An upper bound on drain iterations, not a timeout. Design spec S11:
   ;; "failure is iteration exhaustion, never wall-clock elapsed time" --
@@ -250,6 +276,10 @@
     (when (loop-running? loop)
       (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
     (when (eq? (loop-state loop) 'open)
+      ;; Cancel-then-drain: best-effort-cancel this loop's handle-less DNS
+      ;; requests BEFORE the close sweep, so the drain below delivers every
+      ;; in-flight on-complete before teardown returns (ADR-0011).
+      (cancel-requests-for-loop! loop)
       (for-each close-handle! (registry-snapshot-for-loop loop))
       (let drain ((i 0) (stored teardown-no-error))
         (let ((outcome (drain-step loop)))
