@@ -594,7 +594,7 @@ This is a behavior-preserving refactor plus new (not-yet-reachable) records; the
   - `%make-uv-pipe-record` (ptr loop → record), `uv-pipe-record?`, `pipe-connected?`, `set-pipe-connected!`.
   - `%make-uv-process-record` (ptr loop on-exit → record), `uv-process-record?`, `process-on-exit`, `process-exited?`, `set-process-exited!`.
   - `handle-kinds` = `'(timer tcp pipe process)` (not exported; behavior: teardown sweeps all four).
-  - **(post-spike amendment, corrected):** the `walk` machinery does NOT touch handles.sls. Per ADR-0015/ADR-0008 the walk dispatcher installs LATE, from `(libuv process)`'s library body via `install-dispatch-procedure!` — the dns.sls seam, exactly like `exit` — as a closure over a process.sls-local query cell; the in-queue query helper (follow ADR-0015's recorded name and algorithm) also lives in process.sls and calls native's `uv-walk-native`. A process image that never imports `(libuv process)` keeps the raising stub for `walk` just as it does for `exit`. handles.sls's only Task 5 duties remain the record hierarchy, kinds, and counters.
+  - **(post-spike amendment, per ADR-0015/ADR-0008):** handles.sls gains the walk QUERY machinery but performs no install: a module-level query cell, the exported helper `(handle-in-loop-queue? loop handle) → boolean` (resets the cell, calls native's `uv-walk-native` with the loop's pointer, matches walked handle pointers against the target's), and an exported `walk-dispatch` closure over the cell. The INSTALL happens in Task 8, from `(libuv process)`'s library body via `install-dispatch-procedure!` beside `exit` — the dns.sls seam — so a process image that never imports `(libuv process)` keeps the raising stub for `walk`. Follow ADR-0015's recorded algorithm where this summary and the ADR differ.
 
 - [ ] **Step 1: Run the suite green first**
 
@@ -1565,7 +1565,7 @@ Complete implementation (kill/pid arrive in Task 10 — the export list below al
                               (when (and (list? spec) (eq? 'pipe (car spec)))
                                 (set-pipe-connected! (cadr spec) #t)))
                             (caddr parsed))
-                  (if (and (spawn-handle-in-queue? loop ptr)  ;; process.sls-local, per ADR-0015
+                  (if (and (handle-in-loop-queue? loop ptr)  ;; from handles.sls, per ADR-0015
                            ...)  ;; see ADR-0015's recorded algorithm:
                       ;; exec-class (still in queue): REGISTER (close-
                       ;; dispatch is registry-driven) then close through

@@ -414,13 +414,15 @@ uv-handle-record                      (ptr, kind, loop, state, on-close)
   trampoline, `walk` fires **synchronously**: only for the duration of a
   `uv_walk` call, on the caller's own thread, never from `uv_run`. Its
   only v0.3 consumer is the §5.6 failure path's queue-membership query,
-  which lives in `process.sls` beside the failure path itself: the `walk`
-  dispatcher installs at `(libuv process)`'s library-body time through
+  `(handle-in-loop-queue? loop handle)`, which lives in `handles.sls`
+  beside the registry it complements — the helper and its module-level
+  query cell call native's `uv-walk-native`, and handles.sls EXPORTS the
+  walk dispatcher (a closure over that cell) without installing it. The
+  install happens at `(libuv process)`'s library-body time through
   `install-dispatch-procedure!` — the §5.4 late-install seam, exactly as
-  `exit` does — as a closure over a process.sls-local query cell, so the
-  trampoline body carries no policy and a program that never imports
-  `(libuv process)` keeps the raising stub for `walk` as it does for
-  `exit`. Created with the other eleven, locked in `trampolines-locked`,
+  `exit` — so the trampoline body carries no policy and a program that
+  never imports `(libuv process)` keeps the raising stub for `walk` as it
+  does for `exit` (ADR-0015). Created with the other eleven, locked in `trampolines-locked`,
   entry point taken once and baked into a `uv-walk-native` wrapper — it
   never leaves native.sls otherwise.
 - New foreign-procedures, all direct FFI (ADR-0002): `uv_spawn`
