@@ -36,7 +36,7 @@ Transcribed as given rather than strengthened.
 |---|---|---|---|
 | M1 | src/libuv/dns.sls | chain walk's `next` forced 0 (`ai_next` advance dropped) | `FAIL unpinned socktype: the chain has at least two entries` |
 | M2 | src/libuv/dns.sls | decode-entry reads `ai_addr` at the `ai_canonname` offset and vice versa | `FAIL v4: the literal renders back through uv_ip_name` (then port/canonname/v6 rows) — fails BY NAME, no SIGSEGV, because `sockaddr->address-string` refuses the zero pointer |
-| M3 | src/libuv/dns.sls | step-4 `(uv-freeaddrinfo res)` removed | No suite assertion possible: 75 passes, exit 0; local macOS ASan arm (recipe env, `detect_leaks=0`) also exit 0 — macOS-blind, as predicted. GATE-CAUGHT designation rests on the Linux valgrind leg (definite leak → exit 9), per §9's corrected oracle; to be observed on CI at Stage 5/6 (still outstanding per the report's "Deferred coverage" section, below). |
+| M3 | src/libuv/dns.sls | step-4 `(uv-freeaddrinfo res)` removed | No suite assertion possible: 75 passes, exit 0; local macOS ASan arm (recipe env, `detect_leaks=0`) also exit 0 — macOS-blind, as predicted. **GATE-CAUGHT — OBSERVED** on the Linux valgrind leg, CI run 32509190939 (2026-08-21): suite green under the mutation (`# of expected passes      121` on the v0.2-final tree) while the leak gate fired — `definitely lost: 1,496 bytes in 23 blocks`, both loss records alloc'd at `generate_addrinfo (getaddrinfo.c:1081)` on libuv's worker thread, `make: *** [Makefile:426: test-memory] Error 1`, step-observed exit 2. Full verbatim record and the exit-code-chain note in "Linux valgrind observation" below. |
 | M4 | src/libuv/dns.sls | on-complete delivered BEFORE `complete-request!` (free moved after user code) | `FAIL freed before on-complete: the live counter reads 0 inside the callback` + the ptr-zeroed and registry-popped rows — exactly the three row-g assertions, nothing else |
 | M5 | src/libuv/private/handles.sls | `registry-deregister!` dropped from `complete-request!` | Cascade, exit 255: `Exception ... &uv-invalid-argument who: uv-registry-register! reason: pointer-already-registered` (a later alloc reused the freed-but-registered address; the duplicate check fired as designed) |
 | M6 | src/libuv/dns.sls | freeing-site counter replaced with a no-op | `FAIL in flight: the live counter reads 1 after submit, before stepping` (then row g, row i, row l balance, epilogue) |
@@ -96,8 +96,10 @@ Transcribed as given rather than strengthened.
   `validate-hints`; recorded raising per the tcp.sls:150-156 unreachable-arm
   convention. M14 showed the flag else arm acting as a second net when the
   pure check is mutated away.
-- **M3, above:** its GATE-CAUGHT status is provisional on a Linux valgrind
-  run not yet observed at the time of the report (see Deferred coverage).
+- **M3, above:** its GATE-CAUGHT status was provisional on a Linux valgrind
+  run not yet observed at the time of the report; that run has since been
+  observed and the designation is no longer provisional (see "Linux
+  valgrind observation" below).
 
 ## Deferred coverage (Stage 5 owns, as reported)
 
@@ -113,8 +115,80 @@ Transcribed as given rather than strengthened.
 - `'getnameinfo` membership in `uv-dns-request?`'s kind list (no getnameinfo
   request can exist this stage; M16's row covers the kind-check mechanism,
   the second kind becomes watchable when Stage 5 constructs one).
-- M3's Linux valgrind observation (the actual exit-9 record) — next CI run.
+- M3's Linux valgrind observation — **HARVESTED 2026-08-21** (run
+  32509190939; see "Linux valgrind observation" below). Note the record
+  is not literally "exit 9": valgrind's own `--error-exitcode=9` is
+  converted by the recipe's `|| exit 1` (Makefile:433) before make
+  surfaces exit 2 — the definite-leak marker lines are what prove the
+  leak gate, not the suite, fired.
 - numeric reverse v4/v6 rows (getnameinfo, §9) — Stage 5.
+
+## Linux valgrind observation (2026-08-21, CI run 32509190939)
+
+The deferred M3 observation was harvested from the dedicated workflow
+"DNS Mutation Observation (spike)" (branch `spike/dns-mutation-obs`,
+run 32509190939, conclusion success): Ubuntu 24.04.4, Valgrind-3.22.0,
+the pkg-config build path (distro `libuv.so.1.0.0`), Chez 10.4.1. The
+run's shape: a pristine control (green), then the same one-line M3
+mutation re-applied to the v0.2-final tree by patch
+(`spike/dns/mutations/m3-freeaddrinfo-dropped.patch`, `1 file changed,
+1 deletion(-)`), `make test-memory MEMORY_TESTS=tests/test-dns.sps`,
+revert, then M2 and M12 (stage-5 log), then a final control (green).
+Control evidence, verbatim: `CONTROL GREEN: harness proven before any
+mutation.` before, `FINAL CONTROL GREEN: clean revert proven; three
+mutations observed and reverted without leaving state behind.` after —
+both controls with `definitely lost: 0 bytes in 0 blocks` and
+`ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)`.
+
+Under the M3 mutation the suite itself stayed green — no suite assertion
+possible, exactly as recorded above (`# of expected passes      121` on
+the v0.2-final tree; the Stage 4 tree's count was 75) — and the leak
+gate fired. Verbatim from the mutated run's output (elisions marked):
+
+```
+==5552== 152 bytes in 2 blocks are definitely lost in loss record 6 of 9
+==5552==    at 0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==5552==    by 0x4AA8039: generate_addrinfo (getaddrinfo.c:1081)
+==5552==    by 0x4AA8039: gaih_inet (getaddrinfo.c:1199)
+==5552==    by 0x4AA8039: getaddrinfo (getaddrinfo.c:2391)
+==5552==    by 0x502E434: ??? (in /usr/lib/x86_64-linux-gnu/libuv.so.1.0.0)
+==5552==    by 0x502C6A8: ??? (in /usr/lib/x86_64-linux-gnu/libuv.so.1.0.0)
+==5552==    by 0x49E9B83: start_thread (pthread_create.c:447)
+==5552==    by 0x4A76B63: clone (clone.S:100)
+[...]
+==5552== 1,472 (1,344 direct, 128 indirect) bytes in 21 blocks are definitely lost in loss record 8 of 9
+[...same generate_addrinfo (getaddrinfo.c:1081) allocation site...]
+==5552== LEAK SUMMARY:
+==5552==    definitely lost: 1,496 bytes in 23 blocks
+==5552==    indirectly lost: 128 bytes in 2 blocks
+==5552==      possibly lost: 0 bytes in 0 blocks
+==5552==    still reachable: 3,423 bytes in 10 blocks
+==5552==         suppressed: 0 bytes in 0 blocks
+[...]
+==5552== ERROR SUMMARY: 2 errors from 2 contexts (suppressed: 0 from 0)
+make: *** [Makefile:426: test-memory] Error 1
+```
+
+and the step's own verdict lines:
+
+```
+M3 run exit code: 2
+M3 marker check: FOUND 'definitely lost:' with nonzero bytes
+M3 CONFIRMED: exit 2, definite-leak marker present -- matches the stage-4 log's prediction.
+```
+
+The leaked blocks are glibc's own `getaddrinfo` chain allocations,
+unreferenced at exit because the dropped `uv_freeaddrinfo` was the only
+thing that ever freed them — exactly the mutation's shape.
+
+**Honest discrepancy, recorded:** this log (and §9's corrected oracle)
+said "definite leak → exit 9". The 9 is valgrind's `--error-exitcode=9`
+(Makefile:429); the recipe converts any valgrind failure via `|| exit 1`
+(Makefile:433), make surfaces that as `Error 1` and itself exits 2, and
+2 is what the workflow step observed. The prediction's substance — the
+definite-leak gate, not the suite, is what catches this mutation —
+is confirmed by the marker lines; the literal "exit 9" was never
+observable at the make level and no log may claim it was.
 
 ## Gate tails (as reported)
 
