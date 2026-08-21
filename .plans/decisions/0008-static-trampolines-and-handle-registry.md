@@ -29,6 +29,25 @@ per callback *instance*: alloc, read, connection, write-done, close, timer,
 shutdown, connect. Each is created and `lock-object`'d exactly once, at
 process initialization, and never unlocked, for the life of the process.
 
+> **Amended 2026-08-21 (v0.2 DNS, proposed — pending spike/dns/FINDINGS.md).**
+> v0.2 grows the set from eight to **ten**: getaddrinfo
+> (`(uptr int uptr) -> void`) and getnameinfo (`(uptr int uptr uptr) -> void`),
+> libuv's two DNS completion signatures (uv.h:345-352) — neither matches any
+> existing trampoline's arity, so neither can share one. The invariant this
+> ADR protects was never the literal count; restated: **one locked trampoline
+> per callback *type*, a constant small set per process** — the set moves only
+> when libuv's callback typology does, never with handle or request volume.
+> The two tests that deliberately froze the eight-name literal
+> (tests/test-loop.sps:193-195, tests/test-native.sps:1124-1126) widen to the
+> ten-name literal, watched to fail first. Unlike the original eight, whose
+> dispatcher slots `handles.sls` installs in one batch, the two DNS slots are
+> installed from `(libuv dns)`'s library body via
+> `install-dispatch-procedure!` — exactly the late-added-callback-type case
+> the seeding comment at handles.sls:885-892 anticipates — so a process that
+> never imports `(libuv dns)` keeps the contained, raising stubs behind those
+> two slots: the names exist and fail loudly, rather than silently doing
+> nothing.
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never
