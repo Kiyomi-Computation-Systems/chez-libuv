@@ -404,9 +404,13 @@
   (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
   ;; kind:   'loop | 'timer | 'tcp | 'write-req | 'connect-req | 'shutdown-req
-  ;; loop:   the owning loop record (a loop owns itself). A request registers
-  ;;         its HANDLE's loop, which is what makes registry-loop-of answer
-  ;;         for a request block too.
+  ;;         | 'getaddrinfo-req | 'getnameinfo-req
+  ;; loop:   the owning loop record (a loop owns itself). A handle-owned
+  ;;         request registers its HANDLE's loop; a handle-less DNS request
+  ;;         (ADR-0011) has no handle to inherit one from and registers its
+  ;;         loop EXPLICITLY. Either way the loop lives on the ENTRY, which
+  ;;         is what makes registry-loop-of answer for every request block
+  ;;         through one code path (complete-request! below).
   ;; object: the Scheme record the dispatchers and the teardown sweep hand
   ;;         back to their callers
   (define (registry-register! ptr kind loop object)
