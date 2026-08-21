@@ -374,7 +374,14 @@ git commit -m "feat: shim + constants rows for process/pipe (types, options/cont
 
 ---
 
-### Task 4: native.sls — the eleventh trampoline + process/pipe FFI
+### Task 4: native.sls — the eleventh + twelfth trampolines + process/pipe FFI
+
+> **Amendment (post-spike, user-approved):** ADR-0015's failure-path
+> discriminator is queue membership via `uv_walk`, so the set grows to
+> TWELVE: `exit` (async) and `walk` (synchronous — fires only inside a
+> `uv_walk` call, never from `uv_run`). Both join `dispatcher-names`; the
+> frozen literals widen to twelve. Everywhere this task's text says
+> "eleven"/"eleventh", read "twelve"/`(... exit walk)`.
 
 **Files:**
 - Modify: `src/libuv/private/native.sls`, `tests/test-loop.sps:199-202`, `tests/test-native.sps:1344-1347` (and its exit-stub/live-counts rows)
@@ -403,9 +410,9 @@ git commit -m "feat: shim + constants rows for process/pipe (types, options/cont
 change both to:
 
 ```scheme
-(test-equal "dispatcher-names names the eleven callback types the design commits to"
+(test-equal "dispatcher-names names the twelve callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo exit)
+    getaddrinfo getnameinfo exit walk)
   dispatcher-names)
 ```
 
@@ -418,12 +425,12 @@ Expected: two FAILs (expected list has `exit`, actual has ten). This is the ADR-
 
 - [ ] **Step 3: Implement in native.sls**
 
-(a) Append `exit` to `dispatcher-names` (native.sls:854-856):
+(a) Append `exit` and `walk` to `dispatcher-names` (native.sls:854-856):
 
 ```scheme
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect
-      getaddrinfo getnameinfo exit))
+      getaddrinfo getnameinfo exit walk))
 ```
 
 (b) Beside the DNS callables (after `getnameinfo-callable`), the eleventh trampoline — libuv's exact signature, mechanical body:
@@ -438,11 +445,36 @@ Expected: two FAILs (expected list has `exit`, actual has ten). This is the ADR-
                       (uptr integer-64 int) void))
 ```
 
-(c) Add `exit-callable` to the `trampolines-locked` list (after `getnameinfo-callable`), and beside the other entries:
+(b2) The twelfth callable + its native binding (ADR-0015's discriminator):
+
+```scheme
+  ;; uv_walk_cb: void (*)(uv_handle_t*, void* arg) (vendor/libuv/include/
+  ;; uv.h:341). SYNCHRONOUS: fires only inside a uv_walk call on the
+  ;; caller's own thread, never from uv_run — locked with the others
+  ;; because libuv still calls it by address (ADR-0008, v0.3 amendment).
+  (define walk-callable
+    (foreign-callable (lambda (handle arg)
+                        ((dispatcher-ref 'walk) handle arg))
+                      (uptr uptr) void))
+
+  ;; void uv_walk(uv_loop_t*, uv_walk_cb, void* arg) — no errno.
+  (define raw-walk
+    (foreign-procedure "uv_walk" (uptr uptr uptr) void))
+
+  ;; (uv-walk-native loop-ptr arg) — bakes in the walk trampoline; the
+  ;; installed walk dispatcher (handles.sls) interprets arg.
+  (define (uv-walk-native loop-ptr arg)
+    (raw-walk loop-ptr walk-cb-entry arg))
+```
+
+(c) Add `exit-callable` AND `walk-callable` to the `trampolines-locked` list (after `getnameinfo-callable`), and beside the other entries:
 
 ```scheme
   (define exit-cb-entry (foreign-callable-entry-point exit-callable))
+  (define walk-cb-entry (foreign-callable-entry-point walk-callable))
 ```
+
+Export `uv-walk-native` too, and add a walk uninstalled-stub row beside the exit one in Step 4 (`((dispatcher-ref 'walk) 0 0)`).
 
 (d) The raw bindings + wrapper, after the DNS wrappers:
 
@@ -566,6 +598,7 @@ This is a behavior-preserving refactor plus new (not-yet-reachable) records; the
   - `%make-uv-pipe-record` (ptr loop → record), `uv-pipe-record?`, `pipe-connected?`, `set-pipe-connected!`.
   - `%make-uv-process-record` (ptr loop on-exit → record), `uv-process-record?`, `process-on-exit`, `process-exited?`, `set-process-exited!`.
   - `handle-kinds` = `'(timer tcp pipe process)` (not exported; behavior: teardown sweeps all four).
+  - **(post-spike amendment)** `(handle-in-loop-queue? loop handle) → boolean` — ADR-0015's discriminator: installs the `walk` dispatcher at wiring time (beside timer/close) as a closure over a module-level query cell; the query calls `uv-walk-native` with the loop's pointer and compares each walked handle pointer against the target's, setting the cell on match. Walk fires synchronously inside the call, so the cell needs no reentrancy guard beyond being reset at query start. Exported for process.sls's failure path (Task 8).
 
 - [ ] **Step 1: Run the suite green first**
 
@@ -1525,27 +1558,35 @@ Complete implementation (kill/pid arrive in Task 10 — the export list below al
                 ;; §5.6: the SQ1-selected cleanup. KEEP EXACTLY ONE of the
                 ;; two variants below, per ADR-0015's accepted answer, and
                 ;; delete the other plus this sentence.
+                ;; §5.6 as amended + ADR-0015: CLASS-DEPENDENT cleanup,
+                ;; discriminated by queue membership (spike-measured);
+                ;; consumed pipes are marked connected on failure too
+                ;; (libuv connects the parent ends even when spawn fails
+                ;; — FINDINGS SQ1 Obs 3; §4.3 as amended states the
+                ;; conservative-policy wording for the setup class).
                 (begin
-                  ;; §5.6: the SQ1-selected cleanup — KEEP EXACTLY ONE
-                  ;; variant per ADR-0015's accepted answer, delete the
-                  ;; other and this sentence.
-                  ;;
-                  ;; Variant A (direct free): libuv's error path removed
-                  ;; the handle from the loop's queue; no callback will
-                  ;; ever fire for it, so the block is freed here — via
-                  ;; handles.sls's discard-failed-handle! (added Step 3
-                  ;; wiring note (2)) so freeing stays in one file:
-                  ;;   (discard-failed-handle! proc)
-                  ;;
-                  ;; Variant B (close through the protocol): the handle
-                  ;; WAS initialized, so it may only die by close_cb:
-                  ;;   (registry-register! ptr 'process loop proc)
-                  ;;   (count-process-new!)
-                  ;;   (close-handle! proc)
-                  ;;   ;; close completes on the caller's next uv-run;
-                  ;;   ;; counters balance then, and the ENOENT test's
-                  ;;   ;; counter row must drain the loop first.
-                  ;;
+                  (for-each (lambda (spec)
+                              (when (and (list? spec) (eq? 'pipe (car spec)))
+                                (set-pipe-connected! (cadr spec) #t)))
+                            (caddr parsed))
+                  (if (and (handle-in-loop-queue? loop proc-ptr-view)
+                           ...)  ;; see ADR-0015's recorded algorithm:
+                      ;; exec-class (still in queue): REGISTER (close-
+                      ;; dispatch is registry-driven) then close through
+                      ;; the protocol; the ENOENT test drains the loop
+                      ;; before its counter rows.
+                      (begin
+                        (registry-register! ptr 'process loop proc)
+                        (count-process-new!)
+                        (close-handle! proc))
+                      ;; setup-class (already unlinked): direct free via
+                      ;; handles.sls's discard-failed-handle! (one
+                      ;; freeing discipline, one file).
+                      (discard-failed-handle! proc))
+                  ;; ADR-0015 also records a uv_process_get_pid == 0
+                  ;; guard for the third (source-derived) state — follow
+                  ;; the ADR's algorithm EXACTLY as accepted; where this
+                  ;; sketch and ADR-0015 differ, ADR-0015 governs.
                   (uv-check rc 'uv-spawn!))))))))
 
   ;; --- the exit dispatcher (§5.4) ------------------------------------------
@@ -1681,6 +1722,26 @@ All-new test scenarios against Task 8's implementation; production code changes 
    ;; teardown at with-loop exit; the suite-end counter rows discharge
    ;; Task 5's forward obligation: the pipes' read buffer freed via the
    ;; STREAM arm of the close dispatcher.
+
+;; --- stdio-class spawn failure: the setup-class production twin ----------
+;; (ADR-0015; post-spike addition) (inherit-stream <unconnected pipe>) makes
+;; uv_spawn fail in stdio SETUP (EINVAL-class, handle already unlinked) —
+;; the direct-free arm's twin, as ENOENT is the exec-class arm's.
+(with-loop
+ (lambda (loop)
+   (define unconnected (make-uv-pipe loop))
+   (define procs-before (live-count 'process))
+   (test-assert "inherit-stream of an unconnected pipe fails at spawn with an errno"
+     (guard (e ((uv-errno-error? e) (symbol? (uv-errno-error-errno e))))
+       (uv-spawn! loop "/bin/cat" '("cat")
+                  (list (cons 'stdio (list (cons 'inherit-stream unconnected))))
+                  #f)
+       #f))
+   (test-equal "setup-class failure: no process counted (direct-free arm)"
+     procs-before (live-count 'process))
+   (test-equal "no options block leaked" 0 (live-count 'spawn-options))
+   (uv-close! unconnected)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state unconnected))) 64)))
 
 ;; --- pipe-wrong-loop (§4.3) ----------------------------------------------
 (with-loop
