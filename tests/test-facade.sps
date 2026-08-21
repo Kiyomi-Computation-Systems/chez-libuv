@@ -509,6 +509,97 @@
 (test-equal "the facade's dns loop tore down cleanly"
   'not-open (if (uv-loop-open? dl) 'open 'not-open))
 
+;; --- resolve -> connect: the composition ADR-0012 promises --------------
+;; ADR-0012's first consequence -- "uv-addrinfo-address/uv-addrinfo-port
+;; compose directly with uv-tcp-connect!'s existing parameters:
+;; resolution-to-connection needs no adapter" -- asserted end to end, on
+;; the record's OWN accessor answers, never on the literals they came
+;; from: a loopback listener binds port 0, the kernel's real port is
+;; resolved back hermetically (numeric-host/numeric-serv, ADR-0013 -- no
+;; resolver configuration in the oracle), and the FIRST 'inet record's
+;; address and port feed uv-tcp-connect! verbatim. The accept firing is
+;; what proves the composed connect reached THIS listener: a record port
+;; one off would ECONNREFUSED on loopback and the accept would never come
+;; (watched to fail exactly so -- dns-stage-6 mutation log, MC), and a
+;; literal-for-accessor swap is invisible to this row by construction
+;; (recorded honestly there as MA, not claimed covered).
+(define cl (make-uv-loop))
+(define cserver (make-uv-tcp cl))
+
+(uv-tcp-bind! cserver "127.0.0.1" 0)
+
+(define cport (uv-tcp-getsockname-port cserver))
+(define c-accepted 'never-accepted)
+
+(uv-listen! cserver 128
+            (lambda (err)
+              (collect)
+              (when (not err)
+                (set! c-accepted (uv-accept! cserver)))))
+
+(define c-resolve-err 'resolve-cb-never-fired)
+(define c-records 'resolve-cb-never-fired)
+
+(uv-getaddrinfo! cl "127.0.0.1" (number->string cport)
+                 '((family . inet) (socktype . stream) (protocol . tcp)
+                   (flags . (numeric-host numeric-serv)))
+                 (lambda (err results)
+                   (collect)
+                   (set! c-resolve-err (facade-err->symbol err))
+                   (set! c-records results)))
+
+;; The ticker keeps both drains' iteration bounds real, exactly as the tcp
+;; and dns blocks above.
+(define c-ticker (make-uv-timer cl))
+(uv-timer-start! c-ticker (lambda (t) (collect)) 1 1)
+
+(let drain ((i 0))
+  (when (and (< i 32) (eq? c-resolve-err 'resolve-cb-never-fired))
+    (uv-run cl 'once)
+    (drain (+ i 1))))
+
+;; FIRST 'inet record by search rather than car, so the row's contract
+;; survives a future multi-record answer unchanged. `find` is (rnrs
+;; lists), not a project name, so it cannot mask a dropped re-export.
+(define c-rec
+  (or (and (pair? c-records)
+           (find (lambda (r) (and (uv-addrinfo? r)
+                                  (eq? (uv-addrinfo-family r) 'inet)))
+                 c-records))
+      'no-inet-record))
+
+(define cclient (make-uv-tcp cl))
+(define c-connect-err 'connect-cb-never-fired)
+
+(when (uv-addrinfo? c-rec)
+  (uv-tcp-connect! cclient
+                   (uv-addrinfo-address c-rec)
+                   (uv-addrinfo-port c-rec)
+                   (lambda (err)
+                     (collect)
+                     (set! c-connect-err (facade-err->symbol err)))))
+
+;; Both ends waited for, as the tcp block above records: the accept and
+;; the connect completion are separate poll events.
+(let drain ((i 0))
+  (when (and (< i 32)
+             (or (eq? c-connect-err 'connect-cb-never-fired)
+                 (eq? c-accepted 'never-accepted)))
+    (uv-run cl 'once)
+    (drain (+ i 1))))
+
+(uv-timer-stop! c-ticker)
+(uv-loop-teardown! cl)
+
+(test-equal "resolve->connect: the record's own address and port drive uv-tcp-connect! to the listener (ADR-0012)"
+  '(no-error an-inet-record no-error a-tcp closed closed)
+  (list c-resolve-err
+        (if (uv-addrinfo? c-rec) 'an-inet-record c-rec)
+        c-connect-err
+        (if (uv-tcp? c-accepted) 'a-tcp (list 'not-a-tcp c-accepted))
+        (uv-handle-state cserver)
+        (uv-handle-state cclient)))
+
 ;; --- call-with-uv-loop, through the facade ------------------------------
 (test-equal "call-with-uv-loop is re-exported and returns the body's value"
   'body-value
