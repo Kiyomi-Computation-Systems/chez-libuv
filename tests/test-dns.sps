@@ -1121,18 +1121,31 @@
                (not (eq? #t (cdr (assq 'first obs)))))
       (attempt (+ n 1)))))
 
-(display (string-append "  [informational] double-cancel: first cancel won on attempt "
-                        (number->string (length dc-attempts))
-                        " of max " (number->string dc-max-attempts)))
+;; The wording branches on the OUTCOME: an exhausted retry bound must not
+;; print "won" -- the catcher row below fails in that case, and the
+;; informational line has to agree with it rather than contradict it.
+(display (if (eq? #t (cdr (assq 'first (car dc-attempts))))
+             (string-append "  [informational] double-cancel: first cancel won on attempt "
+                            (number->string (length dc-attempts))
+                            " of max " (number->string dc-max-attempts))
+             (string-append "  [informational] double-cancel: first cancel never won in "
+                            (number->string (length dc-attempts))
+                            " attempts (max " (number->string dc-max-attempts) ")")))
 (newline)
 
-(test-equal "double-cancel: every attempt fired every callback exactly once and balanced"
+;; The losing attempts' tail-err is pinned to the two LEGAL outcomes: the
+;; real reverse delivered ('no-error -- the cancel lost) or 'EAI_CANCELED
+;; (the cancel won on that draw too). Anything else -- a third errno, an
+;; escaped raise turned sentinel -- is an invariant violation even on a
+;; draw the retry loop would otherwise discard.
+(test-equal "double-cancel: every attempt fired every callback exactly once, in a legal branch, and balanced"
   'invariants-held
   (let check ((atts dc-attempts))
     (cond ((null? atts) 'invariants-held)
           ((let ((a (car atts)))
              (and (= 4 (cdr (assq 'blocker-fires a)))
                   (= 1 (cdr (assq 'tail-fires a)))
+                  (memq (cdr (assq 'tail-err a)) '(no-error EAI_CANCELED))
                   (equal? (list 0 0 (+ registry-with-loop 1)) ; loop + probe-timer
                           (cdr (assq 'balance a)))))
            (check (cdr atts)))
@@ -1348,12 +1361,22 @@
                (not (eq? 'EAI_CANCELED (cdr (assq 'tail-err obs)))))
       (attempt (+ n 1)))))
 
-(display (string-append "  [informational] queued-tail teardown: cancel won on attempt "
-                        (number->string (length td-attempts))
-                        " of max " (number->string td-max-attempts)))
+;; Branched on the outcome for the same reason as the double-cancel line:
+;; exhaustion must not print "won" while the catcher row fails.
+(display (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err (car td-attempts))))
+             (string-append "  [informational] queued-tail teardown: cancel won on attempt "
+                            (number->string (length td-attempts))
+                            " of max " (number->string td-max-attempts))
+             (string-append "  [informational] queued-tail teardown: cancel never won in "
+                            (number->string (length td-attempts))
+                            " attempts (max " (number->string td-max-attempts) ")")))
 (newline)
 
-(test-equal "queued-tail teardown: every attempt closed the loop, fired all five exactly once, and balanced"
+;; The tail's err is held to the same two-legal-outcomes set as the
+;; blockers', losing draws included: the drain either cancelled it
+;; ('EAI_CANCELED) or waited its real result out ('no-error). A third
+;; value on ANY attempt fails here even when the branch draw would retry.
+(test-equal "queued-tail teardown: every attempt closed the loop, fired all five exactly once in legal branches, and balanced"
   'invariants-held
   (let check ((atts td-attempts))
     (cond ((null? atts) 'invariants-held)
@@ -1362,6 +1385,7 @@
                   (equal? '(1 1 1 1 1) (cdr (assq 'fires a)))
                   (for-all (lambda (e) (memq e '(no-error EAI_CANCELED)))
                            (cdr (assq 'blocker-errs a)))
+                  (memq (cdr (assq 'tail-err a)) '(no-error EAI_CANCELED))
                   (equal? (list 0 0 td-registry-before)
                           (cdr (assq 'balance a)))))
            (check (cdr atts)))
