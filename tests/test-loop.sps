@@ -582,6 +582,154 @@
        (cons "uv-loop-live-handles"    (lambda () (uv-loop-live-handles dead-loop)))
        (cons "uv-loop-deferred-errors" (lambda () (uv-loop-deferred-errors dead-loop)))))
 
+;; --- pending-error delivery at close (v0.2) -----------------------------
+;; The v0.1 obligation recorded in uv-loop-close!'s comment block, decided
+;; 2026-08-21: a SUCCESSFUL close re-raises a stored pending callback
+;; error, composed exactly as uv-run's exit path composes it -- the
+;; alternative (discard) would silently lose the error for any caller who
+;; skips the next uv-run and goes straight to close. The loop must be
+;; CLOSED when the raise escapes: the error is a message from a callback,
+;; not a reason to abandon the close.
+(define pe-loop (make-uv-loop))
+(define pe-err (make-uv-errno-error 'ECONNRESET -104 "connection reset by peer"))
+(loop-record-error! pe-loop pe-err)
+
+(define raised-by-close
+  (guard (e (#t e))
+    (uv-loop-close! pe-loop)
+    'no-raise))
+
+(test-equal "close with a pending error re-raises it instead of discarding it"
+  'raised (if (condition? raised-by-close) 'raised raised-by-close))
+
+(test-equal "the close-raised condition satisfies uv-callback-error?"
+  'callback-error
+  (if (uv-callback-error? raised-by-close) 'callback-error 'not-callback-error))
+
+(test-equal "the close-raised condition ALSO satisfies the original condition's own predicate"
+  'errno-error
+  (if (uv-errno-error? raised-by-close) 'errno-error 'not-errno-error))
+
+(test-equal "the close-raised compound still answers the original condition's field accessors"
+  'ECONNRESET (uv-errno-error-errno raised-by-close))
+
+(test-equal "the close-raised callback-error's cause is the original condition object"
+  'same (if (eq? pe-err (uv-callback-error-cause raised-by-close)) 'same 'different))
+
+(test-equal "the loop IS closed when the close's re-raise escapes"
+  'closed (loop-state pe-loop))
+
+(test-equal "a second close after the re-raise is the ordinary idempotent no-op"
+  'second-close-ok
+  (guard (e (#t (list 'raised e)))
+    (uv-loop-close! pe-loop)
+    'second-close-ok))
+
+(test-equal "use after a re-raising close raises &uv-handle-closed with kind 'loop"
+  'loop (closed-op-kind (lambda () (uv-run pe-loop 'nowait))))
+
+(test-equal "the pending error was consumed by the close's re-raise"
+  'no-pending
+  (if (loop-has-pending-error? pe-loop) 'still-pending 'no-pending))
+
+;; ...and a callback's (raise #f) keeps its delivery at close too. An
+;; implementation testing the slot's truthiness instead of the predicate
+;; would discard exactly this error (handles.sls's `no-pending` note) --
+;; the same trap uv-run's own re-raise rows pin, re-pinned on this path.
+(define pe-false-loop (make-uv-loop))
+(loop-record-error! pe-false-loop #f)
+
+(define false-raised-by-close
+  (guard (e (#t e))
+    (uv-loop-close! pe-false-loop)
+    'no-raise))
+
+(test-equal "close re-raises a #f callback error instead of dropping it silently"
+  'callback-error
+  (if (uv-callback-error? false-raised-by-close)
+      'callback-error
+      (list 'not-callback-error false-raised-by-close)))
+
+(test-equal "the #f-close's callback-error carries the #f as its cause"
+  'cause-is-false
+  (if (eq? #f (uv-callback-error-cause false-raised-by-close))
+      'cause-is-false
+      'cause-is-something-else))
+
+(test-equal "the #f-raising close still closed the loop"
+  'closed (loop-state pe-false-loop))
+
+;; The EBUSY path must NOT deliver: that close FAILED, the loop is still
+;; open, and the error must stay pending for a later uv-run or close.
+;; The unstarted timer is what makes uv_loop_close answer EBUSY (the
+;; teardown section's trick, reused).
+(define pe-busy-loop (make-uv-loop))
+(define pe-busy-timer (make-uv-timer pe-busy-loop))
+(define pe-busy-err (make-uv-errno-error 'EPIPE -32 "broken pipe"))
+(loop-record-error! pe-busy-loop pe-busy-err)
+
+(define raised-by-busy-close
+  (guard (e (#t e))
+    (uv-loop-close! pe-busy-loop)
+    'no-raise))
+
+(test-equal "a close refused with EBUSY raises the errno error, never the pending callback error"
+  '(EBUSY not-callback-error)
+  (list (if (uv-errno-error? raised-by-busy-close)
+            (uv-errno-error-errno raised-by-busy-close)
+            'not-an-errno-error)
+        (if (uv-callback-error? raised-by-busy-close)
+            'callback-error
+            'not-callback-error)))
+
+(test-equal "the refused close left the loop open"
+  'open (loop-state pe-busy-loop))
+
+(test-equal "the refused close left the error pending, untouched"
+  'still-pending-same
+  (if (and (loop-has-pending-error? pe-busy-loop)
+           (eq? pe-busy-err (loop-pending-error pe-busy-loop)))
+      'still-pending-same
+      'lost-or-replaced))
+
+;; ..."pending for a later uv-run" is real, not a comment: the run that
+;; drains the timer's close delivers the error from ITS exit path.
+(uv-close! pe-busy-timer)
+
+(define busy-drain-raised
+  (guard (e (#t e))
+    (uv-run pe-busy-loop 'default)
+    'no-raise))
+
+(test-equal "the still-pending error is delivered by the next uv-run, cause intact"
+  'same-cause
+  (if (and (uv-callback-error? busy-drain-raised)
+           (eq? pe-busy-err (uv-callback-error-cause busy-drain-raised)))
+      'same-cause
+      (list 'not-delivered busy-drain-raised)))
+
+;; That delivering run was also a STOPPED run -- loop-record-error! calls
+;; uv_stop when it stores the error (design spec S8), and the stored stop
+;; flag makes uv_run return before its first iteration -- so it delivered
+;; the ERROR but not the timer's close callback. One more run drains the
+;; close quietly (nothing pending any more), and the loop then closes
+;; cleanly. Probed before it was asserted: without this run the timer is
+;; still 'closing and the close below answers EBUSY again.
+(test-equal "one more run after the delivery drains the close sweep quietly"
+  'drained
+  (guard (e (#t (list 'raised e)))
+    (uv-run pe-busy-loop 'default)
+    'drained))
+
+(test-equal "the timer's close completed in the drain run"
+  'closed (uv-handle-state pe-busy-timer))
+
+(test-equal "the loop then closes cleanly -- nothing left for close to re-raise"
+  'closed-clean
+  (guard (e (#t (list 'raised e)))
+    (uv-loop-close! pe-busy-loop)
+    (if (eq? 'closed (loop-state pe-busy-loop)) 'closed-clean 'not-closed)))
+
 ;; --- the cancel sweep and the completion machinery (ADR-0011) -----------
 ;; v0.2 Stage 3: uv-loop-teardown! runs cancel-requests-for-loop! before
 ;; its close sweep, and complete-request! resolves the owning loop from the
