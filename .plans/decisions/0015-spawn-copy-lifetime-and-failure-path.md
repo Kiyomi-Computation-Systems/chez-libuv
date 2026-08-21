@@ -117,38 +117,55 @@ class. SQ1 measured exactly two errnos — `ENOENT` for the exec class and
 `EINVAL` for the stdio class — and establishes no mapping for the rest. An errno table would therefore be a guess whose
 wrong answers are a permanently-`EBUSY` loop or a silently-spliced live
 handle, and whose untestable cases (resource exhaustion) are precisely the
-ones it would get wrong.
+ones it would get wrong. This is a second, deliberate disagreement with
+FINDINGS' own phrasing: FINDINGS:432 states "the binding can distinguish
+the classes by rc, but the *robust* discriminator measured here is whether
+the handle is still in the loop" — this ADR adopts only the second half of
+that sentence and rejects the first outright, on the both-sides-of-the-fork
+errno-overlap evidence above, rather than carry rc forward as a fallback
+discriminator.
 
-**The measured instrument for the property is `uv_walk`** — it is what the
-spike used to produce every row above (`spike/process/07-spawn-failure.ss`
-builds a `uv_walk_cb` foreign-callable, locks it, and compares visited
-pointers against ours), it is public API whose documented meaning is exactly
-the property, and it ran memory-clean under Memcheck inside strategy A's `0
-errors` leg. Adopting it costs one new foreign-procedure (`uv_walk`) **and
-one more locked foreign-callable** (`uv_walk_cb` is a callback type no
-existing trampoline matches) — i.e. the v0.3 locked set would grow by two
-callback types, not the one the design spec §5.2/§8 and ADR-0008's v0.3
-amendment currently count. **That arithmetic is a plan-level change this ADR
-does not make unilaterally**; the alternative below avoids it. The property
-is decided; Stage 5 ships one of these two instruments and pins it with the
-test named under Consequences.
+**The measured instrument for the property is `uv_walk`, and it is the one
+this binding ships.** It is what the spike used to produce every row above
+(`spike/process/07-spawn-failure.ss` builds a `uv_walk_cb` foreign-callable,
+locks it, and compares visited pointers against ours), it is public API
+whose documented meaning is exactly the property, and it ran memory-clean
+under Memcheck inside strategy A's `0 errors` leg. Adopting it costs one new
+foreign-procedure (`uv_walk`) **and one more locked foreign-callable**:
+`uv_walk_cb` (uv.h:341) is a callback type no existing trampoline matches,
+so it is the **twelfth** locked callback type, joining `exit` as v0.3's
+second addition — the v0.3 locked set grows by two, and design spec §5.2/§8
+and ADR-0008's v0.3 amendment are both amended to ten → twelve in the same
+change as this decision, with both frozen test literals widened
+watched-to-fail. `walk` joins `dispatcher-names` and is installed at
+`(libuv process)`'s library-body time (the dns.sls late-install seam's
+second application, same as `exit`), wiring `walk` over a module-level
+query cell in `handles.sls` that backs the query the failure path actually
+calls: `(handle-in-loop-queue? loop handle)`. `walk` fires synchronously —
+only for the duration of the `uv_walk` call that drives it, on the caller's
+own thread, never from `uv_run` — which is why it still satisfies ADR-0008's
+invariant: that invariant tracks callback *type*, not when or from where a
+callback fires.
 
-- *Alternative instrument, no new callable:* read the handle's own
+- *Rejected alternative, no new callable:* read the handle's own
   `handle_queue` node through a shim offset row (ADR-0005 mechanism) and
   test `node->next->prev == node`. Its soundness rests on the same FINDINGS
   observation that defeats the naive test — a removed node keeps "pointing
   at its old neighbours" while they no longer point back — and valgrind
   located that node at offset 32 of the 136-byte handle. **Evidence status:
-  not measured by the spike, and it reads a field uv.h marks private**, so
-  it is recorded as the cheaper candidate, not as the measured one.
+  not measured by the spike, and it reads a field uv.h marks private** — the
+  reason it was passed over in favor of the measured instrument, not a
+  defect in the mechanism itself; it remains available if a future need
+  ever justifies re-litigating the trampoline count.
 - *Rejected instrument:* `uv_loop_close`'s `EBUSY`. SQ1 measured it, but it
   answers "some handle is in this loop", not "ours is" — conclusive only in
   an otherwise-empty loop, which no real caller has.
 
 **3. The close-through-protocol arm registers, because in this binding
 closing *is* registration.** `close-dispatch` (handles.sls:872-885) resolves
-the firing pointer through the registry and is "THE ONLY PLACE A HANDLE
-POINTER IS FREED"; an unregistered pointer is filed by
+the firing pointer through the registry and is, per its own comment, "THE
+ONLY PLACE A HANDLE POINTER IS FREED" (handles.sls:848-849); an
+unregistered pointer is filed by
 `record-orphan-callback!` and **never freed**. So the exec-class arm
 `registry-register!`s the record and bumps `count-process-new!` before
 calling `uv_close`, and the standard protocol deregisters, frees, and bumps
@@ -177,15 +194,21 @@ for it, the options block is already gone, and `&uv-errno-error` names the
 was 0 but a later `uv__process_open_stream` fails, `uv_spawn` jumps to
 `error:` (process.c:1060-1067) with the handle *unlinked yet started*
 (`uv__handle_start` at process.c:1056) and a **live child** in
-`loop->process_handles`. Neither measured arm is correct there. The binding's
-own validation forecloses it: that call fails only when the target stream
-already holds an fd (`uv__stream_open` returns `UV_EBUSY`,
-vendor/libuv/src/unix/stream.c:407-408), which `'pipe-already-used` refuses
-before any allocation. Because AGENTS.md prefers a check to a comment, the
-failure path asserts the state instead of asserting the reasoning:
-`uv_process_get_pid` must read `0` (measured `handle->pid = 0` for the exec
-class; the field is only written at process.c:1053 when the exec succeeded).
-A nonzero pid raises loudly with the handle **deliberately untouched** — a
+`loop->process_handles`. Neither measured arm is correct there. The only
+trigger reachable through this binding's own API *by construction* is an
+already-connected target stream (`uv__stream_open` returns `UV_EBUSY`,
+vendor/libuv/src/unix/stream.c:407-408), which `'pipe-already-used`
+forecloses before any allocation; a macOS-only `setsockopt(SO_OOBINLINE)`
+failure arm remains (stream.c:424-430), reachable for the socketpair fd and
+not gated on `'pipe-already-used` at all — which is why the pid==0 guard,
+not this argument, is what covers the remainder. Because AGENTS.md prefers a
+check to a comment, the failure path asserts the state instead of asserting
+the reasoning: `uv_process_get_pid` must read `0` (measured `handle->pid = 0`
+for the exec class; the field is only written at process.c:1053 when the
+exec succeeded). A nonzero pid raises loudly — `&uv-invalid-argument`, who
+`'uv-spawn!`, reason `'spawn-failure-state-unclassifiable` (the
+implementation stage may refine this symbol name; design spec §4.7 gains
+the row when it does) — with the handle **deliberately untouched**: a
 leaked 136-byte block is recoverable and diagnosable; queue corruption and
 use-after-free are neither.
 
@@ -238,14 +261,22 @@ deleted as refuted.
   turns** (exec class), and `0` immediately (setup class). Both are correct
   and neither is new vocabulary: it is the ordinary "you have an unclosed
   handle" answer (ADR-0011 records the same shape for pending requests).
-- **The eleventh trampoline is `exit`, and this ADR does not add a twelfth by
-  itself.** If Stage 5 adopts `uv_walk` as the discriminator's instrument,
-  ADR-0008's v0.3 amendment and design spec §5.2/§8 must move from eleven to
-  twelve in the same change, with both frozen test literals widened
-  watched-to-fail; if it adopts the `handle_queue` back-pointer read, §5.3
-  gains one offset row instead. The decision recorded here — *which property
-  decides the class* — is instrument-independent, and no implementation may
-  substitute an errno table for it.
+- **The trampoline set is twelve: `exit` and `walk`.** `uv_walk` is the
+  discriminator's instrument (Decision 2 above), which makes `uv_walk_cb`
+  the twelfth locked callback type; ADR-0008's v0.3 amendment and design
+  spec §5.2/§8 move from ten to twelve, `walk` joins `dispatcher-names`
+  beside `exit`, and both frozen test literals widen to twelve
+  watched-to-fail. `walk` fires synchronously, only for the duration of the
+  `uv_walk` call the discriminator makes, never from `uv_run`, and installs
+  at `(libuv process)`'s library-body time over a module-level query cell in
+  `handles.sls` that backs `(handle-in-loop-queue? loop handle)`. The
+  `handle_queue` back-pointer read recorded above stays the rejected
+  alternative — unmeasured by the spike and reading a field uv.h marks
+  private, which is why it did not ship — rather than a discarded option;
+  §5.3 would gain one offset row if it were ever adopted instead. The
+  decision recorded here — *which property decides the class* — is
+  instrument-independent regardless, and no implementation may substitute
+  an errno table for it.
 - **Nothing here changes the success path.** Register, count, mark the
   consumed pipes connected, return the record (design spec §5.5 step 6); the
   handle is active from birth and the loop stays alive until the exit

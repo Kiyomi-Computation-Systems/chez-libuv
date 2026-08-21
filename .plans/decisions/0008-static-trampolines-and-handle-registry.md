@@ -48,25 +48,28 @@ process initialization, and never unlocked, for the life of the process.
 > two slots: the names exist and fail loudly, rather than silently doing
 > nothing.
 
-> **Amendment (v0.3, 2026-08-21): eleven trampolines.**
-> The set grows ten → eleven: `exit`, for uv_exit_cb
-> `(uv_process_t*, int64_t, int)` (vendor/libuv/include/uv.h:340) — a foreign
-> type signature no existing trampoline has. The invariant is restated
-> unchanged: one locked trampoline per callback TYPE, a constant small set
-> per process; the set moves only when libuv's callback typology does. The
-> two frozen literals (tests/test-loop.sps, tests/test-native.sps) were
-> widened watched-to-fail first (see .plans/process-stage-2-mutation-log.md).
-> The `exit` slot is installed from `(libuv process)`'s library body — the
-> dns.sls late-install seam's second application.
->
-> One v0.3 item could move the count again, and is recorded rather than
-> pre-empted: if
-> [ADR-0015](0015-spawn-copy-lifetime-and-failure-path.md)'s spawn-failure
-> discriminator ships on `uv_walk`, its `uv_walk_cb` (uv.h:341) is a twelfth
-> callback *type* and this count, design spec §5.2/§8, and both frozen
-> literals move to twelve together. The invariant is indifferent to which way
-> that lands — `uv_walk_cb` is libuv's typology, not a per-handle callable —
-> which is what "the count was never the invariant" means.
+> **Amendment (v0.3, 2026-08-21): twelve trampolines.**
+> The set grows ten → twelve: `exit`, for uv_exit_cb
+> `(uv_process_t*, int64_t, int)` (vendor/libuv/include/uv.h:340), and
+> `walk`, for uv_walk_cb `(uv_handle_t*, void*)` (uv.h:341) — two foreign
+> type signatures no existing trampoline shares. `walk` is synchronous — it
+> fires only inside a `uv_walk` call, on the caller's own thread, never from
+> `uv_run` — and it still locks: the invariant tracks callback *type*, not
+> when or from where a callback fires, and `uv_walk_cb` is one more entry in
+> libuv's callback typology regardless. It is bound as the twelfth locked
+> foreign-callable because ADR-0015's spawn-failure discriminator needs it
+> (design spec §5.2/§5.6). The invariant is restated unchanged: one locked
+> trampoline per callback TYPE, a constant small set per process; the set
+> moves only when libuv's callback typology does. The two frozen literals
+> (tests/test-loop.sps, tests/test-native.sps) widen to the twelve-name
+> literal, watched-to-fail; evidence recorded in
+> .plans/process-stage-2-mutation-log.md when the implementation stage
+> lands. The `exit` slot is installed from `(libuv process)`'s library
+> body — the dns.sls late-install seam's second application; `walk` is
+> installed the same way, wiring `dispatcher-names`'s `walk` slot over a
+> module-level query cell in `handles.sls` that backs
+> `(handle-in-loop-queue? loop handle)`, the query helper ADR-0015's
+> discriminator calls.
 
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names

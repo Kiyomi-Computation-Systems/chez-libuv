@@ -69,7 +69,7 @@ signals; both firsts are governed by new ADRs and gated on a Stage 0 spike
 | 1 | Stream verbs move to `(libuv stream)`; records gain a `uv-stream-record` intermediate type; pipe and tcp are its children | ADR-0014 (new) |
 | 2 | Spawn inputs are co-allocated into one foreign block, freed unconditionally the moment `uv_spawn` returns; failure-path cleanup strategy | ADR-0015 (new, *spike-gated* on SQ1) |
 | 3 | Signals cross the boundary as a closed symbol set from the shim table; exit delivery is `(exit-status term-signal)` results, never conditions; setuid/setgid are bound and tested via an opt-in root lane | ADR-0016 (new) |
-| 4 | The trampoline set grows ten → eleven (`exit`); the two frozen test literals widen watched-to-fail | ADR-0008 (amend) |
+| 4 | The trampoline set grows ten → twelve (`exit`, `walk`); the two frozen test literals widen watched-to-fail | ADR-0008 (amend) |
 | 5 | `uid`/`gid` option presence implies `UV_PROCESS_SETUID`/`SETGID` — the flag+field pair is never split at the public boundary | ADR-0016 |
 | 6 | Pipe direction vocabulary is `to-child`/`from-child`/`duplex`, not libuv's child-perspective `READABLE`/`WRITABLE` names | ADR-0016 |
 
@@ -202,17 +202,32 @@ the child in order.
   by a previous spawn: `uv_spawn` itself creates the socketpair and
   connects the parent end into `p` (V3). After a successful spawn the
   pipe is a connected stream — read, write, shutdown, close like any
-  other. **A failed `uv-spawn!` consumes its pipes too**: libuv opens the
-  parent ends before it can know whether the exec succeeded — measured,
-  `spike/process/FINDINGS.md` SQ1 Observation 3 — so every pipe named in a
-  raising spawn's stdio specs is marked connected, refuses reuse
-  (`'pipe-already-used`), and must be closed by the caller exactly like any
-  other pipe. A spawn that raises does not hand its pipes back unused; the
-  recovery pattern is close-and-remake, not retry-with-the-same-pipes
-  (§5.6, ADR-0015). Naming an already-connected pipe raises
-  `&uv-invalid-argument` (`'pipe-already-used`); the record tracks this.
-  Throughout this spec "open/closed" is always handle state,
-  "connected/unconnected" always the spawn-consumption state.
+  other. **A failed `uv-spawn!` consumes its pipes too, by policy — not
+  uniformly by fact.** Measured only on the exec class
+  (`spike/process/FINDINGS.md` SQ1 Observation 3): libuv opens the parent
+  ends before it can know whether the exec succeeded, so those pipes are
+  genuinely connected (`uv_fileno` rc 0, a real fd) after a failed spawn.
+  On the setup class the socketpair fds libuv itself opened are closed
+  again inside libuv, before `uv__process_open_stream` ever runs
+  (vendor/libuv/src/unix/process.c:1013→1015 — `uv__process_init_stdio`
+  failing sends control straight to `error:`; that label's cleanup loop at
+  :1082-1085 closes both pipe fds) — those pipes are **not** actually
+  connected. The binding still marks **every** consumed pipe connected
+  regardless of class: this is conservative policy, not a factual claim
+  about the setup class's fds, for the same reason ADR-0015 gives —
+  under-reporting connectedness is what would let a later spawn hand libuv
+  an already-opened stream, so the uniform, refuses-reuse-either-way
+  contract is the safe direction even where it over-reports. Every pipe
+  named in a raising spawn's stdio specs therefore refuses reuse
+  (`'pipe-already-used`) and must be closed by the caller exactly like any
+  other pipe — but a test must **not** assert a real fd behind a pipe after
+  a setup-class failure, only after an exec-class one. A spawn that raises
+  does not hand its pipes back unused; the recovery pattern is
+  close-and-remake, not retry-with-the-same-pipes (§5.6, ADR-0015). Naming
+  an already-connected pipe raises `&uv-invalid-argument`
+  (`'pipe-already-used`); the record tracks this. Throughout this spec
+  "open/closed" is always handle state, "connected/unconnected" always the
+  spawn-consumption state.
 - `dir` is one of:
   - `to-child` — parent writes, child reads. The stdin shape.
     (= `UV_READABLE_PIPE`, "readable" from the *child's* perspective.)
@@ -378,12 +393,13 @@ uv-handle-record                      (ptr, kind, loop, state, on-close)
 - New counters: `count-pipe-new!/free!`, `count-process-new!/free!`, with
   `live-counts` rows — every suite's balance assertions extend to them.
 
-### 5.2 native.sls: the eleventh trampoline
+### 5.2 native.sls: the trampoline set grows to twelve
 
 - `dispatcher-names` (native.sls:854, append-only, order is contract)
-  gains `exit` at the end: eleven names. The two frozen ten-name literals
-  — tests/test-loop.sps and tests/test-native.sps — are widened first,
-  watched to fail (ADR-0008 amendment procedure, second application).
+  gains `exit` and `walk`: ten → twelve names. The two frozen ten-name
+  literals — tests/test-loop.sps and tests/test-native.sps — are widened
+  first, watched to fail (ADR-0008 amendment procedure, second
+  application).
 - The `exit` foreign-callable has libuv's exact signature
   `(uptr integer-64 int) -> void` (`uv_exit_cb`: handle, int64_t
   exit_status, int term_signal) — a foreign type signature no existing
@@ -391,11 +407,25 @@ uv-handle-record                      (ptr, kind, loop, state, on-close)
   `(dispatcher-ref 'exit)`, no policy. Created with the other ten, locked
   in `trampolines-locked`, entry point taken once and baked into the
   options block by the spawn path — it never leaves native.sls otherwise.
+- The `walk` foreign-callable has libuv's exact signature
+  `(uptr uptr) -> void` (`uv_walk_cb`: handle, void *arg) — a foreign type
+  signature no existing trampoline has either, so it is a twelfth callback
+  type rather than a reuse of `exit`'s or any other. Unlike every other
+  trampoline, `walk` fires **synchronously**: only for the duration of a
+  `uv_walk` call, on the caller's own thread, never from `uv_run`. Its
+  only v0.3 consumer is the §5.6 failure path's queue-membership query,
+  `(handle-in-loop-queue? loop handle)` — `handles.sls` installs the
+  `walk` dispatcher at wiring time over a module-level query cell the
+  helper reads, so the trampoline body itself carries no policy of its
+  own. Created with the other eleven, locked in `trampolines-locked`,
+  entry point taken once and baked into a `uv-walk-native` wrapper — it
+  never leaves native.sls otherwise.
 - New foreign-procedures, all direct FFI (ADR-0002): `uv_spawn`
   (`(uptr uptr uptr) -> int`), `uv_process_kill` (`(uptr int) -> int`),
   `uv_kill` (`(int int) -> int`), `uv_process_get_pid` (`(uptr) -> int`),
-  `uv_pipe_init` (`(uptr uptr int) -> int`). No wrapper C function exists
-  or is permitted.
+  `uv_pipe_init` (`(uptr uptr int) -> int`), `uv_walk`
+  (`(uptr uptr uptr) -> void`). No wrapper C function exists or is
+  permitted.
 
 ### 5.3 Shim and constants additions (ADR-0005)
 
@@ -509,10 +539,12 @@ handle. FINDINGS' rule — "Ask the loop, don't guess" — is ADR-0015's
 decision; the errno sets of the two classes overlap (`UV_ENOMEM` and
 `EMFILE`/`ENFILE` arise on both sides of the fork), and SQ1 measured only
 `ENOENT` and `EINVAL`, so no errno table can carry this. The measured
-instrument is `uv_walk`; ADR-0015 records it, its one-more-locked-callable
-cost, and the no-new-callable alternative, and Stage 5 pins whichever ships
-with a test that drives **both** classes (`'ENOENT`, and `(inherit-stream
-h)` on an unconnected stream → `EINVAL`, process.c:226).
+instrument is `uv_walk`, adopted as the twelfth locked trampoline (§5.2),
+installed as `walk` in `dispatcher-names`; ADR-0015 records the decision
+and keeps the unmeasured `handle_queue` back-pointer read on file as the
+rejected alternative. Stage 5 pins `uv_walk` with a test that drives
+**both** classes (`'ENOENT`, and `(inherit-stream h)` on an unconnected
+stream → `EINVAL`, process.c:226).
 
 The invariants either way: the options block is already freed (step 5), no
 record escapes, no `on-exit` can fire, and the raise carries the errno
@@ -617,8 +649,9 @@ re-verifies V1 and V5 behaviorally.
 
 ## 8. GC and memory invariants (delta over v0.1 §10, v0.2 §8)
 
-- The locked-object set grows by exactly one (the `exit` trampoline) and
-  remains constant per process — ADR-0008's amended invariant, now eleven.
+- The locked-object set grows by exactly two (the `exit` and `walk`
+  trampolines) and remains constant per process — ADR-0008's amended
+  invariant, now twelve.
 - The options block is the only new foreign allocation kind: one alloc
   site (spawn step 3), one free site (spawn step 5), counted under a new
   debug counter pair so `live-counts` catches an escape.
@@ -788,8 +821,8 @@ tag). Indicative cut — the implementation plan is authority:
    ADR-0008.
 2. **Stage 1** — shim + constants rows (§5.3), required-names walk,
    mutation tests.
-3. **Stage 2** — native.sls: eleventh trampoline (frozen literals widened
-   watched-to-fail first), new foreign-procedures.
+3. **Stage 2** — native.sls: `exit` and `walk` trampolines, twelve total
+   (frozen literals widened watched-to-fail first), new foreign-procedures.
 4. **Stage 3** — handles.sls: `uv-stream-record` hierarchy, pipe/process
    records, kind/counter/close-dispatcher widening; tcp regression green.
 5. **Stage 4** — `(libuv stream)` extraction + `(libuv pipe)` +
