@@ -59,20 +59,35 @@
           ;; same reason the loop's is: a record whose ptr did not come from
           ;; a successful uv_*_init is a segfault waiting to happen.
           %make-uv-handle-record uv-handle? %make-uv-timer-record uv-timer?
+          ;; the stream hierarchy (ADR-0014): uv-stream-record is the parent
+          ;; carrying the read-path fields tcp and pipe share; uv-tcp-record
+          ;; and uv-pipe-record are its children. uv-process-record is a
+          ;; direct uv-handle-record child -- a process is a handle, not a
+          ;; stream (design spec v0.3 S5.1).
+          uv-stream-record?
           %make-uv-tcp-record uv-tcp-record?
+          %make-uv-pipe-record uv-pipe-record?
+          %make-uv-process-record uv-process-record?
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
           timer-on-timeout set-timer-on-timeout!
           tcp-on-connection set-tcp-on-connection!
-          ;; the read-path fields, declared now and filled by Stage 5 (see
-          ;; the record definition below for why they are declared here)
-          tcp-on-data set-tcp-on-data!
-          tcp-on-eof set-tcp-on-eof!
-          tcp-on-error set-tcp-on-error!
-          tcp-read-buf set-tcp-read-buf!
-          tcp-read-buf-len set-tcp-read-buf-len!
-          tcp-reading? set-tcp-reading!
+          ;; the stream-generic read-path fields (ADR-0014; renamed from
+          ;; tcp-* now that uv-pipe-record shares them too), declared on
+          ;; uv-stream-record and filled by v0.1 Stage 5 (see the record
+          ;; definition below for why they are declared where they are)
+          stream-on-data set-stream-on-data!
+          stream-on-eof set-stream-on-eof!
+          stream-on-error set-stream-on-error!
+          stream-read-buf set-stream-read-buf!
+          stream-read-buf-len set-stream-read-buf-len!
+          stream-reading? set-stream-reading!
+          ;; the pipe record's one field (design spec v0.3 S5.1): spawn's
+          ;; consumption state, not handle open/closed state
+          pipe-connected? set-pipe-connected!
+          ;; the process record's two fields (design spec v0.3 S5.1)
+          process-on-exit process-exited? set-process-exited!
           require-handle require-open-handle handle-pointer
 
           ;; the request records (design spec S5's "for both handles and
@@ -95,7 +110,18 @@
           ;; the close protocol, and the seam Stages 4-5 replace their own
           ;; dispatchers through
           close-handle! install-close-handle! close-handle-installed?
-          install-dispatch-procedure!)
+          install-dispatch-procedure!
+
+          ;; the walk QUERY machinery (design spec v0.3 S5.2, ADR-0015).
+          ;; Exported but NOT installed here: handle-in-loop-queue? is the
+          ;; §5.6 spawn-failure discriminator, and walk-dispatch is the
+          ;; closure that backs it -- (libuv process) installs it as the
+          ;; 'walk slot at its own library-body time, through
+          ;; install-dispatch-procedure!, the dns.sls late-install seam's
+          ;; second v0.3 application (beside `exit`). A process image that
+          ;; never imports (libuv process) keeps the raising stub for
+          ;; `walk`.
+          handle-in-loop-queue? walk-dispatch)
   (import (rnrs)
           (libuv private conditions)
           ;; The FFI surface this library needs, and nothing more:
@@ -120,14 +146,22 @@
           ;;                     handle-less DNS requests, return codes
           ;;                     ignored. The raw binding's only other
           ;;                     caller is (libuv dns)'s uv-cancel! policy.
+          ;;   count-pipe-free!/count-process-free! the freeing site owns
+          ;;                     its counter (S10), same as count-tcp-free!,
+          ;;                     for the two v0.3 handle kinds.
+          ;;   uv-walk-native    the walk query machinery's own instrument
+          ;;                     (ADR-0015): bakes in the walk trampoline,
+          ;;                     interpreted here through walk-dispatch.
           (only (libuv private native)
                 uv-cancel
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
+                count-pipe-free! count-process-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-free!
                 uv-buf-set! copy-out
                 uv-errno-condition
+                uv-walk-native
                 dispatcher-names install-callback-dispatchers!)
           ;; UV_EOF is READ FROM THE SHIM's table, never transcribed as
           ;; -4095 (ADR-0005). The read dispatcher's EOF/error split is the
@@ -270,15 +304,17 @@
      (lambda (pargs->new)
        (lambda (ptr loop) ((pargs->new ptr 'timer loop) #f)))))
 
-  ;; The TCP handle. `on-connection` is this stage's field; the six read-path
-  ;; fields after it are DECLARED NOW and used by Stage 5, deliberately:
+  ;; The stream-generic read-path fields, hoisted from the v0.1 tcp record
+  ;; (ADR-0014): everything the alloc/read dispatchers and the close
+  ;; dispatcher's buffer arm touch, shared by tcp and pipe children. The
+  ;; protocol threads the KIND through, because each child names its own.
   ;;
   ;;   * the close dispatcher below already frees `read-buf`, because design
   ;;     spec S5 fixes the close order (pop registry -> free read buffer ->
   ;;     free handle pointer) and S6 makes the close dispatcher the ONLY
-  ;;     place that buffer is ever freed. Splitting that arm across two
-  ;;     stages would mean shipping a close protocol that is right for one
-  ;;     handle type and incomplete for the other.
+  ;;     place that buffer is ever freed. Splitting that arm across handle
+  ;;     types would mean shipping a close protocol that is right for one
+  ;;     stream kind and incomplete for the other.
   ;;   * a record's field list is its layout. Adding fields later is a
   ;;     recompile of every importer; declaring the shape once, from the
   ;;     design spec's own record row, is not.
@@ -294,19 +330,52 @@
   ;; varies across the supported 1.x range; intent needs none. The EOF and
   ;; error dispatchers therefore deliberately leave it set. No production
   ;; code reads it today; tests/test-tcp.sps locks the semantics in by name.
-  (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
+  (define-record-type (uv-stream-record %make-uv-stream-record uv-stream-record?)
     (parent uv-handle-record)
-    (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!)
-            (mutable on-data       tcp-on-data       set-tcp-on-data!)
-            (mutable on-eof        tcp-on-eof        set-tcp-on-eof!)
-            (mutable on-error      tcp-on-error      set-tcp-on-error!)
-            (mutable read-buf      tcp-read-buf      set-tcp-read-buf!)
-            (mutable read-buf-len  tcp-read-buf-len  set-tcp-read-buf-len!)
-            (mutable reading       tcp-reading?      set-tcp-reading!))
+    (fields (mutable on-data      stream-on-data      set-stream-on-data!)
+            (mutable on-eof       stream-on-eof       set-stream-on-eof!)
+            (mutable on-error     stream-on-error     set-stream-on-error!)
+            (mutable read-buf     stream-read-buf     set-stream-read-buf!)
+            (mutable read-buf-len stream-read-buf-len set-stream-read-buf-len!)
+            (mutable reading      stream-reading?     set-stream-reading!))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop)
-         ((pargs->new ptr 'tcp loop) #f #f #f #f 0 0 #f)))))
+       (lambda (ptr kind loop) ((pargs->new ptr kind loop) #f #f #f 0 0 #f)))))
+
+  ;; The TCP child keeps exactly what is TCP-specific: the listener's
+  ;; callback (listen/accept remain TCP-only, THE SPEC §4.6).
+  (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
+    (parent uv-stream-record)
+    (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop) ((pargs->new ptr 'tcp loop) #f)))))
+
+  ;; The pipe child (THE SPEC §5.1). `connected?` is the spawn-consumption
+  ;; state -- NOT handle state ("open/closed" vs "connected/unconnected",
+  ;; §4.3's vocabulary rule): it starts #f and flips exactly once, when a
+  ;; successful uv-spawn! consumes this pipe in a (pipe ...) spec. It
+  ;; exists to make 'pipe-already-used raisable before any allocation.
+  (define-record-type (uv-pipe-record %make-uv-pipe-record uv-pipe-record?)
+    (parent uv-stream-record)
+    (fields (mutable connected pipe-connected? set-pipe-connected!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop) ((pargs->new ptr 'pipe loop) #f)))))
+
+  ;; The process child (THE SPEC §5.1): a process is a handle, not a
+  ;; stream. on-exit is stored AT CONSTRUCTION -- the callback travels
+  ;; inside uv_process_options_t, so it must be on the record before
+  ;; uv_spawn runs (§4.1); there is nothing to clobber on a fresh record.
+  ;; exited? is set by the exit dispatcher (§5.4 step 4) and read by the
+  ;; lifecycle tests; exit stops the handle but never closes it (§6).
+  (define-record-type (uv-process-record %make-uv-process-record uv-process-record?)
+    (parent uv-handle-record)
+    (fields (mutable on-exit process-on-exit set-process-on-exit!)
+            (mutable exited  process-exited? set-process-exited!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop on-exit) ((pargs->new ptr 'process loop) on-exit #f)))))
 
   ;; --- the request records (design spec S5, S7) --------------------------
   ;; A request is NOT a handle: it has no state machine, no close protocol,
@@ -393,7 +462,9 @@
   ;; is what registry-snapshot-for-loop filters on, and therefore what
   ;; uv-loop-teardown! sweeps: every element of that snapshot is handed to
   ;; close-handle!, which refuses anything that is not a handle record.
-  (define handle-kinds '(timer tcp))
+  ;; Widened to four in v0.3 (design spec S5.1): pipe and process are both
+  ;; handles that need the same teardown sweep tcp and timer already get.
+  (define handle-kinds '(timer tcp pipe process))
 
   ;; The kinds that name a HANDLE-LESS request -- one registered against
   ;; the loop directly because no owning handle exists (ADR-0011; Stage 4's
@@ -765,14 +836,19 @@
   ;; delivered to on-error below, never a crash and never a silent stall.
   ;;
   ;; THE WHOLE BUFFER, FROM ITS BASE, IS THE ANSWER THIS DISPATCHER MAY GIVE:
-  ;; read-dispatch copies out of (tcp-read-buf handle), not out of buf->base
-  ;; (see its own note below), so answering a SUB-RANGE here would have to
-  ;; change both sites together or the copy would start at the wrong address.
+  ;; read-dispatch copies out of (stream-read-buf handle), not out of
+  ;; buf->base (see its own note below), so answering a SUB-RANGE here would
+  ;; have to change both sites together or the copy would start at the wrong
+  ;; address.
+  ;;
+  ;; uv-stream-record?, not uv-tcp-record? (ADR-0014): tcp and pipe share
+  ;; this whole read path, so the gate generalizes to the parent that owns
+  ;; the fields rather than naming either child.
   (define (alloc-dispatch handle-ptr suggested buf-ptr)
     (let ((handle (registry-ref handle-ptr)))
-      (if (and (uv-tcp-record? handle)
-               (valid-pointer? (tcp-read-buf handle)))
-          (uv-buf-set! buf-ptr (tcp-read-buf handle) (tcp-read-buf-len handle))
+      (if (and (uv-stream-record? handle)
+               (valid-pointer? (stream-read-buf handle)))
+          (uv-buf-set! buf-ptr (stream-read-buf handle) (stream-read-buf-len handle))
           (uv-buf-set! buf-ptr 0 0))))
 
   ;; uv_read_cb: void (*)(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf).
@@ -792,7 +868,7 @@
   ;;
   ;; THE `buf` ARGUMENT IS NOT DEREFERENCED. libuv hands read_cb back the
   ;; same uv_buf_t alloc-dispatch filled in, and alloc-dispatch fills it with
-  ;; the handle's own buffer and nothing else -- so `(tcp-read-buf handle)`
+  ;; the handle's own buffer and nothing else -- so `(stream-read-buf handle)`
   ;; and `buf->base` are the same address by construction. Reading the
   ;; record's own field keeps this dispatcher's data source inside the
   ;; binding's bookkeeping (if the two ever disagreed, copying from the
@@ -800,9 +876,12 @@
   ;; what makes the nread = 0, UV_EOF and error arms callable from a test
   ;; with a null buf -- which is the only way the nread = 0 arm is observable
   ;; at all, since no public API can ask libuv for one.
+  ;;
+  ;; uv-stream-record?, not uv-tcp-record?, for the same reason as
+  ;; alloc-dispatch above.
   (define (read-dispatch stream-ptr nread buf-ptr)
     (let ((handle (registry-ref stream-ptr)))
-      (if (uv-tcp-record? handle)
+      (if (uv-stream-record? handle)
           (cond ((positive? nread) (deliver-read-data! handle nread))
                 ((zero? nread) #f)
                 ((= nread (uv-eof)) (deliver-read-eof! handle))
@@ -819,18 +898,18 @@
   ;; future zero-copy variant can answer a sub-range of a larger buffer
   ;; without changing the call shape (design spec S6, ADR-0009).
   (define (deliver-read-data! handle nread)
-    (let ((on-data (tcp-on-data handle)))
+    (let ((on-data (stream-on-data handle)))
       (when on-data
         (dispatch-guarded
          (handle-loop handle)
          (lambda ()
-           (on-data (copy-out (tcp-read-buf handle) nread) 0 nread))))))
+           (on-data (copy-out (stream-read-buf handle) nread) 0 nread))))))
 
   ;; EOF is NOT an error and is never wrapped in a condition (design spec S6,
   ;; ADR-0006): it is its own callback, taking no arguments, because there is
   ;; nothing to report beyond "that was the last byte".
   (define (deliver-read-eof! handle)
-    (let ((on-eof (tcp-on-eof handle)))
+    (let ((on-eof (stream-on-eof handle)))
       (when on-eof
         (dispatch-guarded (handle-loop handle) on-eof))))
 
@@ -839,7 +918,7 @@
   ;; here: design spec S6 says "the binding never auto-closes the handle on a
   ;; read error", so what happens next is the caller's decision.
   (define (deliver-read-error! handle nread)
-    (let ((on-error (tcp-on-error handle)))
+    (let ((on-error (stream-on-error handle)))
       (when on-error
         (dispatch-guarded
          (handle-loop handle)
@@ -891,23 +970,69 @@
   ;; stopped". A handle that never called uv-read-start! has 0 here, and
   ;; free! refuses 0 by design -- so the test is on the pointer, not on the
   ;; handle type.
+  ;;
+  ;; uv-stream-record?, not uv-tcp-record? (ADR-0014): pipe shares the same
+  ;; buffer field and the same close-time free.
   (define (free-read-buffer! handle)
-    (when (uv-tcp-record? handle)
-      (let ((buf (tcp-read-buf handle)))
+    (when (uv-stream-record? handle)
+      (let ((buf (stream-read-buf handle)))
         (when (valid-pointer? buf)
           (free! buf)
           (count-read-buffer-free!)
-          (set-tcp-read-buf! handle 0)
-          (set-tcp-read-buf-len! handle 0)))))
+          (set-stream-read-buf! handle 0)
+          (set-stream-read-buf-len! handle 0)))))
 
   ;; One counter class per handle kind (design spec S10). A kind with no arm
   ;; has no counter class, and since `kind` is set by the constructors in
   ;; this file, that cannot be reached from outside it.
   (define (count-handle-free! kind)
     (case kind
-      ((timer) (count-timer-free!))
-      ((tcp)   (count-tcp-free!))
+      ((timer)   (count-timer-free!))
+      ((tcp)     (count-tcp-free!))
+      ((pipe)    (count-pipe-free!))
+      ((process) (count-process-free!))
       (else #f)))
+
+  ;; --- the walk QUERY machinery (design spec v0.3 S5.2, ADR-0015) --------
+  ;; ADR-0015's spawn-failure discriminator needs an instrument for "is this
+  ;; handle still in loop->handle_queue" -- "ask the loop, don't guess"
+  ;; rather than a guess from the rc -- and `uv_walk` is the one this binding
+  ;; ships (the rejected alternative, a private handle_queue back-pointer
+  ;; read, was unmeasured by the spike and reads a field uv.h marks
+  ;; private). The QUERY lives here, beside the registry it complements.
+  ;; INSTALLING walk-dispatch as the 'walk dispatcher slot is (libuv
+  ;; process)'s job, at its own library-body time, through
+  ;; install-dispatch-procedure! -- the dns.sls late-install seam's second
+  ;; v0.3 application, same as `exit` -- so a process image that never
+  ;; imports (libuv process) keeps the raising stub for `walk`.
+  ;;
+  ;; The cell is RESET, THEN FILLED, once per call -- never accumulated
+  ;; across calls: `uv_walk` fires walk-dispatch once per handle currently
+  ;; in the loop's queue, synchronously, only for the duration of the
+  ;; uv_walk call and on the caller's own thread (never from uv_run), so the
+  ;; fresh list a single call builds is what handle-in-loop-queue? compares
+  ;; against. Mirrors spike/process/07-spawn-failure.ss's `walk-acc`.
+  (define walk-query-cell '())
+
+  ;; uv_walk_cb: void (*)(uv_handle_t *handle, void *arg). `arg` is ignored
+  ;; -- the query rides the closed-over cell instead of the void* libuv
+  ;; passes through. NOT dispatch-guarded and NOT routed through
+  ;; record-orphan-callback!: walk visits whatever libuv says is in the
+  ;; queue, recognized by this registry or not, and the point of the query
+  ;; is exactly "what does libuv say is there", not "what do we recognize".
+  (define (walk-dispatch handle-ptr arg)
+    (set! walk-query-cell (cons handle-ptr walk-query-cell)))
+
+  ;; (handle-in-loop-queue? loop handle) -- ADR-0015's measured instrument.
+  ;; Resets the cell, walks the loop, and answers whether HANDLE's own
+  ;; pointer was among the pointers walk-dispatch just collected. Takes the
+  ;; loop and handle RECORDS, not raw uptrs, and reads their pointers
+  ;; through this file's own loop-ptr/handle-ptr accessors -- the same
+  ;; boundary rule every other query in this file follows.
+  (define (handle-in-loop-queue? loop handle)
+    (set! walk-query-cell '())
+    (uv-walk-native (loop-ptr loop) 0)
+    (and (memv (handle-ptr handle) walk-query-cell) #t))
 
   ;; --- the close protocol (design spec S5) -------------------------------
   ;; IDEMPOTENT BY AN EXPLICIT STATE TEST, and the on-close argument of a

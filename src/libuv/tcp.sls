@@ -366,10 +366,10 @@
     (ensure-read-buffer! tcp buffer-size)
     (uv-check (uv-read-start-native (handle-pointer tcp 'uv-read-start!))
               'uv-read-start!)
-    (set-tcp-on-data! tcp on-data)
-    (set-tcp-on-eof! tcp on-eof)
-    (set-tcp-on-error! tcp on-error)
-    (set-tcp-reading! tcp #t))
+    (set-stream-on-data! tcp on-data)
+    (set-stream-on-eof! tcp on-eof)
+    (set-stream-on-error! tcp on-error)
+    (set-stream-reading! tcp #t))
 
   ;; The per-handle buffer of design spec S6, allocated by the FIRST
   ;; uv-read-start! and never again -- which is what lets the alloc dispatcher
@@ -391,12 +391,12 @@
   ;; uv_read_start goes on to fail: the buffer belongs to the HANDLE, not to
   ;; the read, and the close dispatcher will free it exactly once.
   (define (ensure-read-buffer! tcp buffer-size)
-    (if (zero? (tcp-read-buf tcp))
+    (if (zero? (stream-read-buf tcp))
         (let ((size (or buffer-size default-read-buffer-size)))
-          (set-tcp-read-buf! tcp (alloc-zeroed size))
-          (set-tcp-read-buf-len! tcp size)
+          (set-stream-read-buf! tcp (alloc-zeroed size))
+          (set-stream-read-buf-len! tcp size)
           (count-read-buffer-new!))
-        (when (and buffer-size (not (= buffer-size (tcp-read-buf-len tcp))))
+        (when (and buffer-size (not (= buffer-size (stream-read-buf-len tcp))))
           (raise (make-uv-invalid-argument 'uv-read-start!
                                            'buffer-size-fixed)))))
 
@@ -409,7 +409,7 @@
     (require-open-tcp tcp 'uv-read-stop!)
     (uv-check (uv-read-stop (handle-pointer tcp 'uv-read-stop!))
               'uv-read-stop!)
-    (set-tcp-reading! tcp #f))
+    (set-stream-reading! tcp #f))
 
   ;; --- socket options -----------------------------------------------------
   ;; The one v0.1 needs. A boolean is required rather than accepted-and-
