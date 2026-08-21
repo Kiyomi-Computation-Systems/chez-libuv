@@ -1,0 +1,3 @@
+# The compiled probe is a build artifact, not evidence. probe-process.c is the
+# evidence; FINDINGS.md carries its output verbatim.
+probe-process
