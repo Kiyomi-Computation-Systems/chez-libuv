@@ -202,10 +202,17 @@ the child in order.
   by a previous spawn: `uv_spawn` itself creates the socketpair and
   connects the parent end into `p` (V3). After a successful spawn the
   pipe is a connected stream — read, write, shutdown, close like any
-  other. Naming an already-connected pipe raises `&uv-invalid-argument`
-  (`'pipe-already-used`); the record tracks this. Throughout this spec
-  "open/closed" is always handle state, "connected/unconnected" always
-  the spawn-consumption state.
+  other. **A failed `uv-spawn!` consumes its pipes too**: libuv opens the
+  parent ends before it can know whether the exec succeeded — measured,
+  `spike/process/FINDINGS.md` SQ1 Observation 3 — so every pipe named in a
+  raising spawn's stdio specs is marked connected, refuses reuse
+  (`'pipe-already-used`), and must be closed by the caller exactly like any
+  other pipe. A spawn that raises does not hand its pipes back unused; the
+  recovery pattern is close-and-remake, not retry-with-the-same-pipes
+  (§5.6, ADR-0015). Naming an already-connected pipe raises
+  `&uv-invalid-argument` (`'pipe-already-used`); the record tracks this.
+  Throughout this spec "open/closed" is always handle state,
+  "connected/unconnected" always the spawn-consumption state.
 - `dir` is one of:
   - `to-child` — parent writes, child reads. The stdin shape.
     (= `UV_READABLE_PIPE`, "readable" from the *child's* perspective.)
@@ -476,23 +483,61 @@ three stdio slots simultaneously and asserts every value arrived in the
 child (§9.2 — the argv/env/cwd scenario is the mutation target for every
 offset row).
 
-### 5.6 The spawn failure path *(spike-gated: SQ1)*
+### 5.6 The spawn failure path *(SQ1: answered — ADR-0015)*
 
-`uv_spawn` runs `uv__handle_init` before attempting the spawn and removes
-the handle from the loop's queue in its error path (process.c). What the
-binding must do with the ptr — close through the normal protocol
-(callback-driven free) or `foreign-free` directly with no callback
-expected — is **decided by SQ1 evidence** (valgrind + debug counters,
-both strategies, both platforms), not by reading. The invariant either
-way: no registry entry, no counter increment, no record escape, options
-block already freed; the raise carries the errno symbol. ADR-0015 records
-the winner with the evidence.
+**There is no single failure strategy.** SQ1 measured two failure classes
+with opposite correct cleanups, on both platforms
+(`spike/process/FINDINGS.md` SQ1):
 
-A subtlety SQ1 also pins: whether pipes named in `(pipe …)` specs are
-left touched or untouched by a failed spawn (libuv creates the socketpair
-before the fork on Unix; its error path closes what it created — the
-spike asserts our pipe records remain consistently unconnected and
-closeable).
+- an **exec** failure (the child's `execvp` fails; the errno returns over
+  libuv's error pipe) falls off the end of `uv_spawn`
+  (vendor/libuv/src/unix/process.c:1073) with the handle **still linked into
+  `loop->handle_queue`** — measured `uv_walk` visits it, `uv_loop_close`
+  answers `EBUSY`. `uv_close`-then-free is correct; direct `foreign-free`
+  leaves the loop permanently `EBUSY` and a dangling queue node the next
+  spawn writes through (402 valgrind errors, `definitely lost: 576 bytes in
+  2 blocks`, against 0 errors for the close path in the same job);
+- a **stdio-setup** failure leaves through the `error:` label
+  (process.c:1075-1076), which has already unlinked the handle. Direct
+  `foreign-free` is correct; `uv_close` there **silently splices a
+  later-registered live handle out of the loop's handle queue** and still
+  returns `uv_loop_close` 0 (`late handle survived #f`).
+
+So the failure path is **class-dependent**, and the class is decided by a
+runtime property, **never by the errno**: whether the loop still owns our
+handle. FINDINGS' rule — "Ask the loop, don't guess" — is ADR-0015's
+decision; the errno sets of the two classes overlap (`UV_ENOMEM` and
+`EMFILE`/`ENFILE` arise on both sides of the fork), and SQ1 measured only
+`ENOENT` and `EINVAL`, so no errno table can carry this. The measured
+instrument is `uv_walk`; ADR-0015 records it, its one-more-locked-callable
+cost, and the no-new-callable alternative, and Stage 5 pins whichever ships
+with a test that drives **both** classes (`'ENOENT`, and `(inherit-stream
+h)` on an unconnected stream → `EINVAL`, process.c:226).
+
+The invariants either way: the options block is already freed (step 5), no
+record escapes, no `on-exit` can fire, and the raise carries the errno
+symbol. Two refinements ADR-0015 adds, because the close protocol is this
+binding's and not libuv's: the exec-class arm **must** register the record
+before `uv_close`, since `close-dispatch` is registry-driven and the only
+place a handle pointer is freed (handles.sls:872-885) — so that arm's free
+is asynchronous, completing on the caller's next `uv-run` or at teardown,
+exactly like every other `uv-close!` — and the path asserts
+`uv_process_get_pid` reads 0 before choosing an arm, which fails loudly on
+the one state the spike did not measure (exec succeeded, a later
+`uv__process_open_stream` failed: handle unlinked *and* started, child
+alive), a state `'pipe-already-used` forecloses.
+
+**Pipes named in `(pipe …)` specs are consumed by a failed spawn.** §5.6's
+earlier expectation that "our pipe records remain consistently unconnected
+and closeable" is **refuted**: only the *closeable* half held. libuv creates
+the socketpairs before forking and opens the parent ends regardless of
+whether the exec succeeded, so `uv_fileno` goes from `EBADF` to a real fd
+across a failed spawn (SQ1 Observation 3). The contract, per the S6
+no-auto-close precedent (handles.sls:838-840): the failure path **marks
+every consumed pipe connected and leaves it open**, and the caller closes it
+like any pipe (§4.3). Not closing leaks one fd per slot per attempt —
+measured, parent-end fd `9 / 606` over 300 rounds (Linux 12 → 611), 600
+handles left open, with no `EMFILE` to announce it.
 
 ---
 
@@ -711,6 +756,10 @@ Spike-first, both platforms, Linux via the `spike/**`-triggered CI branch
   vs direct `foreign-free`); also assert `(pipe …)`-spec pipes remain
   consistently unconnected and closeable after a failed spawn. Evidence
   decides ADR-0015's failure path.
+  **Answered:** there are two failure classes with opposite correct
+  cleanups (the single-strategy premise was wrong), and the
+  unconnected-pipes assumption was refuted — a failed spawn connects them.
+  §5.6 above is rewritten to the measured result; ADR-0015 records it.
 - **SQ2 — SIGCHLD coexistence (Linux).** In one process, interleave libuv
   spawns with Chez's own subprocess machinery (`open-process-ports`,
   `system`): assert libuv's `exit_cb` still fires and Chez still gets its

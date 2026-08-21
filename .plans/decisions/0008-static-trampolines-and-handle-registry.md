@@ -48,6 +48,26 @@ process initialization, and never unlocked, for the life of the process.
 > two slots: the names exist and fail loudly, rather than silently doing
 > nothing.
 
+> **Amendment (v0.3, 2026-08-21): eleven trampolines.**
+> The set grows ten → eleven: `exit`, for uv_exit_cb
+> `(uv_process_t*, int64_t, int)` (vendor/libuv/include/uv.h:340) — a foreign
+> type signature no existing trampoline has. The invariant is restated
+> unchanged: one locked trampoline per callback TYPE, a constant small set
+> per process; the set moves only when libuv's callback typology does. The
+> two frozen literals (tests/test-loop.sps, tests/test-native.sps) were
+> widened watched-to-fail first (see .plans/process-stage-2-mutation-log.md).
+> The `exit` slot is installed from `(libuv process)`'s library body — the
+> dns.sls late-install seam's second application.
+>
+> One v0.3 item could move the count again, and is recorded rather than
+> pre-empted: if
+> [ADR-0015](0015-spawn-copy-lifetime-and-failure-path.md)'s spawn-failure
+> discriminator ships on `uv_walk`, its `uv_walk_cb` (uv.h:341) is a twelfth
+> callback *type* and this count, design spec §5.2/§8, and both frozen
+> literals move to twelve together. The invariant is indifferent to which way
+> that lands — `uv_walk_cb` is libuv's typology, not a per-handle callable —
+> which is what "the count was never the invariant" means.
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never
