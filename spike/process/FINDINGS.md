@@ -233,9 +233,11 @@ returning `exec_errorno` with the handle **still linked into the loop**
 | `uv_spawn` rc | `ENOENT` | `EINVAL` |
 | our handle still visible to `uv_walk` | **`#t`** | **`#f`** |
 | `uv_is_active` / `uv_is_closing` | 0 / 0 | — |
-| `uv_loop_close` before any cleanup | **`EBUSY`** | 0 |
+| `uv_loop_close` before any cleanup | **`EBUSY`** | 0† |
 | `handle->pid` | 0 | — |
 | stray `exit_cb` | 0 | 0 |
+
+† Inferred from the `uv_walk = #f` row — the handle is not in the queue, so close-before-cleanup cannot return EBUSY for it; not directly measured because parts 2/2b/2c hold a sentinel pipe in the loop at that point.
 
 macOS and Linux printed the same values for every row (the Linux run's only
 differences anywhere in this script's output are fd numbers and
@@ -356,6 +358,7 @@ decision for this spike too.
 **Strategy B (direct `foreign-free`) — 402 errors:**
 
 ```
+(derived tally, not verbatim valgrind lines:)
 Invalid read  : 6
 Invalid write : 7
 Invalid free  : 0
@@ -368,7 +371,9 @@ Invalid free  : 0
 
 The counts above are error *contexts*; the 15 contexts break down by the
 libuv frame that touched the freed block as `uv_walk` ×9, `uv_spawn` ×2,
-`uv_loop_close` ×1, `uv_handle_get_type` ×1. The first one, verbatim, is the
+`uv_loop_close` ×1, `uv_handle_get_type` ×1; the remaining 2 contexts are the
+two `definitely lost` blocks (576 bytes in 2 blocks) promoted to errors by
+`--errors-for-leak-kinds=definite`. The first one, verbatim, is the
 mechanism in one screen:
 
 ```
@@ -476,7 +481,7 @@ its own SIGCHLD disposition over libuv's. Both are ordering-sensitive.
 | 1 | Chez `system` + `open-process-ports` **before libuv has ever spawned** (so Chez's SIGCHLD arrangements, if any, are installed first) |
 | 2 | libuv spawn driven to completion, **then** Chez's calls |
 | 3 | libuv spawn registered, Chez's calls run **before the loop is stepped at all** — the child can exit while Chez is inside its own wait |
-| 4 | a libuv child that `sleep 0.2`s, with 8 Chez `system` calls and an `open-process-ports` running **while it is alive**, so its SIGCHLD lands inside Chez's wait window |
+| 4 | a libuv child that `sleep 0.2`s, with 8 Chez `system` calls and an `open-process-ports` running **while it is alive** — arranged to make it possible for its SIGCHLD to land inside a Chez wait, though no ordering marker proves it did |
 
 libuv's child is `/bin/sh -c 'exit 7'` — status 7 is discriminating, so a
 garbled delivery is not silently plausible. Chez's side is `(system "exit 7")`
@@ -671,11 +676,11 @@ Identical on macOS and Linux, and identical across both runs on each platform.
 This is worth stating plainly, because it is sharper than "expect both":
 
 * With `/bin/cat` as the child — the ordinary case — the stdout EOF arrived
-  **before** the `exit_cb` in **120/120 runs across two platforms and two
-  different child-reaping backends** (kqueue `EVFILT_PROC` on Darwin, SIGCHLD +
-  `waitpid` on Linux). Not once did the exit land first. Both the long
-  (10,000-trip) and the short (1-trip) sweeps agree, so it is not an artifact
-  of how much traffic preceded the shutdown.
+  **before** the `exit_cb` in **140/140 runs across both platforms** (70/70 per
+  platform; kqueue `EVFILT_PROC` on Darwin, SIGCHLD + `waitpid` on Linux). Not
+  once did the exit land first. Both the long (10,000-trip) and the short
+  (1-trip) sweeps agree, so it is not an artifact of how much traffic preceded
+  the shutdown.
 * With the echo moved into a grandchild, so that the watched process exits long
   before the pipe closes, the order **inverts completely**: `exit_cb` first in
   **100/100 runs across both platforms**.
