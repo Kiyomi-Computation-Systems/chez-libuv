@@ -89,6 +89,8 @@
           count-timer-new!       count-timer-free!
           count-write-req-new!   count-write-req-free!
           count-connect-req-new! count-connect-req-free!
+          count-getaddrinfo-req-new! count-getaddrinfo-req-free!
+          count-getnameinfo-req-new! count-getnameinfo-req-free!
           count-read-buffer-new! count-read-buffer-free!)
   ;; file-exists? is deliberately absent from the (chezscheme) import below:
   ;; (rnrs) already exports it via (rnrs files), and importing it from both
@@ -233,6 +235,20 @@
     (foreign-procedure "chez_uv_count_connect_req_free" () void))
   (define live-connect-req
     (foreign-procedure "chez_uv_live_connect_req" () long))
+
+  (define count-getaddrinfo-req-new!
+    (foreign-procedure "chez_uv_count_getaddrinfo_req_new" () void))
+  (define count-getaddrinfo-req-free!
+    (foreign-procedure "chez_uv_count_getaddrinfo_req_free" () void))
+  (define live-getaddrinfo-req
+    (foreign-procedure "chez_uv_live_getaddrinfo_req" () long))
+
+  (define count-getnameinfo-req-new!
+    (foreign-procedure "chez_uv_count_getnameinfo_req_new" () void))
+  (define count-getnameinfo-req-free!
+    (foreign-procedure "chez_uv_count_getnameinfo_req_free" () void))
+  (define live-getnameinfo-req
+    (foreign-procedure "chez_uv_live_getnameinfo_req" () long))
 
   (define count-read-buffer-new!
     (foreign-procedure "chez_uv_count_read_buffer_new" () void))
@@ -644,6 +660,8 @@
           (cons 'timer       (live-timer))
           (cons 'write-req   (live-write-req))
           (cons 'connect-req (live-connect-req))
+          (cons 'getaddrinfo-req (live-getaddrinfo-req))
+          (cons 'getnameinfo-req (live-getnameinfo-req))
           (cons 'read-buffer (live-read-buffer))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------

@@ -254,7 +254,11 @@
         (cons 'SIZEOF_UV_SHUTDOWN_T sizeof-uv-shutdown-t)
         (cons 'SIZEOF_UV_BUF_T      sizeof-uv-buf-t)
         (cons 'SIZEOF_SOCKADDR_IN   sizeof-sockaddr-in)
-        (cons 'SIZEOF_SOCKADDR_STORAGE sizeof-sockaddr-storage)))
+        (cons 'SIZEOF_SOCKADDR_STORAGE sizeof-sockaddr-storage)
+        (cons 'SIZEOF_UV_GETADDRINFO_T sizeof-uv-getaddrinfo-t)
+        (cons 'SIZEOF_UV_GETNAMEINFO_T sizeof-uv-getnameinfo-t)
+        (cons 'SIZEOF_ADDRINFO      sizeof-addrinfo)
+        (cons 'SIZEOF_SOCKADDR_IN6  sizeof-sockaddr-in6)))
 
 (for-each
  (lambda (entry)
@@ -286,14 +290,22 @@
 (test-equal "uv_req_size(UV_SHUTDOWN) agrees with the shim's sizeof(uv_shutdown_t)"
   (sizeof-uv-shutdown-t) (uv-req-size (uv-shutdown-req-type)))
 
-;; The three request tags are distinct members of uv_req_type, exactly as
+(test-equal "uv_req_size(UV_GETADDRINFO) agrees with the shim's sizeof(uv_getaddrinfo_t)"
+  (sizeof-uv-getaddrinfo-t) (uv-req-size (uv-getaddrinfo-req-type)))
+
+(test-equal "uv_req_size(UV_GETNAMEINFO) agrees with the shim's sizeof(uv_getnameinfo_t)"
+  (sizeof-uv-getnameinfo-t) (uv-req-size (uv-getnameinfo-req-type)))
+
+;; The five request tags are distinct members of uv_req_type, exactly as
 ;; UV_TCP/UV_TIMER are of uv_handle_type. Without this, a snapshot that
-;; collapsed them would still satisfy the three assertions above only if the
+;; collapsed them would still satisfy the five assertions above only if the
 ;; sizes happened to coincide -- which two of them nearly do.
-(test-equal "the write, connect, and shutdown request tags are pairwise distinct"
+(test-equal "the write, connect, shutdown, getaddrinfo, and getnameinfo request tags are pairwise distinct"
   #t
   (pairwise-distinct? (list (uv-write-req-type) (uv-connect-req-type)
-                            (uv-shutdown-req-type))))
+                            (uv-shutdown-req-type)
+                            (uv-getaddrinfo-req-type)
+                            (uv-getnameinfo-req-type))))
 
 ;; UV_TCP and UV_TIMER are different members of uv_handle_type; a snapshot
 ;; that collapsed them would make the two handle families indistinguishable.
@@ -302,6 +314,90 @@
 
 (test-equal "AF_INET and AF_UNSPEC are distinct"
   #t (not (= (af-inet) (af-unspec))))
+
+;; --- constants: the DNS additions (design spec v0.2 S5.2) ---------------
+;; Presence is enforced at init (a snapshot name the shim lacks raises
+;; &uv-constant-unavailable before any row here runs); what these rows add
+;; is INTERNAL consistency -- distinctness, bounds -- never a
+;; platform-specific value. glibc and Darwin genuinely disagree on the
+;; addrinfo layout (ai_addr/ai_canonname swap order), which is exactly why
+;; a value assertion here would be wrong on one platform.
+(test-equal "the three address families are pairwise distinct"
+  #t (pairwise-distinct? (list (af-unspec) (af-inet) (af-inet6))))
+
+(test-equal "the three socket types are pairwise distinct"
+  #t (pairwise-distinct? (list (sock-stream) (sock-dgram) (sock-raw))))
+
+(test-equal "IPPROTO_TCP and IPPROTO_UDP are distinct"
+  #t (not (= (ipproto-tcp) (ipproto-udp))))
+
+;; The AI_/NI_ constants are OR-combinable bit flags: a zero would be a
+;; no-op that silently drops the caller's request, and two equal values
+;; would make two spellings of the hints vocabulary indistinguishable.
+(define ai-flag-accessors
+  (list (cons 'AI_PASSIVE     ai-passive)
+        (cons 'AI_CANONNAME   ai-canonname)
+        (cons 'AI_NUMERICHOST ai-numerichost)
+        (cons 'AI_NUMERICSERV ai-numericserv)))
+
+(define ni-flag-accessors
+  (list (cons 'NI_NUMERICHOST ni-numerichost)
+        (cons 'NI_NUMERICSERV ni-numericserv)
+        (cons 'NI_NAMEREQD    ni-namereqd)
+        (cons 'NI_DGRAM       ni-dgram)))
+
+(for-each
+ (lambda (entry)
+   (test-equal (string-append "snapshot: " (symbol->string (car entry))
+                              " is a nonzero flag")
+     #t
+     (positive? ((cdr entry)))))
+ (append ai-flag-accessors ni-flag-accessors))
+
+(test-equal "the four AI_ flags are pairwise distinct"
+  #t (pairwise-distinct? (map (lambda (e) ((cdr e))) ai-flag-accessors)))
+
+(test-equal "the four NI_ flags are pairwise distinct"
+  #t (pairwise-distinct? (map (lambda (e) ((cdr e))) ni-flag-accessors)))
+
+;; The eight addrinfo field offsets. ai_flags sits at offset 0 on both
+;; glibc and Darwin, so positivity is NOT asserted -- zero is a legal
+;; offset. What cannot legally happen: two fields at the same offset, or a
+;; field starting outside the struct the same shim measured.
+(define addrinfo-offset-accessors
+  (list (cons 'OFFSETOF_ADDRINFO_AI_FLAGS     offsetof-addrinfo-ai-flags)
+        (cons 'OFFSETOF_ADDRINFO_AI_FAMILY    offsetof-addrinfo-ai-family)
+        (cons 'OFFSETOF_ADDRINFO_AI_SOCKTYPE  offsetof-addrinfo-ai-socktype)
+        (cons 'OFFSETOF_ADDRINFO_AI_PROTOCOL  offsetof-addrinfo-ai-protocol)
+        (cons 'OFFSETOF_ADDRINFO_AI_ADDRLEN   offsetof-addrinfo-ai-addrlen)
+        (cons 'OFFSETOF_ADDRINFO_AI_ADDR      offsetof-addrinfo-ai-addr)
+        (cons 'OFFSETOF_ADDRINFO_AI_CANONNAME offsetof-addrinfo-ai-canonname)
+        (cons 'OFFSETOF_ADDRINFO_AI_NEXT      offsetof-addrinfo-ai-next)))
+
+(test-equal "the eight addrinfo field offsets are pairwise distinct"
+  #t
+  (pairwise-distinct?
+   (map (lambda (e) ((cdr e))) addrinfo-offset-accessors)))
+
+(for-each
+ (lambda (entry)
+   (test-equal (string-append "snapshot: " (symbol->string (car entry))
+                              " lies inside sizeof(struct addrinfo)")
+     #t
+     (let ((off ((cdr entry))))
+       (and (>= off 0) (< off (sizeof-addrinfo))))))
+ addrinfo-offset-accessors)
+
+;; sin6_port is read with read-net-u16, so its two bytes must fit inside
+;; the struct the same shim measured. And sockaddr_storage exists to hold
+;; ANY sockaddr, sockaddr_in6 included -- a snapshot violating that would
+;; make every storage-sized allocation too small for an IPv6 peer.
+(test-equal "sin6_port's two network-order bytes fit inside sockaddr_in6"
+  #t
+  (<= (+ (offsetof-sockaddr-in6-sin6-port) 2) (sizeof-sockaddr-in6)))
+
+(test-equal "sockaddr_storage can hold a sockaddr_in6"
+  #t (<= (sizeof-sockaddr-in6) (sizeof-sockaddr-storage)))
 
 ;; Informational, deliberately NOT asserted: uv_buf_t is {base,len} on POSIX
 ;; but {len,base} on Windows (WSABUF order), so an assertion here would
@@ -319,6 +415,16 @@
 (display (offsetof-sockaddr-in-sin-family))
 (display " sin_port=")
 (display (offsetof-sockaddr-in-sin-port))
+(newline)
+;; Informational for the same reason as the two above: glibc orders ai_addr
+;; before ai_canonname, Darwin the reverse, so the ORDER of these two is a
+;; platform fact no assertion should encode (design spec v0.2 S5.2).
+(display "  [informational] addrinfo offsets: ai_addr=")
+(display (offsetof-addrinfo-ai-addr))
+(display " ai_canonname=")
+(display (offsetof-addrinfo-ai-canonname))
+(display " sizeof=")
+(display (sizeof-addrinfo))
 (newline)
 
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
@@ -916,8 +1022,9 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-(test-equal "live-counts reports all six allocation classes"
-  '(loop tcp timer write-req connect-req read-buffer)
+(test-equal "live-counts reports all eight allocation classes"
+  '(loop tcp timer write-req connect-req
+    getaddrinfo-req getnameinfo-req read-buffer)
   (map car (live-counts)))
 
 (test-equal "the counters start at zero"
@@ -935,8 +1042,8 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All six classes, not just one. There are eighteen near-identical entry
-;; point names in the shim, and binding count-timer-new! to
+;; All eight classes, not just one. There are twenty-four near-identical
+;; entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
 ;; checked to be the ONLY one that moved, then returned to zero.
@@ -946,6 +1053,10 @@
         (list 'timer       count-timer-new!       count-timer-free!)
         (list 'write-req   count-write-req-new!   count-write-req-free!)
         (list 'connect-req count-connect-req-new! count-connect-req-free!)
+        (list 'getaddrinfo-req
+              count-getaddrinfo-req-new! count-getaddrinfo-req-free!)
+        (list 'getnameinfo-req
+              count-getnameinfo-req-new! count-getnameinfo-req-free!)
         (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)))
 
 (for-each
