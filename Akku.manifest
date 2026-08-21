@@ -1,7 +1,7 @@
 #!r6rs ; -*- scheme -*-
 (import (akku format manifest))
 
-(akku-package ("chez-libuv" "0.1.0")
+(akku-package ("chez-libuv" "0.2.0")
   (synopsis "Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme")
   (authors "Kiyomi Computation Systems LLC")
   (license "BSD-3-Clause")
