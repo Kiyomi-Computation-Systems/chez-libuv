@@ -4,7 +4,7 @@
 
 **Goal:** Ship v0.3.0: `(libuv process)` (uv_spawn/kill/pid with full stdio control), a minimal `(libuv pipe)`, and the `(libuv stream)` extraction both require — per the accepted spec `.plans/2026-08-21-chez-libuv-v0.3-process-design.md` (THE SPEC below; section references like §5.5 point into it).
 
-**Architecture:** Thin legible mirror of libuv 1.52.1 (vendored, pinned). Direct FFI from `(libuv private native)` only; a constants-only C shim; static locked trampolines (ten → eleven); handle registry as GC root; explicit close, no guardians; copy-at-the-boundary. The stream verbs move from TCP-kind gating to a new `uv-stream-record` hierarchy so pipes reuse them unchanged.
+**Architecture:** Thin legible mirror of libuv 1.52.1 (vendored, pinned). Direct FFI from `(libuv private native)` only; a constants-only C shim; static locked trampolines (ten → twelve); handle registry as GC root; explicit close, no guardians; copy-at-the-boundary. The stream verbs move from TCP-kind gating to a new `uv-stream-record` hierarchy so pipes reuse them unchanged.
 
 **Tech Stack:** Chez Scheme (R6RS), libuv 1.52.1 (vendored submodule), C shim (`src/libuv-shim.c`), SRFI-64 tests, GNU/Apple make, GitHub Actions (linux valgrind gate + macos ASan).
 
@@ -180,26 +180,22 @@ git commit -m "spike: process Stage 0 — SQ1 spawn-failure, SQ2 SIGCHLD coexist
 
 - [ ] **Step 3: Write ADR-0016** — signal vocabulary + root lane. Decision: closed signal symbol set from the shim table, exact `0` as the documented liveness probe; term-signal reverse-mapped (unknown ints pass raw); `uid`/`gid` presence implies SETUID/SETGID; `to-child`/`from-child`/`duplex` direction vocabulary with the UV_READABLE_PIPE/UV_WRITABLE_PIPE mapping stated; the root-lane policy refining v0.2's "untestable ⇒ unbound" (privileged-but-deterministic is bindable via an opt-in root lane; host-config-dependent stays unbound).
 
-- [ ] **Step 4: Amend ADR-0008** — append (below the 2026-08-21 amendment):
+- [ ] **Step 4: Amend ADR-0008**
 
-```markdown
-## Amendment (v0.3, <date>): eleven trampolines
+> **HISTORICAL — executed as written pre-spike, then SUPERSEDED.** This
+> step's original text (an "eleven trampolines" amendment) shipped and was
+> later amended by the user-approved twelve decision: the live ADR-0008
+> now records ten → twelve (`exit`, `walk`). Kept for the execution
+> record; the live ADR text governs. See Task 4's amendment banner.
 
-The set grows ten → eleven: `exit`, for uv_exit_cb
-`(uv_process_t*, int64_t, int)` (vendor/libuv/include/uv.h:340) — a foreign
-type signature no existing trampoline has. The invariant is restated
-unchanged: one locked trampoline per callback TYPE, a constant small set
-per process; the set moves only when libuv's callback typology does. The
-two frozen literals (tests/test-loop.sps, tests/test-native.sps) were
-widened watched-to-fail first (see .plans/process-stage-2-mutation-log.md).
-```
+Original step text (superseded): append below the 2026-08-21 amendment an
+amendment recording the `exit` trampoline (uv_exit_cb, uv.h:340 — a
+foreign type signature no existing trampoline has), the invariant restated
+(one locked trampoline per callback TYPE, moved only when libuv's callback
+typology does), and the frozen literals widened watched-to-fail
+(prospective mutation-log citation).
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add .plans/decisions/
-git commit -m "docs: ADR-0014/0015/0016 + ADR-0008 amendment (eleven trampolines)"
-```
+- [ ] **Step 5: Commit** (executed with the pre-supersession message)
 
 ---
 
@@ -394,7 +390,7 @@ git commit -m "feat: shim + constants rows for process/pipe (types, options/cont
   - `(c-uptr-set! addr value)`, `(c-u32-set! addr value)`, `(c-uptr-size)` — boundary writers beside `c-int-set!` (same validation shape; `c-u32-set!` writes `'unsigned-32`, needed because uid/gid are unsigned 32-bit and `foreign-set! 'int` rejects values ≥ 2³¹).
   - `(require-callback proc who reason)` — lifted verbatim from tcp.sls:56-58 (the PR #4 shared-validator rule; tcp.sls and stream.sls/process.sls all need it).
   - `count-pipe-new!/free!`, `count-process-new!/free!`, `count-spawn-options-new!/free!` + three new `live-counts` rows `'pipe`, `'process`, `'spawn-options`.
-  - `dispatcher-names` now ends in `exit` (eleven names).
+  - `dispatcher-names` now ends in `exit walk` (twelve names).
 
 - [ ] **Step 1: Widen the two frozen literals — watched to fail**
 
@@ -419,7 +415,7 @@ change both to:
 - [ ] **Step 2: Run to verify both fail**
 
 ```bash
-make test 2>&1 | grep -B1 -A3 "eleven"
+make test 2>&1 | grep -B1 -A3 "twelve"
 ```
 Expected: two FAILs (expected list has `exit`, actual has ten). This is the ADR-0008 amendment's watched-to-fail requirement — record the observed failure text for the mutation log.
 
@@ -433,7 +429,7 @@ Expected: two FAILs (expected list has `exit`, actual has ten). This is the ADR-
       getaddrinfo getnameinfo exit walk))
 ```
 
-(b) Beside the DNS callables (after `getnameinfo-callable`), the eleventh trampoline — libuv's exact signature, mechanical body:
+(b) Beside the DNS callables (after `getnameinfo-callable`), the exit trampoline — libuv's exact signature, mechanical body:
 
 ```scheme
   ;; uv_exit_cb: void (*)(uv_process_t*, int64_t exit_status, int
@@ -578,7 +574,7 @@ Expected: ALL SUITES PASSED — both widened literals green, exit stub row green
 
 ```bash
 git add src/libuv/private/native.sls tests/test-loop.sps tests/test-native.sps .plans/process-stage-2-mutation-log.md
-git commit -m "feat: eleventh trampoline (exit) + process/pipe FFI in native.sls"
+git commit -m "feat: exit + walk trampolines (ten -> twelve) + process/pipe FFI in native.sls"
 ```
 
 ---
@@ -598,7 +594,7 @@ This is a behavior-preserving refactor plus new (not-yet-reachable) records; the
   - `%make-uv-pipe-record` (ptr loop → record), `uv-pipe-record?`, `pipe-connected?`, `set-pipe-connected!`.
   - `%make-uv-process-record` (ptr loop on-exit → record), `uv-process-record?`, `process-on-exit`, `process-exited?`, `set-process-exited!`.
   - `handle-kinds` = `'(timer tcp pipe process)` (not exported; behavior: teardown sweeps all four).
-  - **(post-spike amendment)** `(handle-in-loop-queue? loop handle) → boolean` — ADR-0015's discriminator: installs the `walk` dispatcher at wiring time (beside timer/close) as a closure over a module-level query cell; the query calls `uv-walk-native` with the loop's pointer and compares each walked handle pointer against the target's, setting the cell on match. Walk fires synchronously inside the call, so the cell needs no reentrancy guard beyond being reset at query start. Exported for process.sls's failure path (Task 8).
+  - **(post-spike amendment, corrected):** the `walk` machinery does NOT touch handles.sls. Per ADR-0015/ADR-0008 the walk dispatcher installs LATE, from `(libuv process)`'s library body via `install-dispatch-procedure!` — the dns.sls seam, exactly like `exit` — as a closure over a process.sls-local query cell; the in-queue query helper (follow ADR-0015's recorded name and algorithm) also lives in process.sls and calls native's `uv-walk-native`. A process image that never imports `(libuv process)` keeps the raising stub for `walk` just as it does for `exit`. handles.sls's only Task 5 duties remain the record hierarchy, kinds, and counters.
 
 - [ ] **Step 1: Run the suite green first**
 
@@ -1569,7 +1565,7 @@ Complete implementation (kill/pid arrive in Task 10 — the export list below al
                               (when (and (list? spec) (eq? 'pipe (car spec)))
                                 (set-pipe-connected! (cadr spec) #t)))
                             (caddr parsed))
-                  (if (and (handle-in-loop-queue? loop proc-ptr-view)
+                  (if (and (spawn-handle-in-queue? loop ptr)  ;; process.sls-local, per ADR-0015
                            ...)  ;; see ADR-0015's recorded algorithm:
                       ;; exec-class (still in queue): REGISTER (close-
                       ;; dispatch is registry-driven) then close through
@@ -1653,7 +1649,7 @@ Expected: ALL SUITES PASSED. The argv/env/cwd row failing here means an offset r
 
 ```bash
 git add src/libuv/process.sls src/libuv/handle.sls tests/test-process.sps src/libuv/private/handles.sls .plans/process-stage-5-mutation-log.md
-git commit -m "feat: (libuv process) — uv-spawn! with full stdio vocabulary + exit dispatcher (eleventh seam)"
+git commit -m "feat: (libuv process) — uv-spawn! with full stdio vocabulary + exit/walk dispatchers (late-install seam)"
 ```
 
 ---
@@ -2416,7 +2412,7 @@ extraction. uv_spawn with the full stdio vocabulary (ignore / inherit-fd /
 inherit-stream / pipe with to-child/from-child/duplex), env/cwd, detached,
 setuid/setgid behind an opt-in root lane (`sudo make test-root`);
 uv-process-kill!/uv-kill! with a closed signal-symbol set; uv-process-pid.
-Eleventh trampoline (exit). ADRs 0014-0016; ADR-0008 amended. Stream verbs
+Trampolines ten → twelve (exit, walk). ADRs 0014-0016; ADR-0008 amended. Stream verbs
 moved to (libuv stream) with gating widened tcp → stream ((libuv tcp)
 re-exports them; no import changes needed).
 ```
