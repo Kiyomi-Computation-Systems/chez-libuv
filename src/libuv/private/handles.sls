@@ -68,6 +68,9 @@
           %make-uv-tcp-record uv-tcp-record?
           %make-uv-pipe-record uv-pipe-record?
           %make-uv-process-record uv-process-record?
+          %make-uv-signal-record uv-signal-record?
+          signal-on-signal set-signal-on-signal!
+          signal-mode set-signal-mode!
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -168,6 +171,7 @@
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
                 count-pipe-free! count-process-free!
+                count-signal-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-free!
                 uv-buf-set! copy-out
@@ -388,6 +392,23 @@
      (lambda (pargs->new)
        (lambda (ptr loop on-exit) ((pargs->new ptr 'process loop) on-exit #f)))))
 
+  ;; The signal child (v0.4 design spec §4.4, ADR-0017): like process, a
+  ;; direct uv-handle-record child -- a watcher is not a stream. on-signal
+  ;; is stored by the start verbs BEFORE arming (the timer discipline).
+  ;; mode is #f until the first successful start verb pins it, then
+  ;; 'continuous | 'oneshot for the life of the handle: it mirrors the
+  ;; vendor's one-way UV_SIGNAL_ONE_SHOT ratchet (EV-8, measured), which is
+  ;; why mode is trackable where armed-state is not -- oneshot auto-disarm
+  ;; happens inside libuv, so a watching? flag would race the vendor's own
+  ;; view (ADR-0017: no armed-state field, deliberately).
+  (define-record-type (uv-signal-record %make-uv-signal-record uv-signal-record?)
+    (parent uv-handle-record)
+    (fields (mutable on-signal signal-on-signal set-signal-on-signal!)
+            (mutable mode      signal-mode      set-signal-mode!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
+
   ;; --- the request records (design spec S5, S7) --------------------------
   ;; A request is NOT a handle: it has no state machine, no close protocol,
   ;; and exactly one lifetime rule -- it lives from the call that started it
@@ -473,9 +494,10 @@
   ;; is what registry-snapshot-for-loop filters on, and therefore what
   ;; uv-loop-teardown! sweeps: every element of that snapshot is handed to
   ;; close-handle!, which refuses anything that is not a handle record.
-  ;; Widened to four in v0.3 (design spec S5.1): pipe and process are both
-  ;; handles that need the same teardown sweep tcp and timer already get.
-  (define handle-kinds '(timer tcp pipe process))
+  ;; Widened to five in v0.4: a signal watcher needs the same teardown
+  ;; sweep (design spec 2026-08-22 §5.1 -- MANDATORY, or teardown never
+  ;; closes it).
+  (define handle-kinds '(timer tcp pipe process signal))
 
   ;; The kinds that name a HANDLE-LESS request -- one registered against
   ;; the loop directly because no owning handle exists (ADR-0011; Stage 4's
@@ -1002,6 +1024,7 @@
       ((tcp)     (count-tcp-free!))
       ((pipe)    (count-pipe-free!))
       ((process) (count-process-free!))
+      ((signal)  (count-signal-free!))
       (else #f)))
 
   ;; --- the setup-class spawn failure's undo (design spec v0.3 S5.6) ------
