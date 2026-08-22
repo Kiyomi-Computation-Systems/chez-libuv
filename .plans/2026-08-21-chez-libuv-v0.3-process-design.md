@@ -546,7 +546,11 @@ with opposite correct cleanups, on both platforms
   (process.c:1075-1076), which has already unlinked the handle. Direct
   `foreign-free` is correct; `uv_close` there **silently splices a
   later-registered live handle out of the loop's handle queue** and still
-  returns `uv_loop_close` 0 (`late handle survived #f`).
+  returns `uv_loop_close` 0 (`late handle survived #f`). Which class a given
+  trigger lands in varies by libuv version — 1.52.0's `3e9ae1bc` is what
+  moved stdio-setup failures into the unlinked class at all (older libuv
+  leaves the same trigger linked, in the exec class) — so the discriminator
+  below, not a trigger table, is the contract (ADR-0015 amendment).
 
 So the failure path is **class-dependent**, and the class is decided by a
 runtime property, **never by the errno**: whether the loop still owns our

@@ -242,6 +242,22 @@ pipe), live only on the setup-class failure path, where the conservative
 direction matches this decision's own over-report policy. Spec §4.3/§5.1
 carry the reconciled wording.
 
+**Amendment (2026-08-21, Task 12 fix wave 1):** the "unlinked" fact above
+(lines 32-33) holds for **libuv >= 1.52.0 only**. Upstream commit
+[`3e9ae1bc`](https://github.com/libuv/libuv/commit/3e9ae1bca07f8155bc4249a21ec41ca2c86fdb93)
+("unix: remove handle from queue on uv_spawn() error (#4980)") added
+`uv__queue_remove(&process->handle_queue)` to `uv_spawn`'s `error:` label
+first in 1.52.0; on an older libuv the handle **remains linked** at the same
+stdio-setup trigger, and the discriminator (decision 2, asking the loop
+rather than the errno) correctly takes the exec-class arm there instead —
+measured on ubuntu-noble's apt `libuv1-dev` 1.48.0, the CI job's
+pkg-config leg (CI run 32543915500, red, on that leg → run 32544754290,
+green, once `tests/test-process.sps` was rewritten to assert decision 2's
+class-independent observables instead of one arm's timing, commit
+`6db61e6`). No production code changed. This **validates** decision 2 —
+the class is decided by asking the loop at runtime, never by a version- or
+platform-keyed table — rather than weakening it.
+
 ## Consequences
 
 - **A failed spawn is not a no-op on its arguments.** `'pipe-already-used`

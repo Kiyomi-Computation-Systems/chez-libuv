@@ -440,6 +440,22 @@ the evidence supports:
    caller as closeable), not assumed untouched. §5.6's "remain consistently
    unconnected" sentence is refuted by measurement and must be rewritten.
 
+### Postscript (2026-08-21, Task 12 fix wave 1)
+
+The 2×2 above was measured on **vendored libuv 1.52.1** — this document's
+environment section already says so, but this SQ1 verdict text reads as
+platform- or version-universal, and it is not. Task 12's CI (the Linux job's
+pkg-config leg, ubuntu-noble's apt `libuv1-dev` 1.48.0) surfaced that on a
+pre-1.52.0 libuv the stdio-setup-class handle **stays linked** at the same
+`(inherit-stream . h)`/`EINVAL` trigger — upstream commit `3e9ae1bc`
+(#4980) is what first unlinks it, in 1.52.0. Original observations above
+stand unchanged for the vendored 1.52.1 build they were measured against;
+the class-dependence-by-version strengthens, rather than weakens, the case
+for decision 2's runtime discriminator (ask the loop, never the errno or a
+version table) — full evidence and CI run ids in
+`.superpowers/sdd/task-12-report.md`'s "Fix wave 1" section and in
+ADR-0015's matching amendment.
+
 ---
 
 ## SQ2 — SIGCHLD coexistence with Chez's own subprocess APIs
