@@ -126,6 +126,15 @@
           uv-process-kill uv-kill uv-process-get-pid uv-pipe-init
           uv-walk-native
 
+          ;; the signal entry points (design spec 2026-08-22 §5.2,
+          ;; ADR-0017). The two start calls take a uv_signal_cb and are NOT
+          ;; exported raw: both wrappers bake in the ONE signal trampoline
+          ;; (ADR-0008 third amendment). init/stop take no callback.
+          ;; uv-os-getpid-native is the raw pid query (libuv process) gates.
+          uv-signal-init uv-signal-start-native
+          uv-signal-start-oneshot-native uv-signal-stop
+          uv-os-getpid-native
+
           ;; debug counters (design spec S10)
           live-counts
           count-loop-new!        count-loop-free!
@@ -138,7 +147,8 @@
           count-read-buffer-new! count-read-buffer-free!
           count-pipe-new!         count-pipe-free!
           count-process-new!      count-process-free!
-          count-spawn-options-new! count-spawn-options-free!)
+          count-spawn-options-new! count-spawn-options-free!
+          count-signal-new!      count-signal-free!)
   ;; file-exists? is deliberately absent from the (chezscheme) import below:
   ;; (rnrs) already exports it via (rnrs files), and importing it from both
   ;; raises "multiple definitions for file-exists? in body". The same is true
@@ -320,6 +330,12 @@
     (foreign-procedure "chez_uv_count_spawn_options_free" () void))
   (define live-spawn-options
     (foreign-procedure "chez_uv_live_spawn_options" () long))
+
+  (define count-signal-new!
+    (foreign-procedure "chez_uv_count_signal_new" () void))
+  (define count-signal-free!
+    (foreign-procedure "chez_uv_count_signal_free" () void))
+  (define live-signal (foreign-procedure "chez_uv_live_signal" () long))
 
   ;; --- libuv bindings ---------------------------------------------------
   ;; v0.1 binds only what the version gate, the error translation, and the
@@ -905,7 +921,8 @@
           (cons 'read-buffer (live-read-buffer))
           (cons 'pipe          (live-pipe))
           (cons 'process       (live-process))
-          (cons 'spawn-options (live-spawn-options))))
+          (cons 'spawn-options (live-spawn-options))
+          (cons 'signal        (live-signal))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
   ;; The twelve trampolines declared below as `foreign-callable`s have
@@ -931,7 +948,7 @@
   ;; volume).
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect
-      getaddrinfo getnameinfo exit walk))
+      getaddrinfo getnameinfo exit walk signal))
 
   (define dispatchers (make-eq-hashtable))
   (define dispatchers-installed #f)
@@ -1116,6 +1133,16 @@
                         ((dispatcher-ref 'walk) handle arg))
                       (uptr uptr) void))
 
+  ;; uv_signal_cb: void (*)(uv_signal_t*, int signum). It SHARES
+  ;; connection's (uptr int) arity and still gets its own locked trampoline:
+  ;; the rule is one per callback TYPE, not per arity (ADR-0008, third
+  ;; amendment -- the original eight already contain same-arity
+  ;; distinct-type pairs: timer and close are both (uptr) -> void).
+  (define signal-callable
+    (foreign-callable (lambda (handle signum)
+                        ((dispatcher-ref 'signal) handle signum))
+                      (uptr int) void))
+
   ;; void uv_walk(uv_loop_t*, uv_walk_cb, void* arg) -- no errno.
   (define raw-walk
     (foreign-procedure "uv_walk" (uptr uptr uptr) void))
@@ -1139,7 +1166,7 @@
                     write-done-callable close-callable timer-callable
                     shutdown-callable connect-callable
                     getaddrinfo-callable getnameinfo-callable
-                    exit-callable walk-callable)))
+                    exit-callable walk-callable signal-callable)))
 
   ;; The entry points are module-private ON PURPOSE (design spec S3: nothing
   ;; outside private/ sees a pointer -- and these are the pointers whose
@@ -1160,6 +1187,7 @@
     (foreign-callable-entry-point getnameinfo-callable))
   (define exit-cb-entry (foreign-callable-entry-point exit-callable))
   (define walk-cb-entry (foreign-callable-entry-point walk-callable))
+  (define signal-cb-entry (foreign-callable-entry-point signal-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -1259,6 +1287,33 @@
     (foreign-procedure "uv_process_get_pid" (uptr) int))
   (define uv-pipe-init
     (foreign-procedure "uv_pipe_init" (uptr uptr int) int))
+
+  ;; --- the signal entry points (design spec 2026-08-22 §5.2, ADR-0017) ---
+  ;; uv_signal_start AND uv_signal_start_oneshot both take a uv_signal_cb,
+  ;; so both are bound raw- and reached only through the wrappers below,
+  ;; which bake in the ONE signal trampoline -- two verbs, one callback
+  ;; TYPE (ADR-0008 third amendment). uv_signal_init and uv_signal_stop
+  ;; take no callback and are exported raw; every int is an errno
+  ;; (uv_signal_stop is rc 0 even on a never-started watcher, EV-2).
+  (define uv-signal-init
+    (foreign-procedure "uv_signal_init" (uptr uptr) int))
+  (define raw-signal-start
+    (foreign-procedure "uv_signal_start" (uptr uptr int) int))
+  (define raw-signal-start-oneshot
+    (foreign-procedure "uv_signal_start_oneshot" (uptr uptr int) int))
+  (define uv-signal-stop
+    (foreign-procedure "uv_signal_stop" (uptr) int))
+
+  (define (uv-signal-start-native handle-ptr signum)
+    (raw-signal-start handle-ptr signal-cb-entry signum))
+
+  (define (uv-signal-start-oneshot-native handle-ptr signum)
+    (raw-signal-start-oneshot handle-ptr signal-cb-entry signum))
+
+  ;; uv_os_getpid: this process's own pid. No errno, no callback; the
+  ;; public gated spelling lives in (libuv process) beside uv-process-pid.
+  (define uv-os-getpid-native
+    (foreign-procedure "uv_os_getpid" () int))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

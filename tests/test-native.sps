@@ -1196,13 +1196,19 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-;; Task 4 added the three new rows to live-counts.
-(test-equal "live-counts reports all eleven allocation classes"
+;; Task 2 (v0.4) added the signal row to live-counts.
+(test-equal "live-counts reports all twelve allocation classes"
   '(loop tcp timer write-req connect-req
-    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
+    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options
+    signal)
   (map car (live-counts)))
 
-;; Superseded by the eleven-class row above, kept for provenance:
+;; Superseded by the twelve-class row above, kept for provenance:
+;; (test-equal "live-counts reports all eleven allocation classes"
+;;   '(loop tcp timer write-req connect-req
+;;     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
+;;   (map car (live-counts)))
+;;
 ;; (test-equal "live-counts reports all eight allocation classes"
 ;;   '(loop tcp timer write-req connect-req
 ;;     getaddrinfo-req getnameinfo-req read-buffer)
@@ -1247,7 +1253,8 @@
               count-getnameinfo-req-new! count-getnameinfo-req-free!)
         (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)
         (list 'spawn-options
-              count-spawn-options-new! count-spawn-options-free!)))
+              count-spawn-options-new! count-spawn-options-free!)
+        (list 'signal count-signal-new! count-signal-free!)))
 
 (for-each
  (lambda (entry)
@@ -1422,9 +1429,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the twelve callback types the design commits to"
+(test-equal "dispatcher-names names the thirteen callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo exit walk)
+    getaddrinfo getnameinfo exit walk signal)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1458,6 +1465,16 @@
                      (string=? (condition-message e)
                                "callback dispatchers have not been installed"))))
     ((dispatcher-ref 'walk) 0 0)
+    #f))
+
+;; The signal slot, v0.4's thirteenth: uv_signal_cb's own (handle signum)
+;; arity. It shares connection's arity and still has its own slot -- the
+;; per-TYPE rule ADR-0008's third amendment states in its own terms.
+(test-assert "the signal slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'signal) 0 0)
     #f))
 
 (test-equal "dispatcher-ref rejects a name that is not one of the twelve"
