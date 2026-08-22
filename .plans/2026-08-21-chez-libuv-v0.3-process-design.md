@@ -153,8 +153,14 @@ keeps the loop alive until the exit callback has fired (vendor fact V10).
 ### 4.2 The options alist
 
 Closed key set; an unknown key raises `&uv-invalid-argument` with reason
-`'option-unknown` naming the key. Omitted, `#f`, and `'()` options all
-mean "defaults" (the hints precedent).
+`'option-unknown`. Omitted, `#f`, and `'()` options all mean "defaults"
+(the hints precedent). A key that appears twice raises `'option-duplicate`
+— first-wins would silently ignore the second entry *unvalidated*, and
+refusal is the only unambiguous answer to which entry the caller meant.
+*(Amended 2026-08-22, v0.3 follow-up wave: the original sentence promised
+`'option-unknown` "naming the key" — the two-field condition (who, reason)
+cannot carry the key, so the overpromise is trimmed; the duplicate-key rule
+is new behavior, added with its own reason symbol.)*
 
 | Key | Value | Absent means | libuv target |
 |-----|-------|--------------|--------------|
@@ -247,9 +253,16 @@ accepted by the validator.
   vocabulary, and the failure mode of copying it is a silent direction
   bug. The mapping above is stated in the module header and in ADR-0016.
 - Spec validation is closed-set with kept-raising else arms: unknown spec
-  shape → `'stdio-spec-unknown`; non-fixnum fd → `'stdio-fd-not-an-fd`;
-  closed/wrong-kind handle in `inherit-stream` → the usual kind/state
-  conditions.
+  shape → `'stdio-spec-unknown`; an `inherit-fd` value that is not a
+  nonnegative exact integer below 2³¹ (the container field is a C int) →
+  `'stdio-fd-not-an-fd`; a *closed* handle in `inherit-stream` → the usual
+  state condition (`&uv-handle-closed`); a *wrong-kind* value in
+  `inherit-stream` → `'stdio-spec-unknown`, because a non-stream in that
+  position makes the spec match no §4.3 form at all — the closed-set answer.
+  *(Amended 2026-08-22, follow-up wave: the original bullet promised "the
+  usual kind condition" for wrong-kind; the implementation's closed-set
+  answer is the defensible one and the spec now matches it. The fd upper
+  bound is new behavior, added the same day.)*
 
 ### 4.4 The exit callback contract
 
@@ -339,15 +352,16 @@ drives every row:
 | `'args-not-a-string-list` | `args` not a non-empty list of strings |
 | `'embedded-nul` | a NUL inside `file`, an `args`/`env` string, or `cwd` |
 | `'option-unknown` | options alist key outside the §4.2 set |
+| `'option-duplicate` | a §4.2 key appearing twice *(added 2026-08-22, follow-up wave)* |
 | `'env-not-a-string-list` | `env` present but not a list of strings |
 | `'cwd-not-a-string` | `cwd` present but not a string |
 | `'detached-not-a-boolean` | `detached` present but not a boolean |
 | `'uid-out-of-range` / `'gid-out-of-range` | outside 0 ≤ n < 2³² |
 | `'stdio-not-a-list` | `stdio` present but not a list of specs |
 | `'stdio-spec-unknown` | a spec matching no §4.3 form (incl. bad `dir`) |
-| `'stdio-fd-not-an-fd` | `inherit-fd` value not a nonnegative fixnum |
+| `'stdio-fd-not-an-fd` | `inherit-fd` value not a nonnegative exact integer < 2³¹ *(bound added 2026-08-22: the container field is a C int)* |
 | `'pipe-already-used` | `(pipe …)` names a connected pipe |
-| `'pipe-wrong-loop` | `(pipe …)` names a pipe from another loop |
+| `'pipe-wrong-loop` | a `(pipe …)` or `(inherit-stream …)` spec names a handle from another loop *(widened 2026-08-22: the same-loop walk covers every handle-bearing spec form, and always did — the row's original pipe-only wording under-described it)* |
 | `'signal-unknown` | `sig` outside the §4.5 symbol set and not `0` |
 | `'on-exit-not-a-procedure` | `on-exit` neither a procedure nor `#f` |
 | `'pid-not-an-exact-integer` | `uv-kill!` given a non-exact-integer pid |

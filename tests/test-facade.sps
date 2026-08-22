@@ -643,8 +643,13 @@
                (collect)
                (set! p-exit (list status sig)))))
 
+;; 2048, not this file's usual 32: every other drain here waits on local,
+;; in-process callbacks, but this one waits on a real fork/exec/exit --
+;; with the 1ms ticker, 32 iterations was a ~32ms budget for the child,
+;; flake-shaped under load. 2048 matches test-process.sps's cap for the
+;; same exit-5 scenario.
 (let drain ((i 0))
-  (when (and (< i 32) (eq? p-exit 'never-exited))
+  (when (and (< i 2048) (eq? p-exit 'never-exited))
     (uv-run pl 'once)
     (drain (+ i 1))))
 

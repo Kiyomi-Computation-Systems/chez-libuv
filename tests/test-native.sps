@@ -1197,11 +1197,11 @@
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the nine-class matrix below. Every
+;; SEED / PRECONDITION, asserted before the eleven-class matrix below. Every
 ;; assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all nine "increments are visible" assertions would
+;; always return 0, so all eleven "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -1209,15 +1209,21 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All nine classes, not just one. There are twenty-four near-identical
-;; entry point names in the shim, and binding count-timer-new! to
+;; All eleven classes, not just one. There are twenty-two near-identical
+;; count entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
-;; checked to be the ONLY one that moved, then returned to zero.
+;; checked to be the ONLY one that moved, then returned to zero. The
+;; process and spawn-options rows are driven through the same exported
+;; count-* procedures as every other row -- this suite deliberately
+;; imports neither (libuv pipe) nor (libuv process); without these rows a
+;; cross-wired spawn-options pair was invisible to everything but
+;; valgrind.
 (define counter-classes
   (list (list 'loop        count-loop-new!        count-loop-free!)
         (list 'tcp         count-tcp-new!         count-tcp-free!)
         (list 'pipe        count-pipe-new!        count-pipe-free!)
+        (list 'process     count-process-new!     count-process-free!)
         (list 'timer       count-timer-new!       count-timer-free!)
         (list 'write-req   count-write-req-new!   count-write-req-free!)
         (list 'connect-req count-connect-req-new! count-connect-req-free!)
@@ -1225,7 +1231,9 @@
               count-getaddrinfo-req-new! count-getaddrinfo-req-free!)
         (list 'getnameinfo-req
               count-getnameinfo-req-new! count-getnameinfo-req-free!)
-        (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)))
+        (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)
+        (list 'spawn-options
+              count-spawn-options-new! count-spawn-options-free!)))
 
 (for-each
  (lambda (entry)

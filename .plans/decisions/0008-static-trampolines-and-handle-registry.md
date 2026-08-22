@@ -61,10 +61,11 @@ process initialization, and never unlocked, for the life of the process.
 > (design spec §5.2/§5.6). The invariant is restated unchanged: one locked
 > trampoline per callback TYPE, a constant small set per process; the set
 > moves only when libuv's callback typology does. The two frozen literals
-> (tests/test-loop.sps, tests/test-native.sps) widen to the twelve-name
-> literal, watched-to-fail; evidence recorded in
-> .plans/process-stage-2-mutation-log.md when the implementation stage
-> lands. The `exit` slot is installed from `(libuv process)`'s library
+> (tests/test-loop.sps, tests/test-native.sps) were widened to the
+> twelve-name literal, watched-to-fail; the evidence is recorded in
+> .plans/process-stage-2-mutation-log.md ("RED evidence": both literals
+> widened first, failing by name against the then-ten-name
+> `dispatcher-names`). The `exit` slot is installed from `(libuv process)`'s library
 > body — the dns.sls late-install seam's second application; `walk` is
 > installed the same way, wiring `dispatcher-names`'s `walk` slot over a
 > module-level query cell in `handles.sls` that backs

@@ -124,6 +124,17 @@
        (unless (and (pair? entry) (memq (car entry) option-keys))
          (raise (make-uv-invalid-argument who 'option-unknown))))
      options)
+    ;; Duplicates are refused, not first-wins. The assq reads below take the
+    ;; FIRST entry per key, so a second entry would be silently ignored
+    ;; WITHOUT VALIDATION -- '((cwd . "/") (cwd . 7)) validated clean while
+    ;; carrying a malformed member. Refusing is also the only unambiguous
+    ;; answer to which of two agreeing-in-type entries the caller meant.
+    (let dup-scan ((entries options) (seen '()))
+      (unless (null? entries)
+        (let ((key (caar entries)))
+          (when (memq key seen)
+            (raise (make-uv-invalid-argument who 'option-duplicate)))
+          (dup-scan (cdr entries) (cons key seen)))))
     (let ((env      (assq 'env options))
           (cwd      (assq 'cwd options))
           (stdio    (assq 'stdio options))
@@ -173,8 +184,14 @@
     (cond
       ((eq? spec 'ignore) #t)
       ((and (pair? spec) (eq? 'inherit-fd (car spec)))
+       ;; Upper bound: the container's data field is a C int, so nothing
+       ;; >= 2^31 can be an fd. Without this clause the value survived to
+       ;; c-int-set! mid-build and escaped as a raw Chez range condition
+       ;; (freed, not leaked -- but not the uniform &uv-invalid-argument
+       ;; every other refusal in this walk raises).
        (let ((fd (cdr spec)))
-         (unless (and (integer? fd) (exact? fd) (>= fd 0))
+         (unless (and (integer? fd) (exact? fd) (>= fd 0)
+                      (< fd 2147483648))
            (raise (make-uv-invalid-argument who 'stdio-fd-not-an-fd)))))
       ((and (pair? spec) (eq? 'inherit-stream (car spec)))
        (let ((h (cdr spec)))

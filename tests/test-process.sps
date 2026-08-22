@@ -273,6 +273,16 @@
      (reason-of (spawn-with "/bin/sh" ok-args '((bogus . 1)) #f)))
    (test-equal "a malformed options alist entry" 'option-unknown
      (reason-of (spawn-with "/bin/sh" ok-args '(not-a-pair) #f)))
+   ;; Duplicates are refused, not first-wins: assq-shaped validation would
+   ;; validate only the first entry, so '((cwd . "/") (cwd . 7)) used to
+   ;; pass with the malformed second entry silently ignored -- invisible to
+   ;; everything but this row.
+   (test-equal "a duplicated key whose second entry is malformed" 'option-duplicate
+     (reason-of (spawn-with "/bin/sh" ok-args '((cwd . "/") (cwd . 7)) #f)))
+   (test-equal "a duplicated key is refused even when both entries validate"
+     'option-duplicate
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            '((detached . #t) (detached . #t)) #f)))
    (test-equal "env that is not a list of strings" 'env-not-a-string-list
      (reason-of (spawn-with "/bin/sh" ok-args '((env . "A=b")) #f)))
    (test-equal "a NUL inside an env string" 'embedded-nul
@@ -298,6 +308,16 @@
    (test-equal "an inherit-fd value that is not an fd" 'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
                             '((stdio . ((inherit-fd . not-a-number)))) #f)))
+   ;; The container field is a C int, so 2^31 cannot be an fd. Unbounded,
+   ;; this escaped as a raw Chez condition from c-int-set! mid-build (the
+   ;; guard freed the block -- no leak, but not the uniform
+   ;; &uv-invalid-argument either). reason-of's guard passes a raw
+   ;; condition through, so the pre-fix behavior fails this row by shape,
+   ;; not just by name.
+   (test-equal "an inherit-fd value too wide for the C int container field"
+     'stdio-fd-not-an-fd
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            '((stdio . ((inherit-fd . 2147483648)))) #f)))
    (test-equal "an on-exit that is neither procedure nor #f"
      'on-exit-not-a-procedure
      (reason-of (spawn-with "/bin/sh" ok-args 'not-a-proc)))
@@ -326,12 +346,12 @@
      (and (pipe-connected? stdin-pipe) (pipe-connected? stdout-pipe)))
    (uv-read-start! stdout-pipe
                    (lambda (bv s e) (collect) (collect-span! out bv s e))
-                   (lambda () (set! eof 'eof))
-                   (lambda (err) (set! eof (list 'error err))))
+                   (lambda () (collect) (set! eof 'eof))
+                   (lambda (err) (collect) (set! eof (list 'error err))))
    (uv-write! stdin-pipe payload
               (lambda (err) (collect)
                 (when (not err)
-                  (uv-shutdown! stdin-pipe (lambda (err2) #f)))))
+                  (uv-shutdown! stdin-pipe (lambda (err2) (collect))))))
    ;; EOF and exit are waited for INDEPENDENTLY -- both orders are legal
    ;; (V5, SQ3's measured evidence). Neither wait implies the other.
    (test-equal "all bytes echo back and EOF arrives"
@@ -501,8 +521,8 @@
                 (lambda (s g) (collect) (set! exit-result (list s g)))))
    (uv-read-start! duplex-pipe
                    (lambda (bv s e) (collect) (collect-span! out bv s e))
-                   (lambda () (set! eof 'eof))
-                   (lambda (err) (set! eof (list 'error err))))
+                   (lambda () (collect) (set! eof 'eof))
+                   (lambda (err) (collect) (set! eof (list 'error err))))
    (uv-write! duplex-pipe (string->utf8 "ping-pong")
               (lambda (err) (collect)
                 (when (not err)
@@ -514,6 +534,13 @@
      (utf8->string (collector-bytes out)))
    (test-equal "the child exits after its duplex end closed"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 8192))
+   ;; The eof sentinel was captured-but-unasserted (v0.3 final-review
+   ;; follow-up): an (error err) delivery after the ninth byte was
+   ;; invisible. Independent wait, matching the argv/env/cwd scenario's
+   ;; "either order" shape -- the child's exit and its end's EOF are
+   ;; separate observations.
+   (test-equal "duplex read reaches EOF once the child's end closed"
+     'satisfied (run-until/ticking loop (lambda () (eq? eof 'eof)) 8192))
    (uv-close! proc) (uv-close! duplex-pipe)
    (test-equal "process and duplex pipe finish closing"
      'satisfied (run-until loop
@@ -535,14 +562,18 @@
                 (lambda (s g) (collect) (set! exit-result (list s g)))))
    (uv-read-start! fd3-pipe
                    (lambda (bv s e) (collect) (collect-span! out bv s e))
-                   (lambda () (set! eof 'eof))
-                   (lambda (err) (set! eof (list 'error err))))
+                   (lambda () (collect) (set! eof 'eof))
+                   (lambda (err) (collect) (set! eof (list 'error err))))
    (test-equal "the byte crosses fd 3"
      'satisfied (run-until/ticking
                  loop (lambda () (= 1 (collector-count out))) 4096))
    (test-equal "x" (utf8->string (collector-bytes out)))
    (test-equal "the child exits"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   ;; Captured-but-unasserted until the v0.3 follow-up wave: same
+   ;; independent-wait shape as the duplex scenario's eof row.
+   (test-equal "the fd-3 pipe reaches EOF once the child's end closed"
+     'satisfied (run-until/ticking loop (lambda () (eq? eof 'eof)) 4096))
    (uv-close! proc) (uv-close! fd3-pipe)
    (test-equal "process and fd-3 pipe finish closing"
      'satisfied (run-until loop
@@ -612,17 +643,27 @@
                 (lambda (s g) (collect) (set! exit-result (list s g)))))
    (uv-read-start! client
                    (lambda (bv s e) (collect) (collect-span! out bv s e))
-                   (lambda () (set! eof 'eof))
-                   (lambda (err) (set! eof (list 'error err))))
+                   (lambda () (collect) (set! eof 'eof))
+                   (lambda (err) (collect) (set! eof (list 'error err))))
    (test-equal "the bytes crossed the inherited socket"
      'satisfied (run-until/ticking
                  loop (lambda () (= 15 (collector-count out))) 4096))
    (test-equal "over-the-socket" (utf8->string (collector-bytes out)))
    (test-equal "the child exits"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   ;; UV_INHERIT_STREAM dups the fd into the child; the PARENT's accepted
+   ;; end stays open, so the child's exit alone cannot EOF the client --
+   ;; the sentinel was captured-but-unasserted because nothing here made
+   ;; EOF observable. Closing the accepted end is what lets the row exist:
+   ;; the child's dup is gone (exit waited above), so this close releases
+   ;; the last copy and the client's read must reach EOF.
+   (uv-close! accepted)
+   (test-equal "client sees EOF once the parent's accepted end closes too"
+     'satisfied (run-until/ticking loop (lambda () (eq? eof 'eof)) 4096))
    (uv-close! proc)))
-   ;; server/client/accepted swept by with-loop's teardown -- also an
-   ;; assertion (the suite-end counter/registry rows are what confirm it).
+   ;; server/client swept by with-loop's teardown -- also an assertion (the
+   ;; suite-end counter/registry rows are what confirm it). accepted is
+   ;; closed above, where the eof row needs it.
 
 ;; --- kill by handle: deterministic blocked child (§9.2) ------------------
 (with-loop
