@@ -1281,7 +1281,10 @@ Create `tests/signal-child.sps` (the name is deliberately outside the `test-*.sp
       (define child-out (make-uv-pipe l4))
       (define proc
         (uv-spawn! l4 chez-exe
-                   (list "chez" "--program" "tests/signal-child.sps")
+                   ;; argv[0] = the REAL binary name (Chez resolves boot
+                   ;; files by invoked name; hardcoded "chez" against a
+                   ;; scheme-named install aborts -- the PR #7 CI failure)
+                   (list chez-exe "--program" "tests/signal-child.sps")
                    (list (cons 'stdio (list 'ignore
                                             (list 'pipe child-out 'from-child))))
                    (lambda (status sig) (collect) (set! done (list status sig)))))
@@ -1291,23 +1294,40 @@ Create `tests/signal-child.sps` (the name is deliberately outside the `test-*.sp
             (if (= i (string-length s))
                 n
                 (count (+ i 1) (if (char=? (string-ref s i) #\newline) (+ n 1) n))))))
+      ;; Every gate FAILS BY NAME when the child exits early, carrying the
+      ;; exit payload -- and the kills are guarded on the child being alive
+      ;; -- so a dead child fails one row with evidence instead of crashing
+      ;; the whole suite on a later ESRCH uv-kill! (the original CI failure
+      ;; mode, which hid all evidence).
+      (define (await-acks n cap)
+        (let ((w (run-until/ticking
+                  l4 (lambda () (or (>= (ack-lines) n) (pair? done))) cap)))
+          (cond ((>= (ack-lines) n) 'acked)
+                ((pair? done) (list 'child-exited-early done))
+                (else w))))
+      (define (kill-child!)
+        (if (pair? done)
+            (list 'child-already-exited done)
+            (begin (uv-kill! (uv-process-pid proc) 'sigterm) 'sent)))
       (uv-read-start! child-out
                       (lambda (bv start end) (collect) (collect-span! out bv start end))
                       (lambda () (collect) (set! eof-mark 'eof))
                       (lambda (err) (collect) (set! eof-mark (list 'error err))))
 
       (test-equal "the child armed and acked READY"
-        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 1)) 4096))
+        'acked (await-acks 1 4096))
 
-      (uv-kill! (uv-process-pid proc) 'sigterm)          ; kill #1
+      (test-equal "kill #1 sent to a live child"
+        'sent (kill-child!))
 
       (test-equal "the child acked delivery (GOT1, from inside the callback)"
-        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 2)) 4096))
+        'acked (await-acks 2 4096))
 
       (test-equal "the child acked disarm (DISARMED, from a later dispatch)"
-        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 3)) 4096))
+        'acked (await-acks 3 4096))
 
-      (uv-kill! (uv-process-pid proc) 'sigterm)          ; kill #2, gated on DISARMED
+      (test-equal "kill #2 sent to a live child, gated on DISARMED"
+        'sent (kill-child!))
 
       (test-equal "the child exited"
         'satisfied (run-until/ticking l4 (lambda () (pair? done)) 4096))
