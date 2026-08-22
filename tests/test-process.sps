@@ -550,6 +550,141 @@
    ;; server/client/accepted swept by with-loop's teardown -- also an
    ;; assertion (the suite-end counter/registry rows are what confirm it).
 
+;; --- kill by handle: deterministic blocked child (§9.2) ------------------
+(with-loop
+ (lambda (loop)
+   (define stdin-pipe (make-uv-pipe loop))
+   (define exit-result 'not-yet)
+   (define proc
+     (uv-spawn! loop "/bin/cat" '("cat")
+                (list (cons 'stdio (list (list 'pipe stdin-pipe 'to-child))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (test-assert "pid is a positive exact integer while the child runs"
+     (let ((pid (uv-process-pid proc)))
+       (and (integer? pid) (exact? pid) (positive? pid))))
+   (test-assert "liveness probe 0 returns without raising while blocked"
+     (begin (uv-process-kill! proc 0) #t))
+   (uv-process-kill! proc 'sigterm)
+   (test-equal "sigterm death delivers (0 sigterm) — V5's shape"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   (test-equal '(0 sigterm) exit-result)
+   (test-assert "pid still readable between exit and close (§4.5)"
+     (positive? (uv-process-pid proc)))
+   (uv-close! proc) (uv-close! stdin-pipe)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
+;; --- kill by raw pid ------------------------------------------------------
+(with-loop
+ (lambda (loop)
+   (define stdin-pipe (make-uv-pipe loop))
+   (define exit-result 'not-yet)
+   (define proc
+     (uv-spawn! loop "/bin/cat" '("cat")
+                (list (cons 'stdio (list (list 'pipe stdin-pipe 'to-child))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (uv-kill! (uv-process-pid proc) 'sigkill)
+   (run-until/ticking loop (lambda () (pair? exit-result)) 4096)
+   (test-equal "sigkill by pid delivers (0 sigkill)" '(0 sigkill) exit-result)
+   (uv-close! proc) (uv-close! stdin-pipe)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
+;; --- signal vocabulary refusals ------------------------------------------
+(with-loop
+ (lambda (loop)
+   (define stdin-pipe (make-uv-pipe loop))
+   (define proc
+     (uv-spawn! loop "/bin/cat" '("cat")
+                (list (cons 'stdio (list (list 'pipe stdin-pipe 'to-child)))) #f))
+   (define (reason-of thunk)
+     (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
+       (thunk) 'no-raise))
+   (test-equal 'signal-unknown
+     (reason-of (lambda () (uv-process-kill! proc 'sigfoo))))
+   (test-equal 'signal-unknown
+     (reason-of (lambda () (uv-process-kill! proc 15))))  ;; ints other than 0: symbols only
+   (test-equal 'signal-unknown
+     (reason-of (lambda () (uv-kill! 99999999 'sigfoo)))) ;; validated BEFORE the errno path
+   (test-equal 'pid-not-an-exact-integer
+     (reason-of (lambda () (uv-kill! "42" 'sigterm))))
+   (test-assert "uv-kill! on a vanished pid raises an errno symbol"
+     (guard (e ((uv-errno-error? e)
+                ;; ESRCH normally; EPERM if the pid was recycled to another
+                ;; user's process -- both prove the errno path.
+                (memq (uv-errno-error-errno e) '(ESRCH EPERM))))
+       (uv-kill! 99999999 0) #f))
+   (uv-process-kill! proc 'sigkill)
+   (run-until/ticking loop (lambda () (process-exited? proc)) 4096)
+   (uv-close! proc) (uv-close! stdin-pipe)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
+;; --- detached (§9.2: no-hang + counters only; never reaped) --------------
+(with-loop
+ (lambda (loop)
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0")
+                (list (cons 'detached #t)) #f))
+   (uv-close! proc)
+   (test-equal "loop drains without waiting on the detached child"
+     'satisfied (run-until loop
+                           (lambda () (eq? 'closed (uv-handle-state proc)))
+                           128))
+   (test-equal "process counter balanced" 0 (live-count 'process))))
+
+;; --- lifecycle: close from inside on-exit / teardown sweep / seam --------
+(with-loop
+ (lambda (loop)
+   (define states 'not-yet)
+   (define proc 'not-yet)
+   (set! proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 3")
+                (lambda (s g)
+                  (collect)
+                  ;; close from INSIDE on-exit -- the documented pattern (§6)
+                  (uv-close! proc (lambda () (set! states 'closed-from-exit))))))
+   (test-equal "close-from-on-exit completes"
+     'satisfied (run-until/ticking loop
+                                   (lambda () (eq? states 'closed-from-exit))
+                                   4096))))
+
+(with-loop
+ (lambda (loop)
+   ;; spawn, wait for silent reap, never close: the TEARDOWN SWEEP owns it.
+   (define proc (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0") #f))
+   (run-until/ticking loop (lambda () (process-exited? proc)) 4096)))
+   ;; with-loop tears down; the suite-end counter/registry rows assert the
+   ;; sweep closed it (Task 5's handle-kinds forward obligation).
+
+(with-loop
+ (lambda (loop)
+   ;; a raise inside on-exit is stored and re-raised by uv-run (S8 seam).
+   (define-condition-type &exit-probe &error make-exit-probe exit-probe?)
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0")
+                (lambda (s g) (raise (make-exit-probe)))))
+   (test-assert "the exit callback's raise surfaces as &uv-callback-error wrapping the probe"
+     (guard (e (#t (and (uv-callback-error? e) (exit-probe? e))))
+       (let drain ((i 0))
+         (uv-run loop 'once)
+         (if (< i 2048) (drain (+ i 1)) 'never-raised))))
+   (uv-close! proc)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
+;; --- term-signal outside the bound set passes through RAW (§4.4) ---------
+(with-loop
+ (lambda (loop)
+   (define exit-result 'not-yet)
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "kill -PIPE $$")
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (run-until/ticking loop (lambda () (pair? exit-result)) 4096)
+   (test-assert "unbound death signal arrives as its raw exact integer"
+     (and (= 0 (car exit-result))
+          (integer? (cadr exit-result))
+          (exact? (cadr exit-result))
+          (positive? (cadr exit-result))))
+   (uv-close! proc)
+   (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
 (collect)
 (test-assert "counters all zero at suite end"
   (for-all (lambda (kv) (zero? (cdr kv))) (live-counts)))

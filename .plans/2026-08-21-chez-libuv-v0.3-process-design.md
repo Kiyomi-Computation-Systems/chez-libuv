@@ -351,6 +351,7 @@ drives every row:
 | `'pipe-wrong-loop` | `(pipe …)` names a pipe from another loop |
 | `'signal-unknown` | `sig` outside the §4.5 symbol set and not `0` |
 | `'on-exit-not-a-procedure` | `on-exit` neither a procedure nor `#f` |
+| `'pid-not-an-exact-integer` | `uv-kill!` given a non-exact-integer pid |
 
 Wrong-kind and closed-handle arguments raise the existing
 `&uv-invalid-argument`/`&uv-handle-closed` shapes the stream verbs already

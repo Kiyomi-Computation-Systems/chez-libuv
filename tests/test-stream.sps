@@ -20,6 +20,7 @@
         (libuv tcp)
         (libuv timer)
         (libuv pipe)
+        (libuv process)
         (libuv private handles)
         (libuv private conditions)
         (only (libuv private native) live-counts)
@@ -87,6 +88,28 @@
 (test-assert "uv-write! still accepts an open tcp (kind gate only -- EBADF-class errno is fine)"
   (guard (e ((uv-errno-error? e) #t))   ;; unbound tcp: libuv may refuse; the KIND gate passed
     (uv-write! tcp (make-bytevector 1 0) nop) #t))
+
+;; --- the refuses-process row (deferred here from Task 7) -----------------
+(define loop2 (make-uv-loop))
+(define proc (uv-spawn! loop2 "/bin/sh" '("sh" "-c" "exit 0") #f))
+(test-assert "uv-write! refuses a process handle"
+  (guard (e (#t (and (uv-invalid-argument? e)
+                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+    (uv-write! proc (make-bytevector 1 0) (lambda (err) #f)) #f))
+(uv-loop-teardown! loop2)
+
+;; --- a CLOSED handle of the WRONG kind (Task 7's mutation probe 2 forward
+;; obligation, .plans/process-stage-4-mutation-log.md): require-open-stream's
+;; kind check runs FIRST, so a closed timer still raises 'not-a-uv-stream --
+;; never &uv-handle-closed. That ordering is exactly what probe 2 (swapping
+;; the kind/state check order) could not observe, because every closed
+;; handle this suite exercised elsewhere was already a real stream kind.
+(uv-close! timer)
+(run-until loop (lambda () (eq? 'closed (uv-handle-state timer))) 64)
+(test-assert "uv-write! on a CLOSED timer raises 'not-a-uv-stream, not &uv-handle-closed"
+  (guard (e (#t (and (uv-invalid-argument? e)
+                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+    (uv-write! timer (make-bytevector 1 0) nop) #f))
 
 (uv-loop-teardown! loop)
 (collect)

@@ -46,10 +46,7 @@
 ;;; (libuv process) keeps the contained raising stubs for both names, and
 ;;; nothing can spawn without the import (S5.2, S5.4, ADR-0015).
 (library (libuv process)
-  ;; uv-process-kill!, uv-kill! and uv-process-pid (S4.5) widen this list in
-  ;; the kill/pid task; naming them here before they exist would export
-  ;; unbound identifiers.
-  (export uv-spawn!)
+  (export uv-spawn! uv-process-kill! uv-kill! uv-process-pid)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -90,6 +87,17 @@
   (define (require-u32 n who reason)
     (unless (and (integer? n) (exact? n) (>= n 0) (< n 4294967296))
       (raise (make-uv-invalid-argument who reason))))
+
+  ;; A process handle, and open. Mirrors require-open-stream/require-open-tcp
+  ;; (stream.sls, tcp.sls): kind check first, state check second, different
+  ;; conditions -- a process is a HANDLE, not a stream (S5.1), so it gets its
+  ;; own gate rather than joining uv-stream-record?'s hierarchy. A closed
+  ;; process handle still answers &uv-handle-closed with kind 'process.
+  (define (require-open-process proc who)
+    (unless (uv-process-record? proc)
+      (raise (make-uv-invalid-argument who 'not-a-uv-process)))
+    (require-open-handle proc who)
+    proc)
 
   ;; --- the options alist (S4.2): a closed key set --------------------------
   ;; Omitted, #f, and '() all mean "defaults" (the uv-getaddrinfo! hints
@@ -496,6 +504,54 @@
         ;; arrive. handles.sls owns the direct free, for the same reason it
         ;; owns close-dispatch's.
         (discard-failed-handle! proc)))
+
+  ;; --- signals (§4.5, ADR-0016) --------------------------------------------
+  ;; A closed symbol set, values from the shim (ADR-0005: SIGTERM's number
+  ;; is never written here), plus exact 0 -- the POSIX liveness probe
+  ;; (kill(pid,0), V9). Symbols only otherwise: 15 is refused even though
+  ;; it is SIGTERM everywhere, because "everywhere" is how transcription
+  ;; bugs start. Lifts to (libuv private native) on its second user
+  ;; (the PR #4 rule) -- today process.sls is the only one.
+  (define (signal-symbol->int sig who)
+    (cond
+      ((eqv? sig 0) 0)
+      ((symbol? sig)
+       (case sig
+         ((sigterm) (sig-term)) ((sigkill) (sig-kill)) ((sigint) (sig-int))
+         ((sighup) (sig-hup)) ((sigquit) (sig-quit))
+         ((sigusr1) (sig-usr1)) ((sigusr2) (sig-usr2))
+         ((sigcont) (sig-cont)) ((sigstop) (sig-stop))
+         (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+      (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+
+  ;; (uv-process-kill! proc sig) -- by handle. On Unix this is literally
+  ;; uv_kill(handle->pid, sig) (V9). Success returns unspecified; failure
+  ;; raises the errno symbol ('ESRCH after reaping -- see the pid-validity
+  ;; header note).
+  (define (uv-process-kill! proc sig)
+    (require-open-process proc 'uv-process-kill!)
+    (let ((signum (signal-symbol->int sig 'uv-process-kill!)))
+      (uv-check (uv-process-kill (handle-pointer proc 'uv-process-kill!)
+                                 signum)
+                'uv-process-kill!)))
+
+  ;; (uv-kill! pid sig) -- by raw pid; the escape hatch for pids learned
+  ;; elsewhere. The pid is validated as an exact integer (the FFI declares
+  ;; int; an inexact or non-number would be a marshalling crash) but NOT
+  ;; range-policed: negative pids are kill(2)'s process-group vocabulary,
+  ;; passed through -- the mirror rule.
+  (define (uv-kill! pid sig)
+    (unless (and (integer? pid) (exact? pid))
+      (raise (make-uv-invalid-argument 'uv-kill! 'pid-not-an-exact-integer)))
+    (let ((signum (signal-symbol->int sig 'uv-kill!)))
+      (uv-check (uv-kill pid signum) 'uv-kill!)))
+
+  ;; (uv-process-pid proc) -- valid between spawn and close, exit included
+  ;; (§4.5): the handle memory holds the pid until the close dispatcher
+  ;; frees it, and require-open-process is what enforces the window.
+  (define (uv-process-pid proc)
+    (require-open-process proc 'uv-process-pid)
+    (uv-process-get-pid (handle-pointer proc 'uv-process-pid)))
 
   ;; --- the exit dispatcher (S5.4) ------------------------------------------
   ;; uv_exit_cb: void (*)(uv_process_t *, int64_t exit_status, int
