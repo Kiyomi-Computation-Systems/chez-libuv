@@ -307,13 +307,15 @@
 (define ev10 (make-uv-signal l3))
 (uv-signal-start! ev10 'sigusr1
                   (lambda (s) (set! ev10-fired (+ ev10-fired 1)) (collect)))
+(define g3-before-ev10 g3-fired)              ; snapshot BEFORE the send
 (uv-kill! (uv-os-getpid) 'sigusr1)            ; pending for ev10 AND guard g3
 (uv-close! ev10)                              ; close BEFORE the next run
 (test-equal "the close drains (iteration-agnostic: signal closes may defer, EV-10)"
   'satisfied
   (run-until/ticking l3 (lambda () (eq? (uv-handle-state ev10) 'closed)) 512))
 (test-equal "the closing watcher's callback was suppressed" 0 ev10-fired)
-(test-assert "the guard still got the delivery" (positive? g3-fired))
+(test-assert "the guard still got THIS delivery (delta, not cumulative)"
+  (> g3-fired g3-before-ev10))
 
 ;; --- EV-4: an armed watcher keeps the loop alive ------------------------
 (test-assert "the loop is alive while watchers are armed (EV-4)"
