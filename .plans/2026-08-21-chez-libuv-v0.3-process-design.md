@@ -1,9 +1,8 @@
 # Design Spec: chez-libuv v0.3 — Process
 
 - **Date:** 2026-08-21
-- **Status:** Proposed — pending Stage 0 spike (`spike/process/`, §10) and
-  spec review; decisions marked *(spike-gated)* are resolved by evidence
-  before their ADRs are accepted
+- **Status:** Accepted (2026-08-21) — Stage 0 spike complete
+  (`spike/process/FINDINGS.md`); implemented on `feat/v0.3-process`
 - **Supersedes:** nothing. Refines the
   [v0.1 design spec](2026-08-18-chez-libuv-v0.1-design.md), the
   [v0.2 design spec](2026-08-21-chez-libuv-v0.2-dns-design.md), and

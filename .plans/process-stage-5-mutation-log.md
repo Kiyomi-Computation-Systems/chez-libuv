@@ -677,3 +677,54 @@ sigterm)"), confirmed empirically rather than merely predicted. Reverted
 immediately; `diff` against the pre-probe backup showed the file
 byte-identical; `make test` reconfirmed `ALL SUITES PASSED` at the GREEN
 totals above before commit.
+
+## Task 12 fix wave
+
+**Probe 6's original discharge evidence named an assertion since replaced.**
+Task 9's "Probe 6 discharged" section above records the setup-class
+discriminator-collapse mutation failing by name against
+`test-equal "setup-class failure: no process counted (direct-free arm)"`.
+That row was rewritten by Task 12 fix wave 1, commit `6db61e6` ("fix(test):
+stdio-setup spawn failure asserts ADR-0015's class-independent observables")
+— the row's hardcoded expectation of the direct-free arm turned out to be a
+build-time fact about the libuv underneath (which failure class a given
+trigger lands in depends on whether the vendored libuv is `>= 1.52.0`, per
+upstream `3e9ae1bc`/#4980; a pre-1.52.0 libuv takes the *other* arm at the
+same trigger), not a property of this binding. `tests/test-process.sps` no
+longer contains an assertion with that name; the class-independent
+observables ADR-0015's own consequences section prescribes (loop closes
+cleanly, a handle registered after the failure still exists, counters
+balance once the loop has turned) replace it. Task 9's discharge of the
+forward obligation still stands — the discriminator-collapse mutation is
+still caught — but a reader chasing that section's assertion name into the
+current suite will not find it; this note is the pointer forward. Full
+account, including the libuv-version root cause and CI evidence, is in
+`.superpowers/sdd/task-12-report.md`'s "Fix wave 1" section (F2) and its
+mutation table, reproduced faithfully below.
+
+**Fix wave 1's mutation A–D table**, lifted verbatim from
+`.superpowers/sdd/task-12-report.md` (F2, "Mutation-style evidence (local,
+macOS, vendored libuv 1.52.1)"), all four directions with a full rebuild
+between runs:
+
+| # | Mutation | Expected | Observed |
+|---|---|---|---|
+| A | `clean-up-failed-spawn!` forced to the close-through-protocol arm (`(if #t ...)`) | RED | `FAIL and that live handle SURVIVED the cleanup, still in the queue` — 1 unexpected failure |
+| B | none (pristine binding, pristine libuv 1.52.1) | GREEN | `# of expected passes 105`, `[informational] stdio-setup (EINVAL) cleanup arm: setup-class-direct-free` |
+| C | `clean-up-failed-spawn!` forced to the direct-free arm (`(if #f ...)`) | RED | `Exception in uv-loop-close!: resource busy or locked` (the `'ENOENT` scenario's teardown) |
+| D | `uv__queue_remove(&process->handle_queue)` **deleted from `vendor/libuv/src/unix/process.c`**, libuv + shim rebuilt — i.e. a real pre-1.52.0 libuv | GREEN | `# of expected passes 105`, `[informational] stdio-setup (EINVAL) cleanup arm: exec-class-close-through-protocol` |
+
+and the decisive back-to-back the report records: against the **same**
+mutated (pre-1.52.0) build, the **pre-fix** suite reproduces the CI failure
+line verbatim —
+
+```
+  [informational] ENOENT cleanup arm: exec-class-close-through-protocol
+FAIL setup-class failure: no process counted (direct-free arm)
+```
+
+— while the post-fix suite passes. That is a local reproduction of the
+Linux CI failure (run 32543915500) without a Linux machine, isolating the
+cause to the single libuv line the version note above describes. The
+vendored source was restored and rebuilt after each mutation; the
+submodule was left clean.

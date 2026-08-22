@@ -1197,11 +1197,11 @@
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the eight-class matrix below. Every
+;; SEED / PRECONDITION, asserted before the nine-class matrix below. Every
 ;; assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all eight "increments are visible" assertions would
+;; always return 0, so all nine "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -1209,7 +1209,7 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All eight classes, not just one. There are twenty-four near-identical
+;; All nine classes, not just one. There are twenty-four near-identical
 ;; entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
