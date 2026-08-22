@@ -1,6 +1,7 @@
 # Design Spec: chez-libuv v0.4 — Signal
 
-Status: **Draft** (adversarial review folded in 2026-08-22; stage-0 spike pending)
+Status: **Accepted** (adversarial review folded in 2026-08-22; stage-0 spike
+measured green on both platforms 2026-08-22 — `spike/signal/FINDINGS.md`)
 Date: 2026-08-22
 Branch: `feat/v0.4-signal`
 
@@ -353,14 +354,13 @@ snapshot-names entry, accessor, export. The nine `SIG*` rows already exist
   deliveries. The suite keeps stop-suppression probes and same-signum rearm
   probes in separate loop drains for exactly this reason.
 
-## 7. Expected vendor facts (pinned libuv v1.52.1 — to be verified by the spike)
+## 7. Vendor facts (pinned libuv v1.52.1 — **measured**, both platforms)
 
-Numbered EV (expected vendor fact) until the spike converts each to a measured
-V-fact in `spike/signal/FINDINGS.md`. A surprising answer reshapes this spec
-before implementation. EV-1, EV-8, EV-9, and EV-10 were established by
-adversarial source-reading of the vendored tree during spec review; the spike
-still measures them (source-reading predicts, measurement confirms — the house
-rule).
+All ten were measured by the stage-0 spike on Darwin/arm64 and Ubuntu
+24.04/x86_64 (twice per script on CI) and confirmed exactly as written —
+zero surprises (`spike/signal/FINDINGS.md`). The EV numbering is kept; read
+each as a V-fact. EV-1, EV-8, EV-9, and EV-10 originated as adversarial
+source-reading during spec review; the spike converted them to observations.
 
 - **EV-1** Continuous rearm has two vendor mechanisms: a **signum change** is
   an internal stop-then-start (signal.c:401-404); a **same-signum** restart
@@ -471,13 +471,15 @@ probed watcher's counter unchanged).
 - End-to-end graceful shutdown (the SQ-S2 probe graduated into the suite):
   the parent `uv-spawn!`s `tests/signal-child.sps` under the Chez binary the
   Makefile exports into the suite environment (§3; the suite **skips with a
-  named row** if the variable is absent — deterministic, honest). Handshake,
-  because cross-process signal sends are inherently racy without
-  acknowledgment: the child arms its oneshot `sigterm` watcher, **then**
-  writes a readiness byte on its stdout pipe; the parent run-untils that byte
-  before kill #1; the child writes an acknowledgment byte from inside the
-  sigterm callback; the parent run-untils that byte before kill #2; the
-  parent then asserts exit `(0 sigterm)`. Dogfoods v0.3.
+  named row** if the variable is absent — deterministic, honest). Handshake:
+  **three acks**, not two (spike finding SQ-S2-F1): the child arms its
+  oneshot `sigterm` watcher, then writes READY; the parent waits for it
+  before kill #1; the child acks delivery from inside the sigterm callback
+  (GOT1), then acks **disarm from a later dispatch** (DISARMED, once the
+  watcher reads inactive) — because the vendor auto-stop runs only after the
+  callback returns (EV-9), the in-callback ack proves delivery, not disarm,
+  and a kill #2 gated on it could be caught-then-dropped. The parent gates
+  kill #2 on DISARMED, then asserts exit `(0 sigterm)`. Dogfoods v0.3.
 - Facade: one exercised-through-the-facade row per §4.6 export in
   tests/test-facade.sps (the v0.3 process-block pattern).
 - Lifecycle: close protocol, counter balance to baseline, teardown sweep
@@ -493,12 +495,16 @@ path. Gate stays definite-only with no new suppressions expected.
 
 ## 10. Stage 0 spike (`spike/signal/`, findings in `spike/signal/FINDINGS.md`)
 
-Spike code is throwaway (may include a spike-local C probe to read installed
-dispositions via `sigaction`, and may hardcode local Chez paths; ADR-0002's
-constants-only rule binds the shipped shim, not spike scaffolding). Platforms:
-Darwin locally + Linux via the spike-branch CI push pattern
-(`push: branches: ['spike/**']`, cached pinned Chez) that served the process
-spike.
+**Done 2026-08-22, both platforms green, zero surprises.** Probes:
+`10-sigint-coexist.ss`, `11-oneshot-e2e.ss`, `12-vendor-microfacts.ss`, with
+`probe-signal.c` (constants) and `sig-probe.c` (disposition reads via
+`sigaction` — spike-local shared library; ADR-0002 binds the shipped shim,
+not spike scaffolding). Darwin locally; Linux via the spike-branch CI push
+pattern (`push: branches: ['spike/**']`, ci.yml's cached pinned Chez), run
+32575647102 on the since-deleted `spike/signal-evidence` branch, each script
+twice. One spec amendment came back: the three-ack E2E handshake (§9.3,
+SQ-S2-F1). The SQ descriptions below are as designed; FINDINGS carries the
+measurements and the ADR-ready SQ-S1 caveat text.
 
 - **SQ-S1 — Chez SIGINT coexistence.** Baseline: what disposition does the
   Chez runtime install for SIGINT in a script (and note REPL differences)?
@@ -543,8 +549,9 @@ ADRs after the spike:
 1. ~~Adversarial spec review of this document.~~ Done 2026-08-22 (four-lens
    review; findings folded into this revision — the mode-fixed contract D10,
    EV-8..10, and the §9 hardening all originate there).
-2. Stage-0 spike (SQ-S1..S3) → `spike/signal/FINDINGS.md`; fold surprises
-   back into this spec (EV → V renumbering).
+2. ~~Stage-0 spike (SQ-S1..S3) → `spike/signal/FINDINGS.md`.~~ Done
+   2026-08-22: both platforms green, zero surprises; EV-1..10 are measured
+   V-facts; §9.3's handshake amended to three acks (SQ-S2-F1).
 3. ADRs: ADR-0017 + ADR-0008 third amendment.
 4. Implementation plan (writing-plans skill) → subagent-driven tasks with
    per-task reviews and mutation logs. **Each task brief carries an explicit
