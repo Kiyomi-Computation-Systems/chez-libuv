@@ -636,3 +636,44 @@ and the `(if ...)` discriminator) byte-identical to pre-probe.
   1a for `exit-callable`. Recorded rather than hidden; Linux CI's valgrind
   leg does not change this (a wrong-width read that happens to recover the
   right bytes is not a memory error).
+
+## Task 10: swap `sig-term`/`sig-kill` in `signal-symbol->int`
+
+Task 10 introduces `uv-process-kill!`, `uv-kill!`, and `uv-process-pid` with
+their signal-vocabulary tests, including rows for SIGTERM and SIGKILL. A probe
+swapping the signal mappings in `signal-symbol->int` verifies both rows are
+sensitive to the mapping.
+
+**Mutation**, in `src/libuv/process.sls`:
+
+```scheme
+         ((sigterm) (sig-kill)) ((sigkill) (sig-term)) ((sigint) (sig-int))
+         ; was: ((sigterm) (sig-term)) ((sigkill) (sig-kill)) ...
+```
+
+**Command and output, verbatim:**
+
+```
+$ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-process.sps
+%%%% Starting test process
+  [informational] ENOENT cleanup arm: exec-class-close-through-protocol
+FAIL
+FAIL sigkill by pid delivers (0 sigkill)
+# of expected passes      96
+# of unexpected failures  2
+```
+
+**Result: FAILS BY NAME, at both rows the swap touches.** `(uv-process-kill!
+proc 'sigterm)` now sends the real SIGKILL int; the child dies by actual
+SIGKILL, so `term-signal->value` (unmodified, reads the raw delivered
+signal) reports `'sigkill`, and the unnamed `(test-equal '(0 sigterm)
+exit-result)` row fails (shown as bare `FAIL` -- `test-equal` with no
+message argument prints no name). Symmetrically, `(uv-kill! pid 'sigkill)`
+now sends the real SIGTERM int, the child dies by actual SIGTERM, and
+`"sigkill by pid delivers (0 sigkill)"` fails by name with `exit-result`
+= `(0 sigterm)`. Exactly the outcome named in the task's own
+Context ("the KILL is sent as SIGKILL so exit delivers (0 sigkill) ≠ (0
+sigterm)"), confirmed empirically rather than merely predicted. Reverted
+immediately; `diff` against the pre-probe backup showed the file
+byte-identical; `make test` reconfirmed `ALL SUITES PASSED` at the GREEN
+totals above before commit.

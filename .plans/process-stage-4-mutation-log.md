@@ -238,3 +238,39 @@ Identical to the Step-5 GREEN run; no probe mutation was left in the tree.
   check, so the swap is unobservable on it specifically). The gap closes
   the day a test closes a handle of the wrong kind before calling a stream
   verb on it.
+
+## Task 10: probe 2 discharge (swapped kind/state order, closed timer)
+
+Task 7's probe 2 is re-run against the completed Task 10 tree, which adds the
+closed-timer row to `tests/test-stream.sps` -- the exact gap the forward
+obligation named.
+
+**Mutation**, in `src/libuv/stream.sls`:
+
+```scheme
+  (define (require-open-stream stream who)
+    (require-open-handle stream who)           ; state check now FIRST
+    (unless (uv-stream-record? stream)         ; kind check now SECOND
+      (raise (make-uv-invalid-argument who 'not-a-uv-stream)))
+    stream)
+```
+
+**Command and output, verbatim:**
+
+```
+$ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-stream.sps
+%%%% Starting test stream
+  [informational] unconnected pipe write: EBADF
+FAIL uv-write! on a CLOSED timer raises 'not-a-uv-stream, not &uv-handle-closed
+# of expected passes      11
+# of unexpected failures  1
+```
+
+**Result: FAILS BY NAME.** Under the swapped order, the closed timer hits
+`require-open-handle` first, which raises `&uv-handle-closed` with kind
+`'timer` before the kind check ever runs -- so the row's guard, which only
+matches `uv-invalid-argument?` with reason `'not-a-uv-stream`, does not
+match, and the assertion is scored FAIL. This is **probe 2 discharged**:
+Task 7's forward obligation is closed. Reverted immediately; `diff` against
+the pre-probe backup showed the file byte-identical; `tests/test-stream.sps`
+alone reconfirmed 12 passes before continuing.
