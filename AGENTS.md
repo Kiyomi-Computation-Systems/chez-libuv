@@ -48,11 +48,21 @@
   submodule and `Akku.lock` to name the same commit was violated *in the same
   commit that introduced it*, and only became true once it was `make check-pins`.
   When a comment is load-bearing, that is the signal it should not be a comment.
+* **A plan's code blocks are executable spec — review them like spec prose.**
+  The v0.4 design spec got a four-lens adversarial review and shipped zero
+  surprises; its implementation plan got only a self-review, and both defects
+  that survived into execution lived in the plan's *example code*, not its
+  decisions — a test assertion that could not fail (caught by a task review)
+  and a hardcoded argv[0] (caught only by CI, one platform, post-merge-review).
+  When a milestone's process reviews the spec adversarially, the plan's code
+  blocks get the same pass.
 
 ## Traps this repo has already hit
 
 Each of these shipped a passing test or a working-looking build that was wrong.
 None is obvious from reading the code.
+
+### Scheme and SRFI-64
 
 * **`0` is truthy in Scheme, and `guard` returns the body's value when nothing
   raises.** So `(test-assert "…" (guard (e ((pred e) #t) (#t #f)) (accessor x)))`
@@ -64,11 +74,6 @@ None is obvious from reading the code.
   a process exit status, so a suite missing that line always reports success and
   `make test` stays green through real failures. Anything appended *after* it is
   dead code — a sabotage test added that way silently never runs.
-* **`foreign-procedure` resolves its entry point when the expression is evaluated,
-  not when the procedure is first called.** Every binding must be defined after
-  `load-shared-object`, which is why the load is written as a definition placed
-  ahead of them in `native.sls`. Getting this wrong fails at *import* time, not at
-  first use, so the error points nowhere near the mistake.
 * **SRFI-64 turns any exception in a test's *actual* expression into `#f`**
   (`vendor/chez-srfi/%3a64/testing-impl.scm:568-571`: the R6RS
   `%test-evaluate-with-catch` is `(guard (ex (else #F)) …)`). An assertion
@@ -79,8 +84,51 @@ None is obvious from reading the code.
   left-to-right when interpreted. Never let an assertion's meaning depend on
   which argument runs first: one named "rejected before anything is allocated"
   was in fact satisfied by the *last* argument's accessor raising.
+* **`(file-options no-fail append)` truncates the file on every open.**
+  `no-fail` without `no-truncate` replaces an existing file, so each "append"
+  leaves exactly the last write — the v0.4 spike's three-line handshake file
+  kept showing one line and read as a vendor bug until measured. Append-or-create
+  is `(file-options no-fail no-truncate append)`.
+* **An unguarded raise in suite plumbing between rows aborts the suite and
+  destroys the evidence.** test-signal's E2E once crashed mid-file on an ESRCH
+  from a bare `uv-kill!` after its child died early: the remaining rows never
+  ran, and the child's exit status — the one datum that explained the failure —
+  was never printed (the first PR #7 CI run yielded nothing to debug with).
+  Plumbing that can fail (kills, reads of another process's output) belongs
+  inside a named row that fails *carrying the evidence*: gate every wait on
+  `(or acked (pair? done))`, guard kills on the child being alive.
+
+### C and the FFI
+
+* **`foreign-procedure` resolves its entry point when the expression is evaluated,
+  not when the procedure is first called.** Every binding must be defined after
+  `load-shared-object`, which is why the load is written as a definition placed
+  ahead of them in `native.sls`. Getting this wrong fails at *import* time, not at
+  first use, so the error points nowhere near the mistake.
 * **A struct tag first named in a prototype's parameter list has prototype scope
   only** (C99 6.2.1p7). Forward-declare it at file scope before the prototype.
+
+### The event loop and child processes
+
+* **A single `uv-run 'once` is not guaranteed to fire an imminently-due
+  timer.** libuv only arms a blocking poll timeout for a `UV_RUN_ONCE`
+  iteration that ran no callbacks that same iteration, so one bare `'once`
+  after activity can return before the timer comes due. This flaked exactly
+  once in five CI runs. Always step with a capped `'once` loop
+  (`run-until`-style), never a single call and never wall-clock.
+* **Chez resolves its boot files by argv[0], not by the executable's path.**
+  A Chez child spawned with `file` = the real binary but argv[0] hardcoded to
+  another name (e.g. `"chez"` against an install whose binary is `scheme`)
+  hunts for a boot file named after argv[0], finds none, and dies of SIGABRT
+  ~60-90ms in — with nothing on stdout or stderr even when inherited. Green on
+  macOS (brew's binary really is named `chez`) and 15 straight local runs;
+  dead on the first Linux CI run. Spawn Chez children with argv[0] = the
+  binary's real name (tests/test-signal.sps passes the resolved path as both
+  `file` and argv[0]); the A/B proof is in the v0.4 SDD ledger's diagnostic
+  narrative.
+
+### The build (make)
+
 * **Apple make 3.81 compares mtimes at whole-second granularity, and deleting a
   stale artifact from within the artifact rule's own evaluation makes it worse.**
   A stamp-identity flip in the same wall-clock second does not force a relink
@@ -93,6 +141,9 @@ None is obvious from reading the code.
   `.plans/stage-6-mutation-log.md` ("The guard's own failure mode, checked
   rather than reasoned about"); the broken shapes were hit in both this repo
   and chez-cmark-gfm on the same day.
+
+### valgrind
+
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.
@@ -108,12 +159,9 @@ None is obvious from reading the code.
   environment-aware (`CHEZ_LIBUV_UNDER_VALGRIND`, exported by `test-memory`);
   its strong form runs in plain `make test`, which is where M35's mutation
   detection lives.
-* **A single `uv-run 'once` is not guaranteed to fire an imminently-due
-  timer.** libuv only arms a blocking poll timeout for a `UV_RUN_ONCE`
-  iteration that ran no callbacks that same iteration, so one bare `'once`
-  after activity can return before the timer comes due. This flaked exactly
-  once in five CI runs. Always step with a capped `'once` loop
-  (`run-until`-style), never a single call and never wall-clock.
+
+### CI and platform
+
 * **glibc under strict `-std=c99` hides POSIX types that macOS exposes
   unconditionally.** `uv/unix.h` needs `pthread_rwlock_t`; every local macOS
   build passed and the first Linux compile failed. The Makefile adds
