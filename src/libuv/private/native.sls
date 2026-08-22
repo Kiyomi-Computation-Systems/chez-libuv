@@ -107,6 +107,9 @@
           ;; the same "is this an on-callback argument a real procedure" gate
           ;; tcp.sls, stream.sls, and process.sls all need.
           require-callback
+          ;; the signal vocabulary (ADR-0016, ADR-0017), lifted verbatim from
+          ;; process.sls on its second user, (libuv signal) -- the PR #4 rule.
+          signal-symbol->int term-signal->value
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
@@ -836,6 +839,45 @@
   (define (require-callback proc who reason)
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
+
+  ;; --- the signal vocabulary (ADR-0016, ADR-0017) ------------------------
+  ;; Lifted verbatim from process.sls on its second user, (libuv signal) --
+  ;; the PR #4 rule the original comment promised. SENDING vocabulary: the
+  ;; closed nine-symbol set plus exact 0 (the POSIX liveness probe,
+  ;; kill(pid,0)). Symbols only otherwise: 15 is refused even though it is
+  ;; SIGTERM everywhere, because "everywhere" is how transcription bugs
+  ;; start. WATCHING's narrower refusal policy (no sigkill/sigstop, no 0)
+  ;; layers on top in signal.sls, not here: vocabulary is shared, refusal
+  ;; policy is not (ADR-0017).
+  (define (signal-symbol->int sig who)
+    (cond
+      ((eqv? sig 0) 0)
+      ((symbol? sig)
+       (case sig
+         ((sigterm) (sig-term)) ((sigkill) (sig-kill)) ((sigint) (sig-int))
+         ((sighup) (sig-hup)) ((sigquit) (sig-quit))
+         ((sigusr1) (sig-usr1)) ((sigusr2) (sig-usr2))
+         ((sigcont) (sig-cont)) ((sigstop) (sig-stop))
+         (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+      (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+
+  ;; The reverse map. 0 -> #f is EXIT-payload vocabulary ("exited
+  ;; normally"); an unbound signal passes through RAW as its exact integer
+  ;; -- never dropped, never fabricated (ADR-0016). The signal dispatcher
+  ;; (v0.4) reuses it for uniformity: its signum is a validated watchable,
+  ;; so only the symbol arms are reachable there.
+  (define (term-signal->value n)
+    (cond ((zero? n) #f)
+          ((= n (sig-term)) 'sigterm)
+          ((= n (sig-kill)) 'sigkill)
+          ((= n (sig-int))  'sigint)
+          ((= n (sig-hup))  'sighup)
+          ((= n (sig-quit)) 'sigquit)
+          ((= n (sig-usr1)) 'sigusr1)
+          ((= n (sig-usr2)) 'sigusr2)
+          ((= n (sig-cont)) 'sigcont)
+          ((= n (sig-stop)) 'sigstop)
+          (else n)))
 
   ;; --- error translation (ADR-0006) -------------------------------------
   ;; Both _r calls get a FRESH scratch bytevector rather than sharing one:

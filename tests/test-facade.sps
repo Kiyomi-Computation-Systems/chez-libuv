@@ -631,6 +631,14 @@
 (test-assert "uv-process-pid is exported"
   (procedure? uv-process-pid))
 
+;; v0.4: the pid query rides the process block (ADR-0017 D8).
+(test-equal "uv-os-getpid is re-exported and answers a positive exact integer"
+  'positive
+  (if (and (integer? (uv-os-getpid)) (exact? (uv-os-getpid))
+           (positive? (uv-os-getpid)))
+      'positive
+      'wrong))
+
 ;; Smoke test: spawn sh -c 'exit 5' through facade names only, assert exit (5 #f)
 (define pl (make-uv-loop))
 (define p-exit 'never-exited)

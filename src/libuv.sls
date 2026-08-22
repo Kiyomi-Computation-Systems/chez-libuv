@@ -75,7 +75,7 @@
           ;; uv-spawn! options/stdio vocabulary: THE SPEC §4.2-§4.3.
           ;; EXIT IS NOT CLOSE: on-exit fires, the handle still needs
           ;; uv-close! (ADR-0007). Killed-by-signal arrives as (0 'sig...).
-          uv-spawn! uv-process-kill! uv-kill! uv-process-pid
+          uv-spawn! uv-process-kill! uv-kill! uv-process-pid uv-os-getpid
 
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to

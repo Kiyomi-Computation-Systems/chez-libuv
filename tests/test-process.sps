@@ -732,6 +732,14 @@
    (uv-close! proc) (uv-close! stdin-pipe)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
 
+;; --- uv-os-getpid (v0.4, ADR-0017 D8) -------------------------------------
+(test-equal "uv-os-getpid answers a positive exact integer, stable across calls"
+  'stable-positive
+  (let ((a (uv-os-getpid)) (b (uv-os-getpid)))
+    (if (and (integer? a) (exact? a) (positive? a) (= a b))
+        'stable-positive
+        'wrong)))
+
 ;; --- detached (§9.2: no-hang + counters only; never reaped) --------------
 (with-loop
  (lambda (loop)
