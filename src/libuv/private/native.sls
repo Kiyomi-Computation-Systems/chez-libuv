@@ -967,7 +967,7 @@
           (cons 'signal        (live-signal))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
-  ;; The twelve trampolines declared below as `foreign-callable`s have
+  ;; The thirteen trampolines declared below as `foreign-callable`s have
   ;; mechanical bodies: they call the slot named for their callback type.
   ;; The slots' CONTENTS -- all dispatch policy, including the
   ;; store-and-reraise guard of design spec S8 -- are installed exactly once
@@ -1044,7 +1044,7 @@
           (raise (make-uv-invalid-argument 'uv-dispatcher-ref
                                            'unknown-dispatcher)))))
 
-  ;; alist: (name . procedure) for all twelve names, in any order.
+  ;; alist: (name . procedure) for all thirteen names, in any order.
   ;;
   ;; All-or-nothing, and once only. A partial install would leave some slots
   ;; holding the raising stub while libuv already had their addresses; a
@@ -1069,7 +1069,7 @@
               dispatcher-names)
     (set! dispatchers-installed #t))
 
-  ;; --- the twelve static trampolines (ADR-0008, design spec S4/S10) -----
+  ;; --- the thirteen static trampolines (ADR-0008, design spec S4/S10) ---
   ;; ONE `foreign-callable` per callback TYPE, never per callback instance,
   ;; each `lock-object`'d exactly once here and never unlocked, for the life
   ;; of the process. That bound is the whole point of ADR-0008: libuv retains
@@ -1077,13 +1077,15 @@
   ;; handle or per request would leave the collector permanently unable to
   ;; move an ever-growing set of code objects -- a leak by another name.
   ;;
-  ;; ALL TWELVE ARE CREATED HERE, together -- the original eight in v0.1
+  ;; ALL THIRTEEN ARE CREATED HERE, together -- the original eight in v0.1
   ;; Stage 3, the two DNS trampolines in v0.2 Stage 2 (ADR-0008 as amended:
   ;; neither DNS callback typedef matches an existing trampoline's arity,
-  ;; vendor/libuv/include/uv.h:345-352), and `exit`/`walk` in v0.3 (ADR-0015:
+  ;; vendor/libuv/include/uv.h:345-352), `exit`/`walk` in v0.3 (ADR-0015:
   ;; `walk` is ADR-0015's spawn-failure-path discriminator, `uv_walk_cb`
-  ;; matches no existing arity either) -- even when a callback type cannot
-  ;; fire yet. Creating them together is what keeps `lock-object` in exactly
+  ;; matches no existing arity either), and `signal` in v0.4 (ADR-0008's
+  ;; third amendment: `uv_signal_cb` shares `connection`'s arity and still
+  ;; gets its own slot) -- even when a callback type cannot fire yet.
+  ;; Creating them together is what keeps `lock-object` in exactly
   ;; one place, evaluated once; the stages add dispatch policy behind the
   ;; slots, not new locked objects. Spike FINDINGS Q1 measured the property
   ;; this depends on: a locked callable's `foreign-callable-entry-point` was

@@ -377,7 +377,7 @@
         "READY\nGOT1\nDISARMED\n" (utf8->string (collector-bytes out)))
 
       (uv-loop-teardown! l4)
-      (test-equal "signal+process+pipe counters balanced after the E2E"
+      (test-equal "signal counter balanced after the E2E"
         signal-base (live-count 'signal))))
 
 (test-end "signal")

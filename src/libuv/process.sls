@@ -527,8 +527,7 @@
   ;; is never written here), plus exact 0 -- the POSIX liveness probe
   ;; (kill(pid,0), V9). Symbols only otherwise: 15 is refused even though
   ;; it is SIGTERM everywhere, because "everywhere" is how transcription
-  ;; bugs start. Lifts to (libuv private native) on its second user
-  ;; (the PR #4 rule) -- today process.sls is the only one.
+  ;; bugs start.
   ;; signal-symbol->int / term-signal->value moved to (libuv private native)
   ;; on their second user, (libuv signal) -- ADR-0016's own lift rule, ADR-0017.
 
