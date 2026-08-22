@@ -478,6 +478,20 @@
 (test-assert "process/pipe type tags resolve"
   (and (integer? (uv-process-type)) (integer? (uv-named-pipe-type))))
 
+;; v0.4 signal (design spec 2026-08-22 S5.5; ADR-0017): UV_SIGNAL must be a
+;; snapshotted, distinct handle type tag, exactly like every other
+;; uv_handle_type member above.
+(test-equal "UV_SIGNAL is snapshotted and distinct from the other handle type tags"
+  'distinct-positive
+  (if (and (integer? (uv-signal-type))
+           (exact? (uv-signal-type))
+           (positive? (uv-signal-type))
+           (not (memv (uv-signal-type)
+                      (list (uv-timer-type) (uv-tcp-type)
+                            (uv-process-type) (uv-named-pipe-type)))))
+      'distinct-positive
+      'wrong))
+
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
 ;; The failure must be structured and must NAME the missing constant. A
 ;; default value, a zero, or a bare #f here is the exact silent-transcription
@@ -1182,13 +1196,19 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-;; Task 4 added the three new rows to live-counts.
-(test-equal "live-counts reports all eleven allocation classes"
+;; Task 2 (v0.4) added the signal row to live-counts.
+(test-equal "live-counts reports all twelve allocation classes"
   '(loop tcp timer write-req connect-req
-    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
+    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options
+    signal)
   (map car (live-counts)))
 
-;; Superseded by the eleven-class row above, kept for provenance:
+;; Superseded by the twelve-class row above, kept for provenance:
+;; (test-equal "live-counts reports all eleven allocation classes"
+;;   '(loop tcp timer write-req connect-req
+;;     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
+;;   (map car (live-counts)))
+;;
 ;; (test-equal "live-counts reports all eight allocation classes"
 ;;   '(loop tcp timer write-req connect-req
 ;;     getaddrinfo-req getnameinfo-req read-buffer)
@@ -1233,7 +1253,8 @@
               count-getnameinfo-req-new! count-getnameinfo-req-free!)
         (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)
         (list 'spawn-options
-              count-spawn-options-new! count-spawn-options-free!)))
+              count-spawn-options-new! count-spawn-options-free!)
+        (list 'signal count-signal-new! count-signal-free!)))
 
 (for-each
  (lambda (entry)
@@ -1396,10 +1417,10 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
-;; --- the twelve callback dispatcher slots, BEFORE anything installs them --
+;; --- the thirteen callback dispatcher slots, BEFORE anything installs them --
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
-;; installs the twelve dispatchers in its own library body, at instantiation
+;; installs the thirteen dispatchers in its own library body, at instantiation
 ;; (design spec S4: "the slots themselves are filled exactly once, by
 ;; handles.sls"). In every other suite's process the install has therefore
 ;; already happened before the first test line runs, so the uninstalled
@@ -1408,9 +1429,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the twelve callback types the design commits to"
+(test-equal "dispatcher-names names the thirteen callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo exit walk)
+    getaddrinfo getnameinfo exit walk signal)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1446,7 +1467,17 @@
     ((dispatcher-ref 'walk) 0 0)
     #f))
 
-(test-equal "dispatcher-ref rejects a name that is not one of the twelve"
+;; The signal slot, v0.4's thirteenth: uv_signal_cb's own (handle signum)
+;; arity. It shares connection's arity and still has its own slot -- the
+;; per-TYPE rule ADR-0008's third amendment states in its own terms.
+(test-assert "the signal slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'signal) 0 0)
+    #f))
+
+(test-equal "dispatcher-ref rejects a name that is not one of the thirteen"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1457,7 +1488,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the twelve is refused, naming who and why"
+(test-equal "an install missing one of the thirteen is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

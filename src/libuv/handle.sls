@@ -15,7 +15,7 @@
 ;;; S10) rather than being swept up at some later GC on some other thread
 ;;; (ADR-0007).
 (library (libuv handle)
-  (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process?
+  (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop
           uv-close!)
@@ -78,6 +78,12 @@
   ;; complementary question, and neither is written in terms of the other.
   (define (uv-process? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'process)))
+
+  ;; Kind-keyed like the three above (v0.4 design spec §4.6): the predicate
+  ;; lives with the kind vocabulary, not with the module that constructs
+  ;; the handle.
+  (define (uv-signal? handle)
+    (and (uv-handle? handle) (eq? (handle-kind handle) 'signal)))
 
   ;; (uv-close! handle [on-close]) -- idempotent, asynchronous, and the only
   ;; way a handle is ever freed.

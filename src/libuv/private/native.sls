@@ -107,6 +107,9 @@
           ;; the same "is this an on-callback argument a real procedure" gate
           ;; tcp.sls, stream.sls, and process.sls all need.
           require-callback
+          ;; the signal vocabulary (ADR-0016, ADR-0017), lifted verbatim from
+          ;; process.sls on its second user, (libuv signal) -- the PR #4 rule.
+          signal-symbol->int term-signal->value
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
@@ -126,6 +129,15 @@
           uv-process-kill uv-kill uv-process-get-pid uv-pipe-init
           uv-walk-native
 
+          ;; the signal entry points (design spec 2026-08-22 §5.2,
+          ;; ADR-0017). The two start calls take a uv_signal_cb and are NOT
+          ;; exported raw: both wrappers bake in the ONE signal trampoline
+          ;; (ADR-0008 third amendment). init/stop take no callback.
+          ;; uv-os-getpid-native is the raw pid query (libuv process) gates.
+          uv-signal-init uv-signal-start-native
+          uv-signal-start-oneshot-native uv-signal-stop
+          uv-os-getpid-native
+
           ;; debug counters (design spec S10)
           live-counts
           count-loop-new!        count-loop-free!
@@ -138,7 +150,8 @@
           count-read-buffer-new! count-read-buffer-free!
           count-pipe-new!         count-pipe-free!
           count-process-new!      count-process-free!
-          count-spawn-options-new! count-spawn-options-free!)
+          count-spawn-options-new! count-spawn-options-free!
+          count-signal-new!      count-signal-free!)
   ;; file-exists? is deliberately absent from the (chezscheme) import below:
   ;; (rnrs) already exports it via (rnrs files), and importing it from both
   ;; raises "multiple definitions for file-exists? in body". The same is true
@@ -320,6 +333,12 @@
     (foreign-procedure "chez_uv_count_spawn_options_free" () void))
   (define live-spawn-options
     (foreign-procedure "chez_uv_live_spawn_options" () long))
+
+  (define count-signal-new!
+    (foreign-procedure "chez_uv_count_signal_new" () void))
+  (define count-signal-free!
+    (foreign-procedure "chez_uv_count_signal_free" () void))
+  (define live-signal (foreign-procedure "chez_uv_live_signal" () long))
 
   ;; --- libuv bindings ---------------------------------------------------
   ;; v0.1 binds only what the version gate, the error translation, and the
@@ -821,6 +840,45 @@
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
 
+  ;; --- the signal vocabulary (ADR-0016, ADR-0017) ------------------------
+  ;; Lifted verbatim from process.sls on its second user, (libuv signal) --
+  ;; the PR #4 rule the original comment promised. SENDING vocabulary: the
+  ;; closed nine-symbol set plus exact 0 (the POSIX liveness probe,
+  ;; kill(pid,0)). Symbols only otherwise: 15 is refused even though it is
+  ;; SIGTERM everywhere, because "everywhere" is how transcription bugs
+  ;; start. WATCHING's narrower refusal policy (no sigkill/sigstop, no 0)
+  ;; layers on top in signal.sls, not here: vocabulary is shared, refusal
+  ;; policy is not (ADR-0017).
+  (define (signal-symbol->int sig who)
+    (cond
+      ((eqv? sig 0) 0)
+      ((symbol? sig)
+       (case sig
+         ((sigterm) (sig-term)) ((sigkill) (sig-kill)) ((sigint) (sig-int))
+         ((sighup) (sig-hup)) ((sigquit) (sig-quit))
+         ((sigusr1) (sig-usr1)) ((sigusr2) (sig-usr2))
+         ((sigcont) (sig-cont)) ((sigstop) (sig-stop))
+         (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+      (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+
+  ;; The reverse map. 0 -> #f is EXIT-payload vocabulary ("exited
+  ;; normally"); an unbound signal passes through RAW as its exact integer
+  ;; -- never dropped, never fabricated (ADR-0016). The signal dispatcher
+  ;; (v0.4) reuses it for uniformity: its signum is a validated watchable,
+  ;; so only the symbol arms are reachable there.
+  (define (term-signal->value n)
+    (cond ((zero? n) #f)
+          ((= n (sig-term)) 'sigterm)
+          ((= n (sig-kill)) 'sigkill)
+          ((= n (sig-int))  'sigint)
+          ((= n (sig-hup))  'sighup)
+          ((= n (sig-quit)) 'sigquit)
+          ((= n (sig-usr1)) 'sigusr1)
+          ((= n (sig-usr2)) 'sigusr2)
+          ((= n (sig-cont)) 'sigcont)
+          ((= n (sig-stop)) 'sigstop)
+          (else n)))
+
   ;; --- error translation (ADR-0006) -------------------------------------
   ;; Both _r calls get a FRESH scratch bytevector rather than sharing one:
   ;; uv-check is reachable from inside a callback (design spec S8), and a
@@ -905,10 +963,11 @@
           (cons 'read-buffer (live-read-buffer))
           (cons 'pipe          (live-pipe))
           (cons 'process       (live-process))
-          (cons 'spawn-options (live-spawn-options))))
+          (cons 'spawn-options (live-spawn-options))
+          (cons 'signal        (live-signal))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
-  ;; The twelve trampolines declared below as `foreign-callable`s have
+  ;; The thirteen trampolines declared below as `foreign-callable`s have
   ;; mechanical bodies: they call the slot named for their callback type.
   ;; The slots' CONTENTS -- all dispatch policy, including the
   ;; store-and-reraise guard of design spec S8 -- are installed exactly once
@@ -931,7 +990,7 @@
   ;; volume).
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect
-      getaddrinfo getnameinfo exit walk))
+      getaddrinfo getnameinfo exit walk signal))
 
   (define dispatchers (make-eq-hashtable))
   (define dispatchers-installed #f)
@@ -985,7 +1044,7 @@
           (raise (make-uv-invalid-argument 'uv-dispatcher-ref
                                            'unknown-dispatcher)))))
 
-  ;; alist: (name . procedure) for all twelve names, in any order.
+  ;; alist: (name . procedure) for all thirteen names, in any order.
   ;;
   ;; All-or-nothing, and once only. A partial install would leave some slots
   ;; holding the raising stub while libuv already had their addresses; a
@@ -1010,7 +1069,7 @@
               dispatcher-names)
     (set! dispatchers-installed #t))
 
-  ;; --- the twelve static trampolines (ADR-0008, design spec S4/S10) -----
+  ;; --- the thirteen static trampolines (ADR-0008, design spec S4/S10) ---
   ;; ONE `foreign-callable` per callback TYPE, never per callback instance,
   ;; each `lock-object`'d exactly once here and never unlocked, for the life
   ;; of the process. That bound is the whole point of ADR-0008: libuv retains
@@ -1018,13 +1077,15 @@
   ;; handle or per request would leave the collector permanently unable to
   ;; move an ever-growing set of code objects -- a leak by another name.
   ;;
-  ;; ALL TWELVE ARE CREATED HERE, together -- the original eight in v0.1
+  ;; ALL THIRTEEN ARE CREATED HERE, together -- the original eight in v0.1
   ;; Stage 3, the two DNS trampolines in v0.2 Stage 2 (ADR-0008 as amended:
   ;; neither DNS callback typedef matches an existing trampoline's arity,
-  ;; vendor/libuv/include/uv.h:345-352), and `exit`/`walk` in v0.3 (ADR-0015:
+  ;; vendor/libuv/include/uv.h:345-352), `exit`/`walk` in v0.3 (ADR-0015:
   ;; `walk` is ADR-0015's spawn-failure-path discriminator, `uv_walk_cb`
-  ;; matches no existing arity either) -- even when a callback type cannot
-  ;; fire yet. Creating them together is what keeps `lock-object` in exactly
+  ;; matches no existing arity either), and `signal` in v0.4 (ADR-0008's
+  ;; third amendment: `uv_signal_cb` shares `connection`'s arity and still
+  ;; gets its own slot) -- even when a callback type cannot fire yet.
+  ;; Creating them together is what keeps `lock-object` in exactly
   ;; one place, evaluated once; the stages add dispatch policy behind the
   ;; slots, not new locked objects. Spike FINDINGS Q1 measured the property
   ;; this depends on: a locked callable's `foreign-callable-entry-point` was
@@ -1116,6 +1177,16 @@
                         ((dispatcher-ref 'walk) handle arg))
                       (uptr uptr) void))
 
+  ;; uv_signal_cb: void (*)(uv_signal_t*, int signum). It SHARES
+  ;; connection's (uptr int) arity and still gets its own locked trampoline:
+  ;; the rule is one per callback TYPE, not per arity (ADR-0008, third
+  ;; amendment -- the original eight already contain same-arity
+  ;; distinct-type pairs: timer and close are both (uptr) -> void).
+  (define signal-callable
+    (foreign-callable (lambda (handle signum)
+                        ((dispatcher-ref 'signal) handle signum))
+                      (uptr int) void))
+
   ;; void uv_walk(uv_loop_t*, uv_walk_cb, void* arg) -- no errno.
   (define raw-walk
     (foreign-procedure "uv_walk" (uptr uptr uptr) void))
@@ -1139,7 +1210,7 @@
                     write-done-callable close-callable timer-callable
                     shutdown-callable connect-callable
                     getaddrinfo-callable getnameinfo-callable
-                    exit-callable walk-callable)))
+                    exit-callable walk-callable signal-callable)))
 
   ;; The entry points are module-private ON PURPOSE (design spec S3: nothing
   ;; outside private/ sees a pointer -- and these are the pointers whose
@@ -1160,6 +1231,7 @@
     (foreign-callable-entry-point getnameinfo-callable))
   (define exit-cb-entry (foreign-callable-entry-point exit-callable))
   (define walk-cb-entry (foreign-callable-entry-point walk-callable))
+  (define signal-cb-entry (foreign-callable-entry-point signal-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -1259,6 +1331,33 @@
     (foreign-procedure "uv_process_get_pid" (uptr) int))
   (define uv-pipe-init
     (foreign-procedure "uv_pipe_init" (uptr uptr int) int))
+
+  ;; --- the signal entry points (design spec 2026-08-22 §5.2, ADR-0017) ---
+  ;; uv_signal_start AND uv_signal_start_oneshot both take a uv_signal_cb,
+  ;; so both are bound raw- and reached only through the wrappers below,
+  ;; which bake in the ONE signal trampoline -- two verbs, one callback
+  ;; TYPE (ADR-0008 third amendment). uv_signal_init and uv_signal_stop
+  ;; take no callback and are exported raw; every int is an errno
+  ;; (uv_signal_stop is rc 0 even on a never-started watcher, EV-2).
+  (define uv-signal-init
+    (foreign-procedure "uv_signal_init" (uptr uptr) int))
+  (define raw-signal-start
+    (foreign-procedure "uv_signal_start" (uptr uptr int) int))
+  (define raw-signal-start-oneshot
+    (foreign-procedure "uv_signal_start_oneshot" (uptr uptr int) int))
+  (define uv-signal-stop
+    (foreign-procedure "uv_signal_stop" (uptr) int))
+
+  (define (uv-signal-start-native handle-ptr signum)
+    (raw-signal-start handle-ptr signal-cb-entry signum))
+
+  (define (uv-signal-start-oneshot-native handle-ptr signum)
+    (raw-signal-start-oneshot handle-ptr signal-cb-entry signum))
+
+  ;; uv_os_getpid: this process's own pid. No errno, no callback; the
+  ;; public gated spelling lives in (libuv process) beside uv-process-pid.
+  (define uv-os-getpid-native
+    (foreign-procedure "uv_os_getpid" () int))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

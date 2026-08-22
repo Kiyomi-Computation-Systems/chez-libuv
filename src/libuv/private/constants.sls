@@ -52,7 +52,7 @@
           ai-passive ai-canonname ai-numerichost ai-numericserv
           ni-numerichost ni-numericserv ni-namereqd ni-dgram
 
-          uv-process-type uv-named-pipe-type
+          uv-process-type uv-named-pipe-type uv-signal-type
           sizeof-uv-process-options-t
           offsetof-uv-process-options-t-exit-cb
           offsetof-uv-process-options-t-file
@@ -137,7 +137,9 @@
       UV_CREATE_PIPE UV_INHERIT_FD UV_INHERIT_STREAM
       UV_READABLE_PIPE UV_WRITABLE_PIPE
       SIGTERM SIGKILL SIGINT SIGHUP SIGQUIT
-      SIGUSR1 SIGUSR2 SIGCONT SIGSTOP))
+      SIGUSR1 SIGUSR2 SIGCONT SIGSTOP
+      ;; v0.4 signal (ADR-0017)
+      UV_SIGNAL))
 
   ;; The fallback errno symbol. It cannot collide with a real name: libuv's
   ;; UV_ERRNO_MAP tokens are the bare codes ("EOF", "ECONNRESET"), never
@@ -357,6 +359,9 @@
   ;; v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005)
   (define (uv-process-type)    (snapshot-ref 'UV_PROCESS))
   (define (uv-named-pipe-type) (snapshot-ref 'UV_NAMED_PIPE))
+
+  ;; v0.4 signal handle type tag (design spec 2026-08-22 §5.5; ADR-0017)
+  (define (uv-signal-type) (snapshot-ref 'UV_SIGNAL))
 
   (define (sizeof-uv-process-options-t) (snapshot-ref 'SIZEOF_UV_PROCESS_OPTIONS_T))
 

@@ -154,6 +154,8 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIGUSR2", SIGUSR2 },
   { "SIGCONT", SIGCONT },
   { "SIGSTOP", SIGSTOP },
+  /* v0.4 signal (design spec 2026-08-22 §5.5; ADR-0017). */
+  { "UV_SIGNAL", UV_SIGNAL },
 };
 
 #define CHEZ_UV_CONSTANT_COUNT \
@@ -221,6 +223,7 @@ static long live_read_buffer     = 0;
 static long live_pipe            = 0;
 static long live_process         = 0;
 static long live_spawn_options   = 0;
+static long live_signal          = 0;
 
 void chez_uv_count_loop_new(void)  { live_loop += 1; }
 void chez_uv_count_loop_free(void) { live_loop -= 1; }
@@ -265,6 +268,10 @@ long chez_uv_live_process(void)       { return live_process; }
 void chez_uv_count_spawn_options_new(void)  { live_spawn_options += 1; }
 void chez_uv_count_spawn_options_free(void) { live_spawn_options -= 1; }
 long chez_uv_live_spawn_options(void)       { return live_spawn_options; }
+
+void chez_uv_count_signal_new(void)  { live_signal += 1; }
+void chez_uv_count_signal_free(void) { live_signal -= 1; }
+long chez_uv_live_signal(void)       { return live_signal; }
 
 #else
 
@@ -311,5 +318,9 @@ long chez_uv_live_process(void)       { return 0; }
 void chez_uv_count_spawn_options_new(void)  { }
 void chez_uv_count_spawn_options_free(void) { }
 long chez_uv_live_spawn_options(void)       { return 0; }
+
+void chez_uv_count_signal_new(void)  { }
+void chez_uv_count_signal_free(void) { }
+long chez_uv_live_signal(void)       { return 0; }
 
 #endif /* CHEZ_LIBUV_DEBUG_COUNTERS */

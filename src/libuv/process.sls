@@ -46,7 +46,7 @@
 ;;; (libuv process) keeps the contained raising stubs for both names, and
 ;;; nothing can spawn without the import (S5.2, S5.4, ADR-0015).
 (library (libuv process)
-  (export uv-spawn! uv-process-kill! uv-kill! uv-process-pid)
+  (export uv-spawn! uv-process-kill! uv-kill! uv-process-pid uv-os-getpid)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -527,19 +527,9 @@
   ;; is never written here), plus exact 0 -- the POSIX liveness probe
   ;; (kill(pid,0), V9). Symbols only otherwise: 15 is refused even though
   ;; it is SIGTERM everywhere, because "everywhere" is how transcription
-  ;; bugs start. Lifts to (libuv private native) on its second user
-  ;; (the PR #4 rule) -- today process.sls is the only one.
-  (define (signal-symbol->int sig who)
-    (cond
-      ((eqv? sig 0) 0)
-      ((symbol? sig)
-       (case sig
-         ((sigterm) (sig-term)) ((sigkill) (sig-kill)) ((sigint) (sig-int))
-         ((sighup) (sig-hup)) ((sigquit) (sig-quit))
-         ((sigusr1) (sig-usr1)) ((sigusr2) (sig-usr2))
-         ((sigcont) (sig-cont)) ((sigstop) (sig-stop))
-         (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
-      (else (raise (make-uv-invalid-argument who 'signal-unknown)))))
+  ;; bugs start.
+  ;; signal-symbol->int / term-signal->value moved to (libuv private native)
+  ;; on their second user, (libuv signal) -- ADR-0016's own lift rule, ADR-0017.
 
   ;; (uv-process-kill! proc sig) -- by handle. On Unix this is literally
   ;; uv_kill(handle->pid, sig) (V9). Success returns unspecified; failure
@@ -570,6 +560,16 @@
     (require-open-process proc 'uv-process-pid)
     (uv-process-get-pid (handle-pointer proc 'uv-process-pid)))
 
+  ;; (uv-os-getpid) -- this process's OWN pid, through the init gate like
+  ;; every public nullary query (the uv-version precedent: the answer must
+  ;; come from a library this binding has validated). It lives here beside
+  ;; uv-process-pid because pid vocabulary is this module's (ADR-0017 D8);
+  ;; the suites' self-delivery ((uv-kill! (uv-os-getpid) 'sigusr1)) is its
+  ;; first consumer.
+  (define (uv-os-getpid)
+    (ensure-native-loaded!)
+    (uv-os-getpid-native))
+
   ;; --- the exit dispatcher (S5.4) ------------------------------------------
   ;; uv_exit_cb: void (*)(uv_process_t *, int64_t exit_status, int
   ;; term_signal). Runs inside handles.sls's seam guard.
@@ -578,25 +578,6 @@
   ;; rule (design spec S5): an exit queued behind a uv_close still deserves
   ;; delivery. NOTHING IS FREED HERE either: exit stops the handle, and the
   ;; close dispatcher remains the only place process memory dies (ADR-0007).
-
-  ;; term_signal 0 means "exited normally" and is the only value that becomes
-  ;; #f (S4.4). A signal outside the bound set passes through RAW as its
-  ;; exact integer -- never dropped, never fabricated -- so a child killed by
-  ;; a signal this table does not name is still reported honestly. Every
-  ;; number comes from the shim's table (ADR-0005): SIGTERM's value is never
-  ;; written in Scheme source.
-  (define (term-signal->value n)
-    (cond ((zero? n) #f)
-          ((= n (sig-term)) 'sigterm)
-          ((= n (sig-kill)) 'sigkill)
-          ((= n (sig-int))  'sigint)
-          ((= n (sig-hup))  'sighup)
-          ((= n (sig-quit)) 'sigquit)
-          ((= n (sig-usr1)) 'sigusr1)
-          ((= n (sig-usr2)) 'sigusr2)
-          ((= n (sig-cont)) 'sigcont)
-          ((= n (sig-stop)) 'sigstop)
-          (else n)))
 
   ;; The three arms are S5.4's steps 1-2, and the middle one is why this
   ;; dispatcher is not shaped like timer-dispatch: an UNREGISTERED pointer
