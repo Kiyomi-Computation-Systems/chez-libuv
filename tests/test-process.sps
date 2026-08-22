@@ -26,7 +26,7 @@
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
-        (only (chezscheme) collect putenv
+        (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor))
 
 (define runner (test-runner-simple))
@@ -486,9 +486,18 @@
                            128))))
 
 ;; --- inherit-fd (§9.2: child writes an inherited temp-file fd) -----------
+;; tests/tmp/ is .gitignored, so a fresh checkout (any CI runner) does NOT
+;; have it and open-file-output-port below would raise unhandled, aborting
+;; the whole suite mid-run. Created here rather than assumed. The
+;; file-exists? guard is not a race check -- it is the ordinary
+;; already-there case; a genuine concurrent creator would make `mkdir`
+;; raise EEXIST, which is a real error worth surfacing, not one to swallow.
 (with-loop
  (lambda (loop)
-   (define path (let ((p "tests/tmp/inherit-fd-probe.txt"))
+   (define tmp-dir (let ((d "tests/tmp"))
+                     (unless (file-exists? d) (mkdir d))
+                     d))
+   (define path (let ((p (string-append tmp-dir "/inherit-fd-probe.txt")))
                   (when (file-exists? p) (delete-file p))
                   p))
    (define port (open-file-output-port path))
