@@ -25,7 +25,11 @@ These were resolved interactively and are settled inputs to this design:
    not — needs a checkout that has run `make build`. Akku users are served
    honestly: Akku manages the Scheme-level dependency; the native shim comes
    from `make build` in a clone. No loader or distribution changes in this
-   pass.
+   pass. **Tripwire for the publication milestone:** verify what
+   `akku publish` actually packs — if submodule contents ride along, the
+   package redistributes libuv/chez-srfi source and must include their
+   license texts; likewise any future release tarball or prebuilt-shim
+   artifact that bundles libuv.
 2. **CONTRIBUTING rigor: gates hard, process soft.** The file requires what
    CI enforces (green `make test` / `check-pins` / `check-purity`,
    Conventional Commits, tests accompany code) and presents the deeper house
@@ -100,7 +104,14 @@ Section order:
    `docs/building.md`, `CHANGELOG.md`, design specs & ADRs under `.plans/`.
 9. **Contributing** — two sentences pointing at `CONTRIBUTING.md` and
    `SECURITY.md`.
-10. License + the existing copyright footer, unchanged.
+10. License + the existing copyright footer, unchanged — plus a short
+    *Third-party software* paragraph: dependencies arrive as git submodules
+    under their own licenses — libuv (MIT; `vendor/libuv/LICENSE` and
+    `LICENSE-extra`) and chez-srfi (permissive; `vendor/chez-srfi/LICENSE`,
+    test suites only); nothing third-party is copied into this tree (no
+    NOTICE file is needed — that is an Apache-2.0 mechanism, and this repo
+    redistributes no third-party source); anyone redistributing binaries or
+    archives that bundle libuv must carry libuv's license texts.
 
 Everything else currently in the README moves to `docs/` (below) — nothing
 is deleted from the corpus, only relocated and tightened.
