@@ -389,7 +389,32 @@ test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, agg
 
 # Refusal is the SUITE's job (it checks euid itself and exits 1 with a
 # message), so a bare `make test-root` fails loudly rather than skipping.
-test-root: build deps check-pins ## Run the root-gated setuid/setgid suite (needs sudo)
+#
+# NO `build deps` PREREQUISITES, deliberately: this target runs under sudo,
+# and on the vendored path $(SHIM) depends on the PHONY `vendor`, so a
+# `build` prerequisite relinked the shim -- as root -- on EVERY run,
+# leaving root-owned artifacts in build/ (plus root-owned symlinks from
+# `deps`). The recipe's first stanza is a CHECK, not a rebuild (AGENTS.md):
+# every artifact `build deps` would have made must already exist, and the
+# two provenance stamps must match THIS invocation's FLAVOR/HAVE_PKG --
+# the same identity relink-guard enforces, asserted here instead of acted
+# on. A stale-but-present shim is accepted; the lane trades staleness for
+# never writing to the tree as root. check-pins stays: it only reads.
+test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `make build deps` unprivileged first)
+	@missing=""; \
+	[ -f $(SHIM) ]           || missing="$$missing $(SHIM)"; \
+	[ -f $(CONFIG_SLS) ]     || missing="$$missing $(CONFIG_SLS)"; \
+	[ -f $(FLAVOR_STAMP) ]   || missing="$$missing $(FLAVOR_STAMP)"; \
+	[ -f $(ACQ_STAMP) ]      || missing="$$missing $(ACQ_STAMP)"; \
+	[ -d $(SRFI_LIBS)/srfi ] || missing="$$missing $(SRFI_LIBS)/srfi"; \
+	if [ -n "$$missing" ]; then \
+	  echo "test-root: missing or provenance-mismatched artifacts:$$missing" >&2; \
+	  echo "test-root deliberately does not build (under sudo, the phony" >&2; \
+	  echo "vendor prerequisite would relink the shim as root). Run" >&2; \
+	  echo "'make build deps' unprivileged first, with the same FLAVOR and" >&2; \
+	  echo "HAVE_PKG as this invocation." >&2; \
+	  exit 1; \
+	fi
 	@for t in $(ROOT_TESTS); do \
 	  echo "=== $$t (root lane) ==="; \
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) $(CHEZ) --program $$t || exit 1; \

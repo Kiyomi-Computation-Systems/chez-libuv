@@ -187,8 +187,10 @@ jobs:
       # Makefile) and run only here, under sudo. `-E env "PATH=$PATH"`
       # because plain sudo drops the PATH this job put the pinned Chez on;
       # `HAVE_PKG=no` matches the vendored-path build just above so
-      # test-root's `build deps` prerequisites re-resolve identically
-      # instead of relinking the pkg-config flavor.
+      # test-root's artifact-precondition check accepts what that build
+      # produced -- the target deliberately does NOT rebuild (under sudo
+      # a `build` prerequisite would relink the shim as root; see the
+      # Makefile's test-root comment).
       - name: Root lane (setuid/setgid, sudo)
         run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
 
