@@ -192,7 +192,7 @@ deps: ## Vendor chez-srfi and symlink it (plus %3a-decoded names) into build/sch
 	  [ "$$d" = "$$b" ] || ln -sfn "$$f" "$$dst/$$d"; \
 	done
 
-check-pins: ## Verify chez-srfi submodule <-> Akku.lock, vendored libuv version, and README floor all agree
+check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, and manifest/CHANGELOG version agree
 	@rec=$$(git ls-files -s $(SRFI_SRC) | awk '{print $$2}'); \
 	lock=$$(sed -n 's/.*akku\.[0-9]*\.\([a-f0-9]*\)_repack.*/\1/p' Akku.lock | head -1); \
 	if [ -z "$$rec" ] || [ -z "$$lock" ]; then \
@@ -223,6 +223,18 @@ check-pins: ## Verify chez-srfi submodule <-> Akku.lock, vendored libuv version,
 	  exit 1; \
 	}
 	@echo "README states the libuv floor ($(UV_FLOOR_DOTTED))"
+	@man=$$(sed -n 's/.*("chez-libuv" "\([0-9][^"]*\)").*/\1/p' Akku.manifest | head -1); \
+	chg=$$(sed -n 's/^## \([0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -1); \
+	if [ -z "$$man" ] || [ -z "$$chg" ]; then \
+	  echo "check-pins: could not read both versions (manifest='$$man' changelog='$$chg')" >&2; \
+	  exit 1; \
+	fi; \
+	if [ "$$man" != "$$chg" ]; then \
+	  echo "VERSION DRIFT: Akku.manifest declares $$man but CHANGELOG.md's top release is $$chg." >&2; \
+	  echo "Bump the manifest when cutting a release; consumers read the manifest." >&2; \
+	  exit 1; \
+	fi; \
+	echo "manifest version matches CHANGELOG ($$man)"
 
 # Nothing outside private/ may see a raw uv_* symbol or pointer (design spec
 # section 3). test-conditions.sps exercises the pure &uv-* condition

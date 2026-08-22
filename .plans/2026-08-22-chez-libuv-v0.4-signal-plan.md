@@ -12,7 +12,7 @@
 
 Every task's requirements implicitly include all of these. Copy them into each task brief's **inherited obligations** alongside the task-specific ones.
 
-- **Repo:** `/Users/yuzu/github/chez-libuv`, branch `feat/v0.4-signal`. Conventional Commits with trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+- **Repo:** the `chez-libuv` repository root, branch `feat/v0.4-signal`. Conventional Commits with trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 - **Run a single suite with:** `CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs CHEZ_LIBUV_TEST_CHEZ="$(command -v chez)" chez --program tests/<suite>.sps` (run `make build deps` once first so the shim and SRFI libs exist). Run `make test` (expect final line `ALL SUITES PASSED`) before every commit.
 - **ADR-0002:** the C shim is constants-only — never wrap a `uv_*` call there.
 - **ADR-0005:** no constant is ever transcribed into Scheme or C source; every number is a shim table row read at build time. `snapshot-ref` never falls through — a name missing from `constants.sls`'s `snapshot-names` raises `&uv-constant-unavailable` at first use.
