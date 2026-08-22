@@ -121,8 +121,10 @@
         ;; env mirrors libuv's own "K=V" array format (S4.2): the binding
         ;; invents no alist encoding and parses none of the strings
         ;; (ADR-0012's never-invent rule applied to a value format). Only the
-        ;; NUL trap is policed.
-        (unless (and (list? (cdr env)) (pair? (cdr env)))
+        ;; NUL trap is policed. An empty env list is explicitly permitted:
+        ;; absent env inherits the parent's (options.env NULL), while '() gives
+        ;; the child an empty environment (a NULL-terminated empty array).
+        (unless (list? (cdr env))
           (raise (make-uv-invalid-argument who 'env-not-a-string-list)))
         (for-each (lambda (s)
                     (require-nul-free-string s who 'env-not-a-string-list))

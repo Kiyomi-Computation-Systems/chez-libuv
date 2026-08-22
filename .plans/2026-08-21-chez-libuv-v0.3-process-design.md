@@ -555,7 +555,7 @@ instrument is `uv_walk`, adopted as the twelfth locked trampoline (§5.2),
 installed as `walk` in `dispatcher-names`; ADR-0015 records the decision
 and keeps the unmeasured `handle_queue` back-pointer read on file as the
 rejected alternative. Stage 5 pins `uv_walk` with a test that drives
-**both** classes (`'ENOENT`, and `(inherit-stream h)` on an unconnected
+**both** classes (`'ENOENT`, and `(inherit-stream . h)` on an unconnected
 stream → `EINVAL`, process.c:226).
 
 The invariants either way: the options block is already freed (step 5), no

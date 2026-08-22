@@ -137,6 +137,30 @@
    ;; it did (design spec v0.3 §6).
    #f))
 
+;; --- explicitly EMPTY env: the child inherits NOTHING (§4.2) ------------
+(with-loop
+ (lambda (loop)
+   (define ignored (putenv "CHEZ_LIBUV_TEST_EMPTY" "should-not-cross"))
+   (define out (make-byte-collector))
+   (define done 'not-yet)
+   (define eof 'not-yet)
+   (define p (make-uv-pipe loop))
+   (define proc
+     (uv-spawn! loop "/bin/sh"
+                '("sh" "-c" "printf 'x%sx' \"$CHEZ_LIBUV_TEST_EMPTY\"")
+                (list (cons 'env '())
+                      (cons 'stdio (list 'ignore (list 'pipe p 'from-child))))
+                (lambda (s g) (collect) (set! done 'exited))))
+   (uv-read-start! p (lambda (bv s e) (collect) (collect-span! out bv s e))
+                     (lambda () (collect) (set! eof 'eof))
+                     (lambda (err) (collect) (set! eof 'error)))
+   (run-until/ticking loop (lambda () (and (eq? done 'exited) (eq? eof 'eof))) 8192)
+   (test-equal "empty env: the parent's variable did not cross" "xx"
+     (utf8->string (collector-bytes out)))
+   (uv-close! proc) (uv-close! p)
+   (run-until loop (lambda () (and (eq? 'closed (uv-handle-state proc))
+                                   (eq? 'closed (uv-handle-state p)))) 128)))
+
 ;; --- spawn failure: 'ENOENT, SQ1's production twin (ADR-0015) ------------
 ;; ADR-0015's failure path is CLASS-DEPENDENT and the class is decided by
 ;; asking the loop, never by the errno -- so this scenario asserts the two
