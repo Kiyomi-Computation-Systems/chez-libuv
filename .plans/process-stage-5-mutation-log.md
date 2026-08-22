@@ -408,3 +408,231 @@ which `git diff` reported as unchanged).
 - **`discard-failed-handle!`'s not-registered check** (handles.sls) is a
   check-instead-of-comment guard on a state the correct discriminator makes
   unreachable; no test drives it, for the same reason probe 6 documents.
+
+## Task 9: stdio scenarios (echo, duplex, extra fd, inherit-fd, inherit-stream,
+## pipe reuse/wrong-loop) -- GREEN, and probe 6's forward obligation discharged
+
+Seven new scenarios appended to `tests/test-process.sps` (54 -> 82
+assertions): full echo loop (write/read/shutdown/EOF/exit + `pipe-already-
+used` reuse refusal), the setup-class spawn-failure twin (`(inherit-stream .
+<unconnected pipe>)` -> `'EINVAL`), `pipe-wrong-loop`, duplex
+(`UV_READABLE_PIPE|UV_WRITABLE_PIPE`), extra fd at slot 3, `inherit-fd` via a
+real temp-file fd (`port-file-descriptor`/`open-file-output-port`, both
+available in this Chez without a fallback), and `inherit-stream` over a real
+loopback TCP pair (ADR-0010 machinery). Full detail, RED/GREEN transcripts,
+and the fix below are in `.superpowers/sdd/task-9-report.md`.
+
+### Fix found while writing the setup-class scenario: `mark-consumed-pipes!`
+### only matched `(pipe h dir)`, never `(inherit-stream . h)`
+
+The setup-class scenario's own record-level assertion --
+"the named pipe is marked connected even on the setup-class path"
+(`pipe-connected?` on the pipe named via `(inherit-stream . unconnected)`) --
+was written RED first and stayed RED against the pre-Task-9 tree:
+
+```
+  [informational] pipe-connected? on the inherit-stream target: #f
+```
+
+`stdio-spec-handle`'s own header comment already claimed "the connected-
+marking walk" as its second caller ("One place decides that, so the loop
+check and the connected-marking walk cannot drift apart") -- but
+`mark-consumed-pipes!` had its own narrower `(and (list? spec) (pair? spec)
+(eq? 'pipe (car spec)))` match instead of calling `stdio-spec-handle`, so the
+two had already drifted. Fixed by routing `mark-consumed-pipes!` through
+`stdio-spec-handle`, guarded by `uv-pipe-record?` (inherit-stream also
+accepts tcp handles, which have no `connected?` field). GREEN after the fix:
+
+```
+  [informational] pipe-connected? on the inherit-stream target: #t
+```
+
+Both the module header comment (S4.3/ADR-0015 decision 6 paragraph) and the
+`mark-consumed-pipes!` comment were updated to state the widened scope. No
+existing test asserted the narrower behavior (grepped `pipe-connected?` and
+`inherit-stream` across every suite before making the change).
+
+### Probe (brief item, Step 4): swap `to-child`/`from-child` in `stdio-spec-flags`
+
+**Mutation**, in `src/libuv/process.sls`:
+
+```scheme
+                      ((to-child)   (uv-stdio-writable-pipe))  ; was readable
+                      ((from-child) (uv-stdio-readable-pipe))  ; was writable
+```
+
+**Command and output, verbatim:**
+
+```
+$ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-process.sps
+%%%% Starting test process
+Exception in uv-read-start!: socket is not connected
+```
+(exit code 255)
+
+**Result: FAILS, louder than a named assertion.** With the bits swapped, the
+echo scenario's `from-child` slot is written `UV_READABLE_PIPE` (child
+reads, parent side stays write-only), so `uv_read_start` on the PARENT's
+`stdout-pipe` end -- the very first stream call the echo scenario makes --
+raises `UV_ENOTCONN` synchronously, before any `test-equal` row runs. Same
+shape as Task 8's probe 2 (a mutation that aborts the suite is still an
+unambiguous FAIL; recorded as observed rather than narrowed to a quieter
+row). Reverted; the suite reconfirmed 82 passes.
+
+### Probe (brief item, Step 4): write the inherit-fd container's data via
+### `c-uptr-set!` instead of `c-int-set!`
+
+**Mutation**, in `src/libuv/process.sls`:
+
+```scheme
+            ((eq? 'inherit-fd (car spec))
+             (c-uptr-set! (+ c (offsetof-uv-stdio-container-t-data)) (cdr spec)))
+             ; was c-int-set!
+```
+
+**Command and output, verbatim:**
+
+```
+$ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-process.sps
+%%%% Starting test process
+  [informational] ENOENT cleanup arm: exec-class-close-through-protocol
+# of expected passes      82
+```
+(exit code 0)
+
+**Result: GREEN -- NOT CAUGHT on this platform, exactly the shape the brief
+flagged as possible, recorded honestly rather than reworded into a pass.**
+Measured rather than assumed: a small C probe against the vendored headers
+gives `sizeof(uv_stdio_container_t)=16`, `offsetof(data)=8`,
+`sizeof(data)=8` (the union is sized for its pointer member, on this
+LP64/little-endian arm64 build). Two facts combine to make the 8-byte write
+harmless here: (1) the union already occupies a full 8-byte slot at the end
+of the 16-byte container, so an 8-byte write at `+8` never overruns into a
+neighbouring container's `flags` field; (2) `(cdr spec)` is a small
+non-negative fd (this scenario uses 3), so `c-uptr-set!` zero-extends it
+into all 8 bytes rather than writing any pre-existing garbage into the high
+4 -- and a little-endian re-read of the low 4 bytes as `int fd` recovers the
+exact value written. No garbage ever lands in the union's high bytes because
+nothing non-zero was ever placed there. The width declaration is real (V2:
+"an fd as a 32-bit int, a stream as a pointer... writing an fd pointer-wide
+would also clear the union's high bytes, which is indistinguishable from
+correct on LP64 until it is not") -- it is simply not falsifiable by THIS
+mutation on THIS platform with a small fd value, the same unfalsifiable-by-
+value-range shape Task 8's probe 1a found for `exit-callable`'s width
+declaration. A value with set high bits (a large fd, or reading the union
+back as a pointer) would be a different, more discriminating probe; not run,
+because inventing an artificially large fd defeats the "measure the real
+code path" rule. Reverted; the suite reconfirmed 82 passes.
+
+### Probe 6 discharged (Context item 2's hard obligation)
+
+Task 8's mutation log recorded probe 6 (collapse ADR-0015's discriminator to
+ALWAYS take the close-through-protocol/exec-class arm) as **GREEN --
+uncovered, and a real gap**, because every spawn failure Task 8's suite
+drove was exec-class; the setup-class arm (`discard-failed-handle!`) shipped
+untested. The forward obligation was explicit: re-run this exact probe once
+the setup-class scenario lands, and it must fail.
+
+**Mutation**, in `src/libuv/process.sls` (identical to Task 8's probe 6):
+
+```scheme
+    (if #t                                    ; was (handle-in-loop-queue? loop proc)
+        (begin (registry-register! ...) (count-process-new!) (close-handle! proc))
+        (discard-failed-handle! proc))
+```
+
+**Command and output, verbatim:**
+
+```
+$ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-process.sps
+%%%% Starting test process
+  [informational] ENOENT cleanup arm: exec-class-close-through-protocol
+FAIL setup-class failure: no process counted (direct-free arm)
+# of expected passes      81
+# of unexpected failures  1
+```
+(exit code 1)
+
+**Result: FAILS BY NAME -- the setup-class row catches it, exactly as
+predicted.** With the discriminator collapsed, the `(inherit-stream .
+<unconnected pipe>)` spawn -- genuinely setup-class (libuv's `error:` label
+at process.c:1075 already unlinked the handle before this code runs) -- is
+now wrongly treated as exec-class: `clean-up-failed-spawn!` registers,
+counts, and asynchronously closes a handle libuv's own `error:` cleanup
+already unlinked from `loop->handle_queue`. The scenario's `procs-before
+(live-count 'process)` check, taken with NO drain (by design -- a genuine
+setup-class failure never registers, so there is nothing to wait for), reads
+`procs-before + 1` and fails by name. Only one row fails: the wrongly-
+registered handle's async close still completes during this scenario's own
+closing `run-until`, so the counters resettle to baseline before the suite-
+end balance rows run -- the corruption ADR-0015 warns about (a live handle
+silently spliced out of `loop->handle_queue`) is a C-level hazard against a
+LATER-registered handle, which this narrow probe run had none of to victimize;
+the discriminator being wrong is still caught, cleanly, by the counter row
+alone. This is a quieter failure signature than Task 8's probe 5 (which blew
+up the whole suite with `loop_close EBUSY`), which is exactly what ADR-0015
+predicts for this direction of the collapse -- probe 5's arm corrupts loudly
+(a live, needed handle gets orphaned from a queue the loop still owns),
+probe 6's arm corrupts quietly (a dead handle gets a redundant, technically-
+survivable close) -- and quiet corruption is precisely why it needed a
+purpose-built test rather than relying on collateral damage to catch it.
+Reverted; the suite reconfirmed 82 passes.
+
+`discard-failed-handle!`'s not-registered check (handles.sls) remains
+formally uncovered by any test that reaches it through the CORRECT
+discriminator (it guards a state the correct code makes unreachable), but
+the setup-class scenario now exercises the `discard-failed-handle!` call
+itself on the normal, undisturbed path -- so the coverage note above is
+narrowed: the ARM is covered; the impossible-state check inside it is not,
+by construction, same as before.
+
+### Post-revert gate tail (pre-commit, Task 9)
+
+```
+=== tests/test-addrinfo.sps ===       41
+=== tests/test-conditions.sps ===     94
+=== tests/test-dns.sps ===           121
+=== tests/test-echo.sps ===           32
+=== tests/test-facade.sps ===         49
+=== tests/test-lifecycle.sps ===      64
+=== tests/test-loop.sps ===          138
+=== tests/test-native.sps ===        243
+=== tests/test-pipe.sps ===           13
+=== tests/test-process.sps ===        82
+=== tests/test-shim-loading.sps ===   24
+=== tests/test-stream.sps ===         10
+=== tests/test-tcp.sps ===           168
+=== tests/test-timer.sps ===         128
+ALL SUITES PASSED
+```
+
+`make test-memory`: exit 0, no `AddressSanitizer` report, every suite at its
+plain-`make test` total (macOS/arm64 ASan-only leg, ADR-0003 -- the Linux
+valgrind leg is the leak authority). `git status` after the last revert
+listed only `src/libuv/process.sls` and `tests/test-process.sps`, matching
+this task's two intended files; `git diff` reported both mutation-touched
+regions (the `to-child`/`from-child` case arms, the `inherit-fd` data write,
+and the `(if ...)` discriminator) byte-identical to pre-probe.
+
+### Task 9 coverage notes
+
+- **`'pipe-already-used` and `'pipe-wrong-loop`, deferred by Task 8, are now
+  driven** -- the former by the echo scenario's second-spawn reuse attempt,
+  the latter by its own dedicated scenario.
+- **The setup-class arm (`discard-failed-handle!`) is no longer an
+  uncovered forward obligation.** Probe 6 above is its discharge.
+- **`inherit-stream`'s pipe-vs-tcp guard (`uv-pipe-record?` in the widened
+  `mark-consumed-pipes!`) is exercised by both branches**: the setup-class
+  scenario (pipe target, marked connected) and the inherit-stream scenario
+  (tcp target `accepted`, which has no `connected?` field and is correctly
+  left untouched -- `test-tcp.sps`/`test-facade.sps` totals are unchanged,
+  which is the negative evidence that the guard did not misfire on a tcp
+  handle).
+- **`duplex`'s OR'd `UV_READABLE_PIPE|UV_WRITABLE_PIPE` bits are exercised
+  for the first time** (Task 8's suite never used `'duplex`); the
+  direction-bit-swap probe above is this row's mutation coverage.
+- **The container fd-width declaration (V2) remains formally unfalsifiable
+  by a small-fd probe on this LP64 platform**, same shape as Task 8's probe
+  1a for `exit-callable`. Recorded rather than hidden; Linux CI's valgrind
+  leg does not change this (a wrong-width read that happens to recover the
+  right bytes is not a memory error).

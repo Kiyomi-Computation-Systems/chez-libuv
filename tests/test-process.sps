@@ -2,9 +2,9 @@
 ;;; SRFI-64 suite for (libuv process) -- uv-spawn!'s core: exit-code
 ;;; delivery, the argv/env/cwd block layout, env inheritance, the two
 ;;; spawn-failure classes, on-exit = #f, and the full validation walk
-;;; (design spec v0.3 §9.2). The stdio vocabulary's remaining scenarios
-;;; (echo, duplex, extra fd, inherit-fd, inherit-stream, pipe reuse) and
-;;; the kill/pid/detached rows land in Tasks 9-10.
+;;; (design spec v0.3 §9.2), PLUS (Task 9) the full stdio vocabulary: echo,
+;;; duplex, extra fd, inherit-fd, inherit-stream, and pipe reuse/wrong-loop.
+;;; The kill/pid/detached rows land in Task 10.
 ;;;
 ;;; HARNESS RULES (design spec v0.3 §9.1): every wait whose predicate
 ;;; depends on a callback is run-until/ticking with an iteration cap;
@@ -21,11 +21,13 @@
         (libuv pipe)
         (libuv process)
         (libuv stream)
+        (libuv tcp)
         (libuv private handles)
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
-        (only (chezscheme) collect putenv))
+        (only (chezscheme) collect putenv
+              get-string-all open-file-output-port port-file-descriptor))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -305,6 +307,247 @@
      0 (live-count 'spawn-options))
    (test-equal "validation created no process handle"
      0 (live-count 'process))))
+
+;; --- full echo loop (§9.2; SQ3's production twin) ------------------------
+(with-loop
+ (lambda (loop)
+   (define stdin-pipe  (make-uv-pipe loop))
+   (define stdout-pipe (make-uv-pipe loop))
+   (define out (make-byte-collector))
+   (define exit-result 'not-yet)
+   (define eof 'not-yet)
+   (define payload (seeded-bytes 4096 42))
+   (define proc
+     (uv-spawn! loop "/bin/cat" '("cat")
+                (list (cons 'stdio (list (list 'pipe stdin-pipe 'to-child)
+                                         (list 'pipe stdout-pipe 'from-child))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (test-assert "both pipes are connected after the spawn"
+     (and (pipe-connected? stdin-pipe) (pipe-connected? stdout-pipe)))
+   (uv-read-start! stdout-pipe
+                   (lambda (bv s e) (collect) (collect-span! out bv s e))
+                   (lambda () (set! eof 'eof))
+                   (lambda (err) (set! eof (list 'error err))))
+   (uv-write! stdin-pipe payload
+              (lambda (err) (collect)
+                (when (not err)
+                  (uv-shutdown! stdin-pipe (lambda (err2) #f)))))
+   ;; EOF and exit are waited for INDEPENDENTLY -- both orders are legal
+   ;; (V5, SQ3's measured evidence). Neither wait implies the other.
+   (test-equal "all bytes echo back and EOF arrives"
+     'satisfied (run-until/ticking
+                 loop (lambda () (and (= 4096 (collector-count out))
+                                      (eq? eof 'eof))) 8192))
+   (test-equal "the child exits (0 #f) after its stdin closed"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 8192))
+   (test-equal "clean exit" '(0 #f) exit-result)
+   (test-assert "payload survived byte-for-byte"
+     (bytevector=? payload (collector-bytes out)))
+   ;; pipe-already-used: a consumed pipe refuses a second spawn (§4.3).
+   ;; Sentinel + test-equal, not test-assert over a guard defaulting to #f
+   ;; (AGENTS.md's named #f trap; Task 8's review caught the same shape in
+   ;; the 'ENOENT/'EPERM rows and this suite has followed the fix since).
+   (test-equal "a connected pipe refuses reuse" 'pipe-already-used
+     (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
+       (uv-spawn! loop "/bin/cat" '("cat")
+                  (list (cons 'stdio (list (list 'pipe stdin-pipe 'to-child))))
+                  #f)
+       'no-raise))
+   (uv-close! proc)
+   (uv-close! stdin-pipe)
+   (uv-close! stdout-pipe)
+   (test-equal "the process and both pipes finish closing"
+     'satisfied (run-until loop
+                           (lambda () (and (eq? 'closed (uv-handle-state proc))
+                                           (eq? 'closed (uv-handle-state stdin-pipe))
+                                           (eq? 'closed (uv-handle-state stdout-pipe))))
+                           128))))
+;; the suite-end counter rows discharge Task 5's forward obligation: the
+;; pipes' read buffer freed via the STREAM arm of the close dispatcher.
+
+;; --- stdio-class spawn failure: the setup-class production twin ----------
+;; (ADR-0015; post-spike addition) (inherit-stream <unconnected pipe>) makes
+;; uv_spawn fail in stdio SETUP (EINVAL-class, handle already unlinked) --
+;; the direct-free arm's twin, as ENOENT is the exec-class arm's. Task 8's
+;; mutation probe 6 shipped this arm UNTESTED
+;; (.plans/process-stage-5-mutation-log.md); this scenario is its forward
+;; obligation, and the probe is re-run against it (see the mutation log).
+;;
+;; The errno is asserted to the specific symbol, measured rather than
+;; assumed: vendor/libuv/src/unix/process.c:226 reads a never-opened
+;; stream's fd and fails EINVAL through the setup class's error: label.
+(with-loop
+ (lambda (loop)
+   (define unconnected (make-uv-pipe loop))
+   (define procs-before (live-count 'process))
+   (define raised
+     (guard (e ((uv-errno-error? e) (uv-errno-error-errno e)))
+       (uv-spawn! loop "/bin/cat" '("cat")
+                  (list (cons 'stdio (list (cons 'inherit-stream unconnected))))
+                  #f)
+       'no-raise))
+   (test-equal "inherit-stream of an unconnected pipe fails at spawn with 'EINVAL"
+     'EINVAL raised)
+   ;; Setup-class failures never register (ADR-0015 decision 2), so --
+   ;; unlike the 'ENOENT scenario -- no loop drain is needed before this
+   ;; reads back to baseline.
+   (test-equal "setup-class failure: no process counted (direct-free arm)"
+     procs-before (live-count 'process))
+   (test-equal "no options block leaked" 0 (live-count 'spawn-options))
+   ;; §4.3's amended consumed-pipe contract: a pipe named in ANY raising
+   ;; spawn's stdio specs is marked connected, whichever spec form named
+   ;; it -- this scenario's own RED against the pre-fix mark-consumed-
+   ;; pipes! (which matched only (pipe h dir)) is what exposed that the
+   ;; inherit-stream form had been left out; see the mutation log / task
+   ;; report for the fix. Deliberately NOT asserting a real fd here: the
+   ;; setup class closes libuv's own socketpair fds before this record
+   ;; could see one (§4.3's own caveat forbids that assertion).
+   (test-assert "the named pipe is marked connected even on the setup-class path"
+     (pipe-connected? unconnected))
+   (uv-close! unconnected)
+   (test-equal "the consumed-but-fdless pipe still closes cleanly"
+     'satisfied (run-until loop (lambda () (eq? 'closed (uv-handle-state unconnected))) 64))))
+
+;; --- pipe-wrong-loop (§4.3) ------------------------------------------------
+(with-loop
+ (lambda (loop)
+   (let* ((other (make-uv-loop))
+          (foreign-pipe (make-uv-pipe other)))
+     (test-equal "a pipe from another loop is refused by name" 'pipe-wrong-loop
+       (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
+         (uv-spawn! loop "/bin/cat" '("cat")
+                    (list (cons 'stdio (list (list 'pipe foreign-pipe 'to-child))))
+                    #f)
+         'no-raise))
+     (uv-loop-teardown! other))))
+
+;; --- duplex (§9.2: sole coverage of the OR'd direction bits) --------------
+(with-loop
+ (lambda (loop)
+   (define duplex-pipe (make-uv-pipe loop))
+   (define out (make-byte-collector))
+   (define exit-result 'not-yet)
+   (define eof 'not-yet)
+   ;; The child reads fd 0 and writes fd 0 -- a socketpair end is
+   ;; bidirectional (V3): cat's stdout is redirected back onto fd 0.
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "/bin/cat >&0")
+                (list (cons 'stdio (list (list 'pipe duplex-pipe 'duplex))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (uv-read-start! duplex-pipe
+                   (lambda (bv s e) (collect) (collect-span! out bv s e))
+                   (lambda () (set! eof 'eof))
+                   (lambda (err) (set! eof (list 'error err))))
+   (uv-write! duplex-pipe (string->utf8 "ping-pong")
+              (lambda (err) (when (not err)
+                              (uv-shutdown! duplex-pipe (lambda (e2) #f)))))
+   (test-equal "duplex round-trip delivers"
+     'satisfied (run-until/ticking
+                 loop (lambda () (= 9 (collector-count out))) 8192))
+   (test-equal "duplex payload intact" "ping-pong"
+     (utf8->string (collector-bytes out)))
+   (test-equal "the child exits after its duplex end closed"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 8192))
+   (uv-close! proc) (uv-close! duplex-pipe)
+   (test-equal "process and duplex pipe finish closing"
+     'satisfied (run-until loop
+                           (lambda () (and (eq? 'closed (uv-handle-state proc))
+                                           (eq? 'closed (uv-handle-state duplex-pipe))))
+                           128))))
+
+;; --- extra fd, slot 3 (§9.2: >3-slot stdio + libuv's own 0-2 padding) ----
+(with-loop
+ (lambda (loop)
+   (define fd3-pipe (make-uv-pipe loop))
+   (define out (make-byte-collector))
+   (define eof 'not-yet)
+   (define exit-result 'not-yet)
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf x >&3")
+                (list (cons 'stdio (list 'ignore 'ignore 'ignore
+                                         (list 'pipe fd3-pipe 'from-child))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (uv-read-start! fd3-pipe
+                   (lambda (bv s e) (collect) (collect-span! out bv s e))
+                   (lambda () (set! eof 'eof))
+                   (lambda (err) (set! eof (list 'error err))))
+   (test-equal "the byte crosses fd 3"
+     'satisfied (run-until/ticking
+                 loop (lambda () (= 1 (collector-count out))) 4096))
+   (test-equal "x" (utf8->string (collector-bytes out)))
+   (test-equal "the child exits"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   (uv-close! proc) (uv-close! fd3-pipe)
+   (test-equal "process and fd-3 pipe finish closing"
+     'satisfied (run-until loop
+                           (lambda () (and (eq? 'closed (uv-handle-state proc))
+                                           (eq? 'closed (uv-handle-state fd3-pipe))))
+                           128))))
+
+;; --- inherit-fd (§9.2: child writes an inherited temp-file fd) -----------
+(with-loop
+ (lambda (loop)
+   (define path (let ((p "tests/tmp/inherit-fd-probe.txt"))
+                  (when (file-exists? p) (delete-file p))
+                  p))
+   (define port (open-file-output-port path))
+   (define fd (port-file-descriptor port))
+   (define exit-result 'not-yet)
+   (define proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf inherited >&1")
+                (list (cons 'stdio (list 'ignore (cons 'inherit-fd fd))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (test-equal "child exits"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   (close-port port)
+   (test-equal "the inherited fd carried the bytes into the file"
+     "inherited"
+     (call-with-port (open-input-file path) get-string-all))
+   (delete-file path)
+   (uv-close! proc)
+   (test-equal "the process handle finishes closing"
+     'satisfied (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 64))))
+
+;; --- inherit-stream (§9.2: sole coverage; loopback TCP, ADR-0010) --------
+(with-loop
+ (lambda (loop)
+   ;; Every DEFINE up front (R6RS body order): accepted/connected/proc start
+   ;; as sentinels and are set! once the value they need exists, the same
+   ;; sentinel-then-set! shape every other scenario in this suite uses for
+   ;; a callback-delivered value.
+   (define server (make-uv-tcp loop))
+   (define port-num (bind-loopback! server))
+   (define client (make-uv-tcp loop))
+   (define accepted 'not-yet)
+   (define connected 'not-yet)
+   ;; Child stdout dups onto the ACCEPTED socket; parent reads the CLIENT.
+   (define out (make-byte-collector))
+   (define eof 'not-yet)
+   (define exit-result 'not-yet)
+   (define proc 'not-yet)
+   (uv-listen! server 8 (lambda (err)
+                          (when (not err)
+                            (set! accepted (uv-accept! server)))))
+   (connect-loopback! client port-num (lambda (err) (set! connected (or err 'ok))))
+   (run-until/ticking loop (lambda () (and (uv-tcp? accepted)
+                                           (eq? 'ok connected))) 2048)
+   (set! proc
+     (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf over-the-socket")
+                (list (cons 'stdio (list 'ignore (cons 'inherit-stream accepted))))
+                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (uv-read-start! client
+                   (lambda (bv s e) (collect) (collect-span! out bv s e))
+                   (lambda () (set! eof 'eof))
+                   (lambda (err) (set! eof (list 'error err))))
+   (test-equal "the bytes crossed the inherited socket"
+     'satisfied (run-until/ticking
+                 loop (lambda () (= 15 (collector-count out))) 4096))
+   (test-equal "over-the-socket" (utf8->string (collector-bytes out)))
+   (test-equal "the child exits"
+     'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
+   (uv-close! proc)))
+   ;; server/client/accepted swept by with-loop's teardown -- also an
+   ;; assertion (the suite-end counter/registry rows are what confirm it).
 
 (collect)
 (test-assert "counters all zero at suite end"

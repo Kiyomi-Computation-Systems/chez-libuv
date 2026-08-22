@@ -23,12 +23,17 @@
 ;;; libuv creates the socketpairs before it forks, so on the exec-failure
 ;;; class the parent ends are genuinely open by the time uv_spawn returns
 ;;; (spike FINDINGS SQ1 Observation 3); the binding marks every pipe named in
-;;; a (pipe ...) spec connected on BOTH paths, uniformly, because
-;;; under-reporting connectedness is what would let a later spawn hand libuv
-;;; an already-opened stream. So the recovery pattern after a raising
-;;; uv-spawn! is close-and-remake, never retry-with-the-same-pipes, and the
-;;; caller still closes those pipes -- not doing so leaks one fd per slot per
-;;; attempt, with no EMFILE to announce it.
+;;; ANY stdio spec -- (pipe h dir) OR (inherit-stream . h) -- connected on
+;;; BOTH paths, uniformly (Task 9 widened this from (pipe ...)-only once the
+;;; setup-class scenario's own record-level assertion showed the two forms
+;;; had drifted), because under-reporting connectedness is what would let a
+;;; later spawn hand libuv an already-opened stream. So the recovery pattern
+;;; after a raising uv-spawn! is close-and-remake, never retry-with-the-same-
+;;; pipes, and the caller still closes those pipes -- not doing so leaks one
+;;; fd per slot per attempt, with no EMFILE to announce it. On the SETUP
+;;; class the fd behind the mark is not necessarily real (S4.3's own
+;;; caveat) -- the mark is a conservative reuse-refusal, not a claim about
+;;; what libuv actually opened.
 ;;;
 ;;; THE TWO RULES OF EVERY START CALL (tcp.sls's, verbatim): every argument
 ;;; is validated before the first allocation, and a failed native call
@@ -204,12 +209,21 @@
      specs))
 
   ;; ADR-0015 decision 6: consumed on BOTH paths, so this runs once,
-  ;; unconditionally, rather than twice with the same body.
+  ;; unconditionally, rather than twice with the same body. Uses
+  ;; stdio-spec-handle (Task 9 fix; see below) rather than its own narrower
+  ;; (pipe h dir)-only match: a pipe named through (inherit-stream . h) is
+  ;; every bit as much "named in a raising spawn's stdio specs" as one named
+  ;; through (pipe h dir) (S4.3's amended wording), and stdio-spec-handle's
+  ;; own header comment already claimed this walk as its second caller
+  ;; before the code agreed. inherit-stream also accepts tcp handles, which
+  ;; have no connected? field, so the guard is uv-pipe-record? rather than
+  ;; "has a handle at all".
   (define (mark-consumed-pipes! specs)
     (for-each
      (lambda (spec)
-       (when (and (list? spec) (pair? spec) (eq? 'pipe (car spec)))
-         (set-pipe-connected! (cadr spec) #t)))
+       (let ((h (stdio-spec-handle spec)))
+         (when (and h (uv-pipe-record? h))
+           (set-pipe-connected! h #t))))
      specs))
 
   ;; Every bit comes from the shim's table (ADR-0005), never a transcribed
