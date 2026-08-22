@@ -359,7 +359,7 @@ the design spec (§4–§6):
   caller's attention.* libuv's spawn-failure path has two different
   correct cleanups depending on how far the child got before failing
   (ADR-0015); the binding picks the right one at runtime, and the caller
-  only ever sees the raise. Any pipe named in a ~(pipe …)~ stdio spec is
+  only ever sees the raise. Any pipe named in any of the spawn's stdio specs is
   marked *connected* by the binding even when the spawn raised — libuv
   opens the parent end before it can know whether the exec will succeed
   — so a raising ~uv-spawn!~ still leaves its pipes needing an explicit

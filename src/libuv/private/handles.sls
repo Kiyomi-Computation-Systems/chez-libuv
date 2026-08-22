@@ -485,7 +485,7 @@
   ;; the close sweep automatically.
   (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
-  ;; kind:   'loop | 'timer | 'tcp | 'write-req | 'connect-req | 'shutdown-req
+  ;; kind:   'loop | 'timer | 'tcp | 'pipe | 'process | 'write-req | 'connect-req | 'shutdown-req
   ;;         | 'getaddrinfo-req | 'getnameinfo-req
   ;; loop:   the owning loop record (a loop owns itself). A handle-owned
   ;;         request registers its HANDLE's loop; a handle-less DNS request
@@ -1141,12 +1141,12 @@
     (set! close-handle-proc proc)
     (set! close-handle-installed #t))
 
-  ;; --- filling the ten dispatcher slots (ADR-0008) -----------------------
+  ;; --- filling the twelve dispatcher slots (ADR-0008) -----------------------
   ;; The slots in (libuv private native) take one procedure each, exactly
   ;; once, for the life of the process. v0.1's Stage 3 could only implement
   ;; two of its eight, and a second install-callback-dispatchers! call is
   ;; (rightly) refused -- so the procedures installed below (one per name
-  ;; in dispatcher-names, ten as of v0.2) are thin closures that look their
+  ;; in dispatcher-names, twelve as of v0.3) are thin closures that look their
   ;; real implementation up in this table AT FIRE TIME.
   ;;
   ;; THE SEAM FOR STAGES 4 AND 5: a later stage calls
@@ -1236,7 +1236,7 @@
   ;;     dispatcher that raised on a known-bad one. It is a bug reporter of
   ;;     last resort; both readings are bugs, and neither is recoverable.
   ;;
-  ;; The first argument of all ten callback signatures is the handle or
+  ;; The first argument of all twelve callback signatures is the handle or
   ;; request pointer, which is why `(car args)` is the key to look up.
   (define (contain-dispatcher-raise! name ptr obj)
     (let ((loop (registry-loop-of ptr)))

@@ -70,8 +70,7 @@ spike under `spike/process/`), and the full design is
   the loop's handle queue and needs `uv-close!`-through-protocol; a
   stdio-setup failure has already been unlinked by libuv and needs a
   direct free. Getting the wrong arm either corrupts the loop's handle
-  queue or leaves it permanently `EBUSY`. A pipe named in a `(pipe …)`
-  stdio spec is marked *connected* by a failed spawn too — libuv opens
+  queue or leaves it permanently `EBUSY`. A pipe named in any of the spawn's stdio specs is marked *connected* by a failed spawn too — libuv opens
   the parent end before it can know whether the exec will succeed — so
   the caller must still close it; naming it again raises
   `'pipe-already-used`. **Version-dependent finding, not a binding bug:**
@@ -94,10 +93,11 @@ spike under `spike/process/`), and the full design is
 - No `uv_signal_t`: v0.3 binds only the signal-*sending* side
   (`uv-process-kill!`/`uv-kill!`). Handling signals in the loop is a
   recorded future-milestone candidate.
-- The root lane, run 32544754290, is also the first Linux CI verdict
-  under valgrind over the whole process surface: zero errors, zero
-  definitely/indirectly lost bytes across all sixteen valgrinded
-  processes.
+- Run 32544754290, which executed the root lane as root on both
+  platforms, also delivered the first Linux valgrind verdict over the
+  process surface (the root suite itself is excluded from the memory
+  gate): zero errors, zero definitely/indirectly lost bytes across all
+  sixteen valgrinded processes.
 - The libuv version floor is unchanged: 1.44.0 or later in the 1.x
   series.
 
