@@ -61,7 +61,7 @@ story, release builds included.
 ** Using Akku
 
 Akku manages this project's Scheme-level dependency (~chez-srfi~, used by
-the test suites only — ~(libuv)~ itself imports nothing beyond ~(rnrs)~).
+the test suites only — ~(libuv)~ itself depends on nothing beyond ~(rnrs)~).
 The package is not yet on the Akku index; until it is, consume it as a git
 checkout exactly as above. A source-only install cannot work anywhere:
 the native shim and the generated ~config.sls~ are per-machine build

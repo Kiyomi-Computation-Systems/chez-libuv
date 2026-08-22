@@ -196,6 +196,9 @@ dispatch.
 
 ## DNS — `(libuv dns)`
 
+The scope is deliberate: whatever the host's resolver does, asynchronously —
+no c-ares, no record types, no caching.
+
 | Export | |
 |---|---|
 | `uv-getaddrinfo!` | Resolve: `(loop node service [hints] on-complete)`; `on-complete` gets `(err results)`, `results` a fresh list of `uv-addrinfo` records in resolver order |
@@ -288,4 +291,5 @@ raises one of the three above (`&uv-errno-error`, `&uv-handle-closed`,
 `&uv-invalid-argument`); the closed set of `&uv-invalid-argument` reason
 symbols (`'stdio-spec-unknown`, `'pipe-already-used`, `'signal-unknown`,
 `'signal-unwatchable`, `'signal-mode-fixed`, and the rest of the validation
-walk) is in the design specs' §4.7, not repeated here.
+walk) is in the per-milestone design specs (v0.3 §4.7; v0.4 §4.2/§4.6),
+not repeated here.
