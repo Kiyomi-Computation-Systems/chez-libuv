@@ -388,7 +388,9 @@ uv-handle-record                      (ptr, kind, loop, state, on-close)
   nothing to clobber on a fresh record; the uv-listen! store-before
   precedent).
 - `uv-pipe-record.connected?` starts `#f`, flips when a spawn consumes
-  the pipe in a `(pipe …)` spec. It exists solely to make
+  the pipe in a `(pipe …)` or `(inherit-stream . h)` spec (the latter a
+  no-op on success, live only on the setup-class failure path — §4.3's
+  uniform consumption contract). It exists solely to make
   `'pipe-already-used` raisable before allocation.
 - `uv-process-record.exited?` starts `#f`, set by the exit dispatcher
   (§5.4 step 4) — the observable behind §9.2's lifecycle scenarios

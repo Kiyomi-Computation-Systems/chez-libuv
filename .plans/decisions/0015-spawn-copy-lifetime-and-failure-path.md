@@ -235,6 +235,13 @@ Design spec §4.3 and §5.6 are amended to say this; the sentence asserting
 that "our pipe records remain consistently unconnected and closeable" is
 deleted as refuted.
 
+**Amendment (2026-08-21, Stage 5):** implementation widened the marking to
+pipes named via `(inherit-stream . h)` specs as well — provably a no-op on
+every success path (inherit-stream only succeeds against an already-connected
+pipe), live only on the setup-class failure path, where the conservative
+direction matches this decision's own over-report policy. Spec §4.3/§5.1
+carry the reconciled wording.
+
 ## Consequences
 
 - **A failed spawn is not a no-op on its arguments.** `'pipe-already-used`

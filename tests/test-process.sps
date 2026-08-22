@@ -439,8 +439,9 @@
                    (lambda () (set! eof 'eof))
                    (lambda (err) (set! eof (list 'error err))))
    (uv-write! duplex-pipe (string->utf8 "ping-pong")
-              (lambda (err) (when (not err)
-                              (uv-shutdown! duplex-pipe (lambda (e2) #f)))))
+              (lambda (err) (collect)
+                (when (not err)
+                  (uv-shutdown! duplex-pipe (lambda (e2) (collect))))))
    (test-equal "duplex round-trip delivers"
      'satisfied (run-until/ticking
                  loop (lambda () (= 9 (collector-count out))) 8192))
