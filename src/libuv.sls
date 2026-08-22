@@ -28,7 +28,7 @@
           ;; (libuv handle) explains the split; the third state is read with
           ;; uv-handle-state. uv-pipe? and uv-process? live in (libuv handle)
           ;; beside uv-tcp?.
-          uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process?
+          uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop uv-close!
 
@@ -77,6 +77,16 @@
           ;; uv-close! (ADR-0007). Killed-by-signal arrives as (0 'sig...).
           uv-spawn! uv-process-kill! uv-kill! uv-process-pid uv-os-getpid
 
+          ;; --- Signal, from (libuv signal) ---
+          ;; The receiving half of the process module's kill pair
+          ;; (ADR-0017). Mode fixed per handle ('signal-mode-fixed);
+          ;; watchable set = the nine minus sigkill/sigstop
+          ;; ('signal-unwatchable); DELIVERY != CLOSE. Watching sigint
+          ;; takes SIGINT from the Chez runtime and stop leaves SIG_DFL --
+          ;; the README carries the measured caveat.
+          make-uv-signal
+          uv-signal-start! uv-signal-start-oneshot! uv-signal-stop!
+
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to
           ;; ("re-exports + uv-version(-compatible?)"). The packed integer
@@ -123,6 +133,7 @@
           (libuv stream)
           (libuv pipe)
           (libuv process)
+          (libuv signal)
           (libuv dns)
           (libuv private conditions)
           ;; uv-version is renamed on the way in purely to resolve a name

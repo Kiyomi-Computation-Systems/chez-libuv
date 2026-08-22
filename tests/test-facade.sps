@@ -639,6 +639,29 @@
       'positive
       'wrong))
 
+;; v0.4 signal block (design spec §4.6): one exercised row per export.
+(define sig-loop (make-uv-loop))
+(define sig-h (make-uv-signal sig-loop))
+
+(test-assert "make-uv-signal and uv-signal? cross the facade"
+  (uv-signal? sig-h))
+
+(test-equal "uv-signal-start-oneshot! crosses the facade and validates"
+  'signal-unwatchable
+  (guard (e (#t (uv-invalid-argument-reason e)))
+    (uv-signal-start-oneshot! sig-h 'sigkill (lambda (s) s))
+    'no-raise))
+
+(test-equal "uv-signal-start! crosses the facade and validates"
+  'signal-unknown
+  (guard (e (#t (uv-invalid-argument-reason e)))
+    (uv-signal-start! sig-h 'sigfoo (lambda (s) s))
+    'no-raise))
+
+(uv-signal-stop! sig-h)   ; rc 0 on a never-started watcher (EV-2)
+(uv-close! sig-h)
+(uv-loop-teardown! sig-loop)
+
 ;; Smoke test: spawn sh -c 'exit 5' through facade names only, assert exit (5 #f)
 (define pl (make-uv-loop))
 (define p-exit 'never-exited)
