@@ -532,17 +532,18 @@ measurements and the ADR-ready SQ-S1 caveat text.
   v0.2 lesson); EV-6 (two watchers, one signum); EV-10 (kill-then-close-
   before-run: implicit stop + deferred close callback).
 
-ADRs after the spike:
+ADRs (written 2026-08-22, post-spike):
 
-- **ADR-0017: signal watching — watchable subset, mode fixed per handle,
-  symbol payload, oneshot.** Records D1-D3, D7, D9-D11, the
-  `sigchld`-stays-out rationale (V6), the refusal vocabulary
-  (`'signal-unwatchable`, `'signal-mode-fixed`, and `0`'s
-  sending-only status), and the SQ-S1 caveat verbatim. Extends ADR-0016 from
+- **[ADR-0017](decisions/0017-signal-watching-vocabulary-and-mode.md):
+  signal watching — watchable subset with its own refusal policy, mode fixed
+  per handle, symbol payload, the coexistence caveat.** Records D1-D3, D7,
+  D9-D11 with the spike measurements as evidence. Extends ADR-0016 from
   sending-vocabulary to watching-policy.
-- **ADR-0008 third amendment**: thirteen trampolines, citing the frozen-list
-  test edits as the designed friction and stating the one-per-callback-TYPE
-  rule explicitly (§5.2).
+- **[ADR-0008](decisions/0008-static-trampolines-and-handle-registry.md)
+  third amendment**: thirteen trampolines — the amendment that states the
+  one-per-callback-TYPE rule in its own terms (uv_signal_cb shares
+  connection's arity, and the original eight already contain same-arity
+  distinct-type pairs), with the frozen-list widening as designed friction.
 
 ## 11. Milestone sequence
 
@@ -552,7 +553,7 @@ ADRs after the spike:
 2. ~~Stage-0 spike (SQ-S1..S3) → `spike/signal/FINDINGS.md`.~~ Done
    2026-08-22: both platforms green, zero surprises; EV-1..10 are measured
    V-facts; §9.3's handshake amended to three acks (SQ-S2-F1).
-3. ADRs: ADR-0017 + ADR-0008 third amendment.
+3. ~~ADRs: ADR-0017 + ADR-0008 third amendment.~~ Done 2026-08-22 (§10 links).
 4. Implementation plan (writing-plans skill) → subagent-driven tasks with
    per-task reviews and mutation logs. **Each task brief carries an explicit
    "inherited obligations" section** — the v0.3 lesson: soft cross-task

@@ -72,6 +72,29 @@ process initialization, and never unlocked, for the life of the process.
 > `(handle-in-loop-queue? loop handle)`, the query helper ADR-0015's
 > discriminator calls.
 
+> **Amendment (v0.4, 2026-08-22): thirteen trampolines.**
+> The set grows twelve → thirteen: `signal`, for uv_signal_cb
+> `(uv_signal_t*, int)` (vendor/libuv/include/uv.h). Unlike the DNS and
+> exit/walk amendments, which were each argued from arity mismatch, this one
+> is the case that forces the rule to be stated in its own terms:
+> `uv_signal_cb` **shares `connection`'s arity** (`(uptr int) -> void`) and
+> still gets its own locked trampoline, because the invariant was never
+> "one trampoline per arity" — the original eight already contain same-arity
+> distinct-type pairs (`timer` and `close` are both `(uptr) -> void`). The
+> rule, stated plainly for the next amendment: **one locked trampoline per
+> callback TYPE in libuv's typology, a constant small set per process** —
+> sharing by arity would make a dispatcher's identity depend on which handle
+> kind happens to fire, which is exactly the coupling the type-keyed slots
+> exist to prevent. Both start verbs (`uv_signal_start`,
+> `uv_signal_start_oneshot`) take the same `uv_signal_cb`, so they share the
+> one `signal` trampoline — two wrappers, one entry point. The `signal` slot
+> is installed from `(libuv signal)`'s library body via
+> `install-dispatch-procedure!` — the late-install seam's third application —
+> so a process image that never imports `(libuv signal)` keeps the contained
+> raising stub. The two frozen literals (tests/test-loop.sps,
+> tests/test-native.sps) widen to the thirteen-name literal, watched to fail
+> first; the RED evidence lands in the v0.4 stage mutation log.
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never
