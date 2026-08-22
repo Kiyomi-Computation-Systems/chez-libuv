@@ -365,35 +365,100 @@
 ;; the suite-end counter rows discharge Task 5's forward obligation: the
 ;; pipes' read buffer freed via the STREAM arm of the close dispatcher.
 
-;; --- stdio-class spawn failure: the setup-class production twin ----------
+;; --- stdio-setup spawn failure: the second ADR-0015 failure trigger -------
 ;; (ADR-0015; post-spike addition) (inherit-stream <unconnected pipe>) makes
-;; uv_spawn fail in stdio SETUP (EINVAL-class, handle already unlinked) --
-;; the direct-free arm's twin, as ENOENT is the exec-class arm's. Task 8's
-;; mutation probe 6 shipped this arm UNTESTED
+;; uv_spawn fail while initialising stdio, BEFORE any fork/exec: process.c's
+;; UV_INHERIT_STREAM arm reads a never-opened stream's fd, gets -1, and
+;; returns UV_EINVAL out through uv_spawn's `error:` label. Task 8's
+;; mutation probe 6 shipped the direct-free arm UNTESTED
 ;; (.plans/process-stage-5-mutation-log.md); this scenario is its forward
 ;; obligation, and the probe is re-run against it (see the mutation log).
 ;;
-;; The errno is asserted to the specific symbol, measured rather than
-;; assumed: vendor/libuv/src/unix/process.c:226 reads a never-opened
-;; stream's fd and fails EINVAL through the setup class's error: label.
+;; WHICH CLEANUP ARM THIS TRIGGER TAKES IS A LIBUV-VERSION QUESTION, NOT A
+;; PLATFORM ONE, and this suite must not hardcode either answer:
+;;
+;;   * libuv >= 1.52.0 unlinks the handle on the way out -- upstream commit
+;;     3e9ae1bc "unix: remove handle from queue on uv_spawn() error"
+;;     (#4980, 2025-12-26) added `uv__queue_remove(&process->handle_queue)`
+;;     as the error: label's first statement. The handle is gone from
+;;     loop->handle_queue, so this binding takes the DIRECT-FREE arm and
+;;     nothing is ever counted.
+;;   * libuv < 1.52.0 has no such statement, so the handle uv__handle_init
+;;     put into loop->handle_queue at the top of uv_spawn is STILL LINKED
+;;     when EINVAL comes back. Closing through the protocol is then the
+;;     correct cleanup, so this binding takes the EXEC-CLASS arm: the handle
+;;     is registered and counted, and `process` returns to baseline only
+;;     after the loop turns (ADR-0015 decision 3 -- the free is async).
+;;     Measured, not inferred: CI's ubuntu-noble leg links apt's libuv
+;;     1.48.0 and takes this arm; its vendored leg (1.52.1) and macOS's
+;;     homebrew libuv (1.52.1) take the other.
+;;
+;; That divergence is exactly what ADR-0015 decision 2 exists to absorb --
+;; the class is decided BY ASKING THE LOOP, never by the errno and never by
+;; a version table -- so this scenario asserts the same class-INDEPENDENT
+;; observables the 'ENOENT scenario does (counters balance once the loop has
+;; turned; no registry entry survives; a handle registered after the failure
+;; is still properly linked) and records which arm ran informationally.
+;; Asserting one arm's timing would be asserting a build-time fact about the
+;; libuv underneath, which is not a property of this binding.
 (with-loop
  (lambda (loop)
    (define unconnected (make-uv-pipe loop))
    (define procs-before (live-count 'process))
+   (define registry-before (registry-count))
    (define raised
      (guard (e ((uv-errno-error? e) (uv-errno-error-errno e)))
        (uv-spawn! loop "/bin/cat" '("cat")
                   (list (cons 'stdio (list (cons 'inherit-stream unconnected))))
                   #f)
        'no-raise))
+   (define procs-at-raise (live-count 'process))
    (test-equal "inherit-stream of an unconnected pipe fails at spawn with 'EINVAL"
      'EINVAL raised)
-   ;; Setup-class failures never register (ADR-0015 decision 2), so --
-   ;; unlike the 'ENOENT scenario -- no loop drain is needed before this
-   ;; reads back to baseline.
-   (test-equal "setup-class failure: no process counted (direct-free arm)"
-     procs-before (live-count 'process))
    (test-equal "no options block leaked" 0 (live-count 'spawn-options))
+   (test-assert "the failure took exactly one of ADR-0015's two arms"
+     (or (= procs-at-raise procs-before)
+         (= procs-at-raise (+ procs-before 1))))
+   (test-assert "[informational] stdio-setup failure class recorded"
+     (begin (display "  [informational] stdio-setup (EINVAL) cleanup arm: ")
+            (display (if (= procs-at-raise procs-before)
+                         'setup-class-direct-free
+                         'exec-class-close-through-protocol))
+            (newline)
+            #t))
+   ;; ADR-0015's second observable, and THE row that kills an arm-collapse
+   ;; mutant on either libuv: the wrong cleanup splices a LATER-registered
+   ;; LIVE handle out of loop->handle_queue (spike SQ1 Observation 2,
+   ;; "late handle survived #f"). uv_walk -- through the `walk` dispatcher
+   ;; (libuv process) installs -- is the measured instrument.
+   ;;
+   ;; ORDER IS LOAD-BEARING, and getting it wrong is how this row silently
+   ;; stops testing anything: the damage is done by the FAILED handle's
+   ;; close callback (uv__finish_close unlinking a second time through a
+   ;; node that still points at its old neighbours), so `late` must be in
+   ;; the queue BEFORE the loop turns. A handle created after the drain
+   ;; cannot witness a splice that already happened -- verified: with
+   ;; clean-up-failed-spawn! mutated to take the close-through-protocol arm
+   ;; unconditionally, the drain-then-create order passes and this order
+   ;; fails.
+   (let ((late (make-uv-pipe loop)))
+     (test-assert "a handle registered before the failure is cleaned up is in the queue"
+       (handle-in-loop-queue? loop late))
+     (test-equal "the failed spawn's handle is gone once the loop has turned"
+       'satisfied (run-until loop
+                             (lambda () (= procs-before (live-count 'process)))
+                             64))
+     (test-assert "and that live handle SURVIVED the cleanup, still in the queue"
+       (handle-in-loop-queue? loop late))
+     (uv-close! late)
+     (test-equal "the late handle closes normally"
+       'satisfied (run-until loop
+                             (lambda () (eq? 'closed (uv-handle-state late)))
+                             64))
+     (test-assert "and is out of the queue once closed"
+       (not (handle-in-loop-queue? loop late))))
+   (test-equal "no registry entry leaked on the failure path"
+     registry-before (registry-count))
    ;; §4.3's amended consumed-pipe contract: a pipe named in ANY raising
    ;; spawn's stdio specs is marked connected, whichever spec form named
    ;; it -- this scenario's own RED against the pre-fix mark-consumed-
@@ -402,7 +467,7 @@
    ;; report for the fix. Deliberately NOT asserting a real fd here: the
    ;; setup class closes libuv's own socketpair fds before this record
    ;; could see one (§4.3's own caveat forbids that assertion).
-   (test-assert "the named pipe is marked connected even on the setup-class path"
+   (test-assert "the named pipe is marked connected even on the failure path"
      (pipe-connected? unconnected))
    (uv-close! unconnected)
    (test-equal "the consumed-but-fdless pipe still closes cleanly"
