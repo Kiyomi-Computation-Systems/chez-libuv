@@ -12,7 +12,7 @@
 
 Every task's requirements implicitly include all of these.
 
-- **Repo:** `/Users/yuzu/github/chez-libuv`, branch `docs/public-release-prep` (exists). Conventional Commits with trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+- **Repo:** the `chez-libuv` repository root, branch `docs/public-release-prep` (exists). Conventional Commits with trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 - **`make test` before every commit** (it runs build + deps + check-pins + all suites; expect final line `ALL SUITES PASSED`). After any Makefile edit, also `make check-help` (expect exit 0, no output).
 - **`README.org` must contain the exact string `libuv 1.44.0`** — `check-pins` greps for it (Makefile:221). Never paraphrase that floor.
 - **README.org ≤ ~130 lines** (spec acceptance #2).

@@ -215,7 +215,7 @@ Reverted, `diff` against pristine empty, rerun: `# of expected passes 89`, `EXIT
 ```
 $ diff conditions.sls.pristine src/libuv/private/conditions.sls  # scratch vs its own pristine backup
 IDENTICAL (no output)
-$ diff conditions.sls.pristine /Users/yuzu/github/chez-libuv/src/libuv/private/conditions.sls  # pristine vs the real repo file
+$ diff conditions.sls.pristine src/libuv/private/conditions.sls  # pristine vs the real repo file
 IDENTICAL (no output)
 $ CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs chez --program tests/test-conditions.sps
 %%%% Starting test conditions
