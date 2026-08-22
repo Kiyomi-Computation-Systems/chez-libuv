@@ -28,6 +28,8 @@
         (libuv handle)
         (libuv timer)
         (libuv tcp)
+        (libuv signal)
+        (libuv process)
         (libuv private handles)
         (libuv private conditions)
         (only (libuv private native) live-counts)
@@ -527,6 +529,46 @@
 
 (test-equal "100 connect/accept/collect/close iterations leave the registry at its baseline"
   registry-count-at-start (registry-count))
+
+;; --- v0.4 signal rows (design spec §9.3; ADR-0007) ----------------------
+(define sig-base (live-count 'signal))
+
+;; Row: ordinary close balances.
+(let ((l (make-uv-loop)))
+  (let ((s (make-uv-signal l)))
+    (test-equal "signal counter counts a construction" (+ sig-base 1) (live-count 'signal))
+    (uv-close! s)
+    (run-until l (lambda () (eq? (uv-handle-state s) 'closed)) 64))
+  (uv-loop-teardown! l))
+(test-equal "signal counter balanced after an ordinary close" sig-base (live-count 'signal))
+
+;; Row: a raising callback still balances (the guard invariant, ADR-0008).
+(let ((l (make-uv-loop)))
+  (let ((s (make-uv-signal l)))
+    (uv-signal-start! s 'sigusr1 (lambda (x) (collect) (raise 'lifecycle-boom)))
+    (uv-kill! (uv-os-getpid) 'sigusr1)
+    (guard (e (#t 'reraised))
+      (let drain ((i 0)) (when (< i 256) (uv-run l 'once) (drain (+ i 1))))))
+  (uv-loop-teardown! l))
+(test-equal "signal counter balanced after a raising callback" sig-base (live-count 'signal))
+
+;; Row: 100 make/arm/fire/close iterations with a full collection each.
+(let ((l (make-uv-loop)))
+  (let loop ((i 0))
+    (when (< i 100)
+      (let ((fired 0))
+        (let ((s (make-uv-signal l)))
+          (uv-signal-start! s 'sigusr1
+                            (lambda (x) (set! fired (+ fired 1)) (collect)))
+          (uv-kill! (uv-os-getpid) 'sigusr1)
+          (run-until/ticking l (lambda () (positive? fired)) 512)
+          (uv-close! s)
+          (run-until l (lambda () (eq? (uv-handle-state s) 'closed)) 64)
+          (collect)))
+      (loop (+ i 1))))
+  (uv-loop-teardown! l))
+(test-equal "signal counter balanced after 100 arm/fire/close iterations"
+  sig-base (live-count 'signal))
 
 (collect)
 

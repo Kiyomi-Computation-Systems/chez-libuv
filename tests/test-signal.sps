@@ -200,5 +200,128 @@
 (test-equal "signal counter balanced after the verb sections"
   signal-base (live-count 'signal))
 
+;; ========================================================================
+;; The measured-behavior sections (spike/signal/FINDINGS.md; every EV cited
+;; was measured on both platforms -- a red row here indicts the binding).
+;; ========================================================================
+(define l3 (make-uv-loop))
+(define g3-fired 0)   ; the section guard: continuous on sigusr1, armed throughout
+(define g3 (make-uv-signal l3))
+(uv-signal-start! g3 'sigusr1 (lambda (s) (set! g3-fired (+ g3-fired 1)) (collect)))
+
+(define (send-usr1-and-wait-guard!)
+  (let ((before g3-fired))
+    (uv-kill! (uv-os-getpid) 'sigusr1)
+    (run-until/ticking l3 (lambda () (> g3-fired before)) 512)))
+
+;; --- oneshot: exactly once, rearm-outside works (EV-2, spike leg1) ------
+(define once-fired 0)
+(define once (make-uv-signal l3))
+(uv-signal-start-oneshot! once 'sigusr1
+                          (lambda (s) (set! once-fired (+ once-fired 1)) (collect)))
+(test-equal "oneshot fires on the first delivery" 'satisfied (send-usr1-and-wait-guard!))
+(test-equal "…exactly once" 1 once-fired)
+(test-equal "a second send reaches only the guard" 'satisfied (send-usr1-and-wait-guard!))
+(test-equal "the oneshot stayed disarmed (auto-disarm)" 1 once-fired)
+(uv-signal-stop! once)   ; rc 0 on an auto-disarmed watcher (EV-2)
+(uv-signal-start-oneshot! once 'sigusr1
+                          (lambda (s) (set! once-fired (+ once-fired 1)) (collect)))
+(test-equal "rearm from OUTSIDE the callback delivers again"
+  'satisfied (send-usr1-and-wait-guard!))
+(test-equal "…and again exactly once" 2 once-fired)
+
+;; --- EV-9: an in-callback rearm is silently undone ----------------------
+(define incb-fired 0)
+(define incb (make-uv-signal l3))
+(define (incb-cb s)
+  (set! incb-fired (+ incb-fired 1))
+  ;; The rearm attempt the vendor auto-stop undoes after this returns.
+  (uv-signal-start-oneshot! incb 'sigusr1 incb-cb)
+  (collect))
+(uv-signal-start-oneshot! incb 'sigusr1 incb-cb)
+(test-equal "in-callback-rearm oneshot fires" 'satisfied (send-usr1-and-wait-guard!))
+(test-equal "the in-callback rearm did NOT take effect (EV-9): second send silent"
+  'satisfied (send-usr1-and-wait-guard!))
+(test-equal "…count still 1" 1 incb-fired)
+
+;; --- EV-1a: continuous rearm across a signum change ---------------------
+(define sw-fired-1 0)
+(define sw-fired-2 0)
+(define sw (make-uv-signal l3))
+(uv-signal-start! sw 'sigusr1 (lambda (s) (set! sw-fired-1 (+ sw-fired-1 1)) (collect)))
+(test-equal "armed on the old signum" 'satisfied (send-usr1-and-wait-guard!))
+(test-equal "…delivered" 1 sw-fired-1)
+;; Switch signum while armed -- and arm a sigusr2 guard FIRST (§9.2).
+(define g3b-fired 0)
+(define g3b (make-uv-signal l3))
+(uv-signal-start! g3b 'sigusr2 (lambda (s) (set! g3b-fired (+ g3b-fired 1)) (collect)))
+(uv-signal-start! sw 'sigusr2 (lambda (s) (set! sw-fired-2 (+ sw-fired-2 1)) (collect)))
+(test-equal "after the switch, the old signum reaches only its guard"
+  'satisfied (send-usr1-and-wait-guard!))
+(test-equal "…switched watcher silent on old signum" 1 sw-fired-1)
+(uv-kill! (uv-os-getpid) 'sigusr2)
+(test-equal "…and fires on the new signum (EV-1a)"
+  'satisfied (run-until/ticking l3 (lambda () (positive? sw-fired-2)) 512))
+
+;; --- EV-1b: same-signum restart swaps the callback, keeps pending -------
+;; ITS OWN DRAIN, apart from the stop-suppression probe below (§6).
+(define swap-old 0)
+(define swap-new 0)
+(define swap (make-uv-signal l3))
+(uv-signal-start! swap 'sigusr2 (lambda (s) (set! swap-old (+ swap-old 1)) (collect)))
+(let ((before g3b-fired))
+  (uv-kill! (uv-os-getpid) 'sigusr2)          ; pending: accepted inside kill
+  (uv-signal-start! swap 'sigusr2             ; same-signum swap, PRE-run
+                    (lambda (s) (set! swap-new (+ swap-new 1)) (collect)))
+  (test-equal "the guard proves the pending delivery was dispatched"
+    'satisfied (run-until/ticking l3 (lambda () (> g3b-fired before)) 512)))
+(test-equal "the swap preserved the pending delivery for the NEW callback (EV-1b)"
+  '(0 1) (list swap-old swap-new))
+
+;; --- EV-5: send -> stop -> run suppression (the discriminating shape) ---
+(define ev5-a 0)
+(define ev5-b 0)
+(define ev5-A (make-uv-signal l3))
+(define ev5-B (make-uv-signal l3))
+(uv-signal-start! ev5-A 'sigusr2 (lambda (s) (set! ev5-a (+ ev5-a 1)) (collect)))
+(uv-signal-start! ev5-B 'sigusr2 (lambda (s) (set! ev5-b (+ ev5-b 1)) (collect)))
+(uv-kill! (uv-os-getpid) 'sigusr2)            ; accepted synchronously
+(uv-signal-stop! ev5-A)                       ; stop A BEFORE the next run
+(test-equal "B's delivery proves the event was dequeued"
+  'satisfied (run-until/ticking l3 (lambda () (positive? ev5-b)) 512))
+(test-equal "A's silence proves suppression (EV-5)" 0 ev5-a)
+
+;; --- a raising callback rides store-and-reraise, counters balance -------
+(define boom (make-uv-signal l3))
+(uv-signal-start! boom 'sigusr1 (lambda (s) (collect) (raise 'signal-boom)))
+(uv-kill! (uv-os-getpid) 'sigusr1)
+(test-equal "a callback raise surfaces from uv-run as &uv-callback-error"
+  'signal-boom
+  (guard (e ((uv-callback-error? e) (uv-callback-error-cause e)))
+    (let drain ((i 0))
+      (if (< i 512) (begin (uv-run l3 'once) (drain (+ i 1))) 'never-raised))))
+(uv-signal-stop! boom)
+
+;; --- EV-10: close with a delivery pending -------------------------------
+(define ev10-fired 0)
+(define ev10 (make-uv-signal l3))
+(uv-signal-start! ev10 'sigusr1
+                  (lambda (s) (set! ev10-fired (+ ev10-fired 1)) (collect)))
+(uv-kill! (uv-os-getpid) 'sigusr1)            ; pending for ev10 AND guard g3
+(uv-close! ev10)                              ; close BEFORE the next run
+(test-equal "the close drains (iteration-agnostic: signal closes may defer, EV-10)"
+  'satisfied
+  (run-until/ticking l3 (lambda () (eq? (uv-handle-state ev10) 'closed)) 512))
+(test-equal "the closing watcher's callback was suppressed" 0 ev10-fired)
+(test-assert "the guard still got the delivery" (positive? g3-fired))
+
+;; --- EV-4: an armed watcher keeps the loop alive ------------------------
+(test-assert "the loop is alive while watchers are armed (EV-4)"
+  (uv-loop-alive? l3))
+
+(uv-loop-teardown! l3)
+(test-equal "teardown swept every armed watcher; counters balanced"
+  signal-base (live-count 'signal))
+
 (test-end "signal")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))
