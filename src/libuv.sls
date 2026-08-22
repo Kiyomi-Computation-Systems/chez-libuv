@@ -26,8 +26,9 @@
           ;; There is no uv-handle-closed? state predicate: that name belongs
           ;; to &uv-handle-closed's condition predicate, four lines below.
           ;; (libuv handle) explains the split; the third state is read with
-          ;; uv-handle-state.
-          uv-handle? uv-timer? uv-tcp?
+          ;; uv-handle-state. uv-pipe? and uv-process? live in (libuv handle)
+          ;; beside uv-tcp?.
+          uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop uv-close!
 
@@ -41,7 +42,8 @@
           ;; of S6. uv-tcp? and uv-close! are already above, in the handle
           ;; block: they are generic over handle types by design, and a
           ;; second TCP-specific spelling of either would be a second thing
-          ;; to keep in step.
+          ;; to keep in step. The four stream verbs below originate in
+          ;; (libuv stream) and are re-exported by (libuv tcp).
           make-uv-tcp
           uv-tcp-bind! uv-tcp-getsockname-port
           uv-listen! uv-accept! uv-tcp-connect!
@@ -62,6 +64,18 @@
           make-uv-addrinfo uv-addrinfo?
           uv-addrinfo-family uv-addrinfo-socktype uv-addrinfo-protocol
           uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname
+
+          ;; --- Pipe, from (libuv pipe) ---
+          ;; Minimal by design (v0.3): a pipe exists to be consumed by
+          ;; uv-spawn!'s (pipe p dir) stdio spec. Stream verbs above accept
+          ;; it once connected; uv-close! is the generic one.
+          make-uv-pipe
+
+          ;; --- Process, from (libuv process) ---
+          ;; uv-spawn! options/stdio vocabulary: THE SPEC §4.2-§4.3.
+          ;; EXIT IS NOT CLOSE: on-exit fires, the handle still needs
+          ;; uv-close! (ADR-0007). Killed-by-signal arrives as (0 'sig...).
+          uv-spawn! uv-process-kill! uv-kill! uv-process-pid
 
           ;; --- version queries (this library's own) ---
           ;; Exactly the two design spec S3 scopes this facade to
@@ -106,6 +120,9 @@
           (libuv handle)
           (libuv timer)
           (libuv tcp)
+          (libuv stream)
+          (libuv pipe)
+          (libuv process)
           (libuv dns)
           (libuv private conditions)
           ;; uv-version is renamed on the way in purely to resolve a name
