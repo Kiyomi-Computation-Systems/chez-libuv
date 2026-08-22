@@ -273,6 +273,16 @@
      (reason-of (spawn-with "/bin/sh" ok-args '((bogus . 1)) #f)))
    (test-equal "a malformed options alist entry" 'option-unknown
      (reason-of (spawn-with "/bin/sh" ok-args '(not-a-pair) #f)))
+   ;; Duplicates are refused, not first-wins: assq-shaped validation would
+   ;; validate only the first entry, so '((cwd . "/") (cwd . 7)) used to
+   ;; pass with the malformed second entry silently ignored -- invisible to
+   ;; everything but this row.
+   (test-equal "a duplicated key whose second entry is malformed" 'option-duplicate
+     (reason-of (spawn-with "/bin/sh" ok-args '((cwd . "/") (cwd . 7)) #f)))
+   (test-equal "a duplicated key is refused even when both entries validate"
+     'option-duplicate
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            '((detached . #t) (detached . #t)) #f)))
    (test-equal "env that is not a list of strings" 'env-not-a-string-list
      (reason-of (spawn-with "/bin/sh" ok-args '((env . "A=b")) #f)))
    (test-equal "a NUL inside an env string" 'embedded-nul
@@ -298,6 +308,16 @@
    (test-equal "an inherit-fd value that is not an fd" 'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
                             '((stdio . ((inherit-fd . not-a-number)))) #f)))
+   ;; The container field is a C int, so 2^31 cannot be an fd. Unbounded,
+   ;; this escaped as a raw Chez condition from c-int-set! mid-build (the
+   ;; guard freed the block -- no leak, but not the uniform
+   ;; &uv-invalid-argument either). reason-of's guard passes a raw
+   ;; condition through, so the pre-fix behavior fails this row by shape,
+   ;; not just by name.
+   (test-equal "an inherit-fd value too wide for the C int container field"
+     'stdio-fd-not-an-fd
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            '((stdio . ((inherit-fd . 2147483648)))) #f)))
    (test-equal "an on-exit that is neither procedure nor #f"
      'on-exit-not-a-procedure
      (reason-of (spawn-with "/bin/sh" ok-args 'not-a-proc)))
