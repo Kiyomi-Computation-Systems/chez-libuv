@@ -85,4 +85,8 @@ void chez_uv_count_spawn_options_new(void);
 void chez_uv_count_spawn_options_free(void);
 long chez_uv_live_spawn_options(void);
 
+void chez_uv_count_signal_new(void);
+void chez_uv_count_signal_free(void);
+long chez_uv_live_signal(void);
+
 #endif /* CHEZ_LIBUV_SHIM_H */

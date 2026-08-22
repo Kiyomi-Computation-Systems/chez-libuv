@@ -478,6 +478,20 @@
 (test-assert "process/pipe type tags resolve"
   (and (integer? (uv-process-type)) (integer? (uv-named-pipe-type))))
 
+;; v0.4 signal (design spec 2026-08-22 S5.5; ADR-0017): UV_SIGNAL must be a
+;; snapshotted, distinct handle type tag, exactly like every other
+;; uv_handle_type member above.
+(test-equal "UV_SIGNAL is snapshotted and distinct from the other handle type tags"
+  'distinct-positive
+  (if (and (integer? (uv-signal-type))
+           (exact? (uv-signal-type))
+           (positive? (uv-signal-type))
+           (not (memv (uv-signal-type)
+                      (list (uv-timer-type) (uv-tcp-type)
+                            (uv-process-type) (uv-named-pipe-type)))))
+      'distinct-positive
+      'wrong))
+
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
 ;; The failure must be structured and must NAME the missing constant. A
 ;; default value, a zero, or a bare #f here is the exact silent-transcription
