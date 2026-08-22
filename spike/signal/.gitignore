@@ -1,0 +1,5 @@
+# The compiled probe is a build artifact, not evidence. probe-signal.c is the
+# evidence; FINDINGS.md carries its output verbatim. (sig-probe.so is already
+# covered by the repo-level *.so rule; the handshake files are runtime litter.)
+probe-signal
+tmp-handshake-*.txt
