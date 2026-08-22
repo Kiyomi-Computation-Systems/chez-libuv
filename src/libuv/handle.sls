@@ -15,7 +15,7 @@
 ;;; S10) rather than being swept up at some later GC on some other thread
 ;;; (ADR-0007).
 (library (libuv handle)
-  (export uv-handle? uv-timer? uv-tcp? uv-pipe?
+  (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop
           uv-close!)
@@ -71,6 +71,13 @@
   ;; constructs the handle.
   (define (uv-pipe? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'pipe)))
+
+  ;; Kind-keyed like the two above (design spec v0.3 S3/S4.5). A process is a
+  ;; handle and not a stream, so this predicate is the one that separates it
+  ;; from the two stream kinds -- the stream verbs' own gate answers the
+  ;; complementary question, and neither is written in terms of the other.
+  (define (uv-process? handle)
+    (and (uv-handle? handle) (eq? (handle-kind handle) 'process)))
 
   ;; (uv-close! handle [on-close]) -- idempotent, asynchronous, and the only
   ;; way a handle is ever freed.

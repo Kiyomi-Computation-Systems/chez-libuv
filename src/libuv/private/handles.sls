@@ -104,13 +104,24 @@
           ;; here so loop.sls never has to import (libuv dns).
           complete-request! abandon-request! cancel-requests-for-loop!
 
-          ;; the callback error policy (design spec S8)
-          loop-record-error! dispatch-guarded orphan-callback-events
+          ;; the callback error policy (design spec S8). record-orphan-callback!
+          ;; is exported for (libuv process)'s exit dispatcher (design spec
+          ;; v0.3 S5.4 step 1): the DNS dispatchers reach the orphan list
+          ;; through complete-request!, but a process has no request path, so
+          ;; its dispatcher records the event directly.
+          loop-record-error! dispatch-guarded
+          record-orphan-callback! orphan-callback-events
 
           ;; the close protocol, and the seam Stages 4-5 replace their own
           ;; dispatchers through
           close-handle! install-close-handle! close-handle-installed?
           install-dispatch-procedure!
+          ;; the OTHER handle-freeing discipline (design spec v0.3 S5.6,
+          ;; ADR-0015): the setup-class spawn failure, whose handle libuv has
+          ;; already unlinked from the loop queue and which therefore never
+          ;; gets a close callback. Here, not in process.sls, so that every
+          ;; way a handle pointer dies stays in this one file.
+          discard-failed-handle!
 
           ;; the walk QUERY machinery (design spec v0.3 S5.2, ADR-0015).
           ;; Exported but NOT installed here: handle-in-loop-queue? is the
@@ -992,6 +1003,47 @@
       ((pipe)    (count-pipe-free!))
       ((process) (count-process-free!))
       (else #f)))
+
+  ;; --- the setup-class spawn failure's undo (design spec v0.3 S5.6) ------
+  ;; ADR-0015 measured two spawn-failure classes with opposite correct
+  ;; cleanups. The exec class rides the ordinary close protocol above -- its
+  ;; handle is still in loop->handle_queue, so uv_close is what unlinks it
+  ;; and close-dispatch is what frees it. The SETUP class left uv_spawn
+  ;; through its `error:` label, which already unlinked the handle
+  ;; (vendor/libuv/src/unix/process.c:1075-1076); calling uv_close there was
+  ;; measured to splice a LATER-registered live handle out of the queue
+  ;; while still answering uv_loop_close 0. So that class frees directly,
+  ;; and this is where it does it.
+  ;;
+  ;; THE SAME ORDER AS close-dispatch, MINUS THE PARTS THAT DO NOT APPLY:
+  ;;   1. free the handle pointer  -- there is no read buffer (uv-read-start!
+  ;;                                  was never reachable on a handle that
+  ;;                                  never escaped uv-spawn!) and no
+  ;;                                  registry entry to pop, because the
+  ;;                                  setup class never registers and never
+  ;;                                  counts (ADR-0015 decision 3)
+  ;;   2. zero the stored uptr     -- at the freeing site, so a use-after-free
+  ;;                                  is a structured condition rather than
+  ;;                                  the plausible wrong answer spike Q1
+  ;;                                  measured
+  ;;   3. transition to 'closed
+  ;; There is no on-close to run: nothing was ever registered, so no caller
+  ;; could have attached one, and no close callback is expected from libuv.
+  ;;
+  ;; The not-registered precondition is CHECKED rather than commented
+  ;; (AGENTS.md): a registered pointer here means the caller took the wrong
+  ;; ADR-0015 arm, and freeing it would leave the registry holding a dangling
+  ;; address for the next dispatcher to resolve. That is worth losing the
+  ;; original errno over.
+  (define (discard-failed-handle! handle)
+    (require-handle handle 'uv-discard-failed-handle!)
+    (let ((ptr (handle-pointer handle 'uv-discard-failed-handle!)))
+      (when (registry-ref ptr)
+        (raise (make-uv-invalid-argument 'uv-discard-failed-handle!
+                                         'failed-handle-still-registered)))
+      (free! ptr)
+      (set-handle-ptr! handle 0)
+      (set-handle-state! handle 'closed)))
 
   ;; --- the walk QUERY machinery (design spec v0.3 S5.2, ADR-0015) --------
   ;; ADR-0015's spawn-failure discriminator needs an instrument for "is this

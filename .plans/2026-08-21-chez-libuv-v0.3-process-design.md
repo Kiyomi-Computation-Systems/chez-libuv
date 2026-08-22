@@ -192,9 +192,16 @@ the child in order.
 | Spec | Meaning | libuv flags |
 |------|---------|-------------|
 | `ignore` | no fd (0–2: /dev/null) | `UV_IGNORE` |
-| `(inherit-fd n)` | child gets a dup of parent fd *n* | `UV_INHERIT_FD` |
-| `(inherit-stream h)` | child gets a dup of the fd under open stream handle *h* (tcp or pipe) | `UV_INHERIT_STREAM` |
+| `(inherit-fd . n)` | child gets a dup of parent fd *n* | `UV_INHERIT_FD` |
+| `(inherit-stream . h)` | child gets a dup of the fd under open stream handle *h* (tcp or pipe) | `UV_INHERIT_STREAM` |
 | `(pipe p dir)` | libuv creates a pipe pair; parent end opens into *p* | `UV_CREATE_PIPE` + direction |
+
+The two one-payload specs are **dotted pairs**, `(cons 'inherit-fd 3)`, not
+one-element lists; `(pipe p dir)` is a proper 3-list because it carries two.
+Amended at implementation time (Task 8) to the spelling the milestone plan's
+own test rows and parser already used throughout — the earlier
+`(inherit-fd n)` notation in this table was never implemented and never
+accepted by the validator.
 
 - In `(pipe p dir)`, `p` must be a pipe from `make-uv-pipe` that is open
   (not closed), belongs to the same loop as the spawn
