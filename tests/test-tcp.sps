@@ -233,8 +233,13 @@
     (uv-tcp-bind! (make-uv-timer l) "127.0.0.1" 0)
     'no-raise))
 
+;; uv-write! moved to (libuv stream) in Task 7 (ADR-0014): its kind check now
+;; widens to uv-stream-record?, so the reason a non-stream handle is refused
+;; with is 'not-a-uv-stream, not 'not-a-uv-tcp -- test-stream.sps carries the
+;; full gating matrix; this row stays as the regression canary through the
+;; re-export.
 (test-equal "uv-write! refuses a handle of another kind, naming who and why"
-  '(uv-write! not-a-uv-tcp)
+  '(uv-write! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
@@ -1048,8 +1053,10 @@
     (uv-read-start! vtcp ignore-data ignore-eof 'not-a-procedure)
     'no-raise))
 
+;; uv-read-start! / uv-read-stop! moved to (libuv stream) in Task 7
+;; (ADR-0014) too: same widened kind check, same reason symbol change.
 (test-equal "uv-read-start! refuses a handle of another kind, naming who and why"
-  '(uv-read-start! not-a-uv-tcp)
+  '(uv-read-start! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
@@ -1057,7 +1064,7 @@
     'no-raise))
 
 (test-equal "uv-read-stop! refuses a handle of another kind, naming who and why"
-  '(uv-read-stop! not-a-uv-tcp)
+  '(uv-read-stop! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
