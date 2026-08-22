@@ -3,6 +3,44 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.4.0 — 2026-08-XX
+
+### Added
+
+- `(libuv signal)`: `make-uv-signal`, `uv-signal-start!`,
+  `uv-signal-start-oneshot!`, `uv-signal-stop!`; kind predicate
+  `uv-signal?`; `uv-os-getpid` (exported from `(libuv process)` beside
+  `uv-process-pid`). The callback receives the watched signal as a symbol.
+- The thirteenth locked trampoline (`signal`) — ADR-0008's third
+  amendment, which states the one-per-callback-TYPE rule in its own terms
+  (`uv_signal_cb` shares `connection`'s arity and still gets its own slot).
+
+### Semantics
+
+- Watchable set: the closed nine-symbol vocabulary minus
+  `sigkill`/`sigstop` (`'signal-unwatchable`); exact `0` stays
+  sending-only (`'signal-unknown`); `sigchld` remains inexpressible (libuv
+  owns SIGCHLD for child reaping — vendor fact V6).
+- **Mode is fixed per handle** (`'signal-mode-fixed`): the first
+  successful start verb pins continuous/oneshot for the handle's life;
+  mode change is close-and-recreate (the vendored `UV_SIGNAL_ONE_SHOT`
+  ratchet, measured — spike/signal/FINDINGS.md EV-8).
+- DELIVERY ≠ CLOSE: stop and oneshot auto-disarm never close; the caller
+  always `uv-close!`s (close implicitly stops an armed watcher, EV-10).
+- Rearming a oneshot watcher from inside its own callback does not take
+  effect (the vendor auto-stop runs after the callback returns, EV-9).
+
+### Notes
+
+- Measured caveat (SQ-S1, both platforms): watching `sigint` takes SIGINT
+  from the Chez runtime, and `uv-signal-stop!` leaves `SIG_DFL` — neither
+  `keyboard-interrupt-handler` nor `register-signal-handler` handling is
+  restored. libuv's behavior, surfaced rather than fixed (README).
+- The signal vocabulary validators lifted from `process.sls` to
+  `(libuv private native)` on their second user — the rule recorded at
+  their v0.3 introduction. `(libuv process)`'s surface is unchanged
+  (plus `uv-os-getpid`).
+
 ## 0.3.0 — 2026-08-21
 
 Child processes: `uv_spawn` with the full stdio vocabulary, as `(libuv
