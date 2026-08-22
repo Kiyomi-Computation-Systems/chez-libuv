@@ -233,8 +233,13 @@
     (uv-tcp-bind! (make-uv-timer l) "127.0.0.1" 0)
     'no-raise))
 
+;; uv-write! moved to (libuv stream) in Task 7 (ADR-0014): its kind check now
+;; widens to uv-stream-record?, so the reason a non-stream handle is refused
+;; with is 'not-a-uv-stream, not 'not-a-uv-tcp -- test-stream.sps carries the
+;; full gating matrix; this row stays as the regression canary through the
+;; re-export.
 (test-equal "uv-write! refuses a handle of another kind, naming who and why"
-  '(uv-write! not-a-uv-tcp)
+  '(uv-write! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
@@ -765,8 +770,8 @@
 ;; close that freed it twice traps (ASan).
 (define buffered-tcp (make-uv-tcp cl))
 
-(set-tcp-read-buf! buffered-tcp (alloc-zeroed 64))
-(set-tcp-read-buf-len! buffered-tcp 64)
+(set-stream-read-buf! buffered-tcp (alloc-zeroed 64))
+(set-stream-read-buf-len! buffered-tcp 64)
 (count-read-buffer-new!)
 
 (test-equal "seed: the handle holds a live read buffer before it is closed"
@@ -780,7 +785,7 @@
 
 (test-equal "the close dispatcher zeroed the read-buffer field"
   '(0 0)
-  (list (tcp-read-buf buffered-tcp) (tcp-read-buf-len buffered-tcp)))
+  (list (stream-read-buf buffered-tcp) (stream-read-buf-len buffered-tcp)))
 
 (uv-loop-teardown! cl)
 
@@ -1048,8 +1053,10 @@
     (uv-read-start! vtcp ignore-data ignore-eof 'not-a-procedure)
     'no-raise))
 
+;; uv-read-start! / uv-read-stop! moved to (libuv stream) in Task 7
+;; (ADR-0014) too: same widened kind check, same reason symbol change.
 (test-equal "uv-read-start! refuses a handle of another kind, naming who and why"
-  '(uv-read-start! not-a-uv-tcp)
+  '(uv-read-start! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
@@ -1057,7 +1064,7 @@
     'no-raise))
 
 (test-equal "uv-read-stop! refuses a handle of another kind, naming who and why"
-  '(uv-read-stop! not-a-uv-tcp)
+  '(uv-read-stop! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
@@ -1115,7 +1122,7 @@
   1 (live-count 'read-buffer))
 
 (test-equal "a failed start leaves the handle NOT reading"
-  'not-reading (if (tcp-reading? vtcp) 'reading 'not-reading))
+  'not-reading (if (stream-reading? vtcp) 'reading 'not-reading))
 
 (uv-loop-teardown! vl)
 
@@ -1195,15 +1202,15 @@
   1 (live-count 'read-buffer))
 
 (test-equal "a started read records that the handle is reading"
-  'reading (if (tcp-reading? s-peer) 'reading 'not-reading))
+  'reading (if (stream-reading? s-peer) 'reading 'not-reading))
 
 ;; --- stop, start, and the ONE buffer -------------------------------------
-(define s-buffer-before-cycles (tcp-read-buf s-peer))
+(define s-buffer-before-cycles (stream-read-buf s-peer))
 
 (uv-read-stop! s-peer)
 
 (test-equal "uv-read-stop! outside a callback clears the reading flag"
-  'not-reading (if (tcp-reading? s-peer) 'reading 'not-reading))
+  'not-reading (if (stream-reading? s-peer) 'reading 'not-reading))
 
 (test-equal "uv-read-stop! on a handle that is not reading is a no-op, not an error"
   'stopped
@@ -1226,7 +1233,7 @@
 
 (test-equal "...and it is the same buffer, not a fresh allocation per call"
   'same
-  (if (= s-buffer-before-cycles (tcp-read-buf s-peer)) 'same 'reallocated))
+  (if (= s-buffer-before-cycles (stream-read-buf s-peer)) 'same 'reallocated))
 
 ;; --- the buffer's size is fixed by the first start -----------------------
 ;; Exercised on the CLIENT handle, which is connected and not reading, so the
@@ -1234,7 +1241,7 @@
 (uv-read-start! sclient ignore-data ignore-eof ignore-error 4096)
 
 (test-equal "seed: an explicit buffer size is the size actually allocated"
-  4096 (tcp-read-buf-len sclient))
+  4096 (stream-read-buf-len sclient))
 
 (test-equal "seed: a second reading handle means a second read buffer"
   2 (live-count 'read-buffer))
@@ -1265,7 +1272,7 @@
     'no-raise))
 
 (test-equal "the refused restart changed neither the buffer's size nor the buffer count"
-  '(4096 2) (list (tcp-read-buf-len sclient) (live-count 'read-buffer)))
+  '(4096 2) (list (stream-read-buf-len sclient) (live-count 'read-buffer)))
 
 ;; The row that separates "the size was omitted" from "the size defaulted":
 ;; a start with no size at all must be accepted against a buffer fixed at
@@ -1275,7 +1282,7 @@
   '(started 4096 2)
   (guard (e (#t (list 'raised (err->symbol e))))
     (uv-read-start! sclient ignore-data ignore-eof ignore-error)
-    (list 'started (tcp-read-buf-len sclient) (live-count 'read-buffer))))
+    (list 'started (stream-read-buf-len sclient) (live-count 'read-buffer))))
 
 (uv-read-stop! sclient)
 
@@ -1343,9 +1350,9 @@
 ;; and the flag must have survived both: only uv-read-stop! clears it.
 (test-equal "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!"
   '(reading not-reading)
-  (list (if (tcp-reading? s-peer) 'reading 'not-reading)
+  (list (if (stream-reading? s-peer) 'reading 'not-reading)
         (begin (uv-read-stop! s-peer)
-               (if (tcp-reading? s-peer) 'reading 'not-reading))))
+               (if (stream-reading? s-peer) 'reading 'not-reading))))
 
 ;; Design spec S5's tolerance rule, on the read path: a read completion can
 ;; be queued behind a uv_close, and the handle it names is 'closing by the
@@ -1375,7 +1382,7 @@
 ((dispatcher-ref 'alloc) (handle-ptr s-peer) 1 s-scratch-buf)
 
 (test-equal "the alloc dispatcher hands libuv the handle's own buffer, at its full length"
-  (list (tcp-read-buf s-peer) (tcp-read-buf-len s-peer))
+  (list (stream-read-buf s-peer) (stream-read-buf-len s-peer))
   (list (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
 
 (uv-buf-set! s-scratch-buf 999 999)
@@ -1612,7 +1619,7 @@
 (test-equal "the first chunk arrived, and on-data stopped the read from inside itself"
   '(satisfied 1 not-reading)
   (list b-first-outcome b-data-fires
-        (if (tcp-reading? b-peer) 'reading 'not-reading)))
+        (if (stream-reading? b-peer) 'reading 'not-reading)))
 
 ;; Written while the reader is stopped. Four kilobytes fit in any socket
 ;; buffer, so nothing here depends on the writes blocking.

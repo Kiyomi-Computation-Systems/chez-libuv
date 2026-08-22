@@ -48,6 +48,30 @@ process initialization, and never unlocked, for the life of the process.
 > two slots: the names exist and fail loudly, rather than silently doing
 > nothing.
 
+> **Amendment (v0.3, 2026-08-21): twelve trampolines.**
+> The set grows ten → twelve: `exit`, for uv_exit_cb
+> `(uv_process_t*, int64_t, int)` (vendor/libuv/include/uv.h:340), and
+> `walk`, for uv_walk_cb `(uv_handle_t*, void*)` (uv.h:341) — two foreign
+> type signatures no existing trampoline shares. `walk` is synchronous — it
+> fires only inside a `uv_walk` call, on the caller's own thread, never from
+> `uv_run` — and it still locks: the invariant tracks callback *type*, not
+> when or from where a callback fires, and `uv_walk_cb` is one more entry in
+> libuv's callback typology regardless. It is bound as the twelfth locked
+> foreign-callable because ADR-0015's spawn-failure discriminator needs it
+> (design spec §5.2/§5.6). The invariant is restated unchanged: one locked
+> trampoline per callback TYPE, a constant small set per process; the set
+> moves only when libuv's callback typology does. The two frozen literals
+> (tests/test-loop.sps, tests/test-native.sps) were widened to the
+> twelve-name literal, watched-to-fail; the evidence is recorded in
+> .plans/process-stage-2-mutation-log.md ("RED evidence": both literals
+> widened first, failing by name against the then-ten-name
+> `dispatcher-names`). The `exit` slot is installed from `(libuv process)`'s library
+> body — the dns.sls late-install seam's second application; `walk` is
+> installed the same way, wiring `dispatcher-names`'s `walk` slot over a
+> module-level query cell in `handles.sls` that backs
+> `(handle-in-loop-queue? loop handle)`, the query helper ADR-0015's
+> discriminator calls.
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never

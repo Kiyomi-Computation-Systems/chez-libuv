@@ -41,6 +41,10 @@
           c-string->string
           alloc-zeroed zero-out! free! copy-in! copy-out
           c-int-size c-int-ref c-int-set! c-uptr-ref read-net-u16
+          ;; the pointer-wide and unsigned-32 siblings of c-int-set! (v0.3
+          ;; S5.5): argv/env pointer arrays and uid/gid need widths c-int-set!
+          ;; cannot write.
+          c-uptr-size c-uptr-set! c-u32-set!
 
           ;; uv_buf_t, the one struct this binding constructs
           uv-buf-set! uv-buf-base uv-buf-len uv-buf-ftype-layout
@@ -99,10 +103,28 @@
           ;; whole-branch review's duplication finding): one copy for the
           ;; tcp.sls and dns.sls verbs that had each restated them.
           require-address require-port
+          ;; lifted verbatim from tcp.sls (PR #4's shared-validator rule):
+          ;; the same "is this an on-callback argument a real procedure" gate
+          ;; tcp.sls, stream.sls, and process.sls all need.
+          require-callback
 
           ;; callback dispatcher slots (ADR-0008, design spec S4)
           dispatcher-names dispatcher-ref dispatchers-installed?
           install-callback-dispatchers!
+
+          ;; the process and pipe entry points (design spec v0.3 S5.2). The
+          ;; one that takes a C function pointer -- uv_spawn's exit_cb, which
+          ;; lives INSIDE uv_process_options_t rather than arriving as an
+          ;; argument -- is NOT exported raw, for the same reason as every
+          ;; other *-native wrapper above: it bakes in this library's own
+          ;; trampoline entry point. uv_process_kill, uv_kill,
+          ;; uv_process_get_pid, and uv_pipe_init take no callback, so they
+          ;; are exported directly. uv-walk-native bakes in the walk
+          ;; trampoline the same way as the timer/stream/DNS *-native
+          ;; wrappers; the query built on top of it lives in handles.sls.
+          uv-spawn-native
+          uv-process-kill uv-kill uv-process-get-pid uv-pipe-init
+          uv-walk-native
 
           ;; debug counters (design spec S10)
           live-counts
@@ -113,7 +135,10 @@
           count-connect-req-new! count-connect-req-free!
           count-getaddrinfo-req-new! count-getaddrinfo-req-free!
           count-getnameinfo-req-new! count-getnameinfo-req-free!
-          count-read-buffer-new! count-read-buffer-free!)
+          count-read-buffer-new! count-read-buffer-free!
+          count-pipe-new!         count-pipe-free!
+          count-process-new!      count-process-free!
+          count-spawn-options-new! count-spawn-options-free!)
   ;; file-exists? is deliberately absent from the (chezscheme) import below:
   ;; (rnrs) already exports it via (rnrs files), and importing it from both
   ;; raises "multiple definitions for file-exists? in body". The same is true
@@ -278,6 +303,23 @@
     (foreign-procedure "chez_uv_count_read_buffer_free" () void))
   (define live-read-buffer
     (foreign-procedure "chez_uv_live_read_buffer" () long))
+
+  (define count-pipe-new!  (foreign-procedure "chez_uv_count_pipe_new" () void))
+  (define count-pipe-free! (foreign-procedure "chez_uv_count_pipe_free" () void))
+  (define live-pipe        (foreign-procedure "chez_uv_live_pipe" () long))
+
+  (define count-process-new!
+    (foreign-procedure "chez_uv_count_process_new" () void))
+  (define count-process-free!
+    (foreign-procedure "chez_uv_count_process_free" () void))
+  (define live-process (foreign-procedure "chez_uv_live_process" () long))
+
+  (define count-spawn-options-new!
+    (foreign-procedure "chez_uv_count_spawn_options_new" () void))
+  (define count-spawn-options-free!
+    (foreign-procedure "chez_uv_count_spawn_options_free" () void))
+  (define live-spawn-options
+    (foreign-procedure "chez_uv_live_spawn_options" () long))
 
   ;; --- libuv bindings ---------------------------------------------------
   ;; v0.1 binds only what the version gate, the error translation, and the
@@ -670,6 +712,29 @@
       (raise (make-uv-invalid-argument 'uv-c-int-set! 'value-not-an-exact-integer)))
     (foreign-set! 'int addr 0 value))
 
+  ;; The pointer-wide sibling of c-int-set!, with the same validation shape.
+  ;; Needed for the process/pipe co-allocation (design spec S5.5): argv/env
+  ;; pointer arrays and the internal pointers a spawn options block fixes up
+  ;; are all uptr-width, not int-width.
+  (define (c-uptr-size) (foreign-sizeof 'uptr))
+
+  (define (c-uptr-set! addr value)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-c-uptr-set! 'null-or-invalid-destination)))
+    (unless (and (integer? value) (exact? value) (>= value 0))
+      (raise (make-uv-invalid-argument 'uv-c-uptr-set! 'value-not-a-pointer)))
+    (foreign-set! 'uptr addr 0 value))
+
+  ;; uid/gid are unsigned 32-bit (design spec S4.2); `foreign-set! 'int`
+  ;; rejects any value >= 2^31, which a large uid/gid legitimately is.
+  (define (c-u32-set! addr value)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-c-u32-set! 'null-or-invalid-destination)))
+    (unless (and (integer? value) (exact? value) (>= value 0)
+                 (< value 4294967296))
+      (raise (make-uv-invalid-argument 'uv-c-u32-set! 'value-out-of-range)))
+    (foreign-set! 'unsigned-32 addr 0 value))
+
   ;; ntohs, by hand, over two unsigned bytes. `sin_port` is stored in NETWORK
   ;; byte order (big-endian) whatever the host's order is, so reading it as a
   ;; host `unsigned-16` would answer a byte-swapped number on every
@@ -745,6 +810,16 @@
   (define (require-port port who)
     (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
       (raise (make-uv-invalid-argument who 'port-out-of-range))))
+
+  ;; Lifted verbatim from tcp.sls:56-58 (the PR #4 shared-validator rule):
+  ;; tcp.sls and stream.sls/process.sls all need the same "is this an
+  ;; on-callback argument a real procedure" gate. tcp.sls keeps its own
+  ;; private copy until Task 7 moves the verbs that use it; the two copies
+  ;; coexist harmlessly until then because tcp.sls does not import this
+  ;; export.
+  (define (require-callback proc who reason)
+    (unless (procedure? proc)
+      (raise (make-uv-invalid-argument who reason))))
 
   ;; --- error translation (ADR-0006) -------------------------------------
   ;; Both _r calls get a FRESH scratch bytevector rather than sharing one:
@@ -827,10 +902,13 @@
           (cons 'connect-req (live-connect-req))
           (cons 'getaddrinfo-req (live-getaddrinfo-req))
           (cons 'getnameinfo-req (live-getnameinfo-req))
-          (cons 'read-buffer (live-read-buffer))))
+          (cons 'read-buffer (live-read-buffer))
+          (cons 'pipe          (live-pipe))
+          (cons 'process       (live-process))
+          (cons 'spawn-options (live-spawn-options))))
 
   ;; --- callback dispatcher slots (ADR-0008, design spec S4) -------------
-  ;; The ten trampolines declared below as `foreign-callable`s have
+  ;; The twelve trampolines declared below as `foreign-callable`s have
   ;; mechanical bodies: they call the slot named for their callback type.
   ;; The slots' CONTENTS -- all dispatch policy, including the
   ;; store-and-reraise guard of design spec S8 -- are installed exactly once
@@ -853,7 +931,7 @@
   ;; volume).
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect
-      getaddrinfo getnameinfo))
+      getaddrinfo getnameinfo exit walk))
 
   (define dispatchers (make-eq-hashtable))
   (define dispatchers-installed #f)
@@ -907,7 +985,7 @@
           (raise (make-uv-invalid-argument 'uv-dispatcher-ref
                                            'unknown-dispatcher)))))
 
-  ;; alist: (name . procedure) for all ten names, in any order.
+  ;; alist: (name . procedure) for all twelve names, in any order.
   ;;
   ;; All-or-nothing, and once only. A partial install would leave some slots
   ;; holding the raising stub while libuv already had their addresses; a
@@ -932,7 +1010,7 @@
               dispatcher-names)
     (set! dispatchers-installed #t))
 
-  ;; --- the ten static trampolines (ADR-0008, design spec S4/S10) --------
+  ;; --- the twelve static trampolines (ADR-0008, design spec S4/S10) -----
   ;; ONE `foreign-callable` per callback TYPE, never per callback instance,
   ;; each `lock-object`'d exactly once here and never unlocked, for the life
   ;; of the process. That bound is the whole point of ADR-0008: libuv retains
@@ -940,10 +1018,12 @@
   ;; handle or per request would leave the collector permanently unable to
   ;; move an ever-growing set of code objects -- a leak by another name.
   ;;
-  ;; ALL TEN ARE CREATED HERE, together -- the original eight in v0.1 Stage
-  ;; 3, the two DNS trampolines in v0.2 Stage 2 (ADR-0008 as amended:
+  ;; ALL TWELVE ARE CREATED HERE, together -- the original eight in v0.1
+  ;; Stage 3, the two DNS trampolines in v0.2 Stage 2 (ADR-0008 as amended:
   ;; neither DNS callback typedef matches an existing trampoline's arity,
-  ;; vendor/libuv/include/uv.h:345-352) -- even when a callback type cannot
+  ;; vendor/libuv/include/uv.h:345-352), and `exit`/`walk` in v0.3 (ADR-0015:
+  ;; `walk` is ADR-0015's spawn-failure-path discriminator, `uv_walk_cb`
+  ;; matches no existing arity either) -- even when a callback type cannot
   ;; fire yet. Creating them together is what keeps `lock-object` in exactly
   ;; one place, evaluated once; the stages add dispatch policy behind the
   ;; slots, not new locked objects. Spike FINDINGS Q1 measured the property
@@ -1019,6 +1099,36 @@
                          req status hostname service))
                       (uptr int uptr uptr) void))
 
+  ;; uv_exit_cb: void (*)(uv_process_t*, int64_t exit_status, int
+  ;; term_signal) (vendor/libuv/include/uv.h:340) -- a foreign type
+  ;; signature no other trampoline has (ADR-0008, v0.3 amendment).
+  (define exit-callable
+    (foreign-callable (lambda (handle exit-status term-signal)
+                        ((dispatcher-ref 'exit) handle exit-status term-signal))
+                      (uptr integer-64 int) void))
+
+  ;; uv_walk_cb: void (*)(uv_handle_t*, void* arg) (vendor/libuv/include/
+  ;; uv.h:341). SYNCHRONOUS: fires only inside a uv_walk call on the
+  ;; caller's own thread, never from uv_run -- locked with the others
+  ;; because libuv still calls it by address (ADR-0008, v0.3 amendment).
+  (define walk-callable
+    (foreign-callable (lambda (handle arg)
+                        ((dispatcher-ref 'walk) handle arg))
+                      (uptr uptr) void))
+
+  ;; void uv_walk(uv_loop_t*, uv_walk_cb, void* arg) -- no errno.
+  (define raw-walk
+    (foreign-procedure "uv_walk" (uptr uptr uptr) void))
+
+  ;; (uv-walk-native loop-ptr arg) -- bakes in the walk trampoline; the
+  ;; installed walk dispatcher (handles.sls) interprets arg. walk-cb-entry
+  ;; is defined further down, beside the other entry points; referencing it
+  ;; here is a forward reference inside a lambda body that is not invoked
+  ;; until well after this library's definitions have all run, same as
+  ;; every other *-native wrapper in this file.
+  (define (uv-walk-native loop-ptr arg)
+    (raw-walk loop-ptr walk-cb-entry arg))
+
   ;; A definition, not a bare expression, for the same reason as `uv-loaded`
   ;; and `dispatchers-seeded` above: R6RS library bodies take all their
   ;; definitions before any expression, and every lock has to be in place
@@ -1028,7 +1138,8 @@
               (list alloc-callable read-callable connection-callable
                     write-done-callable close-callable timer-callable
                     shutdown-callable connect-callable
-                    getaddrinfo-callable getnameinfo-callable)))
+                    getaddrinfo-callable getnameinfo-callable
+                    exit-callable walk-callable)))
 
   ;; The entry points are module-private ON PURPOSE (design spec S3: nothing
   ;; outside private/ sees a pointer -- and these are the pointers whose
@@ -1047,6 +1158,8 @@
     (foreign-callable-entry-point getaddrinfo-callable))
   (define getnameinfo-cb-entry
     (foreign-callable-entry-point getnameinfo-callable))
+  (define exit-cb-entry (foreign-callable-entry-point exit-callable))
+  (define walk-cb-entry (foreign-callable-entry-point walk-callable))
 
   ;; (uv-timer-start-native timer-ptr timeout repeat) -> int (an errno).
   (define (uv-timer-start-native timer-ptr timeout repeat)
@@ -1119,6 +1232,33 @@
   ;; request's own storage before returning (see raw-getnameinfo above).
   (define (uv-getnameinfo-native loop-ptr req-ptr addr-ptr flags)
     (raw-getnameinfo loop-ptr req-ptr getnameinfo-cb-entry addr-ptr flags))
+
+  ;; --- the process and pipe entry points (THE SPEC S5.2) -----------------
+  ;; uv_spawn takes its callback INSIDE uv_process_options_t rather than as
+  ;; an argument, so the wrapper writes the entry point into the caller's
+  ;; options block at the shim-reported offset and then calls the raw
+  ;; binding -- the same "entry points leave this file only baked into
+  ;; wrappers" rule as uv-timer-start-native, adapted to a struct field.
+  ;; NULL is never written: THE SPEC S4.1 -- on-exit = #f is resolved
+  ;; Scheme-side by the dispatcher, so the lifecycle machinery always runs.
+  (define raw-spawn
+    (foreign-procedure "uv_spawn" (uptr uptr uptr) int))
+
+  (define (uv-spawn-native loop-ptr handle-ptr options-ptr)
+    (foreign-set! 'uptr options-ptr
+                  (offsetof-uv-process-options-t-exit-cb) exit-cb-entry)
+    (raw-spawn loop-ptr handle-ptr options-ptr))
+
+  ;; No callback pointers in any of these, so they are exported raw; every
+  ;; int is an errno except uv_process_get_pid's, which is the pid itself.
+  (define uv-process-kill
+    (foreign-procedure "uv_process_kill" (uptr int) int))
+  (define uv-kill
+    (foreign-procedure "uv_kill" (int int) int))
+  (define uv-process-get-pid
+    (foreign-procedure "uv_process_get_pid" (uptr) int))
+  (define uv-pipe-init
+    (foreign-procedure "uv_pipe_init" (uptr uptr int) int))
 
   ;; --- the init gate (design spec S4) -----------------------------------
   (define (version-supported? v)

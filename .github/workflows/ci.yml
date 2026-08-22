@@ -182,6 +182,18 @@ jobs:
       - name: Test (vendored path)
         run: make HAVE_PKG=no test
 
+      # THE SPEC §9.4 / ADR-0016: the setuid/setgid positive tests are
+      # excluded from the default `make test` (see ROOT_TESTS in the
+      # Makefile) and run only here, under sudo. `-E env "PATH=$PATH"`
+      # because plain sudo drops the PATH this job put the pinned Chez on;
+      # `HAVE_PKG=no` matches the vendored-path build just above so
+      # test-root's artifact-precondition check accepts what that build
+      # produced -- the target deliberately does NOT rebuild (under sudo
+      # a `build` prerequisite would relink the shim as root; see the
+      # Makefile's test-root comment).
+      - name: Root lane (setuid/setgid, sudo)
+        run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
+
       # The reason this job exists. Valgrind needs no instrumentation of Chez
       # or libuv and is the only tool in this project that can substantiate a
       # leak claim. Failure here blocks merge.
@@ -319,6 +331,12 @@ jobs:
           make HAVE_PKG=no vendor
           make HAVE_PKG=no build
           make HAVE_PKG=no test
+
+      # Same root lane as the linux job (THE SPEC §9.4 / ADR-0016) -- see
+      # that job's comment for why `-E env "PATH=$PATH"` and `HAVE_PKG=no`
+      # are both needed.
+      - name: Root lane (setuid/setgid, sudo)
+        run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
 
       # ASan only. LeakSanitizer is unsupported on macOS/ARM64, so this catches
       # use-after-free and overflows but CANNOT support a leak claim. Do not

@@ -8,30 +8,36 @@ Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
 
 * What it is
 
-A legible, low-level mirror of libuv's event loop, TCP sockets, timers and
-DNS. "Legible mirror" is the design constraint: the public API follows
-libuv's own verb set — ~accept~, ~read-start~, ~read-stop~, ~write~,
-~shutdown~, ~timer~, ~getaddrinfo~, ~getnameinfo~, ~cancel~, ~close~ —
-closely enough that a caller who knows libuv recognises the Scheme
-surface immediately. It is *transport only*: it parses nothing, understands no
-protocol above raw bytes, and deliberately provides no connection-state or
-backpressure policy of its own, so that the HTTP layer above it
-(~chez-http1~, ~chez-http-server~) can implement those directly against these
-primitives rather than against an abstraction this binding would have to
-invent and justify. The full design, with its ten accepted decision records,
-is ~.plans/2026-08-18-chez-libuv-v0.1-design.md~; the v0.2 DNS addition has
-its own spec, ~.plans/2026-08-21-chez-libuv-v0.2-dns-design.md~, with ADRs
-0011–0013.
+A legible, low-level mirror of libuv's event loop, TCP sockets, timers, DNS,
+child processes and their stdio pipes. "Legible mirror" is the design
+constraint: the public API follows libuv's own verb set — ~accept~,
+~read-start~, ~read-stop~, ~write~, ~shutdown~, ~timer~, ~getaddrinfo~,
+~getnameinfo~, ~cancel~, ~spawn~, ~close~ — closely enough that a caller who
+knows libuv recognises the Scheme surface immediately. It is *transport
+only*: it parses nothing, understands no protocol above raw bytes, and
+deliberately provides no connection-state or backpressure policy of its own,
+so that the HTTP layer above it (~chez-http1~, ~chez-http-server~) can
+implement those directly against these primitives rather than against an
+abstraction this binding would have to invent and justify. The full design,
+with its ten accepted decision records, is
+~.plans/2026-08-18-chez-libuv-v0.1-design.md~; the v0.2 DNS addition has its
+own spec, ~.plans/2026-08-21-chez-libuv-v0.2-dns-design.md~, with ADRs
+0011–0013; the v0.3 process addition has its own spec,
+~.plans/2026-08-21-chez-libuv-v0.3-process-design.md~, with ADRs 0014–0016.
 
 * Status
 
-*v0.2.0.* The event loop, TCP (bind, listen, accept, connect, read with
-backpressure, write, shutdown), timers, and DNS (~getaddrinfo~,
+*v0.3.0.* The event loop, TCP (bind, listen, accept, connect, read with
+backpressure, write, shutdown), timers, DNS (~getaddrinfo~,
 ~getnameinfo~, ~cancel~ — whatever the host's resolver does, asynchronously;
-no c-ares, no record types, no caching). No processes, no
+no c-ares, no record types, no caching), and child processes (~uv_spawn~
+with the full stdio vocabulary, env/cwd, detached, setuid/setgid behind an
+opt-in root lane) with a minimal ~(libuv pipe)~ to give them pipe stdio. No
 filesystem, no UDP, no zero-copy I/O
 ([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]] copies at the
-boundary and reserves the API shape for a later zero-copy variant).
+boundary and reserves the API shape for a later zero-copy variant), no
+~uv_signal_t~ (signal *sending* ships with the process module; handling is a
+recorded future milestone).
 
 CI covers macOS and Linux, on both native-dependency acquisition paths.
 Windows is *deferred, not designed out*
@@ -275,11 +281,110 @@ exist so you can see the whole surface at once, not to restate it.
 | ~uv-listen!~ | Listen; ~on-connection~ is called with the error or ~#f~ |
 | ~uv-accept!~ | A new open handle for the queued connection |
 | ~uv-tcp-connect!~ | Connect; answers the in-flight request record |
+| ~uv-tcp-nodelay!~ | ~TCP_NODELAY~. Takes a boolean, not an int |
+
+~uv-write!~, ~uv-shutdown!~, ~uv-read-start!~ and ~uv-read-stop!~ moved to
+~(libuv stream)~ in v0.3 (below); ~(libuv tcp)~ re-exports all four
+unchanged, so existing importers compile without touching an import line.
+
+** Streams — ~(libuv stream)~
+
+Extracted from ~(libuv tcp)~ in v0.3 (design spec §4.6) so the gating
+predicate is stream-*kind*, not tcp-kind: these four verbs now accept any
+open tcp or pipe handle.
+
+| Export | |
+|--------------------------+------------------------------------------------------------|
 | ~uv-write!~ | Write a bytevector or a span of one. The payload is copied |
 | ~uv-shutdown!~ | Shut the write side down; the read side stays open |
 | ~uv-read-start!~ | Start reading: ~on-data~ ~(bv start end)~, ~on-eof~ ~()~, ~on-error~ ~(condition)~. All three required |
 | ~uv-read-stop!~ | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
-| ~uv-tcp-nodelay!~ | ~TCP_NODELAY~. Takes a boolean, not an int |
+
+** Pipes — ~(libuv pipe)~
+
+Deliberately minimal (design spec §1): no ~bind~/~connect~/~listen~, no
+~ipc=1~ fd-passing. A fresh pipe's only v0.3 purpose is to be named in
+~uv-spawn!~'s ~stdio~ options as a child's stdio end, or closed.
+
+| Export | |
+|---------------+------------------------------------------------------------|
+| ~make-uv-pipe~ | A new, unconnected pipe handle on a loop (~uv_pipe_init~, ipc always 0) |
+| ~uv-pipe?~ | Type predicate (defined in ~(libuv handle)~) |
+
+** Child processes — ~(libuv process)~
+
+| Export | |
+|----------------------+------------------------------------------------------------|
+| ~uv-spawn!~ | ~(loop file args [options] on-exit)~ → process handle, child already running |
+| ~uv-process-kill!~ | Send a signal to the process by handle — ~uv_process_kill~ |
+| ~uv-kill!~ | Send a signal by raw pid — ~uv_kill~ |
+| ~uv-process-pid~ | The pid; valid from spawn through close, including after exit |
+| ~uv-process?~ | Type predicate (defined in ~(libuv handle)~) |
+
+~file~/~args~ are libuv's own execvp/argv contract — unresolved and
+unvalidated by the binding. The ~options~ alist covers ~env~ (a list of
+~"K=V"~ strings, libuv's own format, not an alist encoding), ~cwd~,
+~stdio~, ~detached~, and ~uid~/~gid~. Six behaviours worth knowing before
+the design spec (§4–§6):
+
+- *The spawn surface.* Each child fd (index = slot; 0/1/2 are
+  stdin/stdout/stderr, libuv pads short lists to three ~ignore~s) is one
+  of: ~ignore~ (~/dev/null~ for slots 0–2), ~(inherit-fd . n)~ (a dup of
+  parent fd /n/), ~(inherit-stream . h)~ (a dup of an open tcp or pipe
+  handle's fd), or ~(pipe p dir)~ — ~uv-spawn!~ creates the pipe pair and
+  connects the parent end into /p/, a fresh handle from ~make-uv-pipe~.
+  /dir/ is ~to-child~, ~from-child~, or ~duplex~ — named from the
+  *parent's* perspective, deliberately not libuv's child-perspective
+  ~READABLE~/~WRITABLE~ flag names, which are libuv's single most
+  direction-confusing vocabulary.
+- *Exit ≠ close.* ~on-exit~ firing stops the handle but does not close
+  it; the caller still calls ~uv-close!~ — typically from inside
+  ~on-exit~ — before the handle's memory is reclaimed. Exactly the tcp
+  discipline (ADR-0007), applied to a handle instead of a stream.
+- *Killed-by-signal is ~(0 sigterm)~, not ~(-1 …)~.* ~on-exit~ receives
+  ~(exit-status term-signal)~ as results, never a condition — there is no
+  error argument. ~exit-status~ is libuv's ~WEXITSTATUS~ on a normal
+  exit and *zero* on a signal death; ~term-signal~ is ~#f~ on a normal
+  exit and otherwise the signal symbol (or the raw integer, for a signal
+  outside the bound set — information is never dropped).
+- *Pid validity ends at the exit callback.* The child is reaped by the
+  time ~on-exit~ runs, so a kill or liveness probe (~uv-process-kill!~ /
+  ~uv-kill!~ with signal ~0~) issued after exit races pid reuse — it
+  will usually raise ~'ESRCH~, but the binding cannot promise a recycled
+  pid won't be signalled instead.
+- *The detached pattern.* ~detached~ maps to ~UV_PROCESS_DETACHED~; the
+  documented pattern is spawn, then ~uv-close!~ immediately — the child
+  survives the parent and is never reaped by us.
+- *A failed ~uv-spawn!~ cleans up internally; only its pipes need the
+  caller's attention.* libuv's spawn-failure path has two different
+  correct cleanups depending on how far the child got before failing
+  (ADR-0015); the binding picks the right one at runtime, and the caller
+  only ever sees the raise. Any pipe named in any of the spawn's stdio specs is
+  marked *connected* by the binding even when the spawn raised — libuv
+  opens the parent end before it can know whether the exec will succeed
+  — so a raising ~uv-spawn!~ still leaves its pipes needing an explicit
+  ~uv-close!~; naming an already-consumed pipe again raises
+  ~'pipe-already-used~.
+
+*Root lane.* Exercising ~uid~/~gid~ (which map to
+~UV_PROCESS_SETUID~/~SETGID~) needs to actually run as root, so that
+coverage is opt-in and kept out of the default suite:
+
+#+begin_src sh
+sudo make test-root
+#+end_src
+
+runs ~tests/test-process-setuid.sps~ alone — excluded from ~make test~ and
+~make test-memory~, and refusing with a clear message under a non-root
+euid. CI runs it as its own step on both platforms.
+
+*Coexistence with Chez's own subprocess APIs.* Measured, not assumed:
+interleaving libuv spawns with Chez's ~system~/~open-process-ports~ across
+four orderings showed no conflict — 110/110 libuv ~exit_cb~s delivered
+intact and every Chez call returned its own correct result — measured on
+Linux's SIGCHLD-based child-reaping path, the one path where a stolen wait
+can silently drop a callback
+(~spike/process/FINDINGS.md~ SQ2).
 
 ** DNS — ~(libuv dns)~
 
@@ -369,6 +474,13 @@ the discriminant is a symbol).
 | ~&uv-constant-unavailable~ | ~name~ | The shim has no constant under that name |
 | ~&uv-invalid-argument~ | ~who~ ~reason~ | A caller error, refused before anything was allocated |
 | ~&uv-callback-error~ | ~cause~ | A callback raised; composed with the original condition |
+
+v0.3 adds no new condition types — every ~(libuv process)~/~(libuv pipe)~/
+~(libuv stream)~ failure raises one of the three above (~&uv-errno-error~,
+~&uv-handle-closed~, ~&uv-invalid-argument~); the closed set of new
+~&uv-invalid-argument~ reason symbols (~'stdio-spec-unknown~,
+~'pipe-already-used~, ~'signal-unknown~, and the rest of the validation
+walk) is in the design spec's §4.7, not repeated here.
 
 * Tests
 

@@ -427,6 +427,57 @@
 (display (sizeof-addrinfo))
 (newline)
 
+;; --- v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005) --------------
+;; Structural sanity only: values are platform truths, so the assertions
+;; are relations, never literals.
+(test-assert "process options struct has positive size"
+  (positive? (sizeof-uv-process-options-t)))
+(test-assert "every options offset lies inside the struct"
+  (for-all (lambda (off) (and (>= off 0) (< off (sizeof-uv-process-options-t))))
+           (list (offsetof-uv-process-options-t-exit-cb)
+                 (offsetof-uv-process-options-t-file)
+                 (offsetof-uv-process-options-t-args)
+                 (offsetof-uv-process-options-t-env)
+                 (offsetof-uv-process-options-t-cwd)
+                 (offsetof-uv-process-options-t-flags)
+                 (offsetof-uv-process-options-t-stdio-count)
+                 (offsetof-uv-process-options-t-stdio)
+                 (offsetof-uv-process-options-t-uid)
+                 (offsetof-uv-process-options-t-gid))))
+(test-assert "stdio container: flags precede data, both inside"
+  (and (>= (offsetof-uv-stdio-container-t-flags) 0)
+       (> (offsetof-uv-stdio-container-t-data)
+          (offsetof-uv-stdio-container-t-flags))
+       (< (offsetof-uv-stdio-container-t-data)
+          (sizeof-uv-stdio-container-t))))
+(test-assert "the three process flags are distinct nonzero bits"
+  (let ((flags (list (uv-process-setuid-flag) (uv-process-setgid-flag)
+                     (uv-process-detached-flag))))
+    (and (for-all positive? flags)
+         (= 3 (length flags))
+         (zero? (bitwise-and (car flags) (cadr flags)))
+         (zero? (bitwise-and (car flags) (caddr flags)))
+         (zero? (bitwise-and (cadr flags) (caddr flags))))))
+(test-equal "UV_IGNORE is zero (the header's own definition)"
+  0 (uv-stdio-ignore))
+(test-assert "the stdio modes and direction bits are distinct"
+  (let ((bits (list (uv-stdio-create-pipe) (uv-stdio-inherit-fd)
+                    (uv-stdio-inherit-stream) (uv-stdio-readable-pipe)
+                    (uv-stdio-writable-pipe))))
+    (and (for-all positive? bits)
+         (= (length bits)
+            (length (filter (lambda (b) (= 1 (length (filter (lambda (c) (= b c)) bits)))) bits))))))
+(test-assert "nine signals, all positive and distinct"
+  (let ((sigs (list (sig-term) (sig-kill) (sig-int) (sig-hup) (sig-quit)
+                    (sig-usr1) (sig-usr2) (sig-cont) (sig-stop))))
+    (and (for-all positive? sigs)
+         (= 9 (length sigs))
+         (let loop ((s sigs))
+           (or (null? s)
+               (and (not (memv (car s) (cdr s))) (loop (cdr s))))))))
+(test-assert "process/pipe type tags resolve"
+  (and (integer? (uv-process-type)) (integer? (uv-named-pipe-type))))
+
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
 ;; The failure must be structured and must NAME the missing constant. A
 ;; default value, a zero, or a bare #f here is the exact silent-transcription
@@ -1131,19 +1182,26 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-(test-equal "live-counts reports all eight allocation classes"
+;; Task 4 added the three new rows to live-counts.
+(test-equal "live-counts reports all eleven allocation classes"
   '(loop tcp timer write-req connect-req
-    getaddrinfo-req getnameinfo-req read-buffer)
+    getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
   (map car (live-counts)))
+
+;; Superseded by the eleven-class row above, kept for provenance:
+;; (test-equal "live-counts reports all eight allocation classes"
+;;   '(loop tcp timer write-req connect-req
+;;     getaddrinfo-req getnameinfo-req read-buffer)
+;;   (map car (live-counts)))
 
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the eight-class matrix below. Every
+;; SEED / PRECONDITION, asserted before the eleven-class matrix below. Every
 ;; assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all eight "increments are visible" assertions would
+;; always return 0, so all eleven "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -1151,14 +1209,21 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All eight classes, not just one. There are twenty-four near-identical
-;; entry point names in the shim, and binding count-timer-new! to
+;; All eleven classes, not just one. There are twenty-two near-identical
+;; count entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
-;; checked to be the ONLY one that moved, then returned to zero.
+;; checked to be the ONLY one that moved, then returned to zero. The
+;; process and spawn-options rows are driven through the same exported
+;; count-* procedures as every other row -- this suite deliberately
+;; imports neither (libuv pipe) nor (libuv process); without these rows a
+;; cross-wired spawn-options pair was invisible to everything but
+;; valgrind.
 (define counter-classes
   (list (list 'loop        count-loop-new!        count-loop-free!)
         (list 'tcp         count-tcp-new!         count-tcp-free!)
+        (list 'pipe        count-pipe-new!        count-pipe-free!)
+        (list 'process     count-process-new!     count-process-free!)
         (list 'timer       count-timer-new!       count-timer-free!)
         (list 'write-req   count-write-req-new!   count-write-req-free!)
         (list 'connect-req count-connect-req-new! count-connect-req-free!)
@@ -1166,7 +1231,9 @@
               count-getaddrinfo-req-new! count-getaddrinfo-req-free!)
         (list 'getnameinfo-req
               count-getnameinfo-req-new! count-getnameinfo-req-free!)
-        (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)))
+        (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)
+        (list 'spawn-options
+              count-spawn-options-new! count-spawn-options-free!)))
 
 (for-each
  (lambda (entry)
@@ -1329,10 +1396,10 @@
 (test-equal "the shim this process loaded is the one config.sls names"
   shim-path (shim-file))
 
-;; --- the ten callback dispatcher slots, BEFORE anything installs them ---
+;; --- the twelve callback dispatcher slots, BEFORE anything installs them --
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
-;; installs the ten dispatchers in its own library body, at instantiation
+;; installs the twelve dispatchers in its own library body, at instantiation
 ;; (design spec S4: "the slots themselves are filled exactly once, by
 ;; handles.sls"). In every other suite's process the install has therefore
 ;; already happened before the first test line runs, so the uninstalled
@@ -1341,9 +1408,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the ten callback types the design commits to"
+(test-equal "dispatcher-names names the twelve callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo)
+    getaddrinfo getnameinfo exit walk)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1359,7 +1426,27 @@
        'no-raise)))
  dispatcher-names)
 
-(test-equal "dispatcher-ref rejects a name that is not one of the ten"
+;; The exit and walk slots, specifically: v0.3's two additions to the
+;; twelve, asserted with their own real arity (three args for exit, two for
+;; walk) and the exact uninstalled-stub message, beside the generic
+;; single-arg loop above (ADR-0015; test-native.sps never imports
+;; handles.sls, so both slots stay uninstalled for the life of this suite's
+;; process).
+(test-assert "the exit slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'exit) 0 0 0)
+    #f))
+
+(test-assert "the walk slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'walk) 0 0)
+    #f))
+
+(test-equal "dispatcher-ref rejects a name that is not one of the twelve"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1370,7 +1457,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the ten is refused, naming who and why"
+(test-equal "an install missing one of the twelve is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

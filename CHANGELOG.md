@@ -3,6 +3,104 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.3.0 — 2026-08-21
+
+Child processes: `uv_spawn` with the full stdio vocabulary, as `(libuv
+process)`, plus a deliberately minimal `(libuv pipe)` (`uv_pipe_init` only,
+no bind/connect/listen, no `ipc=1`) that exists so pipes can be handed to a
+spawn as a child's stdio end. Getting there required the one honest
+refactor both needed: the stream verbs (`uv-write!`, `uv-shutdown!`,
+`uv-read-start!`, `uv-read-stop!`) move out of `(libuv tcp)` into a new
+`(libuv stream)`, gated on stream-*kind* rather than tcp-kind — `(libuv
+tcp)` re-exports all four, so no importer has to change. This is the
+binding's first subprocess machinery and its first interaction with the
+host's child-reaping signals; both are governed by three new decision
+records (ADRs 0014–0016 under `.plans/decisions/`, gated on the Stage 0
+spike under `spike/process/`), and the full design is
+`.plans/2026-08-21-chez-libuv-v0.3-process-design.md`.
+
+### Added
+
+- `(libuv process)`: `uv-spawn!` (`loop file args [options] on-exit` →
+  process handle, child already running), with an options alist covering
+  `env` (a list of `"K=V"` strings, libuv's own format — no alist
+  encoding invented), `cwd`, `stdio`, `detached`, and `uid`/`gid` (setting
+  either implies the matching `UV_PROCESS_SETUID`/`SETGID` flag — the
+  binding closes the "field set, flag clear" footgun libuv leaves open).
+  The `stdio` vocabulary covers `ignore`, `(inherit-fd . n)`,
+  `(inherit-stream . h)`, and `(pipe p dir)` with `dir` one of
+  `to-child`/`from-child`/`duplex` — named from the parent's perspective,
+  deliberately not libuv's child-perspective `READABLE`/`WRITABLE` flags.
+  `uv-process-kill!`/`uv-kill!` take a signal from a closed symbol set
+  (`sigterm sigkill sigint sighup sigquit sigusr1 sigusr2 sigcont
+  sigstop`) or the exact integer `0` as the POSIX liveness probe;
+  `uv-process-pid` and `uv-process?` round out the surface. All of it
+  re-exported from `(libuv)`.
+- `(libuv pipe)`: `make-uv-pipe` (`uv_pipe_init`, ipc always 0) and
+  `uv-pipe?`.
+- `(libuv stream)`: the four verbs extracted from `(libuv tcp)`, now
+  accepting any open tcp or pipe handle.
+- The exit callback contract: `on-exit` receives `(exit-status
+  term-signal)` as results, never a condition — libuv's `exit_cb` has no
+  error argument. A child killed by signal delivers `(0 sigterm)`, not
+  `(-1 …)` — `exit-status` is `WEXITSTATUS` on a normal exit and *zero* on
+  a signal death; `term-signal` is `#f` on a normal exit, otherwise the
+  signal symbol or the raw integer for a signal outside the bound set.
+- The root lane: `tests/test-process-setuid.sps`, excluded from `make
+  test`/`make test-memory` and run separately by `sudo make test-root`
+  (refuses with a clear message under a non-root euid), to exercise
+  `uid`/`gid` as the privileged behaviour they are. Both CI jobs (`linux`,
+  `macos`) gained a `sudo make test-root` step.
+
+### Changed
+
+- Callback dispatch grows from ten to twelve static locked trampolines
+  (`exit`, `walk`). ADR-0008 is amended a second time; the "one locked
+  trampoline per callback type, constant per process" invariant now
+  covers twelve.
+- `uv-loop-teardown!`'s close sweep now also covers pipe and process
+  handles (`handle-kinds` widens to include them); an un-closed process
+  handle is caught exactly like an un-closed tcp handle. Exit and close
+  remain two distinct events (unchanged from libuv, newly documented
+  here): `on-exit` firing stops the handle but does not close it — the
+  caller still calls `uv-close!`, typically from inside `on-exit`.
+- The spawn-failure cleanup path is class-dependent, decided at runtime by
+  asking the loop (`uv_walk`, the twelfth trampoline) rather than by
+  errno (ADR-0015): an exec failure leaves the handle still linked into
+  the loop's handle queue and needs `uv-close!`-through-protocol; a
+  stdio-setup failure has already been unlinked by libuv and needs a
+  direct free. Getting the wrong arm either corrupts the loop's handle
+  queue or leaves it permanently `EBUSY`. A pipe named in any of the spawn's stdio specs is marked *connected* by a failed spawn too — libuv opens
+  the parent end before it can know whether the exec will succeed — so
+  the caller must still close it; naming it again raises
+  `'pipe-already-used`. **Version-dependent finding, not a binding bug:**
+  which failure class a given trigger lands in also depends on the
+  libuv underneath — upstream commit `3e9ae1bc` (libuv 1.52.0) is what
+  first unlinks a stdio-setup failure's handle; on an older libuv (found
+  via Linux CI's apt `libuv1-dev` 1.48.0) the same trigger lands in the
+  exec class instead, and the runtime discriminator handles both
+  correctly. ADR-0015 and the design spec's §5.6 carry the full account.
+
+### Notes
+
+- **SQ2 spike finding: no conflict with Chez's own subprocess APIs.**
+  Interleaving libuv spawns with Chez's `system`/`open-process-ports`
+  across four orderings delivered 110/110 libuv `exit_cb`s intact, with
+  every Chez call also returning its own correct result — measured on
+  Linux's SIGCHLD-based child-reaping path, the one path where a stolen
+  wait can silently drop a callback (`spike/process/FINDINGS.md` SQ2). No
+  mutual-exclusion warning was needed as a result.
+- No `uv_signal_t`: v0.3 binds only the signal-*sending* side
+  (`uv-process-kill!`/`uv-kill!`). Handling signals in the loop is a
+  recorded future-milestone candidate.
+- Run 32544754290, which executed the root lane as root on both
+  platforms, also delivered the first Linux valgrind verdict over the
+  process surface (the root suite itself is excluded from the memory
+  gate): zero errors, zero definitely/indirectly lost bytes across all
+  sixteen valgrinded processes.
+- The libuv version floor is unchanged: 1.44.0 or later in the 1.x
+  series.
+
 ## 0.2.0 — 2026-08-21
 
 DNS: libuv's complete resolver surface — `uv_getaddrinfo`, `uv_getnameinfo`,

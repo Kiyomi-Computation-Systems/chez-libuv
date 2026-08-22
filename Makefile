@@ -87,7 +87,15 @@ endif
 SRFI_SRC     := vendor/chez-srfi
 SRFI_LIBS    := $(BUILD_DIR)/scheme-libs
 CHEZ_LIBDIRS := src:tests:$(SRFI_LIBS)
-TESTS        := $(wildcard tests/test-*.sps)
+
+# The root lane (design spec v0.3 §9.4): privileged-but-deterministic
+# setuid/setgid tests, run ONLY by an explicit `sudo make test-root` --
+# never by the default suite, never under the memory gate. The filter-out
+# below is what keeps a `tests/test-*.sps` wildcard from silently running
+# it unprivileged (where it would loudly exit 1 and fail `make test`).
+ROOT_TESTS   := tests/test-process-setuid.sps
+
+TESTS        := $(filter-out $(ROOT_TESTS),$(wildcard tests/test-*.sps))
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
@@ -106,7 +114,7 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-memory vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-memory vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
 
@@ -378,6 +386,40 @@ test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, agg
 	if [ $$fail -eq 0 ]; then echo "ALL SUITES PASSED"; \
 	else echo "SUITE FAILED"; fi; \
 	exit $$fail
+
+# Refusal is the SUITE's job (it checks euid itself and exits 1 with a
+# message), so a bare `make test-root` fails loudly rather than skipping.
+#
+# NO `build deps` PREREQUISITES, deliberately: this target runs under sudo,
+# and on the vendored path $(SHIM) depends on the PHONY `vendor`, so a
+# `build` prerequisite relinked the shim -- as root -- on EVERY run,
+# leaving root-owned artifacts in build/ (plus root-owned symlinks from
+# `deps`). The recipe's first stanza is a CHECK, not a rebuild (AGENTS.md):
+# every artifact `build deps` would have made must already exist, and the
+# two provenance stamps must match THIS invocation's FLAVOR/HAVE_PKG --
+# the same identity relink-guard enforces, asserted here instead of acted
+# on. A stale-but-present shim is accepted; the lane trades staleness for
+# never writing to the tree as root. check-pins stays: it only reads.
+test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `make build deps` unprivileged first)
+	@missing=""; \
+	[ -f $(SHIM) ]           || missing="$$missing $(SHIM)"; \
+	[ -f $(CONFIG_SLS) ]     || missing="$$missing $(CONFIG_SLS)"; \
+	[ -f $(FLAVOR_STAMP) ]   || missing="$$missing $(FLAVOR_STAMP)"; \
+	[ -f $(ACQ_STAMP) ]      || missing="$$missing $(ACQ_STAMP)"; \
+	[ -d $(SRFI_LIBS)/srfi ] || missing="$$missing $(SRFI_LIBS)/srfi"; \
+	if [ -n "$$missing" ]; then \
+	  echo "test-root: missing or provenance-mismatched artifacts:$$missing" >&2; \
+	  echo "test-root deliberately does not build (under sudo, the phony" >&2; \
+	  echo "vendor prerequisite would relink the shim as root). Run" >&2; \
+	  echo "'make build deps' unprivileged first, with the same FLAVOR and" >&2; \
+	  echo "HAVE_PKG as this invocation." >&2; \
+	  exit 1; \
+	fi
+	@for t in $(ROOT_TESTS); do \
+	  echo "=== $$t (root lane) ==="; \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) $(CHEZ) --program $$t || exit 1; \
+	done; \
+	echo "ROOT LANE PASSED"
 
 # Where the macOS arm of test-memory looks for clang's ASan runtime. A
 # variable (deferred, so xcrun never runs on Linux) rather than an inline

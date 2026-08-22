@@ -605,6 +605,70 @@
   'body-value
   (call-with-uv-loop (lambda (loop) (uv-run loop 'nowait) 'body-value)))
 
+;; --- the re-exported stream, pipe, and process surfaces -------------------
+;; Same rule as every block above: each name here has to come from
+;; src/libuv.sls or this file does not expand. Re-exported stream verbs are
+;; tested above with TCP; here we test pipe and process.
+
+(test-assert "make-uv-pipe is exported"
+  (procedure? make-uv-pipe))
+
+(test-assert "uv-pipe? is exported"
+  (procedure? uv-pipe?))
+
+(test-assert "uv-process? is exported"
+  (procedure? uv-process?))
+
+(test-assert "uv-spawn! is exported"
+  (procedure? uv-spawn!))
+
+(test-assert "uv-process-kill! is exported"
+  (procedure? uv-process-kill!))
+
+(test-assert "uv-kill! is exported"
+  (procedure? uv-kill!))
+
+(test-assert "uv-process-pid is exported"
+  (procedure? uv-process-pid))
+
+;; Smoke test: spawn sh -c 'exit 5' through facade names only, assert exit (5 #f)
+(define pl (make-uv-loop))
+(define p-exit 'never-exited)
+(define p-ticker (make-uv-timer pl))
+(uv-timer-start! p-ticker (lambda (t) (collect)) 1 1)
+
+(define p-proc
+  (uv-spawn! pl "/bin/sh" '("sh" "-c" "exit 5")
+             (lambda (status sig)
+               (collect)
+               (set! p-exit (list status sig)))))
+
+;; 2048, not this file's usual 32: every other drain here waits on local,
+;; in-process callbacks, but this one waits on a real fork/exec/exit --
+;; with the 1ms ticker, 32 iterations was a ~32ms budget for the child,
+;; flake-shaped under load. 2048 matches test-process.sps's cap for the
+;; same exit-5 scenario.
+(let drain ((i 0))
+  (when (and (< i 2048) (eq? p-exit 'never-exited))
+    (uv-run pl 'once)
+    (drain (+ i 1))))
+
+(uv-timer-stop! p-ticker)
+
+(test-equal "uv-spawn! through the facade spawned sh -c 'exit 5' and exit callback reports (5 #f)"
+  '(5 #f) p-exit)
+
+(test-assert "uv-process? and uv-process-pid work through the facade"
+  (and (uv-process? p-proc) (number? (uv-process-pid p-proc))))
+
+(uv-close! p-proc)
+(let drain ((i 0))
+  (when (and (< i 32) (not (eq? (uv-handle-state p-proc) 'closed)))
+    (uv-run pl 'once)
+    (drain (+ i 1))))
+
+(uv-loop-teardown! pl)
+
 (test-end "facade")
 
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))
