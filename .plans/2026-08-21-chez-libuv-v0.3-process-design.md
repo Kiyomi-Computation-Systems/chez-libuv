@@ -361,7 +361,7 @@ drives every row:
 | `'stdio-spec-unknown` | a spec matching no §4.3 form (incl. bad `dir`) |
 | `'stdio-fd-not-an-fd` | `inherit-fd` value not a nonnegative exact integer < 2³¹ *(bound added 2026-08-22: the container field is a C int)* |
 | `'pipe-already-used` | `(pipe …)` names a connected pipe |
-| `'pipe-wrong-loop` | `(pipe …)` names a pipe from another loop |
+| `'pipe-wrong-loop` | a `(pipe …)` or `(inherit-stream …)` spec names a handle from another loop *(widened 2026-08-22: the same-loop walk covers every handle-bearing spec form, and always did — the row's original pipe-only wording under-described it)* |
 | `'signal-unknown` | `sig` outside the §4.5 symbol set and not `0` |
 | `'on-exit-not-a-procedure` | `on-exit` neither a procedure nor `#f` |
 | `'pid-not-an-exact-integer` | `uv-kill!` given a non-exact-integer pid |
