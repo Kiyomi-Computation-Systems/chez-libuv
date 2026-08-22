@@ -325,5 +325,60 @@
 (test-equal "teardown swept every armed watcher; counters balanced"
   signal-base (live-count 'signal))
 
+;; ========================================================================
+;; End-to-end graceful shutdown: the SQ-S2 spike probe, graduated (§9.3).
+;; Three-ack handshake (SQ-S2-F1): kill #2 gates on DISARMED, never GOT1.
+;; ========================================================================
+(define chez-exe (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+
+(if (not chez-exe)
+    (test-equal "E2E graceful shutdown SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (let ((l4 (make-uv-loop)))
+      (define out (make-byte-collector))
+      (define eof-mark 'not-yet)
+      (define done 'not-yet)
+      (define child-out (make-uv-pipe l4))
+      (define proc
+        (uv-spawn! l4 chez-exe
+                   (list "chez" "--program" "tests/signal-child.sps")
+                   (list (cons 'stdio (list 'ignore
+                                            (list 'pipe child-out 'from-child))))
+                   (lambda (status sig) (collect) (set! done (list status sig)))))
+      (define (ack-lines)
+        (let ((s (utf8->string (collector-bytes out))))
+          (let count ((i 0) (n 0))
+            (if (= i (string-length s))
+                n
+                (count (+ i 1) (if (char=? (string-ref s i) #\newline) (+ n 1) n))))))
+      (uv-read-start! child-out
+                      (lambda (bv start end) (collect) (collect-span! out bv start end))
+                      (lambda () (collect) (set! eof-mark 'eof))
+                      (lambda (err) (collect) (set! eof-mark (list 'error err))))
+
+      (test-equal "the child armed and acked READY"
+        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 1)) 4096))
+
+      (uv-kill! (uv-process-pid proc) 'sigterm)          ; kill #1
+
+      (test-equal "the child acked delivery (GOT1, from inside the callback)"
+        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 2)) 4096))
+
+      (test-equal "the child acked disarm (DISARMED, from a later dispatch)"
+        'satisfied (run-until/ticking l4 (lambda () (>= (ack-lines) 3)) 4096))
+
+      (uv-kill! (uv-process-pid proc) 'sigterm)          ; kill #2, gated on DISARMED
+
+      (test-equal "the child exited"
+        'satisfied (run-until/ticking l4 (lambda () (pair? done)) 4096))
+      (test-equal "…killed by the second SIGTERM: (0 sigterm) -- graceful then killed"
+        '(0 sigterm) done)
+      (test-equal "the ack transcript is exactly READY/GOT1/DISARMED"
+        "READY\nGOT1\nDISARMED\n" (utf8->string (collector-bytes out)))
+
+      (uv-loop-teardown! l4)
+      (test-equal "signal+process+pipe counters balanced after the E2E"
+        signal-base (live-count 'signal))))
+
 (test-end "signal")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))

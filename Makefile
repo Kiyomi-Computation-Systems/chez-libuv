@@ -381,7 +381,7 @@ test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, agg
 	@fail=0; \
 	for t in $(TESTS); do \
 	  echo "=== $$t ==="; \
-	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) $(CHEZ) --program $$t || fail=1; \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) $(CHEZ) --program $$t || fail=1; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL SUITES PASSED"; \
 	else echo "SUITE FAILED"; fi; \
@@ -468,7 +468,7 @@ ifeq ($(UNAME_S),Linux)
 	@for t in $(MEMORY_TESTS); do \
 	  UV_USE_IO_URING=0 \
 	  CHEZ_LIBUV_UNDER_VALGRIND=1 \
-	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) valgrind --error-exitcode=9 \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) valgrind --error-exitcode=9 \
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \
 	    --undef-value-errors=no \
@@ -494,7 +494,7 @@ else
 	  exit 1; \
 	}; \
 	echo "test-memory: ASan runtime $$asan"; \
-	CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) \
+	CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
 	  DYLD_INSERT_LIBRARIES="$$asan" \
 	  ASAN_OPTIONS=detect_leaks=0 \
 	  MallocNanoZone=0 \
