@@ -1072,8 +1072,8 @@
   ;; record-orphan-callback!: walk visits whatever libuv says is in the
   ;; queue, recognized by this registry or not, and the point of the query
   ;; is exactly "what does libuv say is there", not "what do we recognize".
-  (define (walk-dispatch handle-ptr arg)
-    (set! walk-query-cell (cons handle-ptr walk-query-cell)))
+  (define (walk-dispatch walked-ptr arg)
+    (set! walk-query-cell (cons walked-ptr walk-query-cell)))
 
   ;; (handle-in-loop-queue? loop handle) -- ADR-0015's measured instrument.
   ;; Resets the cell, walks the loop, and answers whether HANDLE's own
