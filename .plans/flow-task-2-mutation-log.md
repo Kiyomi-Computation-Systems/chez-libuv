@@ -420,3 +420,73 @@ review's Finding 2 comment fix, no mutation residue. `tests/test-flow.sps`
 carries Fix 2's recv-buffer constant change (`8192`/`262144` →
 `16384`/`131072`) but is unchanged at 18 rows. `make test` after the last
 revert: `ALL SUITES PASSED`.
+
+---
+
+## Probe E, EXECUTED — the validate-before-allocate decision now has evidence
+
+Probe E was recorded at Task 2 as producing no plain-build failure *by design*:
+moving `require-buffer-size` below the `alloc-zeroed` leaks the `int` cell on
+the refused path only, and the assertions still see the right condition. Until
+now that leak had been **observed nowhere**. `make test` passes under the
+mutation, macOS ASan makes no leak claim (LeakSanitizer does not exist on
+ARM64 — ADR-0003), and the Linux Valgrind leg had only ever run unmutated
+code. So the decision the CHANGELOG advertises — that validation happens
+before the first allocation — had no executed evidence in *either* direction.
+
+Executed 2026-08-30 in a Debian bookworm container mirroring `ci.yml`'s linux
+job: Chez 10.4.1 built from the pinned release tarball
+(`--disable-x11 --disable-curses`, serial make), Valgrind 3.19.0, same flags
+the `test-memory` recipe uses.
+
+**Mutation** (`src/libuv/handle.sls`):
+
+```scheme
+  (define (set-buffer-size! native handle n who)
+    (require-socket-handle handle who)
+    (let ((cell (alloc-zeroed (c-int-size))))
+      (require-buffer-size n who)          ; raises OUTSIDE the guard
+      (guard (e (#t (free! cell) (raise e)))
+```
+
+**Control leg, unmutated:**
+```
+# of expected passes      23
+definitely lost: 0 bytes in 0 blocks
+ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+```
+
+**Probe E leg:**
+```
+# of expected passes      23
+8 bytes in 2 blocks are definitely lost in loss record 1 of 7
+   at 0x48850C8: malloc (vgpreload_memcheck-arm64-linux.so)
+   by 0x19F8AF: s_malloc (csv10.4.1/tarm64le/scheme)
+definitely lost: 8 bytes in 2 blocks
+ERROR SUMMARY: 1 errors from 1 contexts (suppressed: 0 from 0)
+```
+
+**Result: GREEN.** Two blocks, one per refused setter call —
+`(uv-send-buffer-size! btcp 0)` at `tests/test-flow.sps:188` and
+`(uv-recv-buffer-size! btcp 2147483648)` at `:196` — four bytes each, through
+Chez's `s_malloc`, which is what `alloc-zeroed` bottoms out in.
+
+**The row count is the point.** 23 passes on both legs. The suite is
+*completely blind* to this defect; the only difference between a correct
+binding and a leaking one is a line in Valgrind's summary. That is precisely
+why ADR-0003 makes the Linux leg the sole memory gate rather than a
+nice-to-have, and it is now demonstrated rather than argued.
+
+**Caveat, stated rather than buried.** The container is aarch64; CI is x86_64.
+Allocation/free discipline is architecture-independent and the leak is a
+missing `free!` on a Scheme code path, not anything word-size dependent — but
+this specific output was not produced on the architecture CI runs.
+
+**A known trap re-confirmed live, worth recording for anyone reproducing
+this.** The first attempt invoked Chez through a `chez` symlink to `scheme`
+and died in `find_boot` / `S_abnormal_exit` before running a single row,
+reporting `12,384 bytes in 1 blocks definitely lost` from the aborted boot —
+a leak that has nothing to do with this binding. **Chez resolves its boot
+files by `argv[0]`**, so it must be invoked by the install's real binary name.
+Anyone reading a Valgrind leak whose stack bottoms out in `find_boot` is
+looking at a broken invocation, not a defect.
