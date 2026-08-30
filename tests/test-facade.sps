@@ -411,6 +411,10 @@
 (test-equal "the facade's write-queue-size answers zero on an idle stream"
   'zero (if (zero? (uv-stream-write-queue-size fclient)) 'zero 'nonzero))
 
+(test-equal "the facade's peer-address answers the connected peer"
+  (list "127.0.0.1" fport)
+  (let-values (((a p) (uv-tcp-peer-address fclient))) (list a p)))
+
 (uv-loop-teardown! fl)
 
 (test-equal "the facade's tcp loop tore down and closed every handle"

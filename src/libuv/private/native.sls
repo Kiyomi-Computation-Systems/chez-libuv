@@ -77,7 +77,8 @@
           ;; NOT exported raw, for the same reason as uv_timer_start and
           ;; uv_close above: their wrappers bake in this library's own
           ;; trampoline entry points.
-          uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-nodelay
+          uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-getpeername-native
+          uv-tcp-nodelay
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop
@@ -468,6 +469,15 @@
     (foreign-procedure "uv_tcp_bind" (uptr uptr unsigned-int) int))
   (define uv-tcp-getsockname
     (foreign-procedure "uv_tcp_getsockname" (uptr uptr uptr) int))
+  ;; uv_tcp_getpeername (design spec S5, v0.5 Task 4): same signature and
+  ;; same out-parameter contract as uv_tcp_getsockname above -- an
+  ;; in/out namelen and a caller-owned sockaddr_storage scratch buffer.
+  ;; -native, matching uv-tcp-connect-native and its siblings, because the
+  ;; PUBLIC wrapper (libuv tcp)'s uv-tcp-peer-address bakes in the argument
+  ;; validation and the namelen-vs-port-offset check; this raw binding does
+  ;; neither.
+  (define uv-tcp-getpeername-native
+    (foreign-procedure "uv_tcp_getpeername" (uptr uptr uptr) int))
   (define uv-tcp-nodelay
     (foreign-procedure "uv_tcp_nodelay" (uptr int) int))
   (define uv-accept
