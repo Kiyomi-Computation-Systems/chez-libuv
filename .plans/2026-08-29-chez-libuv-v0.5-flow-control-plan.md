@@ -611,7 +611,7 @@ grep -cE '^\(test-(equal|assert|eqv|eq) ' tests/test-flow.sps
 
 Expected: `ALL SUITES PASSED`; `test-flow.sps` = **20** (10 + 10).
 
-- [ ] **Step 7: Watch three mutations fail**
+- [ ] **Step 7: Watch five mutations fail**
 
 *A — the zero seed.* In `get-buffer-size!`, insert `(c-int-set! cell 1)` after the `alloc-zeroed`.
 Expected: `FAIL the send buffer tracks the value set, at two points` and `FAIL the receive buffer tracks independently of the send buffer` and both facade `tracks-upward` rows. The mutated getter sets the buffer to the kernel minimum on every read, so neither reading tracks.
@@ -619,7 +619,13 @@ Expected: `FAIL the send buffer tracks the value set, at two points` and `FAIL t
 *B — the gate.* Change `require-open-handle` back to `require-handle` in `require-socket-handle`.
 Expected: exactly `FAIL all four refuse a closing handle with &uv-handle-closed`.
 
-*C — validate-after-allocate.* Move `require-buffer-size` below the `alloc-zeroed` in `set-buffer-size!`.
+*C — swallow the native return code.* Delete the `uv-check` wrapper in `get-buffer-size!` and `set-buffer-size!`, keeping the bare native call.
+Expected: all four `surfaces the native failure on a pipe with no fd` rows fail, each reporting `'no-raise`.
+
+*D — the kind allowlist.* Delete the `memq` check from `require-socket-handle`.
+Expected: exactly `FAIL a timer is refused as a socket handle`.
+
+*E — validate-after-allocate.* Move `require-buffer-size` below the `alloc-zeroed` in `set-buffer-size!`.
 Expected: no `FAIL` in a plain build — the rows still see the right condition. **This is the point:** the leak is invisible except under `make test-memory`, which must report a `definitely lost:` line on the Linux leg. Record that asymmetry in the log; it is the justification for the four EBADF rows.
 
 Revert after each; confirm `ALL SUITES PASSED` between.
@@ -630,7 +636,7 @@ Revert after each; confirm `ALL SUITES PASSED` between.
 make test-memory 2>&1 | tail -20
 ```
 
-Write `.plans/flow-task-2-mutation-log.md` with all three probes, then:
+Write `.plans/flow-task-2-mutation-log.md` with all five probes, then:
 
 ```bash
 git add src/libuv/private/native.sls src/libuv/handle.sls src/libuv.sls tests/test-flow.sps tests/test-facade.sps .plans/flow-task-2-mutation-log.md
