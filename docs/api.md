@@ -132,13 +132,53 @@ close dispatcher; its size is fixed by that first call, irreversibly — a
 later call with a differing explicit size raises `'buffer-size-fixed`, and a
 call that omits the size is always accepted, which is what makes
 `uv-read-stop!` → `uv-read-start!` the cheap operation read-side
-backpressure needs. A smaller buffer cuts per-connection foreign memory
-linearly, but it also raises `read(2)` count and `on-data` delivery count —
-and therefore Scheme bytevector allocation, one fresh bytevector per
-delivery — proportionally. 64 KiB is libuv's own suggestion and the current
-default; no measurement has been taken of the tradeoff at other sizes, so
-this is deliberately not a recommendation to lower it. A connection-count-
-dominated workload should measure before choosing a smaller size.
+backpressure needs. 64 KiB is libuv's own suggestion and the current default.
+
+The tradeoff has now been measured (`spike/flow/14-readbuf-default.ss`,
+Debian bookworm/aarch64; full method and limits in
+[`spike/flow/FINDINGS.md`](../spike/flow/FINDINGS.md)), and it is more
+one-sided than it looks.
+
+**Memory scales linearly and is the term that clearly differentiates.** The
+buffer is committed at the first `uv-read-start!` whether or not a byte ever
+arrives:
+
+| buffer | 200 connections | extrapolated to 10,000 |
+|---|---|---|
+| 4096 | ~1.2 MiB | ~40 MiB |
+| 16384 | ~3.1 MiB | ~160 MiB |
+| 65536 | ~12.4 MiB | ~625 MiB |
+
+**The costs on the other side did not show up.** Moving 16 MiB through one
+socket: a 4 KiB buffer produced 16× as many `on-data` deliveries as a 64 KiB
+one, exactly as expected — and cost 3 garbage collections against the larger
+buffer's 3, with sub-millisecond GC time at every size and no monotonic
+trend. Throughput varied 9% across a 16× size range, also non-monotonically.
+Neither column can distinguish the sizes at this scale.
+
+Note also that *total bytes* allocated cannot vary with buffer size: each
+delivery allocates exactly `nread` bytes, so a given transfer produces the
+same volume of bytevectors however it is chunked. Only the object count
+changes.
+
+**Two limits worth knowing before you act on this.** The measurement
+discarded every delivery, and a copying collector charges for what
+*survives* — a consumer that **retains** deliveries, as any protocol
+reassembler holding fragments across reads does, was not measured and is
+where an object-count cost would first appear. And the buffer only governs
+delivery size for reads that fill it: under small-message traffic the
+delivery size is set by what arrives, so the buffer does not affect object
+count at all.
+
+**In practice.** Many connections carrying small messages — the case this
+milestone was built for — is where a smaller buffer is close to free and the
+saving is linear; 4096 or 16384 are reasonable there. Bulk transfer keeps
+64 KiB, where the memory is amortised over far fewer connections anyway. If
+you retain deliveries across reads, treat the object-count question as open.
+
+This still is not a change to the default: v0.5 pinned 65536 with a test
+rather than moving it, so that a later milestone can move it deliberately
+and with its own decision record.
 
 **The read-stop/read-start pairing invariant.** `uv-read-stop!` goes through
 the same open-handle gate as every other stream verb, while `read-dispatch`
