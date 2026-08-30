@@ -245,3 +245,61 @@ fast. Already logged per the controller's instruction; not fixed here.
 this log. `git -C vendor/libuv status --porcelain` (and top-level
 `git submodule status`) confirm `vendor/libuv` was never touched — no Step 3
 mutation was applied or left behind.
+
+---
+
+## Controller-run: the vendor drift probe
+
+Run by the controller, not the implementer. This probe edits a **git
+submodule**, where a stray leftover is easier to miss than in the parent tree —
+two subagents earlier in this milestone returned control with live mutations
+applied, so mutation execution moved here.
+
+**Baseline, unmutated:**
+```
+vendor read-path facts ok: ZERO_READ set=2 cleared=0, read_buffer assigned=0
+```
+
+**Mutation:** append a third assignment to `vendor/libuv/src/win/tcp.c`:
+```c
+void chez_probe_drift(uv_tcp_t*h){h->flags |= UV_HANDLE_ZERO_READ;}
+```
+
+**Output:**
+```
+VENDOR DRIFT: UV_HANDLE_ZERO_READ assigned 3 (expected 2: win/tcp.c, win/udp.c),
+  cleared 0 (expected 0); read_buffer assigned 0 (expected 0).
+src/libuv/stream.sls and src/libuv/private/handles.sls both cite these
+facts in the read-buffer comments. Re-verify BOTH before bumping.
+make: *** [check-pins] Error 1
+```
+
+`make check-pins` exit status **2** — make's own code for a recipe that exited
+1. Measured directly rather than through a pipe: `make check-pins | tail` reports
+*tail's* status, which is 0 and looks like a pass. Anyone gating this in a
+script must capture make's status, not a pipeline's.
+
+**Reverted** via `git -C vendor/libuv checkout -- src/win/tcp.c`; submodule and
+parent both clean; `make check-pins` and `make check-help` green again.
+
+**Result: GREEN.** The guard fires on the drift it exists to catch, and its
+message names both Scheme comment sites — which is the whole point, since the
+failure a future maintainer needs to act on is not "a count changed" but
+"two comments in this repo now cite something untrue."
+
+### What this probe does and does not bind
+
+- It binds the **vendored** path only. ADR-0001's system-libuv acquisition path
+  is unaudited by it — a system libuv whose read path differs would not trip
+  this guard.
+- The rule the corrected comments state does **not** depend on the vendor fact.
+  It rests on the portable infallible-alloc invariant
+  (`src/libuv/private/handles.sls:846-858`): freeing anywhere but close means
+  `alloc-dispatch` might have to allocate on a path libuv can call into, and
+  that breaks on every platform. The vendor facts are a *footnote* to the rule,
+  and the tripwire protects the footnote, not the rule.
+
+That distinction is the reason this task exists. The old comments made a
+platform-specific dead-code claim carry a portable invariant's weight; a reader
+who checked the claim would find nothing and could reasonably conclude the rule
+was obsolete.
