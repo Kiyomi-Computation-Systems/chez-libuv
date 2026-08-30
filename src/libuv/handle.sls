@@ -90,8 +90,8 @@
     (and (uv-handle? handle) (eq? (handle-kind handle) 'signal)))
 
   ;; --- OS socket buffer sizes ----------------------------------------------
-  ;; THREE DIFFERENT BUFFERS share confusable names, and docs/api.md tabulates
-  ;; them together for that reason:
+  ;; THREE DIFFERENT BUFFERS share confusable names, which is why docs/api.md
+  ;; will carry them in one table:
   ;;
   ;;   * chez-libuv's per-handle read buffer -- fixed by the first
   ;;     uv-read-start!, freed by the close dispatcher, 64 KiB by default;
