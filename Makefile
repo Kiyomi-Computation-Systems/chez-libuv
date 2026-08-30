@@ -238,14 +238,22 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	@zr=$$(grep -rn 'UV_HANDLE_ZERO_READ' $(VENDOR_DIR)/src | grep -c '|=' || true); \
 	zc=$$(grep -rn 'UV_HANDLE_ZERO_READ' $(VENDOR_DIR)/src | grep -c '&= *~' || true); \
 	rb=$$(grep -rn 'read_buffer *=' $(VENDOR_DIR)/src $(VENDOR_DIR)/include | grep -vc 'read_buffer ==' || true); \
-	if [ "$$zr" != "2" ] || [ "$$zc" != "0" ] || [ "$$rb" != "0" ]; then \
+	wr=$$(grep -c 'WSARecv(' $(VENDOR_DIR)/src/win/tcp.c || true); \
+	pc=$$(grep -c 'CancelIoEx' $(VENDOR_DIR)/src/win/pipe.c || true); \
+	pg=$$(grep -c 'GetOverlappedResult' $(VENDOR_DIR)/src/win/pipe.c || true); \
+	if [ "$$zr" != "2" ] || [ "$$zc" != "0" ] || [ "$$rb" != "0" ] || [ "$$wr" != "2" ] || [ "$$pc" != "2" ] || [ "$$pg" != "2" ]; then \
 	  echo "VENDOR DRIFT: UV_HANDLE_ZERO_READ assigned $$zr (expected 2: win/tcp.c, win/udp.c)," >&2; \
 	  echo "  cleared $$zc (expected 0); read_buffer assigned $$rb (expected 0)." >&2; \
+	  echo "  win/tcp.c WSARecv call sites=$$wr (expected 2, incl. the non-overlapped" >&2; \
+	  echo "  read at tcp.c:1108); win/pipe.c CancelIoEx=$$pc GetOverlappedResult=$$pg" >&2; \
+	  echo "  (expected 2 each -- the overlapped-ReadFile drain sequence at" >&2; \
+	  echo "  pipe.c:2006-2008)." >&2; \
 	  echo "src/libuv/stream.sls and src/libuv/private/handles.sls both cite these" >&2; \
 	  echo "facts in the read-buffer comments. Re-verify BOTH before bumping." >&2; \
 	  exit 1; \
 	fi; \
-	echo "vendor read-path facts ok: ZERO_READ set=$$zr cleared=$$zc, read_buffer assigned=$$rb"
+	echo "vendor read-path facts ok: ZERO_READ set=$$zr cleared=$$zc, read_buffer assigned=$$rb"; \
+	echo "vendor read-path facts ok: tcp WSARecv sites=$$wr, pipe CancelIoEx=$$pc GetOverlappedResult=$$pg"
 
 # Nothing outside private/ may see a raw uv_* symbol or pointer (design spec
 # section 3). test-conditions.sps exercises the pure &uv-* condition

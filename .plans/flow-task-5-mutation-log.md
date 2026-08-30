@@ -294,7 +294,7 @@ failure a future maintainer needs to act on is not "a count changed" but
   this guard.
 - The rule the corrected comments state does **not** depend on the vendor fact.
   It rests on the portable infallible-alloc invariant
-  (`src/libuv/private/handles.sls:846-858`): freeing anywhere but close means
+  (`src/libuv/private/handles.sls:846-860`): freeing anywhere but close means
   `alloc-dispatch` might have to allocate on a path libuv can call into, and
   that breaks on every platform. The vendor facts are a *footnote* to the rule,
   and the tripwire protects the footnote, not the rule.
@@ -303,3 +303,96 @@ That distinction is the reason this task exists. The old comments made a
 platform-specific dead-code claim carry a portable invariant's weight; a reader
 who checked the claim would find nothing and could reasonably conclude the rule
 was obsolete.
+
+## Fix review: widened tripwire coverage (pipe + tcp WSARecv shape)
+
+Code review of the above found the tripwire narrower than the comments
+claimed. Two more count-based checks were added to the same `check-pins`
+recipe block, measured against the pinned vendor tree; no vendor files were
+touched to add them.
+
+### New check 1: pipe drain-sequence presence (`win/pipe.c`)
+
+Binds: that `CancelIoEx` and `GetOverlappedResult` are both still present in
+`win/pipe.c` — i.e. that the pipe read path still cancels and synchronously
+drains an overlapped `ReadFile` before returning, which is the fact the
+corrected comments cite as making the pipe read path safe for the
+close-only-free rule's *old* (now dead-code) Windows justification.
+
+Does NOT bind: that the drain sequence still executes in the order or
+control-flow shape the comment describes, that it is still reachable from
+the same call path, or that its semantics are unchanged — a grep only counts
+occurrences of two identifier strings. A libuv change that renamed, reordered
+non-adjacently, or wrapped these calls differently while keeping both
+identifiers present twice would not trip this guard.
+
+Measured: `CancelIoEx` count in `vendor/libuv/src/win/pipe.c` = **2**
+(`:1012`, `:2006`); `GetOverlappedResult` count = **2** (`:1938`, `:2008`).
+Both asserted `== 2`.
+
+### New check 2: tcp WSARecv call-site count (`win/tcp.c`)
+
+Binds: the *number* of `WSARecv(` call sites in `win/tcp.c` — a coarse proxy
+for "the read/write call shape in this file hasn't changed." The comment's
+load-bearing claim is that the call at `tcp.c:1108` is non-overlapped
+(`WSARecv(..., NULL, NULL)` — no `OVERLAPPED*` or completion routine
+argument); this check does not inspect that call's argument list at all, so
+it cannot detect a change that makes the *existing* call sites overlapped
+while leaving their count at 2.
+
+Does NOT bind: the shape of any individual call (overlapped vs. not,
+argument list, ordering). A count-preserving edit that flips :1108 to pass a
+real `OVERLAPPED*` would leave `wr=2` and pass silently — exactly the gap the
+review flagged, only partially closed. Closing it fully would require
+parsing or otherwise inspecting the call's argument list, which this
+Makefile-shell-grep approach does not attempt; the comment itself was
+reworded (see task-5-report.md Fix 1) to stop claiming this guard proves the
+non-overlapped property.
+
+Measured: `WSARecv(` count in `vendor/libuv/src/win/tcp.c` = **2** (`:571`,
+`:1108`). Asserted `== 2`.
+
+### Combined `make check-pins` output (unmutated tree, after fix)
+
+```
+pins agree: chez-srfi 7879b52
+vendored libuv pin ok: 1.52.1 (0x013401) in [0x012c00,0x01ffff]
+README states the libuv floor (1.44.0)
+manifest version matches CHANGELOG (0.4.0)
+vendor read-path facts ok: ZERO_READ set=2 cleared=0, read_buffer assigned=0
+vendor read-path facts ok: tcp WSARecv sites=2, pipe CancelIoEx=2 GetOverlappedResult=2
+```
+Exit 0. `make check-help` exit 0 (silent). `make test`: `ALL SUITES PASSED`,
+sixteen suites, exit 0, no new or changed rows.
+
+### Net effect on what `check-pins` does and does not bind (supersedes the
+paragraph above for the fuller picture)
+
+- Binds, per handle kind: TCP's `UV_HANDLE_ZERO_READ` set/clear counts and
+  `read_buffer` assignment count (original three checks); TCP's `WSARecv`
+  call-site count (new); pipe's `CancelIoEx` / `GetOverlappedResult`
+  presence counts (new). Together these now cover both handle kinds the
+  comment discusses, closing the Important-1 gap (pipe had zero coverage).
+- Still does not bind: system-libuv (ADR-0001's non-vendored acquisition
+  path is unaudited); the *semantic* shape of any call this counts,
+  including the non-overlapped-ness of `tcp.c:1108`'s `WSARecv` (Important-2
+  gap, only partially closeable by grep — see New check 2 above); ordering
+  or control-flow between the counted calls.
+- The comments were rewritten (not just the Makefile) to stop calling this
+  "a tripwire over these vendor facts" and instead state plainly that it is
+  a coarse count/presence check: tripping it means re-read the cited code
+  before touching either Scheme site; not tripping it is not evidence the
+  cited facts still hold, since a count-preserving semantic change is
+  exactly the failure mode neither new check fully closes.
+- The rule the comments state still does not depend on any of this. It rests
+  on the portable infallible-alloc invariant
+  (`src/libuv/private/handles.sls:846-860`), independent of the vendor
+  facts, which remain a footnote the tripwire protects, not the rule itself.
+
+No vendor drift probe was run against the two new checks by this agent, per
+the controller's instruction that `vendor/libuv` mutations are the
+controller's step. A probe analogous to the existing one — appending a
+second `CancelIoEx(...)` call (as a no-op wrapper) to `win/pipe.c`, or a
+second `WSARecv(...)` call to `win/tcp.c` — would be expected to raise the
+corresponding count and trip the same `VENDOR DRIFT` branch; not
+independently verified here.
