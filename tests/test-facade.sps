@@ -220,13 +220,28 @@
     (uv-run hl 'once)
     (step (+ i 1))))
 
-(test-equal "uv-timer-start! is re-exported and its callback fires"
-  1 ht-fires)
+;; AT LEAST one, not EXACTLY one. ht is a REPEATING timer (1ms initial, 7ms
+;; repeat), so the exact count is a function of how fast the host got back
+;; into the loop -- a wall-clock dependency in disguise, and the one thing
+;; S11 forbids. Measured under Valgrind on aarch64 (`make test-memory-docker`):
+;; the initial AND the first repeat are both already due by the time the loop
+;; processes timers, so a single 'once fires the callback TWICE and an
+;; `(test-equal 1 ht-fires)` fails on a completely clean tree. CI's faster
+;; x86_64 host happens to stay under 7ms and mask it; that is luck, not a
+;; property. What this row is actually for is "the re-exported start! reaches
+;; the callback at all", and `positive?` says exactly that.
+(test-assert "uv-timer-start! is re-exported and its callback fires"
+  (positive? ht-fires))
 
+;; Captured BEFORE the stop, compared after: a delta, not a literal. This is
+;; the stronger form anyway -- it asserts the count did not MOVE across the
+;; stop, which is what "disarms" means, rather than that it equals a number
+;; the row above already had to stop pinning.
+(define ht-fires-at-stop ht-fires)
 (uv-timer-stop! ht)
 
 (test-equal "uv-timer-stop! is re-exported and disarms the timer"
-  1 (begin (uv-run hl 'nowait) ht-fires))
+  ht-fires-at-stop (begin (uv-run hl 'nowait) ht-fires))
 
 (uv-timer-again! ht)
 (let step ((i 0))
