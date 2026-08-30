@@ -11,7 +11,12 @@ reverted (`make test` back to `ALL SUITES PASSED`) before the next probe.
 Probes A-E were recorded during the original Task 2 work; Probes F and G
 were added in a follow-up review pass (Finding 1) to cover two assertions,
 plus a sub-assertion of a third, that A-E left unwatched by any `src/`
-mutation.
+mutation. A second review pass (Fix 2) proved by direct experiment that
+Probe G's `send-unmoved` sub-assertion was never actually exercised under
+the constants `test-flow.sps` used at the time -- `tests/test-flow.sps`'s
+recv-buffer constants were widened to make it detectable, Probe G was
+re-run against the corrected test, and Probe H was added for a fourth
+previously-unwatched assertion (the receive setter's upper-bound refusal).
 
 ## Probe A: The zero seed
 
@@ -231,7 +236,9 @@ n)` restored); `make test` returned to `ALL SUITES PASSED`.
 
 ---
 
-## Probe G: Cross-wire the receive setter (added in review follow-up)
+## Probe G: Cross-wire the receive setter (added in review follow-up;
+narrative corrected in Fix 2 — the original text below overstated what this
+probe had proven; read the whole entry, not just the first run)
 
 **Mutation:** in `uv-recv-buffer-size!`, passed `uv-send-buffer-size-native`
 instead of `uv-recv-buffer-size-native`:
@@ -244,8 +251,9 @@ instead of `uv-recv-buffer-size-native`:
   (set-buffer-size! uv-send-buffer-size-native handle n 'uv-recv-buffer-size!)) ; MUTATION
 ```
 
-**Build & test output** (`make test 2>&1 | grep -E "FAIL|of unexpected failures"`,
-verbatim):
+**First recorded run (Fix 1), under `test-flow.sps`'s ORIGINAL constants**
+(the recv section then used the same `8192`/`262144` the send section uses)
+(`make test 2>&1 | grep -E "FAIL|of unexpected failures"`, verbatim):
 ```
 FAIL the facade's receive-buffer getter and setter track at two points
 # of unexpected failures  1
@@ -253,22 +261,135 @@ FAIL the receive buffer tracks independently of the send buffer
 # of unexpected failures  1
 SUITE FAILED
 ```
+This was logged at the time as proof that the row's `send-unmoved` element
+was watched. It is not: `test-equal` compares the whole two-element list
+`'(tracks-upward send-unmoved)` as one unit, so a `FAIL` here only proves
+*some* element differed from expected — not which one. Evaluating the row's
+own expressions directly (`chez --program`, same libraries, same handle,
+same call sequence, mutation still applied) shows which:
+```
+(send-low 8192 send-high 262144)
+(recv-low 131072 recv-high 131072)
+(row-result (did-not-track send-unmoved) expected (tracks-upward send-unmoved))
+```
+`row-result`'s second element already reads `send-unmoved` — matching what
+`test-equal` expects. Only the first element (`did-not-track` vs. expected
+`tracks-upward`) differs; the row fails entirely on `tracks-upward` and
+`send-unmoved` contributes nothing. The mechanism: `setsockopt` is
+last-write-wins with no history dependence, and the recv section's mutated
+calls write SO_SNDBUF with the SAME two values (`8192` then `262144`) the
+send section already used, landing SO_SNDBUF back on exactly `send-high`
+(`262144`) by coincidence of shared constants — not because the cross-wire
+was caught. `send-unmoved` is structurally unfalsifiable as long as both
+sections share constants, exactly as the reviewer identified.
 
-**Result:** GREEN (failure detected). The predicted row (`"the receive
-buffer tracks independently of the send buffer"`) failed as expected — with
-the setter cross-wired to `uv_send_buffer_size`, `uv-recv-buffer-size!`
-resizes SO_SNDBUF instead of SO_RCVBUF, so `recv-high` no longer exceeds
-`recv-low` (`tracks-upward` fails) and, separately, the real SO_SNDBUF value
-now *does* move underneath the unrelated `send-unmoved` check. `make test`
-also surfaced a second, unpredicted-by-name-in-the-brief-but-expected-by-
-construction failure in `test-facade.sps` (`"the facade's receive-buffer
-getter and setter track at two points"`), which exercises the same
-`uv-recv-buffer-size!` through the facade's own connected pair — confirming
-this mutation is caught by every suite that loads `(libuv handle)`, not
-`test-flow.sps` alone, which is why the brief's verification pass calls for
-the full `make test` rather than a single suite. Reverted
-(`uv-recv-buffer-size-native` restored); `make test` returned to `ALL
-SUITES PASSED`.
+**Fix applied (Fix 2):** `tests/test-flow.sps`'s recv section constants
+changed from `8192`/`262144` to `16384`/`131072`, distinct from the send
+section's. Verified first that the recv `tracks-upward` element still holds
+on this host (Darwin/arm64) with the new constants: a raw
+`setsockopt`/`getsockopt` probe (`SO_RCVBUF` set to `16384` then `131072`)
+read back exactly the requested values, no kernel doubling or clamping on
+this platform, so `16384 -> 131072` is still strictly increasing here; a
+clean-tree `make test` after the constant change alone stayed `ALL SUITES
+PASSED` with `test-flow.sps` still reporting 18 expected passes.
+
+**Second run, same mutation, against the corrected constants** (`make test
+2>&1 | grep -E "FAIL|of unexpected failures"`, verbatim):
+```
+FAIL the facade's receive-buffer getter and setter track at two points
+# of unexpected failures  1
+FAIL the receive buffer tracks independently of the send buffer
+# of unexpected failures  1
+SUITE FAILED
+```
+Same two `FAIL` lines by name as before (expected — the mutation and the
+row names did not change), but the element-level picture is now different:
+```
+(send-low 8192 send-high 262144)
+(recv-low 131072 recv-high 131072)
+(row-result (did-not-track send-moved) expected (tracks-upward send-unmoved))
+```
+With `16384`/`131072` no longer equal to `send-high` (`262144`), the
+cross-wired writes leave real SO_SNDBUF at `131072` when the recv section
+finishes, which no longer equals `send-high` — `send-unmoved` now correctly
+reads `send-moved`. **Both** elements of `row-result` now disagree with
+expected: `tracks-upward` still fails (see aside below for why) and
+`send-unmoved` fails for the first time. As of this fix, Probe G's row is
+genuinely watched through `send-unmoved`, not only through `tracks-upward`.
+
+**Aside, for accuracy, not a defect:** on this Darwin host `recv-low` and
+`recv-high` both read back `131072` under the mutation — not from clamping,
+but because the mutated setter never touches real SO_RCVBUF at all (both
+calls land on SO_SNDBUF instead), so the getter reports this socket's
+untouched default the whole run, and that default happens to equal
+`131072`, one of the two new recv constants (confirmed with a standalone
+`getsockopt(SO_RCVBUF)` probe on a fresh socket). This is coincidental and
+does not affect the unmutated code path: there the setter genuinely writes
+SO_RCVBUF to `16384` then `131072`, so `tracks-upward` passes on real,
+actively-set values, as the clean post-constant-change `make test` run
+above confirms. Under Probe G's mutation specifically, `recv-low` and
+`recv-high` would read as equal — and `tracks-upward` would fail — for any
+pair of distinct recv constants, since the real receive buffer is pinned at
+whatever its untouched default is; `131072` matching one of the chosen
+constants is a coincidence of this host's default, not the reason the
+assertion fails.
+
+`test-facade.sps`'s row (`"the facade's receive-buffer getter and setter
+track at two points"`) failed both times, unaffected by either constant
+set, for a different and simpler reason — see the `test-facade.sps`
+decision note in Fix 2 of `.superpowers/sdd/task-2-report.md`.
+
+Reverted (`uv-recv-buffer-size-native` restored) after each run above;
+`make test` returned to `ALL SUITES PASSED` and `git diff --stat -- src/`
+was empty each time.
+
+---
+
+## Probe H: Weaken the upper-bound check (added in Fix 2)
+
+Row 4, `"the receive setter refuses a size that does not fit an int"`, had
+no `src/` mutation watching it: Probe F only weakens `(positive? n)`;
+nothing in Probes A-G exercises `require-buffer-size`'s upper bound,
+`(< n 2147483648)`.
+
+**Mutation:** in `require-buffer-size`, changed `(< n 2147483648)` to
+`(<= n 2147483648)`:
+```scheme
+;; before
+(unless (and (integer? n) (exact? n) (positive? n) (< n 2147483648))
+;; after
+(unless (and (integer? n) (exact? n) (positive? n) (<= n 2147483648))    ; MUTATION
+```
+`n = 2147483648` (2^31, one past the largest signed 32-bit int) now passes
+validation and reaches `set-buffer-size!`'s `(c-int-set! cell n)`, which the
+comment above `require-buffer-size` already documents as raising a raw Chez
+exception outside this binding's condition hierarchy for a value that does
+not fit an `int`.
+
+**Build & test output** (`make test 2>&1 | grep -E "FAIL|of unexpected failures"`,
+verbatim):
+```
+FAIL the receive setter refuses a size that does not fit an int
+# of unexpected failures  1
+SUITE FAILED
+```
+
+**Result:** GREEN (failure detected), exactly the row named in the brief,
+and no other suite's row — this assertion is one `test-flow.sps` has no
+facade-level counterpart for. Confirmed the predicted mechanism directly
+(same style of standalone `chez --program` check used for Probe G above,
+mutation still applied):
+```
+(wrong-condition #t invalid argument #<compound condition>)
+```
+`c-int-set! cell 2147483648` raises a Chez R6RS condition (a `condition?`,
+message `"invalid argument"`) that is not a `uv-invalid-argument?`, so the
+row's `guard` falls through to its `(#t (list 'wrong-condition e))` arm
+exactly as predicted — `require-buffer-size`'s validation is the only thing
+standing between an out-of-range `n` and this raw foreign-set failure, and
+this probe proves the check is load-bearing for the upper bound, not only
+for `positive?`. Reverted (`(< n 2147483648)` restored); `make test`
+returned to `ALL SUITES PASSED`, `git diff --stat -- src/` empty.
 
 ---
 
@@ -282,7 +403,10 @@ with Task 1's mutation log.
 
 ## Final state
 
-All seven mutations (A-E from the original task, F and G from the review
-follow-up) reverted; `git diff --stat -- src/libuv/handle.sls` shows only
-the Task 2 feature diff plus the review's Finding 2 comment fix, no mutation
-residue. `make test` after the last revert: `ALL SUITES PASSED`.
+All eight mutations (A-E from the original task, F and G from the first
+review follow-up, H from the second) reverted; `git diff --stat --
+src/libuv/handle.sls` shows only the Task 2 feature diff plus the first
+review's Finding 2 comment fix, no mutation residue. `tests/test-flow.sps`
+carries Fix 2's recv-buffer constant change (`8192`/`262144` →
+`16384`/`131072`) but is unchanged at 18 rows. `make test` after the last
+revert: `ALL SUITES PASSED`.

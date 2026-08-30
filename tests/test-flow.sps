@@ -165,9 +165,13 @@
             'positive 'not-positive)
         (if (> send-high send-low) 'tracks-upward 'did-not-track)))
 
-(uv-recv-buffer-size! btcp 8192)
+;; Different from the send section's 8192/262144 on purpose: if the recv
+;; setter is ever cross-wired to write SO_SNDBUF, last-write-wins semantics
+;; mean identical constants would silently land back on send-high and
+;; send-unmoved would pass anyway, giving that assertion no probe at all.
+(uv-recv-buffer-size! btcp 16384)
 (define recv-low (uv-recv-buffer-size btcp))
-(uv-recv-buffer-size! btcp 262144)
+(uv-recv-buffer-size! btcp 131072)
 (define recv-high (uv-recv-buffer-size btcp))
 
 (test-equal "the receive buffer tracks independently of the send buffer"
