@@ -296,3 +296,69 @@ restoring the pre-fix assertion *with the probe still applied* — the only way
 to demonstrate that the fix closed a real hole rather than merely adding
 detail. A probe that shows the new test failing proves the test can fail; only
 the counterfactual proves the old test could not.
+
+
+---
+
+## Probe C, corrected: it is NON-DETERMINISTIC, and the conclusion survives anyway
+
+The re-review flagged a determinism risk in Probe C that the single recorded
+run could not rule out. Repeating the tagged leg five times settles it — the
+reviewer was right:
+
+```
+run 1   # of expected passes 174   # of unexpected failures 1
+run 2   # of expected passes 175                                  <- PASSED
+run 3   # of expected passes 175                                  <- PASSED
+run 4   # of expected passes 174   # of unexpected failures 1
+run 5   # of expected passes 174   # of unexpected failures 1
+```
+
+**3 of 5.** The mechanism is exactly what the reviewer predicted: the kind-scan
+walks `hashtable-keys registry`, and once the first completion deregisters by
+its exact pointer only one `write-req` entry remains, so mis-pairing is
+possible only on the *first* of the two completions and depends on hash
+iteration order over two live pointer keys.
+
+**A probe that is evidence 60% of the time is not evidence.** Recorded as a
+defect in the probe, not smoothed over.
+
+### An attempted deterministic replacement, and why it does not exist here
+
+Probe C2 held the first write completion and fired both callbacks against each
+other's requests when the second arrived — a true swap with both firing exactly
+once, no error, no registry iteration, no order dependence.
+
+It **deadlocks the suite.** Any fixture that issues a single write leaves its
+callback stashed forever, and a `uv-run` step waiting on that completion blocks
+indefinitely — the same hang mode Probe D exposes in `test-tcp.sps`. The run
+was killed at 10 minutes having produced no rows. Reverted; tree clean.
+
+A swap confined to just these two writes would have to key on the fixture, which
+makes it a *test* mutation rather than a `src/` one, and proves nothing about
+the binding. So: no deterministic `src/` routing-swap is available at this
+granularity.
+
+### Why the counterfactual conclusion still holds
+
+The flaky probe undermines its own reliability, not the finding. The untagged
+assertion's blindness is a **proof, not an observation**:
+
+> Both closures pushed the identical `'no-error`. Any permutation of two
+> identical values is that same list. So *no* routing swap — deterministic or
+> not, on any iteration order — can change `(no-error no-error)`. The untagged
+> row could not have failed from a routing defect under any probe whatsoever.
+
+The recorded "untagged: 175 passes" run is consistent with that proof but is
+not what establishes it. What Probe C's 3-of-5 does establish is the other
+half: the **tagged** row *can* detect a real mis-pairing. Together — the old row
+provably cannot, the new row demonstrably can — the fix is justified, on firmer
+ground than either leg alone.
+
+**Method correction for the remaining tasks.** The counterfactual A/B remains
+the right design when a review finds an assertion's stated purpose exceeds what
+it can detect. But: run each leg **more than once** before recording it, and
+where one leg's outcome is provable by construction, say so and lean on the
+proof rather than on a single green run. A single pass cannot distinguish "the
+test is blind" from "this run did not trigger the defect" — which is precisely
+the trap this entry fell into the first time.
