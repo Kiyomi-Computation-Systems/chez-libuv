@@ -125,3 +125,89 @@ on `uv-tcp-peer-address`'s two-allocation guard path.
 native binding and wrapper). No mutation was applied to `src/` by this
 agent — both probes above and the uncovered-property entry are the
 controller's next step, not something this agent ran or reverted.
+
+
+---
+
+## Controller-run results
+
+Both probes were executed by the controller, not the implementer — mutation
+execution moved after two subagents earlier in this milestone returned control
+with a live `src/` mutation still in the working tree. Tree verified clean
+(`git status --porcelain` empty, no probe residue) before and after each run,
+and `make test` green after both reverts.
+
+### Probe A — point the wrapper at `uv_tcp_getsockname`
+
+`src/libuv/tcp.sls`, in `uv-tcp-peer-address`: `uv-tcp-getpeername-native`
+replaced by `uv-tcp-getsockname`.
+
+```
+=== tests/test-facade.sps ===
+FAIL the facade's peer-address answers the connected peer
+=== tests/test-tcp.sps ===
+FAIL the client's peer address and port are the server's
+FAIL the accepted handle's peer port is the client's own local port
+FAIL an unconnected handle refuses with ENOTCONN
+```
+
+**Four rows, not the three predicted** — and the implementer flagged this
+fourth as uncertain rather than asserting three, which was the right call.
+
+The ENOTCONN row fails for a mechanically distinct and instructive reason:
+`uv_tcp_getsockname` on a **bound but unconnected** handle *succeeds* — the
+socket has a local address even with no peer — so no `UV_ENOTCONN` is
+produced, `uv-check` does not raise, and the row's guard falls through to
+`'no-raise`. So this row is not merely collateral: it independently
+discriminates `getpeername` from `getsockname`, because only `getpeername`
+has a failure mode on an unconnected socket.
+
+Both address rows fail, as designed. Row 1 alone would not have been enough:
+on loopback both ends are `127.0.0.1`, so the *address* half is identical
+under the mutation and only the port half moves. Row 2 is what catches a
+`getpeername` implemented as `getsockname` when the two ends share an address.
+
+### Probe B — `sockaddr->address-string` returns constant `#f`
+
+`src/libuv/private/native.sls`: body replaced with `#f`.
+
+```
+FAIL the client's peer address and port are the server's
+FAIL the accepted handle's peer port is the client's own local port
+FAIL the facade's peer-address answers the connected peer
+FAIL sockaddr->address-string renders back the dotted quad uv_ip4_addr parsed
+FAIL synthetic: a non-INET entry is skipped, the entry behind it decoded
+FAIL the driven lookup answered exactly one 'inet record, the literal rendered back
+FAIL unpinned socktype: every entry carries the same address
+FAIL v4: the literal renders back through uv_ip_name
+FAIL v6: the literal renders back
+```
+
+**Nine rows across test-tcp, test-facade, test-native and test-dns.** The six
+beyond this task are correct, not excessive: `sockaddr->address-string` is the
+shared address-decoding helper (ADR-0012's vocabulary), used by the DNS path
+as well as by both TCP name verbs. A mutation to a shared helper legitimately
+breaks every consumer.
+
+The ENOTCONN row **passes** under this probe, as predicted — it asserts a
+raise that happens before any address decoding is reached.
+
+This is why the peer-address rows require the literal `"127.0.0.1"` rather
+than tolerating `#f`: a row written to accept `#f` would pass against exactly
+this mutation.
+
+### Explicitly uncovered property (AGENTS.md)
+
+**Non-interleaving of two consecutive `uv-write!` calls is NOT asserted, and
+deliberately so.** libuv drains its write queue head-of-first
+(`vendor/libuv/src/unix/stream.c:1043`), so a second request cannot begin
+before the head completes. That makes non-interleaving a structural guarantee
+of the vendored library, and "the byte stream is never interleaved" an absence
+assertion no mutation in this binding can break — an empty test by AGENTS.md's
+definition.
+
+What this task asserts instead is what the *binding* owns: that accumulated
+bytes equal payload-A followed by payload-B, and that both `on-complete`
+callbacks fired with `'no-error` **in submission order**. That second row
+fails if completions are ever routed by request kind rather than by block
+pointer.
