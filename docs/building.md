@@ -142,6 +142,56 @@ produces failures that have nothing to do with this binding. That is an
 escape hatch for the Valgrind leg only — `io_uring` stays on for
 `make test`.
 
+If you develop on macOS, that leaves a real hole: the leak gate you most
+need is the one leg you cannot run. v0.5 measured what it costs — four
+independent ways to leak foreign memory in the OS-buffer wrappers, and
+every one of them left the suite fully green. On macOS there is no local
+signal for that entire class of defect, and CI is the first thing to see
+it.
+
+```sh
+make test-memory-docker
+```
+
+runs the Linux Valgrind leg in a container that mirrors CI's toolchain:
+Debian, Valgrind, and Chez built from the same release tarball CI pins.
+The first run builds Chez and takes several minutes; afterwards the image
+is cached by version and only the suites run.
+
+Two details it handles for you, both of which bite if you build such a
+container by hand. The repository is mounted **read-only** and copied
+inside, so a Linux `make build` cannot overwrite your macOS `build/`
+artifacts or the generated `config.sls`. And it invokes Chez as `scheme`
+rather than through a `chez` symlink: Chez resolves its boot files by
+`argv[0]`, so a differently-named symlink aborts in `find_boot` before
+running a line — under Valgrind that shows up as a ~12 KB "definitely
+lost" from the aborted boot, a leak report with nothing to do with your
+code.
+
+Override `DOCKER=` to use another CLI (`podman` works). The Chez version
+is read from `.github/workflows/ci.yml`, so it cannot drift from CI's.
+
+It runs the **vendored** leg as an unprivileged user, because that is what
+CI's Valgrind step does and neither detail is cosmetic. Through
+`pkg-config` you would be testing Debian's libuv rather than the pinned
+one, and two `test-lifecycle` rows that assert libuv's close-versus-timer
+ordering fail on a clean tree. As root, `test-process.sps`'s "setting a
+child's uid as an unprivileged user is refused" row inverts, and the
+spawn-options block whose cleanup only runs on the failure path is
+reported as a 131-byte definite leak — an environment artifact that looks
+exactly like a defect in the binding.
+
+**Expect more leak summaries than suites, and expect a couple to be
+non-zero.** `test-process.sps` deliberately exercises spawn failures, so
+some forked children never reach `exec` and exit under Valgrind, reporting
+whatever the parent had allocated at fork time as lost. Sixteen suites
+produce eighteen summaries. CI's x86_64 runner happens to show all
+eighteen at zero; on arm64 two of them report a hundred-odd bytes. Neither
+is a leak in this binding, and neither gates: `--error-exitcode` applies
+per process, and the suite's own process is the one whose status the loop
+checks. **Read the exit status, not the scrollback** — the same rule
+`make test-memory` has always needed.
+
 ```sh
 sudo make test-root
 ```

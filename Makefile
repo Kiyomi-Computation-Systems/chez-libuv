@@ -114,7 +114,7 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-memory vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-memory test-memory-docker vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
 
@@ -559,6 +559,73 @@ endif
 #     vendored gate now needs no prod-specific rule at all: $(SHIM) already
 #     depends on `vendor` when HAVE_PKG=no, inside the sub-make, after clean
 #     has finished.
+# --- the Linux memory gate, from a non-Linux development box ----------
+# ADR-0003 makes Linux Valgrind the SOLE memory gate, and macOS has no
+# LeakSanitizer on ARM64 -- so `make test-memory` on the primary development
+# platform is silent about the entire leak class. v0.5 measured the cost:
+# four independent leaks in the OS-buffer wrappers, every one invisible to a
+# fully green suite. Without this target the first thing that sees such a
+# defect is CI.
+#
+# The image is cached by Chez version, so only the first run pays for the
+# Chez build.
+DOCKER          ?= docker
+VALGRIND_IMAGE  ?= chez-libuv-valgrind
+
+# ONE source of truth for the Chez floor: ci.yml. Deriving it is what stops
+# the Dockerfile becoming a fourth place the version is written down and a
+# fourth place it can drift.
+CHEZ_FLOOR_VERSION := $(shell sed -n 's/^  CHEZ_FLOOR_VERSION: *"\(.*\)"/\1/p' .github/workflows/ci.yml)
+
+test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS dev boxes)
+	@command -v $(DOCKER) >/dev/null 2>&1 || { \
+	  echo "test-memory-docker: '$(DOCKER)' not found on PATH." >&2; \
+	  echo "Install Docker, or set DOCKER= to a compatible CLI (podman works)." >&2; \
+	  exit 1; \
+	}
+	@test -n "$(CHEZ_FLOOR_VERSION)" || { \
+	  echo "test-memory-docker: could not read CHEZ_FLOOR_VERSION from" >&2; \
+	  echo "  .github/workflows/ci.yml -- has that key been renamed or reformatted?" >&2; \
+	  exit 1; \
+	}
+	@echo "=== building $(VALGRIND_IMAGE):$(CHEZ_FLOOR_VERSION) (cached after the first run) ==="
+	$(DOCKER) build \
+	  --build-arg CHEZ_VERSION=$(CHEZ_FLOOR_VERSION) \
+	  -t $(VALGRIND_IMAGE):$(CHEZ_FLOOR_VERSION) \
+	  -f docker/valgrind.Dockerfile docker/
+	@echo "=== running the memory gate on Linux ==="
+	@# The repo is mounted READ-ONLY and copied inside. A Linux `make build`
+	@# would otherwise overwrite the host's build/ artifacts and the generated
+	@# config.sls, leaving the dev box in a state its own toolchain cannot use.
+	@#
+	@# CHEZ=scheme, not the default `chez`: Chez resolves boot files by argv[0],
+	@# and this image deliberately ships no `chez` symlink -- see the Dockerfile.
+	@#
+	@# Runs as the unprivileged `dev` user, matching CI's ordinary legs -- as
+	@# root, test-process.sps's "uid as non-root is refused" row inverts and
+	@# leaks the spawn-options block on a path that never runs. See the
+	@# Dockerfile. The root-gated suite is `make test-root`, not this target.
+	@#
+	@# HAVE_PKG=no is NOT optional and NOT a preference. ci.yml's valgrind step
+	@# is `make HAVE_PKG=no test-memory` -- the VENDORED leg, at the pinned
+	@# libuv. Debian's libuv is 1.44.2 and the pin is 1.52.1, and the two do not
+	@# behave identically: run through pkg-config, this target failed two
+	@# test-lifecycle rows that assert libuv's documented close-vs-timer
+	@# ordering, rows CI passes every run. A gate that silently tests a
+	@# different libuv than CI invents failures CI cannot reproduce and misses
+	@# ones it would catch. Mirror the leg or do not claim to mirror it.
+	$(DOCKER) run --rm \
+	  -v "$(CURDIR)":/src:ro \
+	  $(VALGRIND_IMAGE):$(CHEZ_FLOOR_VERSION) \
+	  sh -ec 'cp -a /src /work-repo && chown -R dev:dev /work-repo \
+	    && su dev -c "cd /work-repo \
+	      && git config --global --add safe.directory \\"*\\" \
+	      && make CHEZ=scheme deps \
+	      && make CHEZ=scheme HAVE_PKG=no vendor \
+	      && make CHEZ=scheme HAVE_PKG=no build \
+	      && make CHEZ=scheme HAVE_PKG=no test-memory"'
+
+
 prod: ## Rebuild the shim with optimizations and verify the release artifact
 	$(MAKE) clean
 	$(MAKE) build FLAVOR=prod
