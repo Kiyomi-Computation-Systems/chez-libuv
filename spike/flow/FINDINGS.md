@@ -182,11 +182,55 @@ is noise, not signal.
 **So the only term that clearly differentiates is Leg A's memory floor**, and
 it differentiates by 16×: 40 MiB versus 625 MiB at ten thousand connections.
 
+### The qualification — "does not survive measurement" is too strong
+
+Stated plainly, because the section heading above overstates it: the GC
+objection is **aimed at the wrong quantity, and untested in the only regime
+where it could be true.** Three separate claims, with different standing:
+
+1. **"A smaller buffer allocates more bytes."** False, and *structurally* so —
+   no measurement required. `copy-out` allocates exactly `nread` bytes, so the
+   volume is invariant and only the object count varies. Reading the copy site
+   refutes this.
+2. **"A smaller buffer allocates more objects."** True, exactly 16× as
+   predicted — and it cost nothing observable **here**.
+3. **"Therefore a smaller buffer costs more GC."** Unproven either way. Leg B
+   measured the case where it could not possibly be true.
+
+Why (3) is unproven, and both reasons matter more than the numbers:
+
+- **Leg B discards every delivery.** A copying collector's cost is
+  proportional to what *survives*; garbage that dies before the next
+  collection is close to free however many objects it arrives in. A real
+  consumer **retains** deliveries — a protocol reassembler holding fragments
+  across reads is the entire point of one — which promotes those bytevectors
+  out of the nursery and is exactly where object count and size distribution
+  would begin to bite. That case was not measured.
+- **Buffer size only governs object count for buffer-bound reads.** At 256
+  deliveries per MiB with a 4096-byte buffer, every read filled the buffer —
+  bulk transfer. Under small-message traffic the delivery size is set by what
+  arrives, not by the buffer, so the buffer size does not change the object
+  count at all. The objection therefore applies only to bulk transfer, which
+  is precisely the regime where the objects are large and short-lived and it
+  does not matter.
+
+Also worth noting the sample: two or three collections per leg is too few to
+resolve a difference even if one existed. The right reading of Leg B's GC
+column is **"unable to detect an effect"**, not "there is no effect" — the
+same caveat the throughput column carries.
+
+**What would settle it:** a retain-case leg — deliveries held in a growing
+list across a transfer, so the bytevectors survive a collection — across
+several buffer sizes, plus an aggregate run with thousands of concurrently
+reading handles. Until that exists, neither "the GC argument was wrong" nor
+"the GC argument was right" is supportable, and the memory floor is the only
+term anyone should be reasoning from.
+
 This does **not** mean "change the default to 4096." It means the argument
-this project used to *stop* changing it is weaker than it looked, and the
-decision should be reopened on the evidence rather than settled by the
-reasoning that closed it. That is a decision for the milestone that owns it,
-with its own ADR — not for a spike.
+this project used to *stop* changing it was pointed at the wrong quantity, and
+the decision belongs reopened on evidence rather than settled by the reasoning
+that closed it. That is a decision for the milestone that owns it, with its
+own ADR — not for a spike.
 
 ### Honest limits — and one that matters enough to redo
 
