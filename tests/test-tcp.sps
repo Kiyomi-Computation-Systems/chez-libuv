@@ -1611,6 +1611,33 @@
 (define m-outcome
   (run-until/ticking ml (lambda () (>= (collector-count m-in) m-total)) 1024))
 
+;; UNCONDITIONAL, not failure-gated: SRFI-64's simple runner prints only row
+;; NAMES, never expected-vs-actual, so a red row here says "the megabyte did
+;; not arrive" and nothing whatever about why. This line exists because that
+;; happened -- an intermittent failure of these three rows on CI's Linux
+;; Valgrind leg (never reproduced on macOS, nor in 5/5 aarch64 Valgrind runs)
+;; could not be diagnosed from the log at all.
+;;
+;; The three rows fail TOGETHER whenever the transfer falls short, so the
+;; discriminating question is which of the two causes did it: the drain ran
+;; out of iterations, or a callback reported an error. Measured locally, the
+;; drain uses TWO iterations against a cap of 1024 -- so exhaustion here
+;; would itself be the finding, not the explanation. Printing both leaves the
+;; next failure self-diagnosing instead of requiring a bisect.
+(display "  [informational] 1 MiB transfer: outcome=")
+(display m-outcome)
+(display " got=")
+(display (collector-count m-in))
+(display "/")
+(display m-total)
+(display " writes-done=")
+(display m-writes-done)
+(display " write-err=")
+(display m-write-err)
+(display " on-error=")
+(display m-error)
+(newline)
+
 (test-equal "the whole megabyte arrived at the reader"
   'satisfied m-outcome)
 
