@@ -91,7 +91,7 @@
 
   ;; --- OS socket buffer sizes ----------------------------------------------
   ;; THREE DIFFERENT BUFFERS share confusable names, which is why docs/api.md
-  ;; will carry them in one table:
+  ;; carries them in one table:
   ;;
   ;;   * chez-libuv's per-handle read buffer -- fixed by the first
   ;;     uv-read-start!, freed by the close dispatcher, 64 KiB by default;
@@ -99,9 +99,14 @@
   ;;   * the OS RECEIVE buffer -- these procedures.
   ;;
   ;; Setting SO_RCVBUF does not resize the chez-libuv buffer, or vice versa.
-  ;; At high connection counts the OS buffers are a first-class memory cost:
-  ;; Linux autotunes SO_RCVBUF from roughly 87 KB per socket upward, which at
-  ;; ten thousand connections can exceed every read buffer combined.
+  ;; At high connection counts the OS receive buffer is a first-class memory
+  ;; cost: Linux autotunes it, and the autotuned total can substantially
+  ;; exceed every read buffer combined at those counts. The exact
+  ;; per-socket figure is kernel- and sysctl-dependent and was NOT measured
+  ;; by this milestone (design spec §10 Q2 proposed exactly that measurement;
+  ;; dropped -- see the v0.5 entry in .superpowers/sdd/progress.md). A
+  ;; commonly cited figure, 87 KB, is dated -- it is the older tcp_rmem[1]
+  ;; default; modern kernels commonly default to 131072 instead.
   ;;
   ;; PLATFORM SUPPORT IS NOT UNIFORM (vendor/libuv/docs/src/handle.rst:202):
   ;; TCP, pipe and UDP on Unix; TCP and UDP only on Windows. The gate is an

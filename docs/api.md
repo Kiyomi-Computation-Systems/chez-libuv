@@ -84,7 +84,29 @@ independent quantities:
 |---|---|---|---|
 | chez-libuv read buffer | first `uv-read-start!`, irreversibly | close dispatcher | 64 KiB default |
 | OS send buffer | `uv-send-buffer-size!` | kernel, at socket close | tens of KB, tunable |
-| OS receive buffer | `uv-recv-buffer-size!` | kernel, at socket close | autotuned, 87 KB+ on Linux |
+| OS receive buffer | `uv-recv-buffer-size!` | kernel, at socket close | autotuned; kernel- and sysctl-dependent |
+
+**A setter's argument is a request to the kernel, not an assignment.**
+`uv-send-buffer-size!` and `uv-recv-buffer-size!` wrap `setsockopt`, and the
+kernel is free to round the value they ask for. On Linux, `setsockopt`
+doubles the requested size and floors it at `SOCK_MIN_SNDBUF`/
+`SOCK_MIN_RCVBUF` (i.e. it stores `max(2n, SOCK_MIN_*BUF)`), then clamps the
+result to the `net.core.wmem_max`/`net.core.rmem_max` sysctls — so
+`(uv-send-buffer-size! h 262144)` followed immediately by
+`(uv-send-buffer-size h)` can answer `425984`, not `262144`. That is not a
+broken binding: read the getter's return as the kernel's answer, not as
+confirmation that the requested number took effect.
+
+**The OS receive buffer's autotuned default is not a fixed number, and this
+milestone did not measure it.** At high connection counts it can
+substantially exceed the per-handle read buffer, but the exact figure is
+kernel- and sysctl-dependent — it was not measured here (the design spec's
+§10 Q2 proposed exactly that measurement; see the v0.5 entry in
+[`.superpowers/sdd/progress.md`](../.superpowers/sdd/progress.md) for why it
+did not happen). A commonly cited figure for this default is 87 KB, but
+that number is dated: it is the older `tcp_rmem[1]` default, and modern
+kernels commonly default to 131072 instead. Measure on the target kernel
+rather than relying on either number.
 
 **The read-buffer sizing contract is a tradeoff, not a recommendation.**
 The buffer is allocated by the first `uv-read-start!` and freed only by the
@@ -377,6 +399,9 @@ failure raises one of the three above (`&uv-errno-error`,
 `&uv-handle-closed`, `&uv-invalid-argument`); the closed set of
 `&uv-invalid-argument` reason symbols (`'stdio-spec-unknown`,
 `'pipe-already-used`, `'signal-unknown`, `'signal-unwatchable`,
-`'signal-mode-fixed`, `'buffer-size-out-of-range`, `'not-a-socket-handle`,
-and the rest of the validation walk) is in the per-milestone design specs
-(v0.3 §4.7; v0.4 §4.2/§4.6; v0.5 §4.2), not repeated here.
+`'signal-mode-fixed`, `'buffer-size-fixed`, `'buffer-size-out-of-range`
+(reused from `uv-read-start!`, not new to v0.5), `'not-a-socket-handle`
+(the one reason symbol v0.5 actually adds),
+`'sockaddr-too-small-for-a-port`, and the rest of the validation walk) is
+in the per-milestone design specs (v0.3 §4.7; v0.4 §4.2/§4.6; v0.5 §4.2),
+not repeated here.

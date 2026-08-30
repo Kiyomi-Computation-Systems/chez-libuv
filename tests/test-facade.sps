@@ -391,9 +391,14 @@
     'stopped))
 
 ;; --- v0.5 buffer-size surfaces, reached through the facade only -----------
-;; CALLED, not asserted about: this suite's enforcement is that an
-;; un-re-exported name fails to expand (:19-23), so a row that merely mentions
-;; a name proves nothing the import did not already prove.
+;; EACH NAME MUST BE EXERCISED, not merely called: a bare invocation would
+;; only reprove that the re-export expands (already covered at :19-23),
+;; nothing about behaviour. Every row below both calls the facade re-export
+;; AND asserts on what it returns -- tracking direction for the two buffer
+;; setters, the idle-stream zero for the write-queue gauge, the connected
+;; peer's address and port -- and the flow-task-2/3/4 mutation logs record
+;; real `src/` mutations that flip these rows to FAIL, which is what proves
+;; they are load-bearing rather than name-mention rows.
 (test-equal "the facade's send-buffer getter and setter track at two points"
   'tracks-upward
   (begin (uv-send-buffer-size! fclient 8192)

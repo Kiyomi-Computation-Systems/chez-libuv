@@ -362,3 +362,43 @@ where one leg's outcome is provable by construction, say so and lean on the
 proof rather than on a single green run. A single pass cannot distinguish "the
 test is blind" from "this run did not trigger the defect" — which is precisely
 the trap this entry fell into the first time.
+
+---
+
+## Explicitly uncovered property (AGENTS.md): `'sockaddr-too-small-for-a-port` in `uv-tcp-peer-address`
+
+**Unwatched and unrecorded until now.** `uv-tcp-peer-address`'s short-namelen
+refusal (`tcp.sls`, raised when `uv_tcp_getpeername`'s out-parameter comes
+back under `offsetof-sockaddr-in-sin-port + 2`) has no test row asserting it
+and no probe in this log targeting it — Probes A, B and C above all exercise
+the acceptance path (a real, full-size sockaddr) or the address-decoding
+helper, never the namelen guard itself. AGENTS.md requires that every branch
+either carry a mutation or an explicit uncovered-property entry recording why
+one is not possible; this branch got neither at Task 4 time. This entry is
+that missing record.
+
+**Why no mutation reaches it.** Same reasoning as the sibling case
+(`uv-tcp-getsockname-port`, `.plans/stage-5-mutation-log.md` Mutation 18):
+both procedures seed the out-parameter with `sizeof(sockaddr_storage)` (128
+bytes here) and libuv writes back 16 for `sockaddr_in` or 28 for
+`sockaddr_in6` — both far above the four bytes the port decode needs, on
+both platforms this binding supports (Linux, macOS/Darwin). The branch is
+not reachable through the public API on either supported platform without a
+libuv build that reports a short `namelen` for a real connected peer, which
+is not something a caller-side mutation, a fixture, or a `src/`-only edit
+can force without also changing what `uv_tcp_getpeername` itself does.
+
+**Pre-existing, not new to v0.5.** The identical branch in
+`uv-tcp-getsockname-port` has carried this exact gap since it was added —
+`stage-5-mutation-log.md`'s Mutation 18 recorded it as "NOT CAUGHT — the
+refusal arm is unreachable through this API" and kept the check anyway,
+because the failure it guards against is silent (a short namelen decoded
+out of the zeroed scratch tail returns a plausible, in-range, wrong port —
+port 0 — rather than raising or crashing). `uv-tcp-peer-address` copies that
+same guard verbatim for the peer-address case (design spec §4.4's
+"`uv-tcp-getsockname-port` shape verbatim"). v0.5 therefore duplicated a
+known, previously-recorded gap rather than closing it: the second copy of
+the pattern is exactly as untestable through the public API as the first,
+for the same reason, and neither is a defect introduced by this task — both
+are the same structural limit of driving libuv only through its documented
+surface.

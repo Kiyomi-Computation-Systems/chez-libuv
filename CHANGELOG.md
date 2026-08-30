@@ -47,9 +47,11 @@ or configures. The full design is
   restated in prose. A **three-buffers table** distinguishing the
   chez-libuv read buffer from the OS send and receive buffers — setting
   `SO_RCVBUF` does not resize the chez-libuv buffer, or vice versa — plus
-  the six new rows in their per-module tables, the two new
-  `&uv-invalid-argument` reason symbols, and a close-hazard note beside
-  "Exit ≠ close": a second `uv-close!` silently discards its callback,
+  the six new rows in their per-module tables, the new
+  `&uv-invalid-argument` reason symbol (`'not-a-socket-handle`;
+  `'buffer-size-out-of-range` is reused from `uv-read-start!`, not new
+  here), and a close-hazard note beside "Exit ≠ close": a second
+  `uv-close!` silently discards its callback,
   because the close path guards on the handle being `'open`.
 - [ADR-0018](.plans/decisions/0018-unbuffered-write-submission.md): the
   binding will not hold unsubmitted write blocks, enforce a queue-depth or
@@ -84,10 +86,12 @@ or configures. The full design is
   synchronously before returning. The rule itself is unchanged and still
   correct, for the portable reason now stated: `alloc-dispatch` must stay
   infallible.
-- The read-buffer default (65536 bytes) is now pinned by a test — no
-  prior suite exercised a `uv-read-start!` call with the size omitted —
-  so a future change to the default is a deliberate, reviewed edit rather
-  than a silent one.
+- The read-buffer default (65536 bytes) is now pinned by a test — prior
+  suites exercised a size-omitted `uv-read-start!` call (`test-tcp.sps`,
+  `test-echo.sps`, `test-process.sps`, `test-stream.sps`,
+  `test-signal.sps`, `test-facade.sps`), but none asserted the resulting
+  buffer's length — so a future change to the default is a deliberate,
+  reviewed edit rather than a silent one.
 
 ## 0.4.0 — 2026-08-22
 

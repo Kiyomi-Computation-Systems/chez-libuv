@@ -716,8 +716,14 @@ wrappers leaking on a failure path.
 8. **Stage 7** — D6 version bump, CHANGELOG (all **Added**), README ADR count
    17 → 18 and status line, `docs/api.md`: six rows, reason symbols, the
    three-buffers table, the sizing tradeoff, the `uv-close!` callback-drop
-   hazard. Full `make test` + `make test-memory` + `make check-prod`,
-   whole-branch review, squash merge, annotated tag `v0.5.0`, closing ritual.
+   hazard. Full `make test` + `make test-memory` + `make prod` (which ends in
+   `check-prod` itself) — in that order, not `make test` then a bare
+   `check-prod`: `make test` relinks the dev shim, so a `check-prod` run
+   after it would judge the dev build `test` just relinked, not a release
+   one, and fail for the wrong reason (a hazard this repo's own ledger
+   already recorded — `.superpowers/sdd/progress.md`'s Task 3 note on
+   `make prod && make test && package`). Then whole-branch review, squash
+   merge, annotated tag `v0.5.0`, closing ritual.
 
 Stage 1 precedes Stage 2 deliberately: both tests exist and are watched-to-fail
 before a plan is written against them. Stage 2 precedes every `src/` change.
