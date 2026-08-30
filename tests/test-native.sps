@@ -1056,10 +1056,22 @@
 ;; This suite deliberately never imports (libuv private handles): doing so
 ;; instantiates its body and installs the dispatchers, which would break the
 ;; "before installation" rows further down. Everything here is raw pointers.
-(let ((lp (alloc-zeroed (uv-loop-size)))
-      (tp (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
-  (test-equal "seed: the raw loop and tcp handle initialise"
-    '(0 0) (list (uv-loop-init lp) (uv-tcp-init lp tp)))
+;; NO uv_loop_init HERE, and that is the point. An earlier version of this
+;; block built a real loop and a real tcp handle, freed its own two blocks,
+;; and skipped uv_loop_close on the reasoning that the handle was never
+;; closed so a close would answer EBUSY. That reasoning was wrong in a way
+;; macOS cannot see: uv_loop_init allocates libuv's own internals
+;; (uv_loop_init -> uv__process_init -> uv_signal_init -> uv__io_init_start),
+;; and skipping the close leaks them. CI's Linux Valgrind leg caught it at
+;; 128 + 448 bytes definitely lost; the macOS ASan leg makes no leak claim
+;; and stayed green.
+;;
+;; A ZEROED, UNINITIALISED handle exercises both marshalling paths without
+;; libuv allocating anything at all, which is what "stub-level" should have
+;; meant in the first place: write_queue_size is a struct field read, and
+;; uv__socket_sockopt dispatches on handle->type, which is 0
+;; (UV_UNKNOWN_HANDLE) in a zeroed block and answers UV_ENOTSUP.
+(let ((tp (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
 
   ;; size_t, and deliberately not a signed type: the queue size cannot be
   ;; negative and the call cannot fail. Binding it signed would be the mirror
@@ -1072,9 +1084,9 @@
             (if (>= q 0) 'non-negative 'negative))))
 
   ;; The int OUT-parameter, which is the half that can go wrong silently.
-  ;; uv_tcp_init leaves the handle with no fd, so libuv reaches getsockopt(-1)
-  ;; and answers UV_EBADF -- a real negative errno rather than garbage, which
-  ;; is what makes this a marshalling assertion. And the cell is still the
+  ;; A zeroed block has handle->type = 0, so libuv refuses with UV_ENOTSUP --
+  ;; a real negative errno rather than garbage, which is what makes this a
+  ;; marshalling assertion. And the cell is still the
   ;; zero alloc-zeroed put there: on the failure path libuv never writes back,
   ;; so a getter built on foreign-alloc instead would be carrying whatever the
   ;; heap held, unnoticed.
@@ -1087,8 +1099,8 @@
     ;; that mutation only because uv-check gates on negativity before mapping;
     ;; at this level the row has to gate on it itself. This row was written
     ;; the blind way first and caught by running the mutation.
-    (test-equal "uv_send_buffer_size on an fd-less handle answers a NEGATIVE EBADF rc"
-      '(negative EBADF)
+    (test-equal "uv_send_buffer_size on an unknown handle type answers a NEGATIVE ENOTSUP rc"
+      '(negative ENOTSUP)
       (let ((rc (uv-send-buffer-size-native tp cell)))
         (list (if (negative? rc) 'negative 'not-negative)
               (errno->symbol rc))))
@@ -1096,10 +1108,7 @@
       0 (c-int-ref cell))
     (free! cell))
 
-  ;; Freed directly rather than through uv_loop_close: the handle was never
-  ;; closed, so a close would answer EBUSY. These are scratch blocks.
-  (free! tp)
-  (free! lp))
+  (free! tp))
 
 ;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
 ;; The probe value deliberately does NOT fit in 32 bits: on every supported
