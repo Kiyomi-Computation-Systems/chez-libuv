@@ -185,8 +185,23 @@
   ;; different explicit size is REFUSED rather than honoured. Honouring it
   ;; would mean freeing the old buffer here, and design spec S6 makes the
   ;; close dispatcher the only place that buffer may ever be freed -- so that
-  ;; a read completion queued against it (Windows' overlapped model) cannot
-  ;; outlive it. A caller who wants a different size closes the handle.
+  ;; nothing on a path libuv can call into ever has to allocate. THAT is the
+  ;; reason, and it is portable: alloc-dispatch is required to be infallible
+  ;; (handles.sls:846-858), and a realloc reachable from a uv-read-start!
+  ;; issued inside on-data would break the invariant on every platform.
+  ;;
+  ;; This comment used to say the reason was Windows' overlapped-read model
+  ;; keeping a completion queued against the buffer. For the two handle kinds
+  ;; this binding supports, that is DEAD CODE at the pinned libuv: uv_tcp_t
+  ;; never posts a user buffer at all (win/tcp.c:559 queues a zero-byte
+  ;; WSARecv against static uv_zero_; the real read at :1100 is
+  ;; non-overlapped), and uv_pipe_t drains its overlapped ReadFile with
+  ;; CancelIoEx + a blocking GetOverlappedResult before returning
+  ;; (win/pipe.c:2000-2013). The residue: pipe.c:2006 checks CancelIoEx only
+  ;; through an assert that release builds compile out. `make check-pins`
+  ;; carries a tripwire over these vendor facts.
+  ;;
+  ;; A caller who wants a different size closes the handle.
   ;;
   ;; A call that omits the size is not asking for anything, so it is always
   ;; allowed. That is what makes re-starting after a stop the cheap operation
