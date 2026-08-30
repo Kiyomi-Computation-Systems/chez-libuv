@@ -490,3 +490,49 @@ a leak that has nothing to do with this binding. **Chez resolves its boot
 files by `argv[0]`**, so it must be invoked by the install's real binary name.
 Anyone reading a Valgrind leak whose stack bottoms out in `find_boot` is
 looking at a broken invocation, not a defect.
+
+---
+
+## Probes F, G, H — the other three free sites, all executed on Linux Valgrind
+
+Probe E proved the *ordering* of validation against allocation. It did not
+touch the three actual `free!` sites in these wrappers, none of which had ever
+been mutation-tested under a leak detector. Same container, same flags, same
+day. Each mutation applied alone, on top of otherwise-unmodified source.
+
+| Probe | Site removed | Rows that reach it | Leak observed |
+|---|---|---|---|
+| E | validation moved *below* the alloc | 2 refused setters | `8 bytes in 2 blocks` |
+| F | the `guard` handler's `(free! cell)` | 4 EBADF rows | `16 bytes in 4 blocks` |
+| G | `get-buffer-size!`'s success-path free | 5 successful gets | `20 bytes in 5 blocks` |
+| H | `set-buffer-size!`'s success-path free | 6 successful sets | `24 bytes in 6 blocks` |
+
+Every block count matches the number of rows that traverse that path exactly.
+Four bytes each — `(c-int-size)`, one `int` cell per call.
+
+**Every one of the four legs reported `# of expected passes 23`.**
+
+That is the whole finding, and it is worth stating flatly: **the test suite
+cannot detect a single one of these defects.** Not the ordering, not the
+failure-path free, not either success-path free. Four independent ways to leak
+foreign memory on a hot path, and the suite is green for all of them. The only
+thing standing between a correct binding and a leaking one is a line in
+Valgrind's summary on the Linux leg.
+
+ADR-0003 already asserted this — "Linux Valgrind is the sole memory gate" — and
+`make test-memory`'s own comment says a green macOS run "is NOT evidence of no
+leaks." Those were correct claims. What was missing is that nobody had ever
+watched the gate catch anything in this milestone's new code, so its
+effectiveness was assumed rather than observed. Now it is observed, four times,
+with predicted block counts hitting exactly.
+
+**Consequence for anyone editing these four procedures.** A reordering or a
+dropped `free!` will pass `make test` locally on macOS, pass `make test-memory`
+on macOS (ASan makes no leak claim — LeakSanitizer does not exist on ARM64),
+and be caught only by CI's Linux leg. There is no local signal on the primary
+development platform. That is not a defect to fix; it is a property to know.
+
+**Nothing in the shipped tree changed.** All four mutations were applied inside
+a throwaway container against a read-only mount, and the host working tree was
+verified clean after each. The shipped ordering and all three free sites are
+correct — these probes prove they are load-bearing, not that anything is wrong.
