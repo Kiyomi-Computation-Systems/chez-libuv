@@ -210,3 +210,61 @@ All three mutations (A, B, C) reverted; `git diff --stat -- src/` and
 mutation residue. `tests/test-flow.sps` carries 23 rows (18 + 5, matching
 the brief's expectation); `tests/test-facade.sps` gained its one row (64 →
 65). `make test` after the last revert: `ALL SUITES PASSED`.
+
+---
+
+## Probe D: suppress the write completion callback
+
+**Raised by:** Task 3 review, Finding 1 — the drain row's `all-completed`
+element was asserted but no existing probe (A, B or C) made it load-bearing.
+The reviewer instrumented all three and confirmed it: under A the gauge is
+already 0 pre-drain but completions arrive genuinely; under B only one write
+is ever submitted and completions is already satisfied.
+
+**Mutation:** `src/libuv/private/handles.sls`, `write-done-dispatch`. Replace
+the `complete-request!` call with an inline body that deregisters, frees, and
+decrements the counter exactly as `complete-request!` would, but never
+invokes the stored `on-complete`. Nothing leaks and `live-counts` stays
+honest; only the callback is suppressed, so `submissions` keeps incrementing
+while `completions` never does.
+
+**Build & test output:**
+```
+FAIL the server echoed all seven writing clients' payloads back
+FAIL the restart ran from inside another client's delivery, with the stopped client's count unmoved
+FAIL every client's three chunks were written, and no write failed
+FAIL each of the eight peers echoed exactly one 32 KiB payload
+FAIL uv-write! is re-exported and its completion reports success
+FAIL uv-shutdown! is re-exported and its completion reports success
+FAIL the queue falls to zero AND every write completed once the peer reads
+```
+Seven rows across test-echo, test-tcp, test-facade and test-flow.
+
+**Result:** GREEN (failure detected), with one honest qualification.
+
+The target row fails, and instrumentation of a throwaway copy showed its
+actual result list as `(iterations-exhausted (short 0 1))` — so the
+`all-completed` element *does* disagree, `completions` = 0 against
+`submissions` = 1. The element is watched.
+
+**It does not fail in isolation.** A write that never completes also stalls
+the gauge, so the `run-until/ticking` element goes red in the same run. This
+probe therefore demonstrates that `all-completed` is a real, disagreeing
+assertion — not that it is independently necessary. No mutation reachable
+within this milestone's scope makes it fail alone, because every way to
+suppress a completion also prevents the queue from draining. Recorded here
+rather than left implicit.
+
+**Blast radius is wide and that is correct.** `write-done-dispatch` is the
+shared completion path for every write in the binding, so every suite that
+asserts on a write callback fails. Task 1's `alloc-dispatch` probe set the
+same precedent. Breadth here is not imprecision: the mutation is one line of
+behaviour, and all seven failing rows genuinely depend on it.
+
+**Reverted; `make test` green; `git diff -- src/` clean.**
+
+**Process note.** This probe was captured by the controller after a fix
+subagent returned control with the mutation still applied to the working
+tree. That is the one state a mutation must never be left in — an
+un-reverted probe is a commit away from shipping. The revert-and-verify
+sequence is part of the probe, not cleanup after it.

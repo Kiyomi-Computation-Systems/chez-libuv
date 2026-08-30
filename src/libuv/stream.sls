@@ -234,7 +234,7 @@
   ;; bounding memory counts its own submissions against completions -- and
   ;; must count BOTH outstanding payload bytes and outstanding request
   ;; count, since a zero-length write allocates a full block for zero
-  ;; payload bytes (stream.sls:91). See docs/api.md.
+  ;; payload bytes (stream.sls:92). See docs/api.md.
   ;;
   ;; THE NATIVE CANNOT FAIL; THE GATE CAN. On a 'closing handle the pointer
   ;; is still live, so a missing gate returns a plausible number -- which is
