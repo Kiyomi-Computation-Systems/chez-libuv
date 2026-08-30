@@ -216,55 +216,90 @@ the brief's expectation); `tests/test-facade.sps` gained its one row (64 →
 ## Probe D: suppress the write completion callback
 
 **Raised by:** Task 3 review, Finding 1 — the drain row's `all-completed`
-element was asserted but no existing probe (A, B or C) made it load-bearing.
-The reviewer instrumented all three and confirmed it: under A the gauge is
-already 0 pre-drain but completions arrive genuinely; under B only one write
-is ever submitted and completions is already satisfied.
+element was asserted but no existing probe made it load-bearing. Under Probe A
+completions arrive genuinely; under Probe B only one write is submitted and the
+element is already satisfied.
 
-**Mutation:** `src/libuv/private/handles.sls`, `write-done-dispatch`. Replace
-the `complete-request!` call with an inline body that deregisters, frees, and
-decrements the counter exactly as `complete-request!` would, but never
-invokes the stored `on-complete`. Nothing leaks and `live-counts` stays
-honest; only the callback is suppressed, so `submissions` keeps incrementing
-while `completions` never does.
+**Mutation:** `src/libuv/private/handles.sls`, `write-done-dispatch`. Keep
+`registry-deregister!`, `free!`, `count-write-req-free!` and `set-req-ptr!`
+exactly as `complete-request!` performs them; skip only the `on-complete`
+invocation. Nothing leaks, `live-counts` stays balanced, and only the caller's
+callback is suppressed.
 
-**Build & test output:**
+**Result: GREEN (failure detected).** The element is watched.
+
+### The mechanism, measured rather than reasoned
+
+The drain row's predicate is a single fused conjunction,
+`(and (zero? gauge) (= completions submissions))`. Instrumenting the suite
+under the mutation to report the two quantities separately:
+
 ```
-FAIL the server echoed all seven writing clients' payloads back
-FAIL the restart ran from inside another client's delivery, with the stopped client's count unmoved
-FAIL every client's three chunks were written, and no write failed
-FAIL each of the eight peers echoed exactly one 32 KiB payload
-FAIL uv-write! is re-exported and its completion reports success
-FAIL uv-shutdown! is re-exported and its completion reports success
+(INSTRUMENT-before gauge 61440 completions 0 submissions 1)
 FAIL the queue falls to zero AND every write completed once the peer reads
+(INSTRUMENT-after  gauge 0     completions 0 submissions 1)
 ```
-Seven rows across test-echo, test-tcp, test-facade and test-flow.
 
-**Result:** GREEN (failure detected), with one honest qualification.
+**The gauge reaches zero.** `completions` never moving is the *sole* cause of
+the failure. libuv decrements `write_queue_size` in C as the kernel accepts
+bytes (`vendor/libuv/src/unix/stream.c:693-694`), entirely independent of
+whether our Scheme-side `on-complete` runs — Probe D suppresses only the
+latter, so the native gauge is untouched.
 
-The target row fails, and instrumentation of a throwaway copy showed its
-actual result list as `(iterations-exhausted (short 0 1))` — so the
-`all-completed` element *does* disagree, `completions` = 0 against
-`submissions` = 1. The element is watched.
+**A correction, recorded rather than quietly fixed.** An earlier version of
+this entry claimed "a write that never completes also stalls the gauge." That
+is false, as the instrumentation above shows. The real limitation is narrower
+and lives in the *test*, not the mechanism: because the predicate is fused, a
+completions-only failure is still reported as `iterations-exhausted` in the
+outcome's first slot. No mutation can ever produce `(satisfied (short ...))`,
+the one signature that would isolate the second conjunct. So the element is
+demonstrably the sole disagreeing quantity, while the row's construction
+prevents that from showing in its reported value.
 
-**It does not fail in isolation.** A write that never completes also stalls
-the gauge, so the `run-until/ticking` element goes red in the same run. This
-probe therefore demonstrates that `all-completed` is a real, disagreeing
-assertion — not that it is independently necessary. No mutation reachable
-within this milestone's scope makes it fail alone, because every way to
-suppress a completion also prevents the queue from draining. Recorded here
-rather than left implicit.
+This is the **fifth** mechanism narrative in this milestone to be wrong on
+direct test while its `FAIL` line was genuine (after Probe A's "kernel clamp",
+Probe G's "SO_SNDBUF moves", Probe H's "raw Chez exception", and this one).
+Every one was caught by measuring instead of reasoning. Treat a stated
+mechanism as unverified until instrumented.
 
-**Blast radius is wide and that is correct.** `write-done-dispatch` is the
-shared completion path for every write in the binding, so every suite that
-asserts on a write callback fails. Task 1's `alloc-dispatch` probe set the
-same precedent. Breadth here is not imprecision: the mutation is one line of
-behaviour, and all seven failing rows genuinely depend on it.
+### Blast radius: partly UNMEASURABLE, and that is the finding
 
-**Reverted; `make test` green; `git diff -- src/` clean.**
+Rows observed failing — verified by grepping each row string to its source
+file, three suites, not four:
 
-**Process note.** This probe was captured by the controller after a fix
-subagent returned control with the mutation still applied to the working
-tree. That is the one state a mutation must never be left in — an
-un-reverted probe is a commit away from shipping. The revert-and-verify
-sequence is part of the probe, not cleanup after it.
+```
+test-echo.sps    FAIL the server echoed all seven writing clients' payloads back
+test-echo.sps    FAIL the restart ran from inside another client's delivery, with the stopped client's count unmoved
+test-echo.sps    FAIL every client's three chunks were written, and no write failed
+test-echo.sps    FAIL each of the eight peers echoed exactly one 32 KiB payload
+test-facade.sps  FAIL uv-write! is re-exported and its completion reports success
+test-facade.sps  FAIL uv-shutdown! is re-exported and its completion reports success
+test-flow.sps    FAIL the queue falls to zero AND every write completed once the peer reads
+```
+
+**`tests/test-tcp.sps` HANGS under this mutation** rather than failing. Run
+alone it emits `%%%% Starting test tcp` and nothing further within 300s. Its
+write-completion rows (`:486`, `:492`, `:495`, guarded by the
+`'on-complete-never-ran` sentinels at `:444-445`) are never reached, because a
+`uv-run` step waiting on a completion that can never arrive blocks
+indefinitely.
+
+Consequently the seven rows above are **a lower bound, not the full radius**:
+the earlier `timeout 540 make test` capture was truncated by the timeout
+killing the hung suite, not completed. An earlier version of this entry
+presented that truncated list as the complete blast radius and miscounted the
+suites as four. Both corrected here.
+
+**Pre-existing repo hazard this exposed** (not introduced by v0.5, logged for
+final-review triage): `make test` runs suites serially with **no per-suite
+timeout** (`Makefile:392-400`). Any suite that hangs takes the whole run with
+it, and in CI that is a job timeout with no failing-row output to debug from.
+
+**Reverted; `git diff -- src/` clean; `make test` green.**
+
+**Process note.** Two subagents in a row returned control with this mutation
+still applied to the working tree — one fix agent, one reviewer. An
+un-reverted probe is one `git add -A` from shipping a binding whose writes
+never report completion. Mutation execution moved to the controller after the
+second incident, and the evidence above is from controller runs with the tree
+verified clean before and after.
