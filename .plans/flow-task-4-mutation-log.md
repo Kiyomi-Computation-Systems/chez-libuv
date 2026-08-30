@@ -211,3 +211,36 @@ bytes equal payload-A followed by payload-B, and that both `on-complete`
 callbacks fired with `'no-error` **in submission order**. That second row
 fails if completions are ever routed by request kind rather than by block
 pointer.
+
+**A correction, recorded rather than quietly fixed.** The claim directly
+above — that the completion row "fails if completions are ever routed by
+request kind rather than by block pointer" — was false as originally
+written. Both closures pushed the identical opaque value `'no-error` onto
+`pa-order`, and the row compared the reversed list against the constant
+`'(no-error no-error)`. That expected value cannot distinguish "A's callback
+ran for A's completion and B's for B's" from "the two completions were
+routed to each other's callbacks" — a swap still produces exactly two
+`'no-error` entries, in the same list, either way. As written, the row
+tested only two things: that exactly two completions fired (catching a
+dropped or duplicated completion, which changes the list's length) and that
+neither carried an error (catching a real failure, which changes an
+element). It said nothing about *which* callback each completion reached,
+so the routing claim quoted above did not hold for the row that existed at
+the time.
+
+The routing claim becomes true only once each closure is tagged with a
+value the other closure cannot also produce — `'a` for A's callback, `'b`
+for B's, with `(a-failed <cond>)` / `(b-failed <cond>)` on error so a
+genuine failure stays distinguishable from a misroute — and the expected
+value tightens from `'(no-error no-error)` to `'(a b)`. Only with that
+change does a routing swap (both callbacks still firing exactly once, both
+still error-free, but A's completion landing in B's closure or vice versa)
+produce a value the test can tell apart from correct routing.
+
+This is the **sixth** mechanism narrative in this milestone found wrong —
+after Probe A's "kernel clamp", Probe G's "SO_SNDBUF moves", Probe H's "raw
+Chez exception", and Task 3's fused-predicate gauge claim (the fifth). It
+differs from those four in how it was caught: each of those was measured
+wrong by instrumenting a mutation that had actually been run; this one was
+never run at all — the row's own construction was sufficient to show, on
+inspection, that it could not support the claim being made about it.

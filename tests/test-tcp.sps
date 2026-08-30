@@ -770,8 +770,10 @@
 (define pa-a (seeded-bytes 1024 11))
 (define pa-b (seeded-bytes 1024 22))
 (define pa-order '())
-(uv-write! pa-client pa-a (lambda (err) (set! pa-order (cons (or err 'no-error) pa-order))))
-(uv-write! pa-client pa-b (lambda (err) (set! pa-order (cons (or err 'no-error) pa-order))))
+(uv-write! pa-client pa-a
+           (lambda (err) (set! pa-order (cons (if err (list 'a-failed err) 'a) pa-order))))
+(uv-write! pa-client pa-b
+           (lambda (err) (set! pa-order (cons (if err (list 'b-failed err) 'b) pa-order))))
 
 (test-equal "both writes arrive, A then B"
   'identical
@@ -779,8 +781,17 @@
                             (lambda () (>= (collector-count pa-col) 2048)) 8000)
          (compare-bytes (bv-append pa-a pa-b) (collector-bytes pa-col))))
 
+;; TAGGED per write, not a shared 'no-error: two closures pushing the same
+;; opaque value cannot distinguish "both completed cleanly" from "the
+;; completions were routed to each other's callbacks", since the reversed
+;; list is identical either way. The tags are what make this row a test of
+;; per-request routing rather than of completion count.
+;;
+;; An error is carried as (a-failed <cond>) / (b-failed <cond>) rather than
+;; collapsing to a bare symbol, so a failed write is distinguishable from a
+;; misrouted one in the failure output.
 (test-equal "both completions fired with no error, in submission order"
-  '(no-error no-error) (reverse pa-order))
+  '(a b) (reverse pa-order))
 
 (uv-loop-teardown! pa-loop)
 
