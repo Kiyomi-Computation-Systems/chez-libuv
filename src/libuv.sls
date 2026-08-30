@@ -51,6 +51,7 @@
           uv-listen! uv-accept! uv-tcp-connect!
           uv-write! uv-shutdown! uv-tcp-nodelay!
           uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size
 
           ;; --- DNS, from (libuv dns) ---
           ;; The v0.2 surface (design spec v0.2 S4.6): both start calls,

@@ -35,7 +35,8 @@
           uv-tcp-nodelay!
           ;; re-exported from (libuv stream) (ADR-0014): the verbs moved,
           ;; the import surface did not.
-          uv-write! uv-shutdown! uv-read-start! uv-read-stop!)
+          uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)

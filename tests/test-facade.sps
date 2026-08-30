@@ -408,6 +408,9 @@
            (uv-recv-buffer-size! fclient 262144)
            (if (> (uv-recv-buffer-size fclient) lo) 'tracks-upward 'did-not-track))))
 
+(test-equal "the facade's write-queue-size answers zero on an idle stream"
+  'zero (if (zero? (uv-stream-write-queue-size fclient)) 'zero 'nonzero))
+
 (uv-loop-teardown! fl)
 
 (test-equal "the facade's tcp loop tore down and closed every handle"

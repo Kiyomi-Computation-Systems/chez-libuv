@@ -256,6 +256,101 @@
 (uv-loop-teardown! bloop)
 (uv-loop-close! bloop)
 
+;; --- write-queue congestion ------------------------------------------------
+;; A gauge test that only ever sees 0 passes against a stub, a misbound
+;; pointer, and a size_t marshalling bug -- and 0 is truthy. So: observe a
+;; POSITIVE value, then observe it FALL. Two assertions, two mutations.
+(define cloop (make-uv-loop))
+(define cserver (make-uv-tcp cloop))
+(define cport (bind-loopback! cserver))
+(define cpeer 'not-accepted)
+(define cclient (make-uv-tcp cloop))
+
+(uv-listen! cserver 4
+  (lambda (err)
+    (when (and (not err) (eq? cpeer 'not-accepted))
+      (set! cpeer (uv-accept! cserver)))))   ; deliberately NOT reading
+
+;; The idle stream gets its OWN listener: sharing cserver would race for which
+;; connection becomes cpeer.
+(define cidle-server (make-uv-tcp cloop))
+(define cidle-port (bind-loopback! cidle-server))
+(define cidle-peer 'not-accepted)
+(uv-listen! cidle-server 1
+  (lambda (err)
+    (when (and (not err) (eq? cidle-peer 'not-accepted))
+      (set! cidle-peer (uv-accept! cidle-server)))))
+(define cidle (make-uv-tcp cloop))
+
+(connect-loopback! cclient cport (lambda (err) #f))
+(connect-loopback! cidle cidle-port (lambda (err) #f))
+
+(test-equal "seed: both congestion pairs connected"
+  'satisfied
+  (run-until/ticking cloop
+                     (lambda () (and (not (eq? cpeer 'not-accepted))
+                                     (not (eq? cidle-peer 'not-accepted))))
+                     4000))
+
+;; Shrink BOTH: shrinking only the writer's does not bound loopback
+;; buffering, because the peer's receive buffer absorbs independently.
+(uv-send-buffer-size! cclient 4096)
+(uv-recv-buffer-size! cpeer 4096)
+
+(define chunk (seeded-bytes 65536 4242))
+(define submissions 0)
+(define completions 0)
+
+(define congested
+  (let push ((i 0))
+    (cond ((>= i 64) 'gauge-never-went-positive)
+          (else
+           (uv-write! cclient chunk (lambda (err) (set! completions (+ completions 1))))
+           (set! submissions (+ submissions 1))
+           ;; Sampled synchronously after uv-write! returns and BEFORE any
+           ;; uv-run: stream.sls:100-104 submits inline, so this is the
+           ;; moment the queue is deepest.
+           (let ((q (uv-stream-write-queue-size cclient)))
+             (if (positive? q) q (begin (uv-run cloop 'nowait) (push (+ i 1)))))))))
+
+(test-equal "the write queue goes positive against an unreading peer"
+  'positive
+  (if (and (integer? congested) (positive? congested)) 'positive congested))
+
+;; THE per-stream discriminator: the only row separating a real per-stream
+;; read from a per-loop total or a misbound pointer.
+(test-equal "an idle stream on the same loop reads zero while the other is congested"
+  '(congested-positive idle-zero)
+  (list (if (positive? (uv-stream-write-queue-size cclient)) 'congested-positive 'congested-zero)
+        (if (zero? (uv-stream-write-queue-size cidle)) 'idle-zero 'idle-nonzero)))
+
+;; Drain, requiring BOTH halves. Without the completions half, a gauge
+;; stubbed to 0 passes this row trivially.
+(uv-read-start! cpeer (lambda (bv s e) (collect)) (lambda () #f) (lambda (c) #f))
+
+(test-equal "the queue falls to zero AND every write completed once the peer reads"
+  '(satisfied all-completed)
+  (let ((r (run-until/ticking cloop
+                              (lambda () (and (zero? (uv-stream-write-queue-size cclient))
+                                              (= completions submissions)))
+                              20000)))
+    (list r (if (= completions submissions) 'all-completed
+                (list 'short completions submissions)))))
+
+;; The gate, on a CLOSING stream.
+(test-equal "a closing stream refuses the gauge with &uv-handle-closed"
+  'closed
+  (let ((doomed (make-uv-tcp cloop)))
+    (uv-tcp-bind! doomed "127.0.0.1" 0)
+    (uv-close! doomed)
+    (guard (e ((uv-handle-closed? e) 'closed)
+              (#t (list 'wrong-condition e)))
+      (uv-stream-write-queue-size doomed)
+      'no-raise)))
+
+(uv-loop-teardown! cloop)
+(uv-loop-close! cloop)
+
 (uv-loop-teardown! loop)
 (uv-loop-close! loop)
 

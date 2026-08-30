@@ -23,7 +23,8 @@
 ;;;     allocated, registered or counted something undoes exactly that much
 ;;;     before the condition escapes (design spec S5, S7).
 (library (libuv stream)
-  (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!)
+  (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -213,4 +214,34 @@
     (require-open-stream stream 'uv-read-stop!)
     (uv-check (uv-read-stop (handle-pointer stream 'uv-read-stop!))
               'uv-read-stop!)
-    (set-stream-reading! stream #f)))
+    (set-stream-reading! stream #f))
+
+  ;; (uv-stream-write-queue-size stream) -> exact non-negative integer
+  ;;
+  ;; libuv's PLATFORM-DEPENDENT count of queued stream bytes. Unix counts
+  ;; bytes not yet handed to the kernel (unix/stream.c:693-694) and leaves
+  ;; the count non-zero after a FAILED write, deliberately, so the user
+  ;; stops writing (unix/stream.c:719-724). Windows counts the opposite
+  ;; thing: write_queue_size is incremented only in the UV_SUCCEEDED_WITH_IOCP
+  ;; branch (win/tcp.c:986) -- bytes the kernel has ACCEPTED into an
+  ;; incomplete overlapped send -- and the immediate-completion branch never
+  ;; increments.
+  ;;
+  ;; SO: A CONGESTION SIGNAL. Not a memory gauge, and not a portable measure
+  ;; of kernel occupancy. It UNDERCOUNTS the memory this binding holds,
+  ;; because a write's foreign block stays allocated until the whole request
+  ;; completes while this number falls as the kernel takes bytes. A consumer
+  ;; bounding memory counts its own submissions against completions -- and
+  ;; must count BOTH outstanding payload bytes and outstanding request
+  ;; count, since a zero-length write allocates a full block for zero
+  ;; payload bytes (stream.sls:91). See docs/api.md.
+  ;;
+  ;; THE NATIVE CANNOT FAIL; THE GATE CAN. On a 'closing handle the pointer
+  ;; is still live, so a missing gate returns a plausible number -- which is
+  ;; why the suite mutates this gate against a CLOSING stream. A fully
+  ;; closed one does not discriminate: handle-pointer refuses the zeroed
+  ;; pointer first (handles.sls:471-475).
+  (define (uv-stream-write-queue-size stream)
+    (require-open-stream stream 'uv-stream-write-queue-size)
+    (uv-stream-get-write-queue-size-native
+     (handle-pointer stream 'uv-stream-write-queue-size))))

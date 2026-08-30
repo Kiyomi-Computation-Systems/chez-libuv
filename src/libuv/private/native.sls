@@ -81,6 +81,7 @@
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop
+          uv-stream-get-write-queue-size-native
           uv-ip4-addr uv-ip6-addr
 
           ;; the DNS entry points (design spec v0.2 S5.1). The two that take
@@ -493,6 +494,15 @@
     (foreign-procedure "uv_read_start" (uptr uptr uptr) int))
   (define uv-read-stop
     (foreign-procedure "uv_read_stop" (uptr) int))
+
+  ;; A struct field read (vendor/libuv/src/uv-data-getter-setters.c:77): no
+  ;; callback, no allocation, no error return. size_t and not a signed type
+  ;; deliberately -- this repo's scar is binding `nread` unsigned, which
+  ;; routed UV_EOF into the data path as four gigabytes of data
+  ;; (handles.sls:889-895). This is the opposite case: the value cannot be
+  ;; negative and cannot fail.
+  (define uv-stream-get-write-queue-size-native
+    (foreign-procedure "uv_stream_get_write_queue_size" (uptr) size_t))
 
   ;; --- the DNS entry points (design spec v0.2 S5.1) ---------------------
   ;; Every pointer is `uptr` (design spec S4 rule 4), including the two
