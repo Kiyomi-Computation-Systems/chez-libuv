@@ -93,6 +93,30 @@ CHEZ_LIBDIRS := src:tests:$(SRFI_LIBS)
 # never by the default suite, never under the memory gate. The filter-out
 # below is what keeps a `tests/test-*.sps` wildcard from silently running
 # it unprivileged (where it would loudly exit 1 and fail `make test`).
+# --- per-suite timeout (T2a) -----------------------------------------------
+# `make test` and `make test-memory` run suites SERIALLY, so one suite that
+# hangs takes the whole run with it. That is not hypothetical: a v0.5 mutation
+# probe (suppressing the write completion callback) made test-tcp.sps block
+# forever in a uv-run waiting on a completion that could never arrive, and the
+# run died at the outer timeout having produced no failing-row output at all.
+# A hang and a failure looked identical, which is the actual cost.
+#
+# timeout(1) is GNU coreutils and stock macOS DOES NOT SHIP IT. Homebrew
+# installs it as `timeout` when coreutils is installed with default names, and
+# as `gtimeout` otherwise. Absent both, the guard degrades to nothing rather
+# than breaking the target: a developer without coreutils gets the same suite
+# results, just without the HUNG diagnosis.
+#
+# Exit 124 is timeout(1)'s "I killed it" status and is reported DISTINCTLY.
+# Folding it into the ordinary failure path would defeat the point -- the
+# whole reason this exists is that a hang and a failure are different problems
+# that looked the same.
+TIMEOUT_BIN    := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
+# Generous: the slowest plain suite is well under a minute. The memory lane
+# gets its own, because Valgrind is 20-50x slower and shares these loops.
+SUITE_TIMEOUT        ?= 300
+MEMORY_SUITE_TIMEOUT ?= 900
+
 ROOT_TESTS   := tests/test-process-setuid.sps
 
 TESTS        := $(filter-out $(ROOT_TESTS),$(wildcard tests/test-*.sps))
@@ -413,10 +437,17 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 # picked up automatically -- no edit needed here, same reasoning as
 # PURE_TESTS above.
 test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
+	@test -n "$(TIMEOUT_BIN)" || echo "note: no timeout(1) on PATH; a hung suite will not be capped (brew install coreutils)"
 	@fail=0; \
 	for t in $(TESTS); do \
 	  echo "=== $$t ==="; \
-	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) $(CHEZ) --program $$t || fail=1; \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
+	    $(TIMEOUT_BIN) $(if $(TIMEOUT_BIN),$(SUITE_TIMEOUT),) $(CHEZ) --program $$t; \
+	  rc=$$?; \
+	  if [ $$rc -eq 124 ] && [ -n "$(TIMEOUT_BIN)" ]; then \
+	    echo "HUNG: $$t exceeded $(SUITE_TIMEOUT)s and was killed (not a failing assertion)" >&2; \
+	    fail=1; \
+	  elif [ $$rc -ne 0 ]; then fail=1; fi; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL SUITES PASSED"; \
 	else echo "SUITE FAILED"; fi; \
@@ -507,7 +538,12 @@ ifeq ($(UNAME_S),Linux)
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \
 	    --undef-value-errors=no \
-	    $(CHEZ) --program $$t || exit 1; \
+	    $(TIMEOUT_BIN) $(if $(TIMEOUT_BIN),$(MEMORY_SUITE_TIMEOUT),) $(CHEZ) --program $$t; \
+	  rc=$$?; \
+	  if [ $$rc -eq 124 ] && [ -n "$(TIMEOUT_BIN)" ]; then \
+	    echo "HUNG: $$t exceeded $(MEMORY_SUITE_TIMEOUT)s under valgrind and was killed" >&2; \
+	    exit 1; \
+	  elif [ $$rc -ne 0 ]; then exit 1; fi; \
 	done
 else
 	@echo "macOS: ASan preload only; LeakSanitizer is unsupported on arm64."
