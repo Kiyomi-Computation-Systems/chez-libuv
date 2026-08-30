@@ -30,7 +30,8 @@
 ;;;     before the condition escapes (design spec S5, S7).
 (library (libuv tcp)
   (export make-uv-tcp
-          uv-tcp-bind! uv-tcp-getsockname-port uv-tcp-peer-address
+          uv-tcp-bind! uv-tcp-getsockname-port
+          uv-tcp-sockname-address uv-tcp-peer-address
           uv-listen! uv-accept! uv-tcp-connect!
           uv-tcp-nodelay!
           ;; re-exported from (libuv stream) (ADR-0014): the verbs moved,
@@ -117,11 +118,24 @@
       (free! addr)))
 
   ;; --- the bound port (ADR-0010's ephemeral-port dance) -------------------
-  ;; PORT ONLY, and the name says so. Returning a decoded address as well
-  ;; would mean deciding what an address IS in this binding's vocabulary --
-  ;; a string? a family plus bytes? -- and v0.1 has exactly one caller for
-  ;; this: a test (or a server) that bound port 0 and needs to know which
-  ;; port the kernel chose.
+  ;; PORT ONLY, and the name says so -- but the REASON has changed, and this
+  ;; comment used to state the old one. v0.1 returned only the port because
+  ;; "returning a decoded address as well would mean deciding what an address
+  ;; IS in this binding's vocabulary -- a string? a family plus bytes?", and
+  ;; v0.1 had exactly one caller: a test or a server that bound port 0 and
+  ;; needs to know which port the kernel chose.
+  ;;
+  ;; ADR-0012 ENDED THAT DEFERRAL in v0.2 -- an address is a presentation-form
+  ;; string, a port is a separate exact integer -- and the ADR says so in as
+  ;; many words ("The DNS surface ends the deferral"). The local address then
+  ;; stayed unavailable for three milestones purely because nobody circled
+  ;; back, which v0.5's peer-address work finally made conspicuous: the two
+  ;; ends of one socket differed in return arity AND in capability.
+  ;;
+  ;; So this procedure is now a CONVENIENCE over uv-tcp-sockname-address
+  ;; below, kept because the ephemeral-port dance is its own idiom and every
+  ;; existing caller wants exactly this one value. It is not a limitation any
+  ;; more, and a caller who wants the address has somewhere to go.
   ;;
   ;; sin_port is at the same offset for AF_INET and AF_INET6 (both put it
   ;; immediately after the family), and it is stored in NETWORK byte order,
@@ -190,6 +204,38 @@
                   'uv-tcp-peer-address)
         (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
           (raise (make-uv-invalid-argument 'uv-tcp-peer-address
+                                           'sockaddr-too-small-for-a-port)))
+        (let ((address (sockaddr->address-string addr))
+              (port    (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
+          (free! addr)
+          (free! len)
+          (values address port)))))
+
+  ;; (uv-tcp-sockname-address tcp) -> (values address-string-or-#f port)
+  ;;
+  ;; The local half of the pair uv-tcp-peer-address completes, in ADR-0012's
+  ;; vocabulary and with the same arity, so the two ends of a socket are asked
+  ;; the same question the same way. uv_tcp_getsockname is the same native
+  ;; uv-tcp-getsockname-port already calls; only the decode differs.
+  ;;
+  ;; Unlike the peer side, this one does NOT need a connection: a bound but
+  ;; unconnected handle has a local name, which is exactly the ephemeral-port
+  ;; case ADR-0010 depends on. That asymmetry is libuv's, not this binding's --
+  ;; uv_tcp_getpeername on an unconnected handle answers UV_ENOTCONN.
+  ;;
+  ;; The first value may be #f: sockaddr->address-string answers string | #f
+  ;; deliberately, and a caller must handle it.
+  (define (uv-tcp-sockname-address tcp)
+    (require-open-tcp tcp 'uv-tcp-sockname-address)
+    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
+          (len  (alloc-zeroed (c-int-size))))
+      (guard (e (#t (free! addr) (free! len) (raise e)))
+        (c-int-set! len (sizeof-sockaddr-storage))
+        (uv-check (uv-tcp-getsockname
+                   (handle-pointer tcp 'uv-tcp-sockname-address) addr len)
+                  'uv-tcp-sockname-address)
+        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
+          (raise (make-uv-invalid-argument 'uv-tcp-sockname-address
                                            'sockaddr-too-small-for-a-port)))
         (let ((address (sockaddr->address-string addr))
               (port    (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
