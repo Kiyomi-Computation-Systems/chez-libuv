@@ -128,10 +128,88 @@ the commit that lands this file.
 
 ## Q1 — what should the read-buffer default be?
 
-Not yet run. See `14-readbuf-default.ss` when it lands.
+Script: `14-readbuf-default.ss`. Same Linux leg. Q1 feeds a *future*
+milestone — the one that changes `default-read-buffer-size` — and unlike Q2
+nothing about its answer has shipped. v0.5 pinned the current value with a
+test precisely so the change could later be made on evidence.
 
-Q1 is the input to a *future* milestone — the one that changes
-`default-read-buffer-size` — and unlike Q2 nothing about its answer has
-shipped. v0.5 deliberately did not change the default and pinned the current
-value with a test instead, precisely so that change could be made later on
-evidence. Q1 produces that evidence.
+### Leg A — the memory floor (200 connections, read-started)
+
+| size | expected foreign | measured RSS delta | extrapolated to 10k conns |
+|---|---|---|---|
+| 4096 | 800 KiB | 1264 KiB | ~40 MiB |
+| 16384 | 3200 KiB | 3128 KiB | ~160 MiB |
+| 65536 | 12800 KiB | 12704 KiB | ~625 MiB |
+
+Linear and close to `N × size`, as it must be — the buffer is one
+`foreign-alloc` per handle, committed at first `uv-read-start!`.
+
+### Leg B — cost per byte (16 MiB through one socket)
+
+| size | deliveries | /MiB | GCs | GC cpu | real | cpu |
+|---|---|---|---|---|---|---|
+| 4096 | 4096 | 256 | 3 | 752 µs | 2291 ms | 1753 ms |
+| 16384 | 1024 | 64 | 2 | 233 µs | 2302 ms | 1768 ms |
+| 65536 | 256 | 16 | 3 | 673 µs | 2106 ms | 1699 ms |
+
+### The finding, which contradicts the reasoning that shaped v0.5
+
+**The GC-pressure argument that withdrew 16384 does not survive
+measurement.**
+
+That argument, made during design review and accepted without measurement,
+was that a smaller buffer "quadruples Scheme allocation churn" because every
+`on-data` delivery allocates a fresh bytevector. Measuring it sharpens it into
+two claims, one true and one false:
+
+- **True:** the object count scales exactly as predicted. 4096 deliveries at
+  4 KiB versus 256 at 64 KiB — sixteen times as many allocations for the same
+  payload.
+- **False:** that cost anything observable. Three GCs at 4 KiB, three at
+  64 KiB. GC CPU is sub-millisecond at every size and **not monotonic** in
+  the delivery count (16384 is the cheapest of the three). At 16 MiB of
+  traffic the sixteen-fold difference in allocation count is invisible.
+
+The *bytes* allocated never differed at all, and could not have: `copy-out`
+allocates exactly `nread` bytes, so 16 MiB moved is 16 MiB of bytevectors at
+every buffer size. Only the object count varies. The original phrasing
+conflated volume with count, and the count turns out not to matter here.
+
+**Throughput does not clearly differentiate either.** A 9% spread across a
+16× size range, and non-monotonic — 16384 measured *slower* than 4096. That
+is noise, not signal.
+
+**So the only term that clearly differentiates is Leg A's memory floor**, and
+it differentiates by 16×: 40 MiB versus 625 MiB at ten thousand connections.
+
+This does **not** mean "change the default to 4096." It means the argument
+this project used to *stop* changing it is weaker than it looked, and the
+decision should be reopened on the evidence rather than settled by the
+reasoning that closed it. That is a decision for the milestone that owns it,
+with its own ADR — not for a spike.
+
+### Honest limits — and one that matters enough to redo
+
+- **Leg B's pump is suspect.** It writes 64 KiB then ticks the loop a fixed
+  two iterations, so the harness's own interleaving may dominate wall time
+  and mask real buffer-size effects. The throughput column should be treated
+  as *unable to detect* a difference rather than as evidence there is none. A
+  proper version would pump to completion and measure only drain time. **Any
+  milestone acting on Leg B should redo it first.**
+- Leg B is one connection. Aggregate GC behaviour across thousands of
+  concurrently-reading handles is not measured and is where a per-object cost
+  would most plausibly appear.
+- 16 MiB is a small transfer; loopback on aarch64 under nested virtualisation
+  is not a representative throughput environment.
+- Leg A's RSS delta at 4096 (1264 KiB against 800 KiB expected) carries
+  proportionally more fixed overhead than the larger sizes — at that size the
+  per-connection accounting is closer to the noise floor.
+
+### Pattern worth recording
+
+This is the eighth time in this milestone that a confidently-stated mechanism
+did not survive direct measurement, and the first where the casualty is the
+project's own architectural reasoning rather than a mutation log's prose. The
+GC argument was mine, it was made during design review, it changed the
+milestone's scope, and it was never measured until now. Every earlier
+instance was caught by instrumenting instead of arguing; so was this one.
