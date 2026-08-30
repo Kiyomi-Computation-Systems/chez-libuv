@@ -396,3 +396,60 @@ second `CancelIoEx(...)` call (as a no-op wrapper) to `win/pipe.c`, or a
 second `WSARecv(...)` call to `win/tcp.c` — would be expected to raise the
 corresponding count and trip the same `VENDOR DRIFT` branch; not
 independently verified here.
+
+---
+
+## Controller-run: the two new checks, and a diagnostic defect they exposed
+
+The Task 5 review found the original tripwire narrower than the comment it
+backs: three counters keyed to `UV_HANDLE_ZERO_READ` and `read_buffer`, neither
+of which appears anywhere in `win/pipe.c`. The pipe half of the claim had
+**zero** coverage, and even the tcp half checked proxies rather than the
+operative "the real read is non-overlapped" fact. Three counters added:
+`win/tcp.c` `WSARecv` sites, and `win/pipe.c` `CancelIoEx` / `GetOverlappedResult`.
+
+**Probe — extra `CancelIoEx` in `win/pipe.c`:** trips, `exit=2`, reports
+`CancelIoEx=3`.
+**Probe — extra `WSARecv` in `win/tcp.c`:** trips, `exit=2`, reports
+`WSARecv sites=3`.
+Both reverted; submodule verified clean after each.
+
+### The defect the probes exposed in the guard itself
+
+The first version emitted one fused paragraph naming every counter whether or
+not it had moved. Under the pipe probe its opening line read:
+
+```
+VENDOR DRIFT: UV_HANDLE_ZERO_READ assigned 2 (expected 2: win/tcp.c, win/udp.c),
+```
+
+— leading with a counter that was **correct**, while the actual drift
+(`CancelIoEx=3`) sat four lines down. A maintainer scanning the first line of a
+CI failure during a vendor bump would be pointed at the wrong file.
+
+Rewritten to accumulate and print only the counters that disagree:
+
+```
+VENDOR DRIFT -- only the counters below moved:
+  win/pipe.c CancelIoEx=3, expected 2 (drain sequence, pipe.c:2006)
+```
+
+This is worth recording as more than tidying. The guard's entire purpose is to
+be read correctly, once, under time pressure, by someone who did not write it.
+A check that fires accurately but *reports* misleadingly has failed at its job
+in the way that matters — the same failure mode as a comment stating something
+untrue, which is what this whole task exists to correct.
+
+### What these checks bind, stated in the failure text itself
+
+The message now ends: *"These are symbol counts, not semantic proofs: tripping
+means re-read the cited code; NOT tripping is not evidence the claims
+survived."*
+
+That sentence is the honest limit. A grep cannot prove `WSARecv` is called
+without an `OVERLAPPED`, only that the number of call sites is unchanged. And
+the guard binds the **vendored** path only — ADR-0001's system-libuv leg is
+unaudited. The rule the comments state does not rest on any of this: it rests
+on the portable infallible-alloc invariant
+(`src/libuv/private/handles.sls:846-860`). The tripwire protects the footnote,
+not the rule.
