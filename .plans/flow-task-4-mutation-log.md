@@ -244,3 +244,55 @@ differs from those four in how it was caught: each of those was measured
 wrong by instrumenting a mutation that had actually been run; this one was
 never run at all — the row's own construction was sufficient to show, on
 inspection, that it could not support the claim being made about it.
+
+---
+
+## Probe C: route write completions by kind, not by block pointer
+
+**Raised by:** Task 4 review. The completion-order row originally had both
+closures push the identical opaque `'no-error`, so a routing swap was
+structurally invisible — `(no-error no-error)` reversed is itself. The row
+tested completion *count* and error-freedom, never routing, while this log
+claimed it tested routing. Sixth mechanism narrative in this milestone found
+wrong on inspection.
+
+**Fix under test:** each closure now pushes a distinguishing tag (`'a` / `'b`,
+with `(a-failed <cond>)` / `(b-failed <cond>)` on error so a failed write stays
+distinguishable from a misrouted one), and the row expects `'(a b)`.
+
+**Mutation:** `complete-request!` in `src/libuv/private/handles.sls` selects
+`on-complete` by scanning the registry for the first live entry of kind
+`write-req`, instead of taking it from the request whose block actually
+completed. With two writes outstanding this mis-pairs callbacks to completions
+while leaving completion count, order and error status untouched.
+
+### The counterfactual, which is the whole point
+
+Same probe, run twice against the two versions of the assertion:
+
+```
+UNTAGGED (as originally written):  # of expected passes  175      <- NO failure
+TAGGED   (after the fix):          FAIL both completions fired with no error, in submission order
+                                   # of expected passes  174
+                                   # of unexpected failures  1
+```
+
+**The original row passed clean against the exact defect it was documented as
+catching.** Not a weak test — a blind one, and blind specifically along the
+axis its own name advertised. The tagged row fails, and fails alone: the
+sibling `"both writes arrive, A then B"` still passes, isolating the routing
+defect from the byte-order property.
+
+That isolation matters. It means the two rows now test genuinely different
+things: one that the bytes arrive in submission order, one that the
+*completions* are paired to their own requests. Before the fix the second row
+was, for routing purposes, a duplicate of nothing.
+
+**Reverted; `git diff -- src/` clean; `make test` green.**
+
+**Method note.** Both legs were run by the controller with the tree verified
+clean before and after, and the untagged leg was produced by temporarily
+restoring the pre-fix assertion *with the probe still applied* — the only way
+to demonstrate that the fix closed a real hole rather than merely adding
+detail. A probe that shows the new test failing proves the test can fail; only
+the counterfactual proves the old test could not.
