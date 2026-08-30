@@ -192,6 +192,25 @@ per process, and the suite's own process is the one whose status the loop
 checks. **Read the exit status, not the scrollback** — the same rule
 `make test-memory` has always needed.
 
+Both `make test` and `make test-memory` cap each suite individually. A
+suite that hangs — rather than failing an assertion — is reported as
+
+```
+HUNG: tests/test-tcp.sps exceeded 300s and was killed (not a failing assertion)
+```
+
+and **the run continues to the remaining suites**. Before this, a single
+hang took the whole run with it and produced no failing-row output at all,
+so a hang and a failure were indistinguishable in the log. Override with
+`SUITE_TIMEOUT=` (default 300s) or `MEMORY_SUITE_TIMEOUT=` (default 900s,
+because Valgrind is far slower).
+
+The cap needs GNU coreutils' `timeout(1)`, which **stock macOS does not
+ship**; Homebrew installs it as `timeout`, or as `gtimeout` when coreutils
+is installed with prefixed names. Without either, the target prints a note
+and runs exactly as before — you get the same suite results, just no HUNG
+diagnosis.
+
 ```sh
 sudo make test-root
 ```
