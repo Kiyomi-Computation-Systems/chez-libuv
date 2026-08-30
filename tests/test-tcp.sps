@@ -1246,6 +1246,16 @@
 (test-equal "seed: a second reading handle means a second read buffer"
   2 (live-count 'read-buffer))
 
+;; --- the DEFAULT buffer size, pinned -------------------------------------
+;; The rows above fix their own sizes explicitly; this is the only row in the
+;; suite that observes what a size-LESS uv-read-start! actually allocates.
+;; s-peer was started size-lessly at :1227, so its buffer is the default.
+;;
+;; v0.5 does not change this number. The row exists so the milestone that
+;; does cannot change it silently.
+(test-equal "a size-less read-start allocates default-read-buffer-size"
+  65536 (stream-read-buf-len s-peer))
+
 (test-equal "starting a read that is already running surfaces libuv's errno"
   'EALREADY
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))

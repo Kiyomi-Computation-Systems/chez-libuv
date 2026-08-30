@@ -169,21 +169,6 @@
                  (list 'duplicate-payloads i j))
                 (else (inner (+ j 1))))))))
 
-;; 'identical, or the FIRST index that differs and both bytes there. A bare
-;; test-equal on two 32 KiB bytevectors reports a failure by printing both of
-;; them; this reports the one number that says what went wrong.
-(define (compare-bytes expected actual)
-  (cond ((not (= (bytevector-length expected) (bytevector-length actual)))
-         (list 'wrong-length (bytevector-length actual)))
-        (else
-         (let scan ((i 0))
-           (cond ((= i (bytevector-length expected)) 'identical)
-                 ((= (bytevector-u8-ref expected i) (bytevector-u8-ref actual i))
-                  (scan (+ i 1)))
-                 (else (list 'differs-at i
-                             (bytevector-u8-ref expected i)
-                             (bytevector-u8-ref actual i))))))))
-
 (test-begin "echo")
 
 ;; --- seeds ---------------------------------------------------------------
