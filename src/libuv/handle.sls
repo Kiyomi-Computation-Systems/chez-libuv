@@ -120,8 +120,16 @@
     handle)
 
   ;; n must fit an int: c-int-set! bottoms out in foreign-set! 'int, which
-  ;; raises a raw Chez exception -- outside this binding's condition hierarchy
-  ;; -- for a value that does not fit.
+  ;; does NOT raise for a value that does not fit -- it truncates silently
+  ;; via two's-complement wraparound. Without this check, an out-of-range n
+  ;; like 2147483648 (2^31) becomes -2147483648 in the cell and reaches the
+  ;; native call as a negative buffer size. Relying on the OS to reject that
+  ;; incidentally (setsockopt happens to answer EINVAL, surfaced by uv-check
+  ;; as &uv-errno-error) would be weaker than this explicit range check, not
+  ;; equivalent to it -- and that condition's message text reads literally
+  ;; "invalid argument" (uv_strerror(UV_EINVAL)), easily mistaken for this
+  ;; binding's own &uv-invalid-argument rather than the OS's rejection of a
+  ;; value this check exists to catch first.
   (define (require-buffer-size n who)
     (unless (and (integer? n) (exact? n) (positive? n) (< n 2147483648))
       (raise (make-uv-invalid-argument who 'buffer-size-out-of-range)))

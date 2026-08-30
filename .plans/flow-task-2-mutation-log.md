@@ -361,10 +361,7 @@ nothing in Probes A-G exercises `require-buffer-size`'s upper bound,
 (unless (and (integer? n) (exact? n) (positive? n) (<= n 2147483648))    ; MUTATION
 ```
 `n = 2147483648` (2^31, one past the largest signed 32-bit int) now passes
-validation and reaches `set-buffer-size!`'s `(c-int-set! cell n)`, which the
-comment above `require-buffer-size` already documents as raising a raw Chez
-exception outside this binding's condition hierarchy for a value that does
-not fit an `int`.
+validation and reaches `set-buffer-size!`'s `(c-int-set! cell n)`.
 
 **Build & test output** (`make test 2>&1 | grep -E "FAIL|of unexpected failures"`,
 verbatim):
@@ -376,19 +373,32 @@ SUITE FAILED
 
 **Result:** GREEN (failure detected), exactly the row named in the brief,
 and no other suite's row — this assertion is one `test-flow.sps` has no
-facade-level counterpart for. Confirmed the predicted mechanism directly
-(same style of standalone `chez --program` check used for Probe G above,
-mutation still applied):
-```
-(wrong-condition #t invalid argument #<compound condition>)
-```
-`c-int-set! cell 2147483648` raises a Chez R6RS condition (a `condition?`,
-message `"invalid argument"`) that is not a `uv-invalid-argument?`, so the
-row's `guard` falls through to its `(#t (list 'wrong-condition e))` arm
-exactly as predicted — `require-buffer-size`'s validation is the only thing
-standing between an out-of-range `n` and this raw foreign-set failure, and
-this probe proves the check is load-bearing for the upper bound, not only
-for `positive?`. Reverted (`(< n 2147483648)` restored); `make test`
+facade-level counterpart for.
+
+**Narrative corrected (Fix 3):** the original text here, and the comment it
+was copied from above `require-buffer-size` in `src/libuv/handle.sls`, both
+claimed `c-int-set!` raises a raw Chez exception for a value that does not
+fit an `int`. A reviewer tested `c-int-set!` directly against the compiled
+library and found this false: `(c-int-set! cell 2147483648)` does not raise
+at all — it silently truncates via two's-complement wraparound, and
+`(c-int-ref cell)` afterward reads back `-2147483648`. That negative value
+is what actually reaches `uv_recv_buffer_size`; its `setsockopt` rejects it
+with `EINVAL` (`rc = -22`), and `uv-check` converts *that* into
+`&uv-errno-error` — a member of this binding's own condition hierarchy, and
+specifically not `&uv-invalid-argument`. That is why the row's guard falls
+through to its `'wrong-condition` arm: the raised condition is real and is
+what the pasted `FAIL` output above correctly recorded, but it is an
+`&uv-errno-error` from the OS's rejection, not a raw Chez exception from
+`foreign-set!`. Confusingly, `&uv-errno-error`'s message text reads
+literally `"invalid argument"` (libuv's `uv_strerror(UV_EINVAL)`), which is
+almost certainly what produced the original "raw Chez exception" misreading
+in the first place. The reviewer's mechanism was verified here by direct
+test against the compiled library, not inferred from the code — the same
+standard Probe A's "kernel clamp" and Probe G's "SO_SNDBUF now moves" were
+both held to and both failed on inspection; this is the third mechanism
+narrative in this task to be wrong on first telling and only caught by
+running the actual check, which is worth noting as a pattern for future
+probes in this log. Reverted (`(< n 2147483648)` restored); `make test`
 returned to `ALL SUITES PASSED`, `git diff --stat -- src/` empty.
 
 ---
