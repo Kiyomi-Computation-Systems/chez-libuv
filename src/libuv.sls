@@ -31,6 +31,8 @@
           uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop uv-close!
+          uv-send-buffer-size uv-send-buffer-size!
+          uv-recv-buffer-size uv-recv-buffer-size!
 
           ;; --- timers, from (libuv timer) ---
           make-uv-timer

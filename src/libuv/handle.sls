@@ -18,13 +18,17 @@
   (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop
+          uv-send-buffer-size uv-send-buffer-size!
+          uv-recv-buffer-size uv-recv-buffer-size!
           uv-close!)
-  ;; No (libuv private conditions) import: every condition this library can
-  ;; produce is raised by (libuv private handles) on its behalf
-  ;; (require-handle, and the close protocol's own checks). Importing it
-  ;; "just in case" would put a name in scope that nothing here uses.
+  ;; v0.5 adds the OS socket buffer-size wrappers below, which DO raise
+  ;; &uv-invalid-argument directly (not merely by way of (libuv private
+  ;; handles)), so (libuv private conditions) and (libuv private native) join
+  ;; the import here for the first time.
   (import (rnrs)
-          (libuv private handles))
+          (libuv private conditions)
+          (libuv private handles)
+          (libuv private native))
 
   ;; WHY THERE IS NO `uv-handle-closed?` PREDICATE. The name is already
   ;; taken, by the condition predicate of &uv-handle-closed (design spec S9),
@@ -84,6 +88,72 @@
   ;; the handle.
   (define (uv-signal? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'signal)))
+
+  ;; --- OS socket buffer sizes ----------------------------------------------
+  ;; THREE DIFFERENT BUFFERS share confusable names, and docs/api.md tabulates
+  ;; them together for that reason:
+  ;;
+  ;;   * chez-libuv's per-handle read buffer -- fixed by the first
+  ;;     uv-read-start!, freed by the close dispatcher, 64 KiB by default;
+  ;;   * the OS SEND buffer -- these procedures;
+  ;;   * the OS RECEIVE buffer -- these procedures.
+  ;;
+  ;; Setting SO_RCVBUF does not resize the chez-libuv buffer, or vice versa.
+  ;; At high connection counts the OS buffers are a first-class memory cost:
+  ;; Linux autotunes SO_RCVBUF from roughly 87 KB per socket upward, which at
+  ;; ten thousand connections can exceed every read buffer combined.
+  ;;
+  ;; PLATFORM SUPPORT IS NOT UNIFORM (vendor/libuv/docs/src/handle.rst:202):
+  ;; TCP, pipe and UDP on Unix; TCP and UDP only on Windows. The gate is an
+  ;; allowlist failing closed for kinds libuv never supports; libuv's own
+  ;; UV_ENOTSUP is the backstop for the platform-specific case.
+  ;;
+  ;; A socket needs an fd but NOT a connection: bind is sufficient.
+  ;;
+  ;; require-open-handle, not require-handle: on a 'closing handle the pointer
+  ;; is still live, so a bare require-handle would let all four SILENTLY
+  ;; SUCCEED against a handle that is going away.
+  (define (require-socket-handle handle who)
+    (require-open-handle handle who)
+    (unless (memq (handle-kind handle) '(tcp pipe))
+      (raise (make-uv-invalid-argument who 'not-a-socket-handle)))
+    handle)
+
+  ;; n must fit an int: c-int-set! bottoms out in foreign-set! 'int, which
+  ;; raises a raw Chez exception -- outside this binding's condition hierarchy
+  ;; -- for a value that does not fit.
+  (define (require-buffer-size n who)
+    (unless (and (integer? n) (exact? n) (positive? n) (< n 2147483648))
+      (raise (make-uv-invalid-argument who 'buffer-size-out-of-range)))
+    n)
+
+  ;; THE ZERO IS THE API. alloc-zeroed, never foreign-alloc.
+  (define (get-buffer-size! native handle who)
+    (require-socket-handle handle who)
+    (let ((cell (alloc-zeroed (c-int-size))))
+      (guard (e (#t (free! cell) (raise e)))
+        (uv-check (native (handle-pointer handle who) cell) who)
+        (let ((v (c-int-ref cell)))
+          (free! cell)
+          v))))
+
+  (define (set-buffer-size! native handle n who)
+    (require-socket-handle handle who)
+    (require-buffer-size n who)
+    (let ((cell (alloc-zeroed (c-int-size))))
+      (guard (e (#t (free! cell) (raise e)))
+        (c-int-set! cell n)
+        (uv-check (native (handle-pointer handle who) cell) who)
+        (free! cell))))
+
+  (define (uv-send-buffer-size handle)
+    (get-buffer-size! uv-send-buffer-size-native handle 'uv-send-buffer-size))
+  (define (uv-send-buffer-size! handle n)
+    (set-buffer-size! uv-send-buffer-size-native handle n 'uv-send-buffer-size!))
+  (define (uv-recv-buffer-size handle)
+    (get-buffer-size! uv-recv-buffer-size-native handle 'uv-recv-buffer-size))
+  (define (uv-recv-buffer-size! handle n)
+    (set-buffer-size! uv-recv-buffer-size-native handle n 'uv-recv-buffer-size!))
 
   ;; (uv-close! handle [on-close]) -- idempotent, asynchronous, and the only
   ;; way a handle is ever freed.

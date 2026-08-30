@@ -69,6 +69,7 @@
           uv-timer-init uv-timer-start-native uv-timer-stop uv-timer-again
           uv-timer-set-repeat uv-timer-get-repeat
           uv-close-native uv-is-closing
+          uv-send-buffer-size-native uv-recv-buffer-size-native
 
           ;; the TCP and stream entry points (design spec S5, S6, S7). The
           ;; five that take a C function pointer -- uv_listen, uv_tcp_connect,
@@ -426,6 +427,23 @@
     (foreign-procedure "uv_close" (uptr uptr) void))
   (define uv-is-closing
     (foreign-procedure "uv_is_closing" (uptr) int))
+
+  ;; uv_send_buffer_size / uv_recv_buffer_size overload ONE entry point on
+  ;; whether *value is zero (get) or non-zero (set):
+  ;;
+  ;;   len = sizeof(*value);
+  ;;   if (*value == 0)  r = getsockopt(fd, SOL_SOCKET, optname, value, &len);
+  ;;   else              r = setsockopt(fd, SOL_SOCKET, optname, value, len);
+  ;;                                     -- vendor/libuv/src/unix/core.c:255-261
+  ;;
+  ;; libuv reads the CALLER'S MEMORY to decide which operation to perform, so
+  ;; the getter's zero is load-bearing and alloc-zeroed is mandatory. The
+  ;; -native suffix is required here: (libuv handle)'s public wrappers take
+  ;; these exact names.
+  (define uv-send-buffer-size-native
+    (foreign-procedure "uv_send_buffer_size" (uptr uptr) int))
+  (define uv-recv-buffer-size-native
+    (foreign-procedure "uv_recv_buffer_size" (uptr uptr) int))
 
   ;; --- the TCP and stream entry points (design spec S5, S7) -------------
   ;; Every pointer is `uptr` (design spec S4 rule 4). The three scalar

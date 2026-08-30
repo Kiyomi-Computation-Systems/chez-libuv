@@ -390,6 +390,24 @@
     (uv-read-stop! f-accepted)
     'stopped))
 
+;; --- v0.5 buffer-size surfaces, reached through the facade only -----------
+;; CALLED, not asserted about: this suite's enforcement is that an
+;; un-re-exported name fails to expand (:19-23), so a row that merely mentions
+;; a name proves nothing the import did not already prove.
+(test-equal "the facade's send-buffer getter and setter track at two points"
+  'tracks-upward
+  (begin (uv-send-buffer-size! fclient 8192)
+         (let ((lo (uv-send-buffer-size fclient)))
+           (uv-send-buffer-size! fclient 262144)
+           (if (> (uv-send-buffer-size fclient) lo) 'tracks-upward 'did-not-track))))
+
+(test-equal "the facade's receive-buffer getter and setter track at two points"
+  'tracks-upward
+  (begin (uv-recv-buffer-size! fclient 8192)
+         (let ((lo (uv-recv-buffer-size fclient)))
+           (uv-recv-buffer-size! fclient 262144)
+           (if (> (uv-recv-buffer-size fclient) lo) 'tracks-upward 'did-not-track))))
+
 (uv-loop-teardown! fl)
 
 (test-equal "the facade's tcp loop tore down and closed every handle"
