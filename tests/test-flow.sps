@@ -119,12 +119,29 @@
 ;; compare-bytes answers 'identical, (wrong-length n), or
 ;; (differs-at i expected actual) -- never #f, which SRFI-64 also produces
 ;; for a raise.
-(test-equal "survivor 1 received exactly its own bytes"
-  'identical (compare-bytes (payload-for 1) (collector-bytes (vector-ref cols 1))))
-(test-equal "survivor 2 received exactly its own bytes"
-  'identical (compare-bytes (payload-for 2) (collector-bytes (vector-ref cols 2))))
-(test-equal "survivor 3 received exactly its own bytes"
-  'identical (compare-bytes (payload-for 3) (collector-bytes (vector-ref cols 3))))
+;; Accept order is NOT contractually uv-tcp-connect! call order, so peers[i]
+;; is not guaranteed to be cli[i]'s connection. Asserting an index-keyed
+;; correspondence would risk a spurious failure unrelated to any regression.
+;; The property under test does not need that mapping: each survivor must
+;; have received ONE COMPLETE, UNCORRUPTED payload, and all three distinct
+;; payloads must have arrived EXACTLY ONCE across the three survivors. That
+;; is strictly stronger against cross-wiring -- two survivors handed the same
+;; bytes fails here, where three index-keyed rows could each still pass under
+;; some permutations.
+;;
+;; 0 marks "matched no payload at all", which is what a corrupting mutation
+;; produces; it cannot be confused with a success value, since the expected
+;; list contains only 1, 2 and 3.
+(define (which-payload bv)
+  (let scan ((i 1))
+    (cond ((> i 3) 0)
+          ((eq? 'identical (compare-bytes (payload-for i) bv)) i)
+          (else (scan (+ i 1))))))
+
+(test-equal "each survivor received exactly one complete, uncorrupted payload"
+  '(1 2 3)
+  (list-sort < (map (lambda (i) (which-payload (collector-bytes (vector-ref cols i))))
+                    '(1 2 3))))
 
 (test-equal "the closed reader received nothing further"
   closed-deliveries-at-gate (collector-count (vector-ref cols 0)))

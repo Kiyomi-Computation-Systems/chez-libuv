@@ -45,6 +45,17 @@ Total, not a raise: `alloc-dispatch` is infallible by requirement
 and length — it only reads from the wrong address, one byte into the
 buffer's tail padding, dropping the true buffer's last byte on every read.
 
+**Correction (fix report Task 1 review, see `.superpowers/sdd/task-1-report.md`
+`## Fix 1`):** the three index-keyed `survivor N received exactly its own
+bytes` rows below were replaced by one row, `"each survivor received exactly
+one complete, uncorrupted payload"`, because accept order is not
+contractually `uv-tcp-connect!` call order — `peers[i]` was never guaranteed
+to be `cli[i]`'s connection, so the index-keyed comparison could spuriously
+fail (or spuriously pass under a corrupting mutation, via permutation) for
+reasons unrelated to any regression. `test-flow.sps`'s row count dropped
+from 10 to 8. The mutation was re-run against the corrected suite below;
+output re-captured verbatim.
+
 **Build & test output** (`make test 2>&1 | grep -E '^FAIL|unexpected
 failures|^==='`, verbatim):
 ```
@@ -62,10 +73,8 @@ FAIL client 7 received back exactly the bytes it sent
 FAIL uv-read-start! is re-exported and delivered the payload to the peer
 # of unexpected failures  1
 === tests/test-flow.sps ===
-FAIL survivor 1 received exactly its own bytes
-FAIL survivor 2 received exactly its own bytes
-FAIL survivor 3 received exactly its own bytes
-# of unexpected failures  3
+FAIL each survivor received exactly one complete, uncorrupted payload
+# of unexpected failures  1
 === tests/test-process.sps ===
 FAIL argv[0], argv[1], env, and cwd all arrived as written
 FAIL omitted env inherits the parent's
