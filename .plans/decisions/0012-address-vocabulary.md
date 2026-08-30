@@ -28,6 +28,18 @@ composition is the point of resolving — so v0.2 has to decide what an address
 is, and the decision has to hold for inputs (`uv-getnameinfo!` takes one) as
 well as outputs.
 
+> **Closed 2026-08-30 (v0.5 follow-up).** This ADR ended the deferral in
+> v0.2, but `uv-tcp-getsockname-port` stayed port-only for three further
+> milestones because nobody circled back — the vocabulary existed and the
+> local side simply never adopted it. v0.5's `uv-tcp-peer-address` made the
+> gap conspicuous: the two ends of one socket then differed in return arity
+> AND in capability, while `tcp.sls` claimed the milestone "completes the
+> mirror". `uv-tcp-sockname-address` closes it, in this ADR's vocabulary and
+> with the peer side's arity. `uv-tcp-getsockname-port` is kept as a
+> convenience over it — the ephemeral-port dance of ADR-0010 is its own idiom
+> and every existing caller wants exactly that one value — and its comment,
+> which still recited the v0.1 deferral as though current, now says so.
+
 ## Decision
 
 An address crosses the public boundary as a **presentation-form string**

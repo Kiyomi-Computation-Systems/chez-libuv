@@ -44,6 +44,7 @@ libraries exist for narrower imports.
 | `make-uv-tcp` | A new TCP handle on a loop |
 | `uv-tcp-bind!` | Bind to an address and port; IPv4 or IPv6 literal |
 | `uv-tcp-getsockname-port` | The real port the kernel chose, for a bind to port 0 |
+| `uv-tcp-sockname-address` | This end's own address and port, as `(values address-string-or-#f port)`. Unlike the peer side it needs no connection — a bound handle has a local name |
 | `uv-listen!` | Listen; `on-connection` is called with the error or `#f` |
 | `uv-accept!` | A new open handle for the queued connection |
 | `uv-tcp-connect!` | Connect; answers the in-flight request record |

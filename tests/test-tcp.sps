@@ -740,6 +740,41 @@
   (list "127.0.0.1" (uv-tcp-getsockname-port pa-client))
   (let-values (((a p) (uv-tcp-peer-address pa-peer))) (list a p)))
 
+;; --- the local half of the pair -------------------------------------------
+;; Both directions, as with the peer side: on loopback the ADDRESSES are
+;; identical at both ends, so only the PORTS discriminate. Row 1 pins the
+;; accepted handle's local name against the listener's port; row 2 pins the
+;; client's local name against the port its own peer sees. Together they
+;; catch a sockname implemented as getpeername -- the exact inverse of the
+;; mutation the peer rows catch.
+(test-equal "the accepted handle's local address and port are the server's"
+  (list "127.0.0.1" pa-server-port)
+  (let-values (((a p) (uv-tcp-sockname-address pa-peer))) (list a p)))
+
+(test-equal "the client's local port is what its peer reports as the peer port"
+  'agree
+  (let-values (((ca cp) (uv-tcp-sockname-address pa-client)))
+    (let-values (((pa pp) (uv-tcp-peer-address pa-peer)))
+      (if (and (equal? ca pa) (= cp pp)) 'agree (list 'differ ca cp pa pp)))))
+
+;; The port agrees with the existing convenience, which is the whole claim
+;; that one is now a narrowing of this rather than a separate capability.
+(test-equal "sockname-address's port agrees with uv-tcp-getsockname-port"
+  'agree
+  (let-values (((a p) (uv-tcp-sockname-address pa-client)))
+    (if (= p (uv-tcp-getsockname-port pa-client)) 'agree (list 'differ p))))
+
+;; And UNLIKE the peer side, this needs no connection -- the ephemeral-port
+;; case ADR-0010 depends on. The asymmetry is libuv's, so it is asserted
+;; rather than left to a comment.
+(test-equal "a bound but unconnected handle HAS a local name"
+  'has-a-local-name
+  (let ((u (make-uv-tcp pa-loop)))
+    (uv-tcp-bind! u "127.0.0.1" 0)
+    (let-values (((a p) (uv-tcp-sockname-address u)))
+      (if (and (equal? a "127.0.0.1") (positive? p))
+          'has-a-local-name (list 'unexpected a p)))))
+
 (test-equal "an unconnected handle refuses with ENOTCONN"
   'ENOTCONN
   (let ((u (make-uv-tcp pa-loop)))

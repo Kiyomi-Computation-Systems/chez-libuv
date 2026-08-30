@@ -431,6 +431,10 @@
 (test-equal "the facade's write-queue-size answers zero on an idle stream"
   'zero (if (zero? (uv-stream-write-queue-size fclient)) 'zero 'nonzero))
 
+(test-equal "the facade's sockname-address answers this end's own name"
+  (list "127.0.0.1" (uv-tcp-getsockname-port fclient))
+  (let-values (((a p) (uv-tcp-sockname-address fclient))) (list a p)))
+
 (test-equal "the facade's peer-address answers the connected peer"
   (list "127.0.0.1" fport)
   (let-values (((a p) (uv-tcp-peer-address fclient))) (list a p)))
