@@ -99,14 +99,24 @@
   ;;   * the OS RECEIVE buffer -- these procedures.
   ;;
   ;; Setting SO_RCVBUF does not resize the chez-libuv buffer, or vice versa.
-  ;; At high connection counts the OS receive buffer is a first-class memory
-  ;; cost: Linux autotunes it, and the autotuned total can substantially
-  ;; exceed every read buffer combined at those counts. The exact
-  ;; per-socket figure is kernel- and sysctl-dependent and was NOT measured
-  ;; by this milestone (design spec §10 Q2 proposed exactly that measurement;
-  ;; dropped -- see the v0.5 entry in .superpowers/sdd/progress.md). A
-  ;; commonly cited figure, 87 KB, is dated -- it is the older tcp_rmem[1]
-  ;; default; modern kernels commonly default to 131072 instead.
+  ;;
+  ;; AND SO_RCVBUF IS A CEILING, NOT A CHARGE. An earlier version of this
+  ;; comment said the OS receive buffer is "a first-class memory cost" that
+  ;; can exceed every read buffer combined at high connection counts. That
+  ;; was reasoned, not measured, and measuring it (spike/flow/13-rcvbuf-cost.ss,
+  ;; Debian bookworm/aarch64) showed it is true only of the reported ceiling:
+  ;;
+  ;;   SO_RCVBUF reported        131072 B/conn   2x the read buffer
+  ;;   kernel charge, idle       ~11-15 KiB/conn 0.2x -- five times SMALLER
+  ;;   kernel charge, unread     ~530 KiB/conn   8x, and unbounded
+  ;;
+  ;; At rest the chez-libuv read buffer is the LARGER cost by roughly 5x --
+  ;; it is committed at uv-read-start! whether or not data arrives, while the
+  ;; kernel fills its allowance only as data does. The receive buffer becomes
+  ;; dominant precisely when the application stops reading, which makes it a
+  ;; function of backpressure discipline rather than of connection count.
+  ;; tcp_rmem[1] was 131072 on the measured host; the commonly cited 87 KB is
+  ;; the older default. Both are sysctl-tunable -- measure the target kernel.
   ;;
   ;; PLATFORM SUPPORT IS NOT UNIFORM (vendor/libuv/docs/src/handle.rst:202):
   ;; TCP, pipe and UDP on Unix; TCP and UDP only on Windows. The gate is an

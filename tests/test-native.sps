@@ -1047,6 +1047,69 @@
     (c-int-ref 0)
     'no-raise))
 
+;; --- v0.5's natives: the size_t return and the int out-parameter --------
+;; Design spec v0.5 §13.5. STUB-LEVEL round-trips: a raw loop and a raw tcp
+;; handle sized from uv_loop_size/uv_handle_size, no dispatcher installed and
+;; no live socket, so these exercise the FFI marshalling and nothing else. The
+;; wrappers' live-socket behaviour is tests/test-flow.sps's job.
+;;
+;; This suite deliberately never imports (libuv private handles): doing so
+;; instantiates its body and installs the dispatchers, which would break the
+;; "before installation" rows further down. Everything here is raw pointers.
+;; NO uv_loop_init HERE, and that is the point. An earlier version of this
+;; block built a real loop and a real tcp handle, freed its own two blocks,
+;; and skipped uv_loop_close on the reasoning that the handle was never
+;; closed so a close would answer EBUSY. That reasoning was wrong in a way
+;; macOS cannot see: uv_loop_init allocates libuv's own internals
+;; (uv_loop_init -> uv__process_init -> uv_signal_init -> uv__io_init_start),
+;; and skipping the close leaks them. CI's Linux Valgrind leg caught it at
+;; 128 + 448 bytes definitely lost; the macOS ASan leg makes no leak claim
+;; and stayed green.
+;;
+;; A ZEROED, UNINITIALISED handle exercises both marshalling paths without
+;; libuv allocating anything at all, which is what "stub-level" should have
+;; meant in the first place: write_queue_size is a struct field read, and
+;; uv__socket_sockopt dispatches on handle->type, which is 0
+;; (UV_UNKNOWN_HANDLE) in a zeroed block and answers UV_ENOTSUP.
+(let ((tp (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
+
+  ;; size_t, and deliberately not a signed type: the queue size cannot be
+  ;; negative and the call cannot fail. Binding it signed would be the mirror
+  ;; of the `nread` scar the read dispatcher records -- there, reading UV_EOF
+  ;; through an unsigned binding delivered four gigabytes of data.
+  (test-equal "uv_stream_get_write_queue_size marshals as a non-negative exact integer"
+    '(exact non-negative)
+    (let ((q (uv-stream-get-write-queue-size-native tp)))
+      (list (if (and (integer? q) (exact? q)) 'exact 'inexact)
+            (if (>= q 0) 'non-negative 'negative))))
+
+  ;; The int OUT-parameter, which is the half that can go wrong silently.
+  ;; A zeroed block has handle->type = 0, so libuv refuses with UV_ENOTSUP --
+  ;; a real negative errno rather than garbage, which is what makes this a
+  ;; marshalling assertion. And the cell is still the
+  ;; zero alloc-zeroed put there: on the failure path libuv never writes back,
+  ;; so a getter built on foreign-alloc instead would be carrying whatever the
+  ;; heap held, unnoticed.
+  (let ((cell (alloc-zeroed (c-int-size))))
+    ;; THE SIGN IS THE ASSERTION, and the symbol alone cannot carry it:
+    ;; errno->symbol answers EBADF for -9 AND for its unsigned 32-bit wrap
+    ;; 4294967287 (measured -- it normalises the wraparound). A row asserting
+    ;; only the symbol is therefore blind to the exact defect it looks like it
+    ;; is testing, an `int` rc bound as `unsigned-int`. The wrappers survive
+    ;; that mutation only because uv-check gates on negativity before mapping;
+    ;; at this level the row has to gate on it itself. This row was written
+    ;; the blind way first and caught by running the mutation.
+    (test-equal "uv_send_buffer_size on an unknown handle type answers a NEGATIVE ENOTSUP rc"
+      '(negative ENOTSUP)
+      (let ((rc (uv-send-buffer-size-native tp cell)))
+        (list (if (negative? rc) 'negative 'not-negative)
+              (errno->symbol rc))))
+    (test-equal "the int out-parameter still holds alloc-zeroed's zero after a failed call"
+      0 (c-int-ref cell))
+    (free! cell))
+
+  (free! tp))
+
 ;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
 ;; The probe value deliberately does NOT fit in 32 bits: on every supported
 ;; target a c-uptr-ref accidentally narrowed to a 32-bit read would answer a

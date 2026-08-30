@@ -84,7 +84,7 @@ independent quantities:
 |---|---|---|---|
 | chez-libuv read buffer | first `uv-read-start!`, irreversibly | close dispatcher | 64 KiB default |
 | OS send buffer | `uv-send-buffer-size!` | kernel, at socket close | tens of KB, tunable |
-| OS receive buffer | `uv-recv-buffer-size!` | kernel, at socket close | autotuned; kernel- and sysctl-dependent |
+| OS receive buffer | `uv-recv-buffer-size!` | kernel, at socket close | a *ceiling*, autotuned; what the kernel charges depends on whether you read |
 
 **A setter's argument is a request to the kernel, not an assignment.**
 `uv-send-buffer-size!` and `uv-recv-buffer-size!` wrap `setsockopt`, and the
@@ -97,16 +97,33 @@ result to the `net.core.wmem_max`/`net.core.rmem_max` sysctls — so
 broken binding: read the getter's return as the kernel's answer, not as
 confirmation that the requested number took effect.
 
-**The OS receive buffer's autotuned default is not a fixed number, and this
-milestone did not measure it.** At high connection counts it can
-substantially exceed the per-handle read buffer, but the exact figure is
-kernel- and sysctl-dependent — it was not measured here (the design spec's
-§10 Q2 proposed exactly that measurement; see the v0.5 entry in
-[`.superpowers/sdd/progress.md`](../.superpowers/sdd/progress.md) for why it
-did not happen). A commonly cited figure for this default is 87 KB, but
-that number is dated: it is the older `tcp_rmem[1]` default, and modern
-kernels commonly default to 131072 instead. Measure on the target kernel
-rather than relying on either number.
+**`SO_RCVBUF` is a ceiling, not memory the kernel has charged — and the
+difference is most of the story.** Measured on Debian bookworm (aarch64,
+libuv 1.52.1) with `spike/flow/13-rcvbuf-cost.ss`; figures are that host's,
+the shape is structural:
+
+| Per connection | Bytes | vs the 64 KiB read buffer |
+|---|---|---|
+| `SO_RCVBUF` as reported | 131072 | 2× — the ceiling |
+| Kernel memory charged, connections **idle** | ~11–15 KiB | ~0.2× — five times *smaller* |
+| Kernel memory charged, data pushed and **never read** | ~530 KiB | ~8× — and unbounded in principle |
+
+So the receive buffer is **not** a fixed per-connection tax that outweighs
+the read buffer. It is close to free at rest, and becomes the dominant cost
+exactly when the application has stopped reading. The variable that decides
+which regime you are in is backpressure discipline, not connection count —
+see `uv-read-stop!` and `uv-stream-write-queue-size` below.
+
+**The chez-libuv read buffer is the opposite shape**, and at rest it is the
+larger of the two by roughly 5×: 65536 bytes of resident foreign memory
+committed the moment `uv-read-start!` runs, whether or not a byte ever
+arrives, and not reclaimed until close.
+
+`tcp_rmem[1]` was 131072 on the measured host. A commonly cited 87 KB is the
+older default; both are sysctl-tunable, so measure on the target kernel
+rather than trusting either. Full method, honest limits, and the reason this
+was measured after the fact rather than before are in
+[`spike/flow/FINDINGS.md`](../spike/flow/FINDINGS.md).
 
 **The read-buffer sizing contract is a tradeoff, not a recommendation.**
 The buffer is allocated by the first `uv-read-start!` and freed only by the
