@@ -1047,6 +1047,60 @@
     (c-int-ref 0)
     'no-raise))
 
+;; --- v0.5's natives: the size_t return and the int out-parameter --------
+;; Design spec v0.5 §13.5. STUB-LEVEL round-trips: a raw loop and a raw tcp
+;; handle sized from uv_loop_size/uv_handle_size, no dispatcher installed and
+;; no live socket, so these exercise the FFI marshalling and nothing else. The
+;; wrappers' live-socket behaviour is tests/test-flow.sps's job.
+;;
+;; This suite deliberately never imports (libuv private handles): doing so
+;; instantiates its body and installs the dispatchers, which would break the
+;; "before installation" rows further down. Everything here is raw pointers.
+(let ((lp (alloc-zeroed (uv-loop-size)))
+      (tp (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
+  (test-equal "seed: the raw loop and tcp handle initialise"
+    '(0 0) (list (uv-loop-init lp) (uv-tcp-init lp tp)))
+
+  ;; size_t, and deliberately not a signed type: the queue size cannot be
+  ;; negative and the call cannot fail. Binding it signed would be the mirror
+  ;; of the `nread` scar the read dispatcher records -- there, reading UV_EOF
+  ;; through an unsigned binding delivered four gigabytes of data.
+  (test-equal "uv_stream_get_write_queue_size marshals as a non-negative exact integer"
+    '(exact non-negative)
+    (let ((q (uv-stream-get-write-queue-size-native tp)))
+      (list (if (and (integer? q) (exact? q)) 'exact 'inexact)
+            (if (>= q 0) 'non-negative 'negative))))
+
+  ;; The int OUT-parameter, which is the half that can go wrong silently.
+  ;; uv_tcp_init leaves the handle with no fd, so libuv reaches getsockopt(-1)
+  ;; and answers UV_EBADF -- a real negative errno rather than garbage, which
+  ;; is what makes this a marshalling assertion. And the cell is still the
+  ;; zero alloc-zeroed put there: on the failure path libuv never writes back,
+  ;; so a getter built on foreign-alloc instead would be carrying whatever the
+  ;; heap held, unnoticed.
+  (let ((cell (alloc-zeroed (c-int-size))))
+    ;; THE SIGN IS THE ASSERTION, and the symbol alone cannot carry it:
+    ;; errno->symbol answers EBADF for -9 AND for its unsigned 32-bit wrap
+    ;; 4294967287 (measured -- it normalises the wraparound). A row asserting
+    ;; only the symbol is therefore blind to the exact defect it looks like it
+    ;; is testing, an `int` rc bound as `unsigned-int`. The wrappers survive
+    ;; that mutation only because uv-check gates on negativity before mapping;
+    ;; at this level the row has to gate on it itself. This row was written
+    ;; the blind way first and caught by running the mutation.
+    (test-equal "uv_send_buffer_size on an fd-less handle answers a NEGATIVE EBADF rc"
+      '(negative EBADF)
+      (let ((rc (uv-send-buffer-size-native tp cell)))
+        (list (if (negative? rc) 'negative 'not-negative)
+              (errno->symbol rc))))
+    (test-equal "the int out-parameter still holds alloc-zeroed's zero after a failed call"
+      0 (c-int-ref cell))
+    (free! cell))
+
+  ;; Freed directly rather than through uv_loop_close: the handle was never
+  ;; closed, so a close would answer EBUSY. These are scratch blocks.
+  (free! tp)
+  (free! lp))
+
 ;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
 ;; The probe value deliberately does NOT fit in 32 bits: on every supported
 ;; target a c-uptr-ref accidentally narrowed to a 32-bit read would answer a
