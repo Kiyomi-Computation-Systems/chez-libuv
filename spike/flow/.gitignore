@@ -1,0 +1,4 @@
+# Spike scratch: measurement output is recorded in FINDINGS.md, not committed.
+*.log
+*.out
+.sockstat-mem
