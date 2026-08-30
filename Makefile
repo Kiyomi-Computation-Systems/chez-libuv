@@ -192,7 +192,7 @@ deps: ## Vendor chez-srfi and symlink it (plus %3a-decoded names) into build/sch
 	  [ "$$d" = "$$b" ] || ln -sfn "$$f" "$$dst/$$d"; \
 	done
 
-check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, and manifest/CHANGELOG version agree
+check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, manifest/CHANGELOG version, and vendor read-path facts agree
 	@rec=$$(git ls-files -s $(SRFI_SRC) | awk '{print $$2}'); \
 	lock=$$(sed -n 's/.*akku\.[0-9]*\.\([a-f0-9]*\)_repack.*/\1/p' Akku.lock | head -1); \
 	if [ -z "$$rec" ] || [ -z "$$lock" ]; then \
@@ -235,6 +235,29 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	  exit 1; \
 	fi; \
 	echo "manifest version matches CHANGELOG ($$man)"
+	@zr=$$(grep -rn 'UV_HANDLE_ZERO_READ' $(VENDOR_DIR)/src | grep -c '|=' || true); \
+	zc=$$(grep -rn 'UV_HANDLE_ZERO_READ' $(VENDOR_DIR)/src | grep -c '&= *~' || true); \
+	rb=$$(grep -rn 'read_buffer *=' $(VENDOR_DIR)/src $(VENDOR_DIR)/include | grep -vc 'read_buffer ==' || true); \
+	wr=$$(grep -c 'WSARecv(' $(VENDOR_DIR)/src/win/tcp.c || true); \
+	pc=$$(grep -c 'CancelIoEx' $(VENDOR_DIR)/src/win/pipe.c || true); \
+	pg=$$(grep -c 'GetOverlappedResult' $(VENDOR_DIR)/src/win/pipe.c || true); \
+	drift=""; \
+	[ "$$zr" = "2" ] || drift="$$drift\n  UV_HANDLE_ZERO_READ assigned $$zr, expected 2 (win/tcp.c, win/udp.c)"; \
+	[ "$$zc" = "0" ] || drift="$$drift\n  UV_HANDLE_ZERO_READ cleared $$zc, expected 0 (it is never cleared)"; \
+	[ "$$rb" = "0" ] || drift="$$drift\n  read_buffer assigned $$rb, expected 0 (include/uv/win.h:444 is read-only)"; \
+	[ "$$wr" = "2" ] || drift="$$drift\n  win/tcp.c WSARecv sites=$$wr, expected 2 (incl. the non-overlapped read at tcp.c:1108)"; \
+	[ "$$pc" = "2" ] || drift="$$drift\n  win/pipe.c CancelIoEx=$$pc, expected 2 (drain sequence, pipe.c:2006)"; \
+	[ "$$pg" = "2" ] || drift="$$drift\n  win/pipe.c GetOverlappedResult=$$pg, expected 2 (drain sequence, pipe.c:2008)"; \
+	if [ -n "$$drift" ]; then \
+	  printf "VENDOR DRIFT -- only the counters below moved:%b\n" "$$drift" >&2; \
+	  echo "src/libuv/stream.sls and src/libuv/private/handles.sls both cite these" >&2; \
+	  echo "facts in the read-buffer comments. Re-verify BOTH before bumping." >&2; \
+	  echo "These are symbol counts, not semantic proofs: tripping means re-read the" >&2; \
+	  echo "cited code; NOT tripping is not evidence the claims survived." >&2; \
+	  exit 1; \
+	fi; \
+	echo "vendor read-path facts ok: ZERO_READ set=$$zr cleared=$$zc, read_buffer assigned=$$rb"; \
+	echo "vendor read-path facts ok: tcp WSARecv sites=$$wr, pipe CancelIoEx=$$pc GetOverlappedResult=$$pg"
 
 # Nothing outside private/ may see a raw uv_* symbol or pointer (design spec
 # section 3). test-conditions.sps exercises the pure &uv-* condition

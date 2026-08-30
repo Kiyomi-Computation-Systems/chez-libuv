@@ -69,6 +69,7 @@
           uv-timer-init uv-timer-start-native uv-timer-stop uv-timer-again
           uv-timer-set-repeat uv-timer-get-repeat
           uv-close-native uv-is-closing
+          uv-send-buffer-size-native uv-recv-buffer-size-native
 
           ;; the TCP and stream entry points (design spec S5, S6, S7). The
           ;; five that take a C function pointer -- uv_listen, uv_tcp_connect,
@@ -76,10 +77,12 @@
           ;; NOT exported raw, for the same reason as uv_timer_start and
           ;; uv_close above: their wrappers bake in this library's own
           ;; trampoline entry points.
-          uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-nodelay
+          uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-getpeername-native
+          uv-tcp-nodelay
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop
+          uv-stream-get-write-queue-size-native
           uv-ip4-addr uv-ip6-addr
 
           ;; the DNS entry points (design spec v0.2 S5.1). The two that take
@@ -427,6 +430,23 @@
   (define uv-is-closing
     (foreign-procedure "uv_is_closing" (uptr) int))
 
+  ;; uv_send_buffer_size / uv_recv_buffer_size overload ONE entry point on
+  ;; whether *value is zero (get) or non-zero (set):
+  ;;
+  ;;   len = sizeof(*value);
+  ;;   if (*value == 0)  r = getsockopt(fd, SOL_SOCKET, optname, value, &len);
+  ;;   else              r = setsockopt(fd, SOL_SOCKET, optname, value, len);
+  ;;                                     -- vendor/libuv/src/unix/core.c:255-261
+  ;;
+  ;; libuv reads the CALLER'S MEMORY to decide which operation to perform, so
+  ;; the getter's zero is load-bearing and alloc-zeroed is mandatory. The
+  ;; -native suffix is required here: (libuv handle)'s public wrappers take
+  ;; these exact names.
+  (define uv-send-buffer-size-native
+    (foreign-procedure "uv_send_buffer_size" (uptr uptr) int))
+  (define uv-recv-buffer-size-native
+    (foreign-procedure "uv_recv_buffer_size" (uptr uptr) int))
+
   ;; --- the TCP and stream entry points (design spec S5, S7) -------------
   ;; Every pointer is `uptr` (design spec S4 rule 4). The three scalar
   ;; parameters mirror libuv's own declarations rather than being widened or
@@ -449,6 +469,15 @@
     (foreign-procedure "uv_tcp_bind" (uptr uptr unsigned-int) int))
   (define uv-tcp-getsockname
     (foreign-procedure "uv_tcp_getsockname" (uptr uptr uptr) int))
+  ;; uv_tcp_getpeername (design spec S5, v0.5 Task 4): same signature and
+  ;; same out-parameter contract as uv_tcp_getsockname above -- an
+  ;; in/out namelen and a caller-owned sockaddr_storage scratch buffer.
+  ;; -native, matching uv-tcp-connect-native and its siblings, because the
+  ;; PUBLIC wrapper (libuv tcp)'s uv-tcp-peer-address bakes in the argument
+  ;; validation and the namelen-vs-port-offset check; this raw binding does
+  ;; neither.
+  (define uv-tcp-getpeername-native
+    (foreign-procedure "uv_tcp_getpeername" (uptr uptr uptr) int))
   (define uv-tcp-nodelay
     (foreign-procedure "uv_tcp_nodelay" (uptr int) int))
   (define uv-accept
@@ -475,6 +504,15 @@
     (foreign-procedure "uv_read_start" (uptr uptr uptr) int))
   (define uv-read-stop
     (foreign-procedure "uv_read_stop" (uptr) int))
+
+  ;; A struct field read (vendor/libuv/src/uv-data-getter-setters.c:77): no
+  ;; callback, no allocation, no error return. size_t and not a signed type
+  ;; deliberately -- this repo's scar is binding `nread` unsigned, which
+  ;; routed UV_EOF into the data path as four gigabytes of data
+  ;; (handles.sls:889-895). This is the opposite case: the value cannot be
+  ;; negative and cannot fail.
+  (define uv-stream-get-write-queue-size-native
+    (foreign-procedure "uv_stream_get_write_queue_size" (uptr) size_t))
 
   ;; --- the DNS entry points (design spec v0.2 S5.1) ---------------------
   ;; Every pointer is `uptr` (design spec S4 rule 4), including the two

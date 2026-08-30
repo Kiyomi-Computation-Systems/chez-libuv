@@ -19,16 +19,18 @@ a caller who knows libuv recognises the Scheme surface immediately.
 It is transport only: it parses nothing, understands no protocol above raw
 bytes, and provides no connection-state or backpressure policy of its own —
 those belong to the layers built on top of these primitives. The full
-design, with seventeen accepted decision records, lives under
+design, with eighteen accepted decision records, lives under
 [[file:.plans/][.plans/]].
 
 * Status
 
-*v0.4.0* — event loop, TCP (bind, listen, accept, connect, reads with
+*v0.5.0* — event loop, TCP (bind, listen, accept, connect, reads with
 backpressure, writes, shutdown), timers, DNS (~getaddrinfo~,
 ~getnameinfo~, ~cancel~), child processes (the full ~uv_spawn~ stdio
-vocabulary) with minimal pipes, and signal watching (continuous and
-oneshot). No filesystem, no UDP, no zero-copy I/O
+vocabulary) with minimal pipes, signal watching (continuous and oneshot),
+and flow control (read/write buffer sizing, the write-queue congestion
+gauge, peer addresses — see ~docs/api.md~'s Flow control section). No
+filesystem, no UDP, no zero-copy I/O
 ([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]]). CI
 covers macOS and Linux on both dependency-acquisition paths; Windows is
 deferred, not designed out

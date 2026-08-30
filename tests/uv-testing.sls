@@ -14,7 +14,7 @@
 (library (uv-testing)
   (export run-until run-until/ticking
           bind-loopback! connect-loopback! loopback-address
-          seeded-bytes
+          seeded-bytes compare-bytes
           make-byte-collector byte-collector? collect-span!
           collector-count collector-bytes)
   (import (rnrs)
@@ -194,6 +194,21 @@
             (let ((next (mod (+ (* lcg-multiplier x) lcg-increment) lcg-modulus)))
               (bytevector-u8-set! bv i (mod (div next 65536) 256))
               (fill (+ i 1) next))))))
+
+  ;; 'identical, or the FIRST index that differs and both bytes there. A bare
+  ;; test-equal on two 32 KiB bytevectors reports a failure by printing both of
+  ;; them; this reports the one number that says what went wrong.
+  (define (compare-bytes expected actual)
+    (cond ((not (= (bytevector-length expected) (bytevector-length actual)))
+           (list 'wrong-length (bytevector-length actual)))
+          (else
+           (let scan ((i 0))
+             (cond ((= i (bytevector-length expected)) 'identical)
+                   ((= (bytevector-u8-ref expected i) (bytevector-u8-ref actual i))
+                    (scan (+ i 1)))
+                   (else (list 'differs-at i
+                               (bytevector-u8-ref expected i)
+                               (bytevector-u8-ref actual i))))))))
 
   ;; --- accumulating what a read delivered ---------------------------------
   ;; Somewhere for on-data to put its spans, plus the running byte count a

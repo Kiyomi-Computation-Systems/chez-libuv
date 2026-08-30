@@ -3,6 +3,96 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.5.0 — 2026-08-30
+
+Flow control: three per-connection memory surfaces made visible and
+adjustable, and the one write-side congestion signal Scheme could not
+otherwise derive. No new libuv subsystem and **no behaviour changes** — the
+read-buffer default is pinned, not altered, and every new procedure reports
+or configures. The full design is
+`.plans/2026-08-29-chez-libuv-v0.5-flow-control-design.md`.
+
+### Added
+
+- `(libuv stream)`: `uv-stream-write-queue-size`, libuv's own
+  `uv_stream_get_write_queue_size` — a platform-dependent congestion
+  signal, not a memory gauge: Unix counts bytes not yet handed to the
+  kernel and deliberately leaves the count non-zero after a *failed*
+  write; Windows increments only when the kernel has accepted an
+  overlapped send that has not completed. Allocation-free; re-exported
+  from `(libuv tcp)`.
+- `(libuv handle)`: `uv-send-buffer-size`/`uv-send-buffer-size!` and
+  `uv-recv-buffer-size`/`uv-recv-buffer-size!`, mirroring
+  `uv_send_buffer_size`/`uv_recv_buffer_size`. Handle-generic (tcp, pipe
+  and UDP on Unix; tcp and UDP only on Windows — libuv's own platform
+  split, not this binding's), gated to handles with a socket
+  (`'not-a-socket-handle`) and validating the setter's argument before
+  any allocation (`'buffer-size-out-of-range`, exact/positive/below
+  2^31 — `c-int-set!` truncates silently outside that range rather than
+  raising).
+- `(libuv tcp)`: `uv-tcp-peer-address`, mirroring `uv_tcp_getpeername` —
+  `(values address-string-or-#f port)` for the remote end, completing the
+  local/peer address mirror `uv-tcp-getsockname-port` has covered alone
+  since v0.1.
+- `docs/api.md`: a **Flow control** section — the read-buffer sizing
+  contract stated as a tradeoff rather than a recommendation (a smaller
+  buffer cuts foreign memory linearly and raises `read(2)` count,
+  `on-data` delivery count, and Scheme bytevector allocation
+  proportionally; no measurement has been taken), the read-stop/read-start
+  pairing invariant with the `uv-handle-open?` guard for a stop that races
+  a close, how a consumer bounds write memory (outstanding payload bytes
+  **and** outstanding request count, incremented only after `uv-write!`
+  returns successfully — a zero-length write allocates a full request
+  block for zero payload bytes), and the write-queue gauge's contract
+  restated in prose. A **three-buffers table** distinguishing the
+  chez-libuv read buffer from the OS send and receive buffers — setting
+  `SO_RCVBUF` does not resize the chez-libuv buffer, or vice versa — plus
+  the six new rows in their per-module tables, the new
+  `&uv-invalid-argument` reason symbol (`'not-a-socket-handle`;
+  `'buffer-size-out-of-range` is reused from `uv-read-start!`, not new
+  here), and a close-hazard note beside "Exit ≠ close": a second
+  `uv-close!` silently discards its callback,
+  because the close path guards on the handle being `'open`.
+- [ADR-0018](.plans/decisions/0018-unbuffered-write-submission.md): the
+  binding will not hold unsubmitted write blocks, enforce a queue-depth or
+  byte cap, or have `uv-write!` refuse. `uv-shutdown!` submits immediately,
+  so a deferred write would let a later shutdown reach libuv first; and
+  `uv-close!` frees only the read buffer and the handle pointer, so
+  nothing would free a queued block or fire its `on-complete`. Queueing
+  and admission stay server policy.
+- A dated amendment to
+  [ADR-0009](.plans/decisions/0009-copy-at-the-boundary.md): `uv__read` is
+  a loop (`alloc_cb`/`read()`/`read_cb`, repeated until the read does not
+  fill the buffer), so callback-scoped borrowing is the natural lifetime
+  under any read-buffer ownership model; and, correcting an assumption
+  made at v0.1, `uv-read-stop!` does not make a retained span safe — the
+  close dispatcher frees the buffer unconditionally, so a retained-borrow
+  design needs explicit borrow ownership of its own.
+- `make check-pins` gained a vendor read-path audit: it now asserts, over
+  the vendored tree, that `UV_HANDLE_ZERO_READ` is assigned in exactly two
+  places and cleared in none, that `read_buffer` is never assigned, and
+  that the TCP `WSARecv` call-site count and the pipe
+  `CancelIoEx`/`GetOverlappedResult` counts match the read-path shape the
+  binding's two Scheme comments describe — replacing a claim a grep can
+  check with a check, per AGENTS.md. Tripping it names both Scheme
+  comment sites as the thing to re-verify; not tripping is not evidence
+  the underlying claim survived.
+- Both of those Scheme comments (`src/libuv/stream.sls`,
+  `src/libuv/private/handles.sls`) corrected: the buffer-freed-only-at-close
+  rule was previously attributed to Windows' overlapped-read model
+  retaining a queued completion against the buffer, which is dead code for
+  the two handle kinds this binding supports — `uv_tcp_t` never posts a
+  user buffer at all, and `uv_pipe_t` drains its overlapped read
+  synchronously before returning. The rule itself is unchanged and still
+  correct, for the portable reason now stated: `alloc-dispatch` must stay
+  infallible.
+- The read-buffer default (65536 bytes) is now pinned by a test — prior
+  suites exercised a size-omitted `uv-read-start!` call (`test-tcp.sps`,
+  `test-echo.sps`, `test-process.sps`, `test-stream.sps`,
+  `test-signal.sps`, `test-facade.sps`), but none asserted the resulting
+  buffer's length — so a future change to the default is a deliberate,
+  reviewed edit rather than a silent one.
+
 ## 0.4.0 — 2026-08-22
 
 ### Added

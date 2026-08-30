@@ -703,6 +703,98 @@
 (test-equal "every tcp handle of the exchange was freed"
   0 (live-count 'tcp))
 
+;; --- peer address ---------------------------------------------------------
+(define pa-loop (make-uv-loop))
+(define pa-server (make-uv-tcp pa-loop))
+(define pa-server-port (bind-loopback! pa-server))
+(define pa-peer 'never-accepted)
+
+(uv-listen! pa-server 128
+            (lambda (err)
+              (collect)
+              (when (and (not err) (eq? pa-peer 'never-accepted))
+                (set! pa-peer (uv-accept! pa-server)))))
+
+(define pa-client (make-uv-tcp pa-loop))
+(define pa-connect-err 'connect-cb-never-fired)
+(connect-loopback! pa-client pa-server-port
+                   (lambda (err) (collect) (set! pa-connect-err err)))
+
+(test-equal "seed: the peer-address pair connected and was accepted"
+  'satisfied
+  (run-until/ticking pa-loop
+                     (lambda () (and (not (eq? pa-peer 'never-accepted))
+                                     (not (eq? pa-connect-err 'connect-cb-never-fired))))
+                     4000))
+
+;; The expected IPv4 string is REQUIRED, not tolerated: a row accepting #f
+;; passes against an implementation whose address conversion returns #f.
+(test-equal "the client's peer address and port are the server's"
+  (list "127.0.0.1" pa-server-port)
+  (let-values (((a p) (uv-tcp-peer-address pa-client))) (list a p)))
+
+;; The direction that catches getpeername implemented as getsockname. Two
+;; independent ports also shrink the byte-order blind spot (tcp.sls:125-129
+;; records why read-net-u16 exists) from ~1/256 to ~1/65536.
+(test-equal "the accepted handle's peer port is the client's own local port"
+  (list "127.0.0.1" (uv-tcp-getsockname-port pa-client))
+  (let-values (((a p) (uv-tcp-peer-address pa-peer))) (list a p)))
+
+(test-equal "an unconnected handle refuses with ENOTCONN"
+  'ENOTCONN
+  (let ((u (make-uv-tcp pa-loop)))
+    (uv-tcp-bind! u "127.0.0.1" 0)
+    (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+              (#t (list 'wrong-condition e)))
+      (uv-tcp-peer-address u)
+      'no-raise)))
+
+;; --- two-write ordering (design spec S13.5) --------------------------------
+;; What the BINDING owns: FIFO submission order and per-request completion
+;; routing. Non-interleaving itself is structural (head-of-queue drain,
+;; unix/stream.c:1043) and is logged as an uncovered property, not asserted.
+(define pa-col (make-byte-collector))
+(uv-read-start! pa-peer (lambda (bv s e) (collect-span! pa-col bv s e) (collect))
+                (lambda () #f) (lambda (c) #f))
+;; Chez has NO bytevector-append -- it is R7RS, and absent from both (rnrs)
+;; and (chezscheme). Verified: "variable bytevector-append is not bound".
+;; R6RS bytevector-copy! is (source source-start target target-start count).
+(define (bv-append a b)
+  (let* ((la (bytevector-length a))
+         (lb (bytevector-length b))
+         (out (make-bytevector (+ la lb))))
+    (bytevector-copy! a 0 out 0 la)
+    (bytevector-copy! b 0 out la lb)
+    out))
+
+(define pa-a (seeded-bytes 1024 11))
+(define pa-b (seeded-bytes 1024 22))
+(define pa-order '())
+(uv-write! pa-client pa-a
+           (lambda (err) (set! pa-order (cons (if err (list 'a-failed err) 'a) pa-order))))
+(uv-write! pa-client pa-b
+           (lambda (err) (set! pa-order (cons (if err (list 'b-failed err) 'b) pa-order))))
+
+(test-equal "both writes arrive, A then B"
+  'identical
+  (begin (run-until/ticking pa-loop
+                            (lambda () (>= (collector-count pa-col) 2048)) 8000)
+         (compare-bytes (bv-append pa-a pa-b) (collector-bytes pa-col))))
+
+;; TAGGED per write, not a shared 'no-error: two closures pushing the same
+;; opaque value cannot distinguish "both completed cleanly" from "the
+;; completions were routed to each other's callbacks", since the reversed
+;; list is identical either way. The tags are what make this row a test of
+;; per-request routing rather than of completion count.
+;;
+;; An error is carried as (a-failed <cond>) / (b-failed <cond>) rather than
+;; collapsing to a bare symbol, so a failed write is distinguishable from a
+;; misrouted one in the failure output.
+(test-equal "both completions fired with no error, in submission order"
+  '(a b) (reverse pa-order))
+
+(uv-loop-teardown! pa-loop)
+
 ;; --- use after close -----------------------------------------------------
 (define cl (make-uv-loop))
 (define closed-tcp (make-uv-tcp cl))
@@ -1245,6 +1337,16 @@
 
 (test-equal "seed: a second reading handle means a second read buffer"
   2 (live-count 'read-buffer))
+
+;; --- the DEFAULT buffer size, pinned -------------------------------------
+;; The rows above fix their own sizes explicitly; this is the only row in the
+;; suite that observes what a size-LESS uv-read-start! actually allocates.
+;; s-peer was started size-lessly at :1227, so its buffer is the default.
+;;
+;; v0.5 does not change this number. The row exists so the milestone that
+;; does cannot change it silently.
+(test-equal "a size-less read-start allocates default-read-buffer-size"
+  65536 (stream-read-buf-len s-peer))
 
 (test-equal "starting a read that is already running surfaces libuv's errno"
   'EALREADY

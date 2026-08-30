@@ -33,6 +33,8 @@ libraries exist for narrower imports.
 | `uv-handle-open?` `uv-handle-closing?` | State predicates. Never raise, on anything |
 | `uv-handle-state` | `'open` \| `'closing` \| `'closed`. There is no `uv-handle-closed?` — that name is the condition predicate |
 | `uv-handle-loop` | The owning loop; answers for a closed handle too |
+| `uv-send-buffer-size` `uv-send-buffer-size!` | The OS send buffer (`SO_SNDBUF`), in bytes. tcp/pipe/UDP on Unix, tcp/UDP only on Windows |
+| `uv-recv-buffer-size` `uv-recv-buffer-size!` | The OS receive buffer (`SO_RCVBUF`), in bytes. Same platform support as the send-side pair |
 | `uv-close!` | Start the close, optionally with an `on-close` callback. Idempotent |
 
 ## TCP — `(libuv tcp)`
@@ -46,6 +48,7 @@ libraries exist for narrower imports.
 | `uv-accept!` | A new open handle for the queued connection |
 | `uv-tcp-connect!` | Connect; answers the in-flight request record |
 | `uv-tcp-nodelay!` | `TCP_NODELAY`. Takes a boolean, not an int |
+| `uv-tcp-peer-address` | `(values address-string-or-#f port)` for the remote end. `uv_tcp_getpeername` |
 
 `uv-write!`, `uv-shutdown!`, `uv-read-start!` and `uv-read-stop!` moved to
 `(libuv stream)` in v0.3 (below); `(libuv tcp)` re-exports all four
@@ -63,6 +66,103 @@ tcp or pipe handle.
 | `uv-shutdown!` | Shut the write side down; the read side stays open |
 | `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required |
 | `uv-read-stop!` | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
+| `uv-stream-write-queue-size` | Queued write bytes libuv is holding for this stream. Allocation-free. See Flow control, below |
+
+## Flow control
+
+v0.5 adds no new libuv subsystem and changes no default: it makes three
+per-connection memory surfaces visible and adjustable, and gives write
+callers the one congestion signal they cannot derive themselves. At high
+connection counts these surfaces are the difference between a server whose
+memory is legible and one that grows silently.
+
+**Three buffers share confusable names.** Setting `SO_RCVBUF` does not
+resize the chez-libuv read buffer, or vice versa — they are three
+independent quantities:
+
+| Buffer | Set by | Freed by | Typical scale |
+|---|---|---|---|
+| chez-libuv read buffer | first `uv-read-start!`, irreversibly | close dispatcher | 64 KiB default |
+| OS send buffer | `uv-send-buffer-size!` | kernel, at socket close | tens of KB, tunable |
+| OS receive buffer | `uv-recv-buffer-size!` | kernel, at socket close | autotuned; kernel- and sysctl-dependent |
+
+**A setter's argument is a request to the kernel, not an assignment.**
+`uv-send-buffer-size!` and `uv-recv-buffer-size!` wrap `setsockopt`, and the
+kernel is free to round the value they ask for. On Linux, `setsockopt`
+doubles the requested size and floors it at `SOCK_MIN_SNDBUF`/
+`SOCK_MIN_RCVBUF` (i.e. it stores `max(2n, SOCK_MIN_*BUF)`), then clamps the
+result to the `net.core.wmem_max`/`net.core.rmem_max` sysctls — so
+`(uv-send-buffer-size! h 262144)` followed immediately by
+`(uv-send-buffer-size h)` can answer `425984`, not `262144`. That is not a
+broken binding: read the getter's return as the kernel's answer, not as
+confirmation that the requested number took effect.
+
+**The OS receive buffer's autotuned default is not a fixed number, and this
+milestone did not measure it.** At high connection counts it can
+substantially exceed the per-handle read buffer, but the exact figure is
+kernel- and sysctl-dependent — it was not measured here (the design spec's
+§10 Q2 proposed exactly that measurement; see the v0.5 entry in
+[`.superpowers/sdd/progress.md`](../.superpowers/sdd/progress.md) for why it
+did not happen). A commonly cited figure for this default is 87 KB, but
+that number is dated: it is the older `tcp_rmem[1]` default, and modern
+kernels commonly default to 131072 instead. Measure on the target kernel
+rather than relying on either number.
+
+**The read-buffer sizing contract is a tradeoff, not a recommendation.**
+The buffer is allocated by the first `uv-read-start!` and freed only by the
+close dispatcher; its size is fixed by that first call, irreversibly — a
+later call with a differing explicit size raises `'buffer-size-fixed`, and a
+call that omits the size is always accepted, which is what makes
+`uv-read-stop!` → `uv-read-start!` the cheap operation read-side
+backpressure needs. A smaller buffer cuts per-connection foreign memory
+linearly, but it also raises `read(2)` count and `on-data` delivery count —
+and therefore Scheme bytevector allocation, one fresh bytevector per
+delivery — proportionally. 64 KiB is libuv's own suggestion and the current
+default; no measurement has been taken of the tradeoff at other sizes, so
+this is deliberately not a recommendation to lower it. A connection-count-
+dominated workload should measure before choosing a smaller size.
+
+**The read-stop/read-start pairing invariant.** `uv-read-stop!` goes through
+the same open-handle gate as every other stream verb, while `read-dispatch`
+deliberately tolerates a `'closing` handle for a delivery already in flight.
+A stop issued from inside `on-data` for a delivery that raced a close
+therefore *raises* rather than succeeding as a no-op. Guard it:
+
+```scheme
+(when (uv-handle-open? stream)
+  (uv-read-stop! stream))
+```
+
+**Bounding write memory.** Each `uv-write!` allocates one foreign block
+sized for its request plus its payload — a **zero-length write allocates a
+full request block while contributing zero payload bytes** — so payload
+bytes alone are not a memory bound and request count alone is not either.
+A consumer that wants a deterministic bound tracks both:
+
+- **outstanding payload bytes**, and
+- **outstanding request count**,
+
+incrementing each **only after `uv-write!` returns successfully** — a
+synchronous failure raises and produces no completion callback, so nothing
+was actually queued — and decrementing both from the matching
+`on-complete`.
+
+**The write-queue gauge's contract, stated portably.** `uv-stream-write-queue-size`
+is libuv's own platform-dependent counter, not this binding's:
+
+- **Unix** counts bytes not yet handed to the kernel, and deliberately
+  leaves the count non-zero after a *failed* write, so the caller stops
+  writing instead of retrying blind.
+- **Windows** counts the opposite direction: it increments only when the
+  kernel has *accepted* an overlapped send that has not yet completed: the
+  immediate-completion path never increments it at all.
+
+Treat it as **a congestion signal, not a memory gauge, and not a portable
+measure of kernel occupancy** — thresholds need platform- and
+workload-specific calibration. Callback status remains the authoritative
+answer to "is this stream healthy"; the payload-byte and request-count
+bounds above are what actually bound memory, with this gauge supplemental
+to them.
 
 ## Pipes — `(libuv pipe)`
 
@@ -89,7 +189,7 @@ Deliberately minimal (design spec §1): no `bind`/`connect`/`listen`, no
 `file`/`args` are libuv's own execvp/argv contract — unresolved and
 unvalidated by the binding. The `options` alist covers `env` (a list of
 `"K=V"` strings, libuv's own format, not an alist encoding), `cwd`,
-`stdio`, `detached`, and `uid`/`gid`. Six behaviours worth knowing before
+`stdio`, `detached`, and `uid`/`gid`. Seven behaviours worth knowing before
 the design spec (§4–§6):
 
 - **The spawn surface.** Each child fd (index = slot; 0/1/2 are
@@ -106,6 +206,14 @@ the design spec (§4–§6):
   it; the caller still calls `uv-close!` — typically from inside
   `on-exit` — before the handle's memory is reclaimed. Exactly the tcp
   discipline (ADR-0007), applied to a handle instead of a stream.
+- **A second `uv-close!` silently discards its callback.** The close path
+  guards on the handle being `'open`, so a close issued against a handle
+  that is already `'closing` stores nothing and the supplied `on-close`
+  never runs — this applies to every handle kind, not just processes. A
+  server that deregisters a connection from `on-close` must own *every*
+  close initiation for that handle; the protocol for doing that is server-
+  layer design, not binding design — see
+  [`.plans/chez-http-server-architecture.md`](../.plans/chez-http-server-architecture.md).
 - **Killed-by-signal is `(0 sigterm)`, not `(-1 …)`.** `on-exit` receives
   `(exit-status term-signal)` as results, never a condition — there is no
   error argument. `exit-status` is libuv's `WEXITSTATUS` on a normal exit
@@ -285,11 +393,15 @@ discriminant is a symbol).
 | `&uv-invalid-argument` | `who` `reason` | A caller error, refused before anything was allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
 
-v0.3 and v0.4 added no new condition types — every
-`(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)` failure
-raises one of the three above (`&uv-errno-error`, `&uv-handle-closed`,
-`&uv-invalid-argument`); the closed set of `&uv-invalid-argument` reason
-symbols (`'stdio-spec-unknown`, `'pipe-already-used`, `'signal-unknown`,
-`'signal-unwatchable`, `'signal-mode-fixed`, and the rest of the validation
-walk) is in the per-milestone design specs (v0.3 §4.7; v0.4 §4.2/§4.6),
+v0.3, v0.4 and v0.5 added no new condition types — every `(libuv
+process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv handle)`
+failure raises one of the three above (`&uv-errno-error`,
+`&uv-handle-closed`, `&uv-invalid-argument`); the closed set of
+`&uv-invalid-argument` reason symbols (`'stdio-spec-unknown`,
+`'pipe-already-used`, `'signal-unknown`, `'signal-unwatchable`,
+`'signal-mode-fixed`, `'buffer-size-fixed`, `'buffer-size-out-of-range`
+(reused from `uv-read-start!`, not new to v0.5), `'not-a-socket-handle`
+(the one reason symbol v0.5 actually adds),
+`'sockaddr-too-small-for-a-port`, and the rest of the validation walk) is
+in the per-milestone design specs (v0.3 §4.7; v0.4 §4.2/§4.6; v0.5 §4.2),
 not repeated here.

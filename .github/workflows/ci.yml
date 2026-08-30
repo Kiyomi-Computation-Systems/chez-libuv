@@ -30,6 +30,14 @@ jobs:
   linux:
     name: linux (vendored + valgrind)
     runs-on: ubuntu-latest
+    # Observed wall clock: ~4min on a Chez-cache hit, ~14min on a cache miss
+    # (Chez Scheme built from source -- see the cache step below). 30min
+    # gives headroom over the worst case observed (cache miss + apt install +
+    # the valgrind leg, which is the slower of this workflow's two jobs) while
+    # still cutting a genuine hang off in minutes instead of GitHub's
+    # 360-minute default, which would burn the whole billing budget for
+    # nothing.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -263,6 +271,11 @@ jobs:
   macos:
     name: macos (pkg-config + vendored, no leak claim)
     runs-on: macos-latest
+    # Observed wall clock: consistently under 1.5min (homebrew installs a
+    # prebuilt Chez formula, no from-source build, and ASan is faster than
+    # the linux job's Valgrind leg). 15min is ample headroom for a slow
+    # homebrew day while still ending far short of the 360-minute default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:

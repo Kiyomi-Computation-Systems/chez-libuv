@@ -390,6 +390,36 @@
     (uv-read-stop! f-accepted)
     'stopped))
 
+;; --- v0.5 buffer-size surfaces, reached through the facade only -----------
+;; EACH NAME MUST BE EXERCISED, not merely called: a bare invocation would
+;; only reprove that the re-export expands (already covered at :19-23),
+;; nothing about behaviour. Every row below both calls the facade re-export
+;; AND asserts on what it returns -- tracking direction for the two buffer
+;; setters, the idle-stream zero for the write-queue gauge, the connected
+;; peer's address and port -- and the flow-task-2/3/4 mutation logs record
+;; real `src/` mutations that flip these rows to FAIL, which is what proves
+;; they are load-bearing rather than name-mention rows.
+(test-equal "the facade's send-buffer getter and setter track at two points"
+  'tracks-upward
+  (begin (uv-send-buffer-size! fclient 8192)
+         (let ((lo (uv-send-buffer-size fclient)))
+           (uv-send-buffer-size! fclient 262144)
+           (if (> (uv-send-buffer-size fclient) lo) 'tracks-upward 'did-not-track))))
+
+(test-equal "the facade's receive-buffer getter and setter track at two points"
+  'tracks-upward
+  (begin (uv-recv-buffer-size! fclient 8192)
+         (let ((lo (uv-recv-buffer-size fclient)))
+           (uv-recv-buffer-size! fclient 262144)
+           (if (> (uv-recv-buffer-size fclient) lo) 'tracks-upward 'did-not-track))))
+
+(test-equal "the facade's write-queue-size answers zero on an idle stream"
+  'zero (if (zero? (uv-stream-write-queue-size fclient)) 'zero 'nonzero))
+
+(test-equal "the facade's peer-address answers the connected peer"
+  (list "127.0.0.1" fport)
+  (let-values (((a p) (uv-tcp-peer-address fclient))) (list a p)))
+
 (uv-loop-teardown! fl)
 
 (test-equal "the facade's tcp loop tore down and closed every handle"

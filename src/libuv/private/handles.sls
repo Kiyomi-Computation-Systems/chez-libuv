@@ -997,12 +997,49 @@
           (record-orphan-callback! 'close handle-ptr))))
 
   ;; Step 2 of the close order above. Design spec S6: the per-handle read
-  ;; buffer "is freed in exactly one place: the close dispatcher, never
-  ;; earlier, because Windows' overlapped-read model can still reference it
-  ;; after a read completion is queued but before the handle has fully
-  ;; stopped". A handle that never called uv-read-start! has 0 here, and
-  ;; free! refuses 0 by design -- so the test is on the pointer, not on the
-  ;; handle type.
+  ;; buffer is freed in exactly one place -- the close dispatcher, never
+  ;; earlier -- so that
+  ;; nothing on a path libuv can call into ever has to allocate. THAT is the
+  ;; reason, and it is portable: alloc-dispatch is required to be infallible
+  ;; (handles.sls:846-860), and a realloc reachable from a uv-read-start! issued
+  ;; inside on-data would break the invariant on every platform. The refusal is
+  ;; unconditional -- not merely "when called from on-data" -- because
+  ;; uv-read-start! cannot tell what context it was invoked from; blanket
+  ;; refusal is the only rule that is actually implementable at the point that
+  ;; matters.
+  ;;
+  ;; Concretely: unix/stream.c:1043-1145 and win/tcp.c:1096-1114 have the same
+  ;; shape -- both loop, calling alloc_cb then read_cb repeatedly within a
+  ;; single synchronous call frame, without returning to the embedding event
+  ;; loop between iterations. A resize triggered reentrantly from inside on-data
+  ;; can therefore be observed by a later alloc_cb in the same call stack, on
+  ;; both platforms.
+  ;;
+  ;; This comment used to say the reason was Windows' overlapped-read model
+  ;; keeping a completion queued against the buffer. For the two handle kinds
+  ;; this binding supports, that is DEAD CODE at the pinned libuv: uv_tcp_t
+  ;; never posts a user buffer at all (win/tcp.c:559 queues a zero-byte WSARecv
+  ;; against static uv_zero_; the real read, win/tcp.c:1108, is the
+  ;; non-overlapped WSARecv(..., NULL, NULL)), and uv_pipe_t drains its
+  ;; overlapped ReadFile with CancelIoEx (win/pipe.c:2006) plus a blocking
+  ;; GetOverlappedResult (win/pipe.c:2008) before returning. The residue: the
+  ;; assert checking CancelIoEx's result is at pipe.c:2007 (the call itself is
+  ;; 2006), and release builds compile that assert out.
+  ;;
+  ;; `make check-pins` runs a coarse check over symbol counts and presence in
+  ;; the vendored tree -- not a proof these mechanisms still mean what this
+  ;; comment says; a grep cannot verify a semantic property. It checks the TCP
+  ;; UV_HANDLE_ZERO_READ set/clear counts and read_buffer assignment count, the
+  ;; TCP WSARecv call-site count (so a change to that file's read/write call
+  ;; shape is noticed), and that CancelIoEx and GetOverlappedResult are both
+  ;; still present in win/pipe.c (so a change that stops draining the overlapped
+  ;; ReadFile synchronously is noticed). A bump that trips this check means:
+  ;; re-read the cited code before touching either Scheme site. A bump that does
+  ;; NOT trip it is NOT evidence the claim above survived -- re-read on any
+  ;; vendor bump regardless.
+  ;;
+  ;; A handle that never called uv-read-start! has 0 here, and free! refuses
+  ;; 0 by design -- so the test is on the pointer, not on the handle type.
   ;;
   ;; uv-stream-record?, not uv-tcp-record? (ADR-0014): pipe shares the same
   ;; buffer field and the same close-time free.

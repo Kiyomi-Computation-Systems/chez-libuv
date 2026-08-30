@@ -23,7 +23,8 @@
 ;;;     allocated, registered or counted something undoes exactly that much
 ;;;     before the condition escapes (design spec S5, S7).
 (library (libuv stream)
-  (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!)
+  (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -184,8 +185,46 @@
   ;; different explicit size is REFUSED rather than honoured. Honouring it
   ;; would mean freeing the old buffer here, and design spec S6 makes the
   ;; close dispatcher the only place that buffer may ever be freed -- so that
-  ;; a read completion queued against it (Windows' overlapped model) cannot
-  ;; outlive it. A caller who wants a different size closes the handle.
+  ;; nothing on a path libuv can call into ever has to allocate. THAT is the
+  ;; reason, and it is portable: alloc-dispatch is required to be infallible
+  ;; (handles.sls:846-860), and a realloc reachable from a uv-read-start! issued
+  ;; inside on-data would break the invariant on every platform. The refusal is
+  ;; unconditional -- not merely "when called from on-data" -- because
+  ;; uv-read-start! cannot tell what context it was invoked from; blanket
+  ;; refusal is the only rule that is actually implementable at the point that
+  ;; matters.
+  ;;
+  ;; Concretely: unix/stream.c:1043-1145 and win/tcp.c:1096-1114 have the same
+  ;; shape -- both loop, calling alloc_cb then read_cb repeatedly within a
+  ;; single synchronous call frame, without returning to the embedding event
+  ;; loop between iterations. A resize triggered reentrantly from inside on-data
+  ;; can therefore be observed by a later alloc_cb in the same call stack, on
+  ;; both platforms.
+  ;;
+  ;; This comment used to say the reason was Windows' overlapped-read model
+  ;; keeping a completion queued against the buffer. For the two handle kinds
+  ;; this binding supports, that is DEAD CODE at the pinned libuv: uv_tcp_t
+  ;; never posts a user buffer at all (win/tcp.c:559 queues a zero-byte WSARecv
+  ;; against static uv_zero_; the real read, win/tcp.c:1108, is the
+  ;; non-overlapped WSARecv(..., NULL, NULL)), and uv_pipe_t drains its
+  ;; overlapped ReadFile with CancelIoEx (win/pipe.c:2006) plus a blocking
+  ;; GetOverlappedResult (win/pipe.c:2008) before returning. The residue: the
+  ;; assert checking CancelIoEx's result is at pipe.c:2007 (the call itself is
+  ;; 2006), and release builds compile that assert out.
+  ;;
+  ;; `make check-pins` runs a coarse check over symbol counts and presence in
+  ;; the vendored tree -- not a proof these mechanisms still mean what this
+  ;; comment says; a grep cannot verify a semantic property. It checks the TCP
+  ;; UV_HANDLE_ZERO_READ set/clear counts and read_buffer assignment count, the
+  ;; TCP WSARecv call-site count (so a change to that file's read/write call
+  ;; shape is noticed), and that CancelIoEx and GetOverlappedResult are both
+  ;; still present in win/pipe.c (so a change that stops draining the overlapped
+  ;; ReadFile synchronously is noticed). A bump that trips this check means:
+  ;; re-read the cited code before touching either Scheme site. A bump that does
+  ;; NOT trip it is NOT evidence the claim above survived -- re-read on any
+  ;; vendor bump regardless.
+  ;;
+  ;; A caller who wants a different size closes the handle.
   ;;
   ;; A call that omits the size is not asking for anything, so it is always
   ;; allowed. That is what makes re-starting after a stop the cheap operation
@@ -213,4 +252,34 @@
     (require-open-stream stream 'uv-read-stop!)
     (uv-check (uv-read-stop (handle-pointer stream 'uv-read-stop!))
               'uv-read-stop!)
-    (set-stream-reading! stream #f)))
+    (set-stream-reading! stream #f))
+
+  ;; (uv-stream-write-queue-size stream) -> exact non-negative integer
+  ;;
+  ;; libuv's PLATFORM-DEPENDENT count of queued stream bytes. Unix counts
+  ;; bytes not yet handed to the kernel (unix/stream.c:693-694) and leaves
+  ;; the count non-zero after a FAILED write, deliberately, so the user
+  ;; stops writing (unix/stream.c:719-724). Windows counts the opposite
+  ;; thing: write_queue_size is incremented only in the UV_SUCCEEDED_WITH_IOCP
+  ;; branch (win/tcp.c:986) -- bytes the kernel has ACCEPTED into an
+  ;; incomplete overlapped send -- and the immediate-completion branch never
+  ;; increments.
+  ;;
+  ;; SO: A CONGESTION SIGNAL. Not a memory gauge, and not a portable measure
+  ;; of kernel occupancy. It UNDERCOUNTS the memory this binding holds,
+  ;; because a write's foreign block stays allocated until the whole request
+  ;; completes while this number falls as the kernel takes bytes. A consumer
+  ;; bounding memory counts its own submissions against completions -- and
+  ;; must count BOTH outstanding payload bytes and outstanding request
+  ;; count, since a zero-length write allocates a full block for zero
+  ;; payload bytes (stream.sls:92). See docs/api.md.
+  ;;
+  ;; THE NATIVE CANNOT FAIL; THE GATE CAN. On a 'closing handle the pointer
+  ;; is still live, so a missing gate returns a plausible number -- which is
+  ;; why the suite mutates this gate against a CLOSING stream. A fully
+  ;; closed one does not discriminate: handle-pointer refuses the zeroed
+  ;; pointer first (handles.sls:471-475).
+  (define (uv-stream-write-queue-size stream)
+    (require-open-stream stream 'uv-stream-write-queue-size)
+    (uv-stream-get-write-queue-size-native
+     (handle-pointer stream 'uv-stream-write-queue-size))))

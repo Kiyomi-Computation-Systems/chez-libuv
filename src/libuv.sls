@@ -31,6 +31,8 @@
           uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop uv-close!
+          uv-send-buffer-size uv-send-buffer-size!
+          uv-recv-buffer-size uv-recv-buffer-size!
 
           ;; --- timers, from (libuv timer) ---
           make-uv-timer
@@ -45,10 +47,11 @@
           ;; to keep in step. The four stream verbs below originate in
           ;; (libuv stream) and are re-exported by (libuv tcp).
           make-uv-tcp
-          uv-tcp-bind! uv-tcp-getsockname-port
+          uv-tcp-bind! uv-tcp-getsockname-port uv-tcp-peer-address
           uv-listen! uv-accept! uv-tcp-connect!
           uv-write! uv-shutdown! uv-tcp-nodelay!
           uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size
 
           ;; --- DNS, from (libuv dns) ---
           ;; The v0.2 surface (design spec v0.2 S4.6): both start calls,

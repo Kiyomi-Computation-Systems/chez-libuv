@@ -30,12 +30,13 @@
 ;;;     before the condition escapes (design spec S5, S7).
 (library (libuv tcp)
   (export make-uv-tcp
-          uv-tcp-bind! uv-tcp-getsockname-port
+          uv-tcp-bind! uv-tcp-getsockname-port uv-tcp-peer-address
           uv-listen! uv-accept! uv-tcp-connect!
           uv-tcp-nodelay!
           ;; re-exported from (libuv stream) (ADR-0014): the verbs moved,
           ;; the import surface did not.
-          uv-write! uv-shutdown! uv-read-start! uv-read-stop!)
+          uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+          uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)
           (libuv private constants)
@@ -163,6 +164,38 @@
           (free! addr)
           (free! len)
           port))))
+
+  ;; --- the peer's address (design spec S5, v0.5 Task 4) -------------------
+  ;; Completes the mirror: this binding has had uv-tcp-getsockname-port
+  ;; since v0.1 and no uv-tcp-getpeername at all.
+  ;;
+  ;; (uv-tcp-peer-address tcp) -> (values address-string-or-#f port)
+  ;;
+  ;; The uv-tcp-getsockname-port shape verbatim (ADR-0012's address
+  ;; vocabulary), with one difference: the local side answers only the PORT,
+  ;; because what a caller needs locally is the ephemeral port a zero-bind
+  ;; chose. What a caller needs about the PEER is the address -- for per-IP
+  ;; limits and access logging, both of which are the consumer's policy.
+  ;;
+  ;; The first value may be #f: sockaddr->address-string answers string | #f
+  ;; deliberately. An unconnected handle answers UV_ENOTCONN through uv-check.
+  (define (uv-tcp-peer-address tcp)
+    (require-open-tcp tcp 'uv-tcp-peer-address)
+    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
+          (len  (alloc-zeroed (c-int-size))))
+      (guard (e (#t (free! addr) (free! len) (raise e)))
+        (c-int-set! len (sizeof-sockaddr-storage))
+        (uv-check (uv-tcp-getpeername-native
+                   (handle-pointer tcp 'uv-tcp-peer-address) addr len)
+                  'uv-tcp-peer-address)
+        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
+          (raise (make-uv-invalid-argument 'uv-tcp-peer-address
+                                           'sockaddr-too-small-for-a-port)))
+        (let ((address (sockaddr->address-string addr))
+              (port    (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
+          (free! addr)
+          (free! len)
+          (values address port)))))
 
   ;; --- listening ----------------------------------------------------------
   ;; The callback is stored BEFORE uv_listen, not after: a connection can
