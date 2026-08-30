@@ -274,7 +274,7 @@ grep -cE '^\(test-(equal|assert|eqv|eq) ' tests/test-flow.sps
 grep -cE '^\(test-(equal|assert|eqv|eq) ' tests/test-tcp.sps
 ```
 
-Expected: `ALL SUITES PASSED`; `test-flow.sps` = **10**; `test-tcp.sps` = **169** (168 + Step 1's row).
+Expected: `ALL SUITES PASSED`; `test-flow.sps` = **8** (after Task 1's fix consolidates three rows into one); `test-tcp.sps` = **169** (168 + Step 1's row).
 
 - [ ] **Step 5: Watch the default pin fail**
 
@@ -609,7 +609,7 @@ make test 2>&1 | tail -3
 grep -cE '^\(test-(equal|assert|eqv|eq) ' tests/test-flow.sps
 ```
 
-Expected: `ALL SUITES PASSED`; `test-flow.sps` = **20** (10 + 10).
+Expected: `ALL SUITES PASSED`; `test-flow.sps` = **18** (8 + 10).
 
 - [ ] **Step 7: Watch five mutations fail**
 
@@ -829,7 +829,7 @@ make test 2>&1 | tail -3
 grep -cE '^\(test-(equal|assert|eqv|eq) ' tests/test-flow.sps
 ```
 
-Expected: `ALL SUITES PASSED`; `test-flow.sps` = **25** (20 + 5).
+Expected: `ALL SUITES PASSED`; `test-flow.sps` = **23** (18 + 5).
 
 - [ ] **Step 6: Watch three mutations fail**
 
@@ -1167,4 +1167,4 @@ Then the closing ritual (AGENTS.md): squash merge, catch up local `main`, delete
 
 **Known gap, stated rather than hidden.** `"the closed reader received nothing further"` (Task 1) may be unfalsifiable — `close-dispatch` deregisters before anything further can deliver. Step 8 requires logging it as an explicitly uncovered property with that reason if no `src/` mutation moves it, rather than shipping a green row that proves nothing.
 
-**Type consistency.** `-native` suffix on all four new bindings, none shadowed by a public name. `compare-bytes` → `'identical` at every use. `uv-errno-error-errno` at every use. `uv-handle-state` → `'open`/`'closing`/`'closed`. Setters `!`-suffixed, getters not. Pass counts stated with their derivation command: `test-flow` 10 → 20 → 25; `test-tcp` 168 → 169 → 175.
+**Type consistency.** `-native` suffix on all four new bindings, none shadowed by a public name. `compare-bytes` → `'identical` at every use. `uv-errno-error-errno` at every use. `uv-handle-state` → `'open`/`'closing`/`'closed`. Setters `!`-suffixed, getters not. Pass counts stated with their derivation command: `test-flow` 8 → 18 → 23; `test-tcp` 168 → 169 → 175.
