@@ -1,9 +1,19 @@
 name: CI
 
-# Linux is the gate for every memory claim (ADR-0003). LeakSanitizer does not
-# exist on macOS/ARM64, so a green macOS run is NOT evidence of no leaks --
-# only Valgrind on Linux can support that claim. macOS is still tested because
-# it is the primary development platform.
+# One job, Linux, deliberately. Linux is the gate for every memory claim
+# (ADR-0003): LeakSanitizer does not exist on macOS/ARM64, so a green macOS
+# run was never evidence of no leaks -- only Valgrind on Linux can support
+# that claim.
+#
+# The macOS job that used to run beside this one was removed because it billed
+# at 10x the Linux minute rate for a leg that largely duplicated Linux's
+# coverage while lacking the one check that matters most. macOS is the primary development
+# platform, so it is covered by running `make test` and `make test-memory`
+# (ASan, no leak detection) on the laptop before pushing -- see
+# docs/building.md. Two things that only the macOS leg used to catch now
+# depend on that local run actually happening: `relink-guard` under make 3.81's
+# one-second mtime granularity (macOS ships 3.81; this runner has make 4.x),
+# and homebrew's chezscheme drifting below $CHEZ_FLOOR_VERSION.
 #
 # Both acquisition paths are exercised on every run (ADR-0001): pkg-config
 # and the pinned vendored submodule. Nothing here treats the vendored path as
@@ -31,12 +41,11 @@ jobs:
     name: linux (vendored + valgrind)
     runs-on: ubuntu-latest
     # Observed wall clock: ~4min on a Chez-cache hit, ~14min on a cache miss
-    # (Chez Scheme built from source -- see the cache step below). 30min
+    # (Chez Scheme built from source -- see the cache steps below). 30min
     # gives headroom over the worst case observed (cache miss + apt install +
-    # the valgrind leg, which is the slower of this workflow's two jobs) while
-    # still cutting a genuine hang off in minutes instead of GitHub's
-    # 360-minute default, which would burn the whole billing budget for
-    # nothing.
+    # the valgrind leg, the slowest step here) while still cutting a genuine
+    # hang off in minutes instead of GitHub's 360-minute default, which would
+    # burn the whole billing budget for nothing.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -62,9 +71,23 @@ jobs:
       # -v2: the v1 key cached a build that never finished (see the disable
       # flags below) -- bumping the suffix means the retry can't be served a
       # poisoned cache entry from the failed run under the old key.
-      - name: Cache built Chez Scheme
+      #
+      # restore/save rather than the combined actions/cache@v4: the combined
+      # action writes the cache from an implicit post-job step, and GitHub
+      # skips that step when the job fails. Every red run -- a failing suite,
+      # a Valgrind report, a flake -- therefore threw away a ~10-minute Chez
+      # build and made the NEXT run pay for it again, which is the opposite
+      # of what a cache is for on a repository that is out of minutes. Saving
+      # explicitly, immediately after the build succeeds, banks it no matter
+      # what the suites do afterwards.
+      #
+      # Scope note: caches written on a branch are visible to that branch and
+      # to anything based on it, but a cache written on `main` is visible to
+      # every PR. So the miss is paid once per floor bump on main, not once
+      # per branch, provided main runs at least once after a bump.
+      - name: Restore built Chez Scheme
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.chez-install
           key: chez-${{ env.CHEZ_FLOOR_VERSION }}-linux-${{ runner.arch }}-v2
@@ -96,6 +119,18 @@ jobs:
           # over, since it would resurface on every cache miss (a floor bump).
           make
           make install
+
+      # Gated on the same cache-miss condition as the build above, so it
+      # runs only when there is something new to store -- and, sitting
+      # directly after it, only if `make install` actually succeeded.
+      # `cache-primary-key` is the restore step's own key, so the two cannot
+      # drift apart if the key expression is ever edited.
+      - name: Save built Chez Scheme
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.chez-install
+          key: ${{ steps.cache-chez.outputs.cache-primary-key }}
 
       - name: Add built Chez Scheme to PATH
         run: echo "${{ github.workspace }}/.chez-install/bin" >> "$GITHUB_PATH"
@@ -258,110 +293,6 @@ jobs:
       # the dev artifact back, rather than leaving a release build in place
       # for dev callers. pkg-config is present on this runner, so `prod`
       # links against the system libuv and rebuilds nothing vendored.
-      - name: Release build guard (make prod -> check-prod)
-        run: |
-          make prod
-          make build
-          if make check-prod; then
-            echo "::error::check-prod passed against a dev shim"
-            exit 1
-          fi
-          echo "check-prod correctly refused the dev shim"
-
-  macos:
-    name: macos (pkg-config + vendored, no leak claim)
-    runs-on: macos-latest
-    # Observed wall clock: consistently under 1.5min (homebrew installs a
-    # prebuilt Chez formula, no from-source build, and ASan is faster than
-    # the linux job's Valgrind leg). 15min is ample headroom for a slow
-    # homebrew day while still ending far short of the 360-minute default.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install toolchain
-        run: brew install chezscheme libuv cmake pkg-config
-
-      - name: Report versions
-        run: |
-          echo "chez:  $(chez --version 2>&1)"
-          echo "pkg-config libuv: $(pkg-config --modversion libuv)"
-
-      # homebrew's chezscheme happens to name its binary `chez` today, but
-      # nothing pins that -- same resolution as the linux job, not an
-      # assumption about brew's naming.
-      - name: Resolve the Chez binary
-        run: |
-          if command -v chez >/dev/null; then echo "CHEZ=chez" >> "$GITHUB_ENV"
-          elif command -v chezscheme >/dev/null; then echo "CHEZ=chezscheme" >> "$GITHUB_ENV"
-          elif command -v scheme >/dev/null; then echo "CHEZ=scheme" >> "$GITHUB_ENV"
-          else echo "no Chez Scheme binary found" >&2; exit 1; fi
-
-      # Same gate as the linux job: homebrew's chezscheme happens to be at
-      # $CHEZ_FLOOR_VERSION today, but a formula update could drop that, and
-      # this is what would catch it instead of a mystifying native-feature
-      # error further down.
-      - name: Assert Chez Scheme meets the declared floor
-        run: |
-          bin=""
-          for c in chez chezscheme scheme; do
-            if command -v "$c" >/dev/null; then bin="$c"; break; fi
-          done
-          if [ -z "$bin" ]; then
-            echo "::error::no Chez Scheme binary found to version-check" >&2
-            exit 1
-          fi
-          raw="$("$bin" --version 2>&1)"
-          ver="$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          if [ -z "$ver" ]; then
-            echo "::error::could not parse a version out of '$bin --version' ($raw)" >&2
-            exit 1
-          fi
-          lowest="$(printf '%s\n%s\n' "$ver" "$CHEZ_FLOOR_VERSION" | sort -V | head -1)"
-          if [ "$lowest" != "$CHEZ_FLOOR_VERSION" ]; then
-            echo "::error::Chez Scheme $ver is below the declared floor $CHEZ_FLOOR_VERSION" >&2
-            exit 1
-          fi
-          echo "Chez Scheme $ver satisfies the $CHEZ_FLOOR_VERSION floor"
-
-      - name: Scheme dependencies
-        run: make deps
-
-      # `test` depends on `check-pins`, so both legs below also cover pin
-      # agreement -- no separate step needed (matches the linux job's
-      # explicit "make check-pins", just reached through the prerequisite
-      # instead, since macOS runs no step that would otherwise exercise it
-      # before the first `make test`).
-      - name: Build and test (pkg-config path)
-        run: |
-          make build
-          make test
-
-      - name: Build and test (vendored path)
-        run: |
-          make HAVE_PKG=no vendor
-          make HAVE_PKG=no build
-          make HAVE_PKG=no test
-
-      # Same root lane as the linux job (THE SPEC §9.4 / ADR-0016) -- see
-      # that job's comment for why `-E env "PATH=$PATH"` and `HAVE_PKG=no`
-      # are both needed.
-      - name: Root lane (setuid/setgid, sudo)
-        run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
-
-      # ASan only. LeakSanitizer is unsupported on macOS/ARM64, so this catches
-      # use-after-free and overflows but CANNOT support a leak claim. Do not
-      # read a green result here as "no leaks" -- that is the Linux job's job.
-      - name: Memory (ASan, no leak detection)
-        run: make test-memory
-
-      # Same guard as the linux job, and it is worth running on both: the
-      # relink it depends on is a make-version-sensitive question (macOS
-      # ships make 3.81, whose one-second mtime granularity is what
-      # `relink-guard` exists to defeat). LAST, because `prod` starts with
-      # `make clean`.
       - name: Release build guard (make prod -> check-prod)
         run: |
           make prod
