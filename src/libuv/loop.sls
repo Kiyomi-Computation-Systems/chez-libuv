@@ -1,15 +1,6 @@
 #!r6rs
-;;; (libuv loop) -- the event loop's public surface, per design spec S5's
-;;; "Loop operations" and S8's callback error policy.
-;;;
-;;; Nothing here hands a caller a pointer. A loop is an opaque record; every
-;;; procedure below takes that record, and the only way to get one is
-;;; make-uv-loop or call-with-uv-loop.
-;;;
-;;; TEARDOWN IS EXPLICIT (ADR-0007). No guardian, no finalizer: a loop the
-;;; caller never closes stays allocated and stays visible in the debug
-;;; counters (design spec S10), which is the point -- a leak that a test can
-;;; see beats a close that happens at some indeterminate later GC.
+;;; Event-loop lifecycle and callback-error delivery. Loops own native memory
+;;; explicitly; callers close or tear them down rather than relying on GC.
 (library (libuv loop)
   (export make-uv-loop uv-loop? uv-loop-open?
           uv-run uv-stop! uv-loop-alive? uv-now
@@ -21,23 +12,7 @@
           (libuv private native)
           (libuv private handles))
 
-  ;; --- construction -------------------------------------------------------
-  ;; ensure-native-loaded! is called HERE rather than being assumed: it is
-  ;; idempotent and mutex'd (design spec S4), and make-uv-loop is the first
-  ;; thing any program using this binding calls, so this is where the version
-  ;; gate, the constants snapshot, and the uv_buf_t layout check actually run
-  ;; for most callers.
-  ;;
-  ;; The allocation size comes from uv_loop_size() -- the RUNNING library's
-  ;; own answer -- not from the shim's compile-time SIZEOF_UV_LOOP_T. They
-  ;; agree (tests/test-native.sps asserts it), and the version gate is what
-  ;; keeps them agreeing; but the block libuv writes into should be sized by
-  ;; libuv.
-  ;;
-  ;; Order matters on the failure path: if uv_loop_init fails, the block is
-  ;; freed BEFORE the condition escapes and nothing has been registered, so
-  ;; there is no half-built loop for a caller to find (design spec S5's
-  ;; "nonzero rc => free immediately + raise; nothing registered yet").
+  ;; make-uv-loop : -> uv-loop
   (define (make-uv-loop)
     (ensure-native-loaded!)
     (let ((ptr (alloc-zeroed (uv-loop-size))))
@@ -48,14 +23,11 @@
         (count-loop-new!)
         loop)))
 
+  ;; uv-loop-open? : uv-loop -> boolean
   (define (uv-loop-open? loop)
     (require-loop loop 'uv-loop-open?)
     (loop-open? loop))
 
-  ;; --- running ------------------------------------------------------------
-  ;; The mode symbols are mapped through (libuv private constants), never
-  ;; transcribed (ADR-0005): UV_RUN_DEFAULT/ONCE/NOWAIT are whatever the
-  ;; running libuv's enum says they are.
   (define (run-mode->int mode who)
     (case mode
       ((default) (uv-run-default))
@@ -63,25 +35,7 @@
       ((nowait)  (uv-run-nowait))
       (else (raise (make-uv-invalid-argument who 'unknown-run-mode)))))
 
-  ;; THE ONE DELIVERY SHAPE for a stored pending callback error, shared by
-  ;; uv-run's exit path and uv-loop-close!'s post-close re-raise (v0.2) so
-  ;; the two cannot drift apart:
-  ;;
-  ;;   * Tested with the predicate, never with the VALUE's truthiness: a
-  ;;     callback may legitimately have raised #f, and `(when pending ...)`
-  ;;     would drop exactly that error on the floor (handles.sls's
-  ;;     `no-pending` note).
-  ;;   * The slot is consumed BEFORE the raise -- delivery is what empties
-  ;;     it, and delivering twice would turn one callback error into two.
-  ;;   * Composed with the cause when the cause is a condition, so a guard
-  ;;     written against the ORIGINAL type still matches -- the
-  ;;     load-bearing half of store-and-reraise (design spec S8). R6RS
-  ;;     `raise` accepts any object, so a callback may also have raised a
-  ;;     non-condition; that one is wrapped alone, since `condition` only
-  ;;     composes conditions.
-  ;;
-  ;; A no-op when nothing is pending, which is what lets both callers
-  ;; invoke it unconditionally.
+  ;; Consume before raising so one callback failure cannot be delivered twice.
   (define (deliver-pending-callback-error! loop)
     (when (loop-has-pending-error? loop)
       (let ((pending (loop-pending-error loop)))
@@ -90,25 +44,9 @@
                    (condition (make-uv-callback-error pending) pending)
                    (make-uv-callback-error pending))))))
 
-  ;; (uv-run loop [mode]) -> #t if work remains, #f if the loop ran dry.
-  ;;
-  ;; The return value is a BOOLEAN, deliberately, even though uv_run returns
-  ;; an int: 0 is true in Scheme, so handing the raw int to a caller would
-  ;; make `(when (uv-run l) ...)` fire on precisely the case it means to
-  ;; skip (AGENTS.md's named trap).
-  ;;
-  ;; Re-entry is refused. Design spec S8 lists uv-run among the operations
-  ;; that are illegal from inside a callback; the running? flag is what makes
-  ;; that detectable, and dynamic-wind is what clears it even when the extent
-  ;; is left by a raise or a continuation jump.
-  ;;
-  ;; WHAT IS CLEARED WHEN, and why they differ (design spec S8): the DEFERRED
-  ;; list is cleared at the START of a run, because it is a record of the
-  ;; previous run's aftermath that the caller had until now to read. The
-  ;; PENDING error is consumed at the END, by the re-raise, because that is
-  ;; the value being delivered -- clearing it on the way in would silently
-  ;; discard an error a callback stored during the run that is only just
-  ;; finishing.
+  ;; uv-run : uv-loop [symbol] -> boolean
+  ;; The boolean says whether work remains; libuv's raw integer would invert
+  ;; ordinary Scheme truth tests because zero is true.
   (define uv-run
     (case-lambda
       ((loop) (uv-run loop 'default))
@@ -123,81 +61,38 @@
                     (lambda () (set-loop-running! loop #t))
                     (lambda () (uv-loop-run ptr mode-int))
                     (lambda () (set-loop-running! loop #f)))))
-           ;; The composition, the #f discipline and the consume-first order
-           ;; live in deliver-pending-callback-error! above, shared with
-           ;; uv-loop-close!'s post-close re-raise.
            (deliver-pending-callback-error! loop)
-           ;; uv_run's int is "handles or requests still active", NOT an
-           ;; errno: it must not go through uv-check, whose contract is that
-           ;; any nonzero is a failure (native.sls).
            (not (zero? rc)))))))
 
-  ;; Legal from inside a callback (design spec S8), which is why it takes the
-  ;; open-loop check and nothing else: stopping a loop that is currently
-  ;; running is the entire point.
+  ;; uv-stop! : uv-loop -> unspecified
   (define (uv-stop! loop)
     (require-open-loop loop 'uv-stop!)
     (uv-loop-stop (loop-pointer loop 'uv-stop!)))
 
+  ;; uv-loop-alive? : uv-loop -> boolean
   (define (uv-loop-alive? loop)
     (require-open-loop loop 'uv-loop-alive?)
     (not (zero? (uv-loop-alive (loop-pointer loop 'uv-loop-alive?)))))
 
-  ;; libuv's cached "now", in milliseconds from an arbitrary origin. Cached
-  ;; is the important word: it is updated once per loop iteration, so two
-  ;; calls with no run between them answer the same number by design.
+  ;; uv-now : uv-loop -> exact-nonnegative-integer
+  ;; This is libuv's cached time and changes only when the loop updates it.
   (define (uv-now loop)
     (require-open-loop loop 'uv-now)
     (uv-loop-now (loop-pointer loop 'uv-now)))
 
-  ;; --- inspection ---------------------------------------------------------
-  ;; A fresh list of the handle RECORDS registered against this loop. Fresh
-  ;; because the registry is the binding's own dispatch table; handing out a
-  ;; structure a caller could mutate would let them unhook a live callback.
+  ;; uv-loop-live-handles : uv-loop -> (listof uv-handle)
   (define (uv-loop-live-handles loop)
     (require-open-loop loop 'uv-loop-live-handles)
     (registry-snapshot-for-loop loop))
 
-  ;; Everything a callback raised this run AFTER the first (design spec S8).
-  ;; In occurrence order, freshly consed, cleared by the next uv-run.
+  ;; uv-loop-deferred-errors : uv-loop -> list
   (define (uv-loop-deferred-errors loop)
     (require-open-loop loop 'uv-loop-deferred-errors)
     (reverse (loop-deferred-error-list loop)))
 
-  ;; --- teardown -----------------------------------------------------------
-  ;; Idempotent by an explicit state test: closing an already-closed loop is
-  ;; a no-op, not an error, because cleanup code that has to remember whether
-  ;; it already ran is cleanup code that eventually gets it wrong. This is
-  ;; also what makes call-with-uv-loop's after-thunk safe to run on a loop
-  ;; the body already closed.
-  ;;
-  ;; uv_loop_close returns -EBUSY (spike FINDINGS Q2 measured -16) when
-  ;; handles are still open. That IS an errno, so it goes through uv-check
-  ;; and reaches the caller as &uv-errno-error with errno 'EBUSY -- a symbol,
-  ;; never a raw int (ADR-0006). Nothing is freed on that path: the loop is
-  ;; still open and still usable, which is exactly what a caller who needs to
-  ;; close their handles first requires.
-  ;;
-  ;; PENDING-ERROR DELIVERY AT CLOSE (decided 2026-08-21, v0.2, closing the
-  ;; obligation v0.1 recorded here): after a SUCCESSFUL close -- native
-  ;; close returned 0, state flipped, registry popped, block freed, pointer
-  ;; zeroed, counter bumped -- a stored pending callback error is
-  ;; RE-RAISED, composed as &uv-callback-error with the original condition,
-  ;; through the same deliver-pending-callback-error! as uv-run's exit
-  ;; path. The discard alternative was rejected because a caller who skips
-  ;; the next uv-run and goes straight here would silently lose the error;
-  ;; this was previously the one path on which it could be lost.
-  ;;
-  ;; The loop IS closed when the raise escapes: the error is a message from
-  ;; a callback, not a reason to abandon the close (the same reasoning as
-  ;; teardown's finish-then-re-raise). On the EBUSY path nothing is
-  ;; delivered -- that close FAILED, the loop is still open, and the error
-  ;; stays pending for a later uv-run or close. The DEFERRED list is left
-  ;; alone, mirroring uv-run's exit: it was readable until this call, and
-  ;; closing makes the query raise &uv-handle-closed, exactly as v0.1's
-  ;; close did. uv-loop-teardown!'s own close never has anything to
-  ;; deliver here: its drain's last uv-run already consumed the pending
-  ;; slot (caught and re-raised after the close by teardown itself).
+  ;; uv-loop-close! : uv-loop -> unspecified
+  ;; Idempotent, but raises EBUSY while handles remain. Native state is marked
+  ;; closed before freeing, then any pending callback error is delivered.
   (define (uv-loop-close! loop)
     (require-loop loop 'uv-loop-close!)
     (when (loop-running? loop)
@@ -205,80 +100,30 @@
     (when (eq? (loop-state loop) 'open)
       (let ((ptr (loop-pointer loop 'uv-loop-close!)))
         (uv-check (uv-loop-close ptr) 'uv-loop-close!)
-        ;; 'closed the INSTANT the native close succeeds, before the registry
-        ;; pop and the free: nothing after uv_loop_close can un-close the
-        ;; native loop, so a raise from a later step (unreachable today --
-        ;; the entry is registered and the pointer valid by construction)
-        ;; must not leave a record still claiming 'open over a loop libuv
-        ;; has already shut down, where a retried close! would hand the
-        ;; closed loop back to uv_loop_close. Final-review triage item;
-        ;; ordering rationale recorded in .plans/stage-2-mutation-log.md.
         (set-loop-state! loop 'closed)
         (registry-deregister! ptr)
         (free! ptr)
-        ;; Zeroed IMMEDIATELY at the freeing site (design spec S10): a freed
-        ;; uv_loop_t does not fault when read, it answers plausibly and
-        ;; wrongly (spike FINDINGS Q1), so the stored pointer is the only
-        ;; thing that can make a use-after-free detectable.
         (set-loop-ptr! loop 0)
         (count-loop-free!)
-        ;; Last, after every step of the close has completed: see the
-        ;; delivery decision above.
         (deliver-pending-callback-error! loop))))
 
-  ;; An upper bound on drain iterations, not a timeout. Design spec S11:
-  ;; "failure is iteration exhaustion, never wall-clock elapsed time" --
-  ;; a wall-clock bound turns a slow machine into a flaky suite.
+  ;; Bound iterations, not wall time, so teardown is deterministic under load.
   (define max-drain-iterations 1024)
 
-  ;; Close every handle on this loop, drain until they have finished closing,
-  ;; then close the loop. The sweep is over the registry filtered by loop,
-  ;; because v0.1 binds no uv_walk (design spec S5).
-  ;;
-  ;; The snapshot is taken ONCE, before the sweep: close-handle! deregisters
-  ;; as it goes, and iterating a hashtable while deleting from it is
-  ;; undefined behaviour in R6RS.
-  ;;
-  ;; The drain is what turns uv_close (which only STARTS a close) into a
-  ;; completed one -- close_cb fires from inside uv_run, and until it does,
-  ;; uv_loop_close would answer EBUSY.
-  ;;
-  ;; A CALLBACK ERROR DURING THE DRAIN IS CAUGHT, THE TEARDOWN IS FINISHED,
-  ;; AND THE ERROR IS RE-RAISED AFTERWARDS. This was Stage 2's recorded open
-  ;; question; Stage 3 made it reachable (an on-close callback that raises)
-  ;; and decided it here. The alternative -- letting the first re-raise
-  ;; escape as it stood -- leaves the loop OPEN with its handles half-closed,
-  ;; which is precisely the invisible cleanup obligation spike FINDINGS Q2
-  ;; measured and design spec S8 exists to avoid: the caller sees an error,
-  ;; goes to close the loop, and gets EBUSY with no explanation. Teardown's
-  ;; contract is that the loop is closed when it returns, and an error raised
-  ;; by one on-close callback is not a reason to abandon the other handles.
-  ;;
-  ;; Only &uv-callback-error is caught -- the class uv-run itself
-  ;; manufactures. Anything else (a broken pointer, a closed loop) is a
-  ;; failure of the teardown machinery rather than a message from a callback,
-  ;; and escapes immediately.
-  ;;
-  ;; Only the FIRST is kept, matching the pending/deferred split of S8. Later
-  ;; drain iterations clear the deferred list as they go, which is the one
-  ;; thing this policy costs: an error deferred during teardown is reported
-  ;; by count only if the caller read it before the next iteration. Recorded
-  ;; in .plans/stage-3-mutation-log.md rather than papered over.
   (define teardown-no-error (list 'no-error))
 
-  ;; Answers 'drained, 'work, or the caught &uv-callback-error object.
   (define (drain-step loop)
     (guard (e ((uv-callback-error? e) e))
       (if (uv-run loop 'default) 'work 'drained)))
 
+  ;; uv-loop-teardown! : uv-loop -> unspecified
+  ;; Cancel handle-less requests, close handles, drain completions, then close.
+  ;; A callback failure is retained until cleanup finishes and then re-raised.
   (define (uv-loop-teardown! loop)
     (require-loop loop 'uv-loop-teardown!)
     (when (loop-running? loop)
       (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
     (when (eq? (loop-state loop) 'open)
-      ;; Cancel-then-drain: best-effort-cancel this loop's handle-less DNS
-      ;; requests BEFORE the close sweep, so the drain below delivers every
-      ;; in-flight on-complete before teardown returns (ADR-0011).
       (cancel-requests-for-loop! loop)
       (for-each close-handle! (registry-snapshot-for-loop loop))
       (let drain ((i 0) (stored teardown-no-error))
@@ -299,17 +144,8 @@
                          (make-message-condition
                           "loop still had work after the drain bound")))))))))
 
-  ;; dynamic-wind is valid around a LOOP, unlike around an individual handle:
-  ;; teardown is synchronous once entered, whereas a handle's close completes
-  ;; in a later callback (design spec S5).
-  ;;
-  ;; The before-thunk is the re-entry guard. On the first entry it is a
-  ;; no-op; on a re-entry through a continuation captured inside the body and
-  ;; invoked after the extent was left, the loop has already been torn down,
-  ;; and the body would otherwise resume holding a record whose pointer is 0.
-  ;; Refusing there means the failure names the actual problem
-  ;; (&uv-handle-closed, kind 'loop) at the moment of re-entry, instead of
-  ;; surfacing as a null-pointer condition from whatever the body did first.
+  ;; call-with-uv-loop : (uv-loop -> object) -> object
+  ;; The before thunk rejects continuation re-entry after teardown.
   (define (call-with-uv-loop proc)
     (let ((loop (make-uv-loop)))
       (dynamic-wind

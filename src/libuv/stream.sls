@@ -1,27 +1,6 @@
 #!r6rs
-;;; (libuv stream) -- the four stream verbs (design spec S6, S7), extracted
-;;; from (libuv tcp) so a second stream kind can use them without a second
-;;; copy (ADR-0014). Every signature, callback contract and copy/free
-;;; discipline below is IDENTICAL to v0.1/v0.2's tcp-only versions -- this
-;;; is a move, not a rewrite. The one thing that changed is the GATE:
-;;; require-open-tcp's uv-tcp-record? check widens to uv-stream-record?, so
-;;; a pipe passes it too, once uv-spawn! (Task 10) has connected one.
-;;;
-;;; NO PROCEDURE HERE TAKES OR RETURNS A POINTER, for the same reason as
-;;; (libuv tcp): a stream handle is an opaque record, and the request
-;;; records these verbs answer with are opaque too.
-;;;
-;;; TWO RULES RUN THROUGH EVERY PROCEDURE BELOW, unchanged from tcp.sls and
-;;; still design spec requirements rather than style:
-;;;
-;;;   * EVERY ARGUMENT IS VALIDATED BEFORE THE FIRST ALLOCATION. Not merely
-;;;     before the native call: a span check that runs after the block has
-;;;     been foreign-alloc'd leaks it on the failure path, and the leak is
-;;;     invisible to everything except Valgrind. tests/test-tcp.sps asserts
-;;;     the allocation counters are unchanged across a refused write.
-;;;   * A FAILED NATIVE CALL LEAVES NOTHING HALF-BUILT. Every path that has
-;;;     allocated, registered or counted something undoes exactly that much
-;;;     before the condition escapes (design spec S5, S7).
+;;; Stream operations shared by TCP and pipe handles. Validate arguments before
+;;; allocation; native start failures must leave no registered request behind.
 (library (libuv stream)
   (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -31,42 +10,20 @@
           (libuv private native)
           (libuv private handles))
 
-  ;; --- argument predicates ------------------------------------------------
-  ;; A STREAM handle (tcp or pipe), and open. Kind check first, state check
-  ;; second, different conditions -- the require-open-tcp split (tcp.sls:44-54),
-  ;; widened to the record hierarchy ADR-0014 introduces. uv_write/uv_read
-  ;; on a non-stream handle is undefined behaviour, not an errno; a closed
-  ;; stream still answers &uv-handle-closed with ITS kind.
+  ;; Passing a non-stream handle to libuv stream functions is undefined.
   (define (require-open-stream stream who)
     (unless (uv-stream-record? stream)
       (raise (make-uv-invalid-argument who 'not-a-uv-stream)))
     (require-open-handle stream who)
     stream)
 
-  ;; --- writing ------------------------------------------------------------
-  ;; (uv-write! stream bv on-complete)
-  ;; (uv-write! stream bv start end on-complete)
-  ;;
-  ;; ONE foreign-alloc: [uv_write_t | pad to 16 | uv_buf_t | payload copy]
-  ;; (design spec S7). One block means one free, in one place -- the
-  ;; write-done dispatcher -- and one debug counter for the whole thing.
-  ;;
-  ;; The payload is COPIED (ADR-0009). The caller's bytevector is free to be
-  ;; mutated or collected the instant this returns: nothing libuv holds
-  ;; points into the Scheme heap, so there is no pinning, no lock-object, and
-  ;; no window in which a moving collector could invalidate an in-flight
-  ;; write.
-  ;;
-  ;; The span is `[start, end)`, matching bytevector-copy! and every other
-  ;; R6RS range. An empty span is legal and is passed to libuv as a
-  ;; zero-length buffer.
+  ;; uv-write! : uv-stream bytevector procedure -> uv-request
+  ;; uv-write! : uv-stream bytevector exact-nonnegative-integer
+  ;;             exact-nonnegative-integer procedure -> uv-request
+  ;; The [start, end) payload is copied into request-owned foreign memory.
   (define uv-write!
     (case-lambda
       ((stream bv on-complete)
-       ;; The implicit span is computed from the bytevector, so both checks
-       ;; have to happen HERE too rather than waiting for the general clause
-       ;; -- and in the same order, so which condition a caller gets does not
-       ;; depend on which arity they used.
        (require-open-stream stream 'uv-write!)
        (unless (bytevector? bv)
          (raise (make-uv-invalid-argument 'uv-write! 'source-not-a-bytevector)))
@@ -81,14 +38,10 @@
                     (<= 0 start) (<= start end)
                     (<= end (bytevector-length bv)))
          (raise (make-uv-invalid-argument 'uv-write! 'span-out-of-range)))
-       ;; EVERY CHECK ABOVE, THE FIRST ALLOCATION BELOW. Moving one of them
-       ;; the other way leaks the block on the failure path.
        (let* ((len (- end start))
               (buf-offset (align-16 (uv-req-size (uv-write-req-type))))
               (payload-offset (+ buf-offset (sizeof-uv-buf-t)))
-              ;; max 1: an empty write still needs its payload pointer to
-              ;; address memory this block actually owns, rather than one
-              ;; byte past its end.
+              ;; Empty writes still need an address inside the owned block.
               (block (alloc-zeroed (+ payload-offset (max len 1))))
               (payload (+ block payload-offset)))
          (copy-in! payload bv start len)
@@ -105,9 +58,7 @@
                        'uv-write!))
            req)))))
 
-  ;; --- shutting down the write side ---------------------------------------
-  ;; A plain request block: uv_shutdown_t and nothing else. Same pattern as
-  ;; the other two, and the same single freeing site.
+  ;; uv-shutdown! : uv-stream procedure -> uv-request
   (define (uv-shutdown! stream on-shutdown)
     (require-open-stream stream 'uv-shutdown!)
     (require-callback on-shutdown 'uv-shutdown! 'on-shutdown-not-a-procedure)
@@ -119,45 +70,20 @@
                   'uv-shutdown!))
       req))
 
-  ;; --- reading (design spec S6) -------------------------------------------
-  ;; (uv-read-start! stream on-data on-eof on-error [buffer-size])
-  ;;
-  ;;   on-data  (bv start end) -- a FRESH bytevector per delivery, handed as a
-  ;;            SPAN so a future zero-copy variant can answer a sub-range of a
-  ;;            larger buffer without changing the call shape (ADR-0009).
-  ;;   on-eof   () -- the end of the stream, which is NOT an error and is
-  ;;            never wrapped in a condition (design spec S6, ADR-0006).
-  ;;   on-error (condition) -- a plain object, never raised across the
-  ;;            callback boundary (design spec S8). The handle is not closed:
-  ;;            what to do about a read error is the caller's decision.
-  ;;
-  ;; All three are REQUIRED. There is no "just give me the data" arity,
-  ;; because a stream whose end and whose failure both go unnoticed is not a
-  ;; simplification -- it is the two bugs this split exists to prevent.
   (define default-read-buffer-size 65536)
 
+  ;; uv-read-start! : uv-stream procedure procedure procedure
+  ;;                  [exact-positive-integer] -> unspecified
+  ;; on-data receives (bytevector start end); EOF and errors have distinct
+  ;; callbacks, and read errors never close the handle automatically.
   (define uv-read-start!
     (case-lambda
-      ;; #f, not the default size: "the caller did not ask for a size" and
-      ;; "the caller asked for 65536" are different questions to the
-      ;; buffer-size rule below, and collapsing them here would make a
-      ;; re-start with the size omitted fail against any handle whose buffer
-      ;; was fixed at anything else.
       ((stream on-data on-eof on-error)
        (start-reading! stream on-data on-eof on-error #f))
       ((stream on-data on-eof on-error buffer-size)
        (start-reading! stream on-data on-eof on-error buffer-size))))
 
-  ;; EVERY CHECK FIRST, THE ALLOCATION AFTER THEM, the native call after
-  ;; that, and the record updated only once libuv has said yes -- the same
-  ;; order, and for the same reasons, as uv-write!.
-  ;;
-  ;; The callbacks are stored AFTER the native call, unlike uv-listen!'s: a
-  ;; uv_read_start that libuv refuses (UV_EALREADY on a handle that is
-  ;; already reading, UV_ENOTCONN on one that is not connected) must not
-  ;; leave this handle's stored callbacks swapped for a read that never
-  ;; started. Nothing can be delivered in the window either way, since libuv
-  ;; only ever calls read_cb from inside uv_run.
+  ;; Store callbacks only after libuv accepts the read start.
   (define (start-reading! stream on-data on-eof on-error buffer-size)
     (require-open-stream stream 'uv-read-start!)
     (require-callback on-data 'uv-read-start! 'on-data-not-a-procedure)
@@ -176,63 +102,8 @@
     (set-stream-on-error! stream on-error)
     (set-stream-reading! stream #t))
 
-  ;; The per-handle buffer of design spec S6, allocated by the FIRST
-  ;; uv-read-start! and never again -- which is what lets the alloc dispatcher
-  ;; be infallible: it has an already-allocated pointer to hand back on every
-  ;; read and never allocates on the hot path.
-  ;;
-  ;; ITS SIZE IS FIXED BY THAT FIRST CALL, and a later call asking for a
-  ;; different explicit size is REFUSED rather than honoured. Honouring it
-  ;; would mean freeing the old buffer here, and design spec S6 makes the
-  ;; close dispatcher the only place that buffer may ever be freed -- so that
-  ;; nothing on a path libuv can call into ever has to allocate. THAT is the
-  ;; reason, and it is portable: alloc-dispatch is required to be infallible
-  ;; (handles.sls:846-860), and a realloc reachable from a uv-read-start! issued
-  ;; inside on-data would break the invariant on every platform. The refusal is
-  ;; unconditional -- not merely "when called from on-data" -- because
-  ;; uv-read-start! cannot tell what context it was invoked from; blanket
-  ;; refusal is the only rule that is actually implementable at the point that
-  ;; matters.
-  ;;
-  ;; Concretely: unix/stream.c:1043-1145 and win/tcp.c:1096-1114 have the same
-  ;; shape -- both loop, calling alloc_cb then read_cb repeatedly within a
-  ;; single synchronous call frame, without returning to the embedding event
-  ;; loop between iterations. A resize triggered reentrantly from inside on-data
-  ;; can therefore be observed by a later alloc_cb in the same call stack, on
-  ;; both platforms.
-  ;;
-  ;; This comment used to say the reason was Windows' overlapped-read model
-  ;; keeping a completion queued against the buffer. For the two handle kinds
-  ;; this binding supports, that is DEAD CODE at the pinned libuv: uv_tcp_t
-  ;; never posts a user buffer at all (win/tcp.c:559 queues a zero-byte WSARecv
-  ;; against static uv_zero_; the real read, win/tcp.c:1108, is the
-  ;; non-overlapped WSARecv(..., NULL, NULL)), and uv_pipe_t drains its
-  ;; overlapped ReadFile with CancelIoEx (win/pipe.c:2006) plus a blocking
-  ;; GetOverlappedResult (win/pipe.c:2008) before returning. The residue: the
-  ;; assert checking CancelIoEx's result is at pipe.c:2007 (the call itself is
-  ;; 2006), and release builds compile that assert out.
-  ;;
-  ;; `make check-pins` runs a coarse check over symbol counts and presence in
-  ;; the vendored tree -- not a proof these mechanisms still mean what this
-  ;; comment says; a grep cannot verify a semantic property. It checks the TCP
-  ;; UV_HANDLE_ZERO_READ set/clear counts and read_buffer assignment count, the
-  ;; TCP WSARecv call-site count (so a change to that file's read/write call
-  ;; shape is noticed), and that CancelIoEx and GetOverlappedResult are both
-  ;; still present in win/pipe.c (so a change that stops draining the overlapped
-  ;; ReadFile synchronously is noticed). A bump that trips this check means:
-  ;; re-read the cited code before touching either Scheme site. A bump that does
-  ;; NOT trip it is NOT evidence the claim above survived -- re-read on any
-  ;; vendor bump regardless.
-  ;;
-  ;; A caller who wants a different size closes the handle.
-  ;;
-  ;; A call that omits the size is not asking for anything, so it is always
-  ;; allowed. That is what makes re-starting after a stop the cheap operation
-  ;; backpressure needs it to be.
-  ;;
-  ;; NOTHING FREES THE BUFFER ON A FAILURE PATH, including one where
-  ;; uv_read_start goes on to fail: the buffer belongs to the HANDLE, not to
-  ;; the read, and the close dispatcher will free it exactly once.
+  ;; The first start fixes one reusable buffer until close. A stopped read may
+  ;; restart without specifying a size, but may not resize the existing buffer.
   (define (ensure-read-buffer! stream buffer-size)
     (if (zero? (stream-read-buf stream))
         (let ((size (or buffer-size default-read-buffer-size)))
@@ -243,42 +114,16 @@
           (raise (make-uv-invalid-argument 'uv-read-start!
                                            'buffer-size-fixed)))))
 
-  ;; Stopping a stream that is not reading is rc 0 at the libuv level, so this
-  ;; is idempotent without a state test of its own. The stored callbacks and
-  ;; the buffer are left alone on purpose: a stop is backpressure, not a
-  ;; teardown, and the next uv-read-start! is meant to be able to pass the
-  ;; same callbacks against the same buffer (design spec S6).
+  ;; uv-read-stop! : uv-stream -> unspecified
+  ;; Stop retains callbacks and the buffer so it can implement backpressure.
   (define (uv-read-stop! stream)
     (require-open-stream stream 'uv-read-stop!)
     (uv-check (uv-read-stop (handle-pointer stream 'uv-read-stop!))
               'uv-read-stop!)
     (set-stream-reading! stream #f))
 
-  ;; (uv-stream-write-queue-size stream) -> exact non-negative integer
-  ;;
-  ;; libuv's PLATFORM-DEPENDENT count of queued stream bytes. Unix counts
-  ;; bytes not yet handed to the kernel (unix/stream.c:693-694) and leaves
-  ;; the count non-zero after a FAILED write, deliberately, so the user
-  ;; stops writing (unix/stream.c:719-724). Windows counts the opposite
-  ;; thing: write_queue_size is incremented only in the UV_SUCCEEDED_WITH_IOCP
-  ;; branch (win/tcp.c:986) -- bytes the kernel has ACCEPTED into an
-  ;; incomplete overlapped send -- and the immediate-completion branch never
-  ;; increments.
-  ;;
-  ;; SO: A CONGESTION SIGNAL. Not a memory gauge, and not a portable measure
-  ;; of kernel occupancy. It UNDERCOUNTS the memory this binding holds,
-  ;; because a write's foreign block stays allocated until the whole request
-  ;; completes while this number falls as the kernel takes bytes. A consumer
-  ;; bounding memory counts its own submissions against completions -- and
-  ;; must count BOTH outstanding payload bytes and outstanding request
-  ;; count, since a zero-length write allocates a full block for zero
-  ;; payload bytes (stream.sls:92). See docs/api.md.
-  ;;
-  ;; THE NATIVE CANNOT FAIL; THE GATE CAN. On a 'closing handle the pointer
-  ;; is still live, so a missing gate returns a plausible number -- which is
-  ;; why the suite mutates this gate against a CLOSING stream. A fully
-  ;; closed one does not discriminate: handle-pointer refuses the zeroed
-  ;; pointer first (handles.sls:471-475).
+  ;; uv-stream-write-queue-size : uv-stream -> exact-nonnegative-integer
+  ;; This platform-dependent value is a congestion signal, not a memory gauge.
   (define (uv-stream-write-queue-size stream)
     (require-open-stream stream 'uv-stream-write-queue-size)
     (uv-stream-get-write-queue-size-native

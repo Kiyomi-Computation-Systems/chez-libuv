@@ -1,29 +1,6 @@
 #!r6rs
-;;; Init-time snapshot of the shim's constant table and errno enumeration
-;;; (ADR-0005: constants are never transcribed).
-;;;
-;;; Every value this library serves was computed by a C compiler from a real
-;;; macro, enum member, `sizeof`, or `offsetof` in src/libuv-shim.c, looked
-;;; up BY NAME at initialisation. Nothing here is a literal, and a name the
-;;; shim does not define is not a zero, a #f, or a default -- it is
-;;; &uv-constant-unavailable carrying the missing name, raised before any
-;;; handle can exist.
-;;;
-;;; DEPENDENCY DIRECTION. This library imports (rnrs) and
-;;; (libuv private conditions) only -- deliberately NOT
-;;; (libuv private native). The FFI primitives arrive as arguments to
-;;; `constants-init!`, which (libuv private native) calls from
-;;; `ensure-native-loaded!`. That keeps the import graph acyclic (native ->
-;;; constants, never the reverse), keeps `foreign-procedure` confined to the
-;;; one library design spec S3 permits it in, and makes this module's whole
-;;; decision surface -- name resolution, the errno tables, the missing-name
-;;; failure -- exercisable against a synthetic lookup with no shim present.
-;;;
-;;; Accessors are nullary procedures rather than plain variables because the
-;;; values are not known until init; the snapshot behind them is an
-;;; IMMUTABLE hashtable keyed by the shim's own constant name, so there is no
-;;; positional contract between this file and src/libuv-shim.c that could
-;;; drift silently (the failure mode a value-ordered record would have).
+;;; Immutable init-time snapshot of compiler-derived constants, sizes, offsets,
+;;; and libuv's errno table. This library stays independent of the FFI layer.
 (library (libuv private constants)
   (export constants-init! constants-init-count constants-initialized?
           constant-ref
@@ -79,24 +56,15 @@
   (import (rnrs)
           (libuv private conditions))
 
-  ;; --- the snapshot -----------------------------------------------------
-  ;; snapshot: an immutable eq-hashtable, symbol -> exact integer.
-  ;; lookup:   the shim's chez_uv_constant wrapper, string -> integer or #f.
-  ;; Both are #f until constants-init! runs.
+  ;; Values remain false until constants-init! commits a complete snapshot.
   (define snapshot #f)
   (define lookup   #f)
   (define init-count 0)
 
-  ;; errno tables, both immutable after init:
-  ;;   value->symbol : eqv-hashtable, exact integer -> symbol
-  ;;   symbol->value : eq-hashtable,  symbol -> exact integer
   (define errno-value-table  #f)
   (define errno-symbol-table #f)
   (define errno-name-list    '())
 
-  ;; The names this binding snapshots. The list is the single place a new
-  ;; constant is declared; init walks it, so adding one here is the whole
-  ;; change on the Scheme side (the C side gets one table entry).
   (define snapshot-names
     '(UV_RUN_DEFAULT UV_RUN_ONCE UV_RUN_NOWAIT
       UV_EOF AF_INET AF_UNSPEC AF_INET6 UV_TCP UV_TIMER
@@ -138,12 +106,8 @@
       UV_READABLE_PIPE UV_WRITABLE_PIPE
       SIGTERM SIGKILL SIGINT SIGHUP SIGQUIT
       SIGUSR1 SIGUSR2 SIGCONT SIGSTOP
-      ;; v0.4 signal (ADR-0017)
       UV_SIGNAL))
 
-  ;; The fallback errno symbol. It cannot collide with a real name: libuv's
-  ;; UV_ERRNO_MAP tokens are the bare codes ("EOF", "ECONNRESET"), never
-  ;; UV_-prefixed, and the shim exports them unprefixed on purpose.
   (define unknown-errno-symbol 'UV_UNKNOWN)
 
   (define (constants-initialized?) (and snapshot #t))
@@ -153,11 +117,7 @@
     (unless snapshot
       (raise (make-uv-invalid-argument who 'constants-not-initialized))))
 
-  ;; Resolve any name the shim's table might carry, at any time after init.
-  ;; This is the primitive `constants-init!` itself uses, exported so a name
-  ;; the shim does not define can be probed directly -- ADR-0005's
-  ;; mutation-testability claim rests on that failure being observable and
-  ;; specific.
+  ;; constant-ref : symbol -> exact-integer
   (define (constant-ref name)
     (require-initialized 'uv-constant-ref)
     (let ((cached (hashtable-ref snapshot name 'absent)))
@@ -166,9 +126,6 @@
               (raise (make-uv-constant-unavailable name)))
           cached)))
 
-  ;; Reader for a snapshotted name. Distinct from constant-ref only in that
-  ;; it never falls through to the shim: everything in snapshot-names is
-  ;; resolved once, at init, and served from memory afterwards.
   (define (snapshot-ref name)
     (require-initialized 'uv-constant-snapshot-ref)
     (let ((v (hashtable-ref snapshot name 'absent)))
@@ -176,19 +133,9 @@
           (raise (make-uv-constant-unavailable name))
           v)))
 
-  ;; --- init -------------------------------------------------------------
-  ;; lookup-proc     : string -> exact integer or #f
-  ;; errno-count-proc: -> exact integer
-  ;; errno-name-proc : index -> string or #f
-  ;; errno-value-proc: index -> exact integer
-  ;;
-  ;; Idempotent by an explicit guard, not by accident: a second call is a
-  ;; no-op and leaves init-count alone, which is what tests/test-native.sps
-  ;; asserts (removing the guard makes the count climb).
-  ;; Everything is built into locals and committed together, at the end: a
-  ;; lookup that raises part way through must leave the library UNinitialised
-  ;; rather than half-initialised, since `require-initialized` tests one flag
-  ;; on behalf of all of them.
+  ;; constants-init! : procedure procedure procedure procedure -> unspecified
+  ;; Build into locals and publish the immutable snapshot last, so failure
+  ;; cannot expose partial initialization.
   (define (constants-init! lookup-proc errno-count-proc
                            errno-name-proc errno-value-proc)
     (unless snapshot
@@ -207,21 +154,11 @@
           (set! errno-name-list names)
           (set! errno-value-table by-value)
           (set! errno-symbol-table by-symbol)
-          ;; hashtable-copy with no mutability argument yields an IMMUTABLE
-          ;; copy (R6RS), so the snapshot cannot be edited after init -- the
-          ;; "immutable record" the design spec asks for, enforced rather
-          ;; than promised. Assigning `snapshot` last makes it the commit
-          ;; point every accessor's initialised-check keys on.
           (set! snapshot (hashtable-copy table))
           (set! init-count (+ init-count 1))))))
 
-  ;; The errno enumeration is walked by index over the shim's X-macro
-  ;; expansion of libuv's own UV_ERRNO_MAP, so the name list tracks the
-  ;; pinned header rather than being copied out by hand (ADR-0005). A NULL
-  ;; name at an index below the reported count means the shim's count and
-  ;; its table have come apart -- fail closed, naming the index.
-  ;; Returns three values: the symbol list in enumeration order, the
-  ;; immutable value->symbol table, and the immutable symbol->value table.
+  ;; build-errno-tables : procedure procedure procedure
+  ;;                      -> (values (listof symbol) hashtable hashtable)
   (define (build-errno-tables count-proc name-proc value-proc)
     (let ((n (count-proc))
           (by-value  (make-eqv-hashtable))
@@ -247,16 +184,12 @@
     (require-initialized 'uv-errno-count)
     (length errno-name-list))
 
-  ;; A fresh list each call: the caller must not be able to mutate the
-  ;; snapshot's own view of the enumeration.
+  ;; Return a fresh list so callers cannot mutate the stored enumeration.
   (define (errno-symbols)
     (require-initialized 'uv-errno-symbols)
     (map values errno-name-list))
 
-  ;; ADR-0006: a code libuv does not name is not an error to raise on here --
-  ;; the raw int stays reachable through &uv-errno-error's `code` field, so
-  ;; nothing is lost -- but it must never come back as #f or as some other
-  ;; code's symbol.
+  ;; Unknown numeric errors retain a stable UV_UNKNOWN discriminant.
   (define (errno-value->symbol n)
     (require-initialized 'uv-errno-value->symbol)
     (hashtable-ref errno-value-table n unknown-errno-symbol))
@@ -268,9 +201,6 @@
           (raise (make-uv-constant-unavailable sym))
           v)))
 
-  ;; --- named accessors --------------------------------------------------
-  ;; One per snapshotted constant. Each names its own key, so there is no
-  ;; way for an accessor and a value to drift apart.
   (define (uv-run-default) (snapshot-ref 'UV_RUN_DEFAULT))
   (define (uv-run-once)    (snapshot-ref 'UV_RUN_ONCE))
   (define (uv-run-nowait)  (snapshot-ref 'UV_RUN_NOWAIT))
@@ -282,9 +212,6 @@
   (define (uv-tcp-type)    (snapshot-ref 'UV_TCP))
   (define (uv-timer-type)  (snapshot-ref 'UV_TIMER))
 
-  ;; uv_req_type tags, for uv_req_size(). Named *-req-type rather than
-  ;; uv-write/uv-connect so they cannot be mistaken for the operations of
-  ;; the same name that Tasks 4 and 5 of the milestone sequence add.
   (define (uv-write-req-type)    (snapshot-ref 'UV_WRITE))
   (define (uv-connect-req-type)  (snapshot-ref 'UV_CONNECT))
   (define (uv-shutdown-req-type) (snapshot-ref 'UV_SHUTDOWN))
@@ -312,10 +239,7 @@
   (define (offsetof-sockaddr-in-sin-family)
     (snapshot-ref 'OFFSETOF_SOCKADDR_IN_SIN_FAMILY))
 
-  ;; struct addrinfo field offsets, the portability trap's antidote (design
-  ;; spec v0.2 S5.2): glibc orders ai_addr before ai_canonname, Darwin the
-  ;; reverse, so any ftype guess is wrong on one platform. Chain walking
-  ;; reads fields through these, never through a declared layout.
+  ;; addrinfo field order differs across supported platforms.
   (define (offsetof-addrinfo-ai-flags)
     (snapshot-ref 'OFFSETOF_ADDRINFO_AI_FLAGS))
   (define (offsetof-addrinfo-ai-family)
@@ -335,10 +259,6 @@
   (define (offsetof-sockaddr-in6-sin6-port)
     (snapshot-ref 'OFFSETOF_SOCKADDR_IN6_SIN6_PORT))
 
-  ;; getaddrinfo hint vocabulary (design spec v0.2 S4.2): socket types,
-  ;; protocols, and the OR-combinable AI_/NI_ flag bits. AI_ADDRCONFIG and
-  ;; AI_V4MAPPED are deliberately absent -- outside the closed validation
-  ;; sets they would be unreachable dead weight (S1 non-goal).
   (define (sock-stream) (snapshot-ref 'SOCK_STREAM))
   (define (sock-dgram)  (snapshot-ref 'SOCK_DGRAM))
   (define (sock-raw)    (snapshot-ref 'SOCK_RAW))
@@ -356,11 +276,9 @@
   (define (ni-namereqd)    (snapshot-ref 'NI_NAMEREQD))
   (define (ni-dgram)       (snapshot-ref 'NI_DGRAM))
 
-  ;; v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005)
   (define (uv-process-type)    (snapshot-ref 'UV_PROCESS))
   (define (uv-named-pipe-type) (snapshot-ref 'UV_NAMED_PIPE))
 
-  ;; v0.4 signal handle type tag (design spec 2026-08-22 §5.5; ADR-0017)
   (define (uv-signal-type) (snapshot-ref 'UV_SIGNAL))
 
   (define (sizeof-uv-process-options-t) (snapshot-ref 'SIZEOF_UV_PROCESS_OPTIONS_T))

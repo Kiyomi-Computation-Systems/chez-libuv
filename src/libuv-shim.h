@@ -1,46 +1,24 @@
-/* chez-libuv constants-only shim.
- *
- * Deliberately thin (ADR-0002): no uv_* call is ever wrapped here. Its jobs
- * are version reporting, exposing values C can compute that Scheme cannot
- * obtain any other way -- struct sizes and offsets, the errno enumeration
- * built from libuv's own UV_ERRNO_MAP X-macro (ADR-0005) -- and counting
- * live allocations in debug builds.
- */
+/* Thin ABI shim for compiler-derived constants, layouts, errnos, and optional
+ * allocation counters. It does not wrap uv_* operations. */
 #ifndef CHEZ_LIBUV_SHIM_H
 #define CHEZ_LIBUV_SHIM_H
 
-/* A struct tag first named in a prototype's parameter-type-list has
- * prototype scope only (C99 6.2.1p7): it would not extend past that one
- * prototype to any later use in this file. Forward-declared here at file
- * scope so any future prototype naming it stays consistent with the .c
- * file's own <uv.h>-derived definition, the same discipline
- * cmark-gfm-shim.h applies to `struct cmark_node` (AGENTS.md's named
- * trap). Currently unused: none of this shim's exported entry points takes
- * a libuv struct pointer, since the shim never wraps a uv_* call.
- */
+/* A struct tag introduced only in a prototype has prototype scope. */
 struct uv_handle_s;
 
-/* Version the shim was COMPILED against, from the installed header
- * (UV_VERSION_HEX). */
+/* Version from the header used to compile the shim. */
 int chez_uv_shim_compiled_version(void);
 
-/* Name-keyed constant lookup (ADR-0005). Writes *out and returns 1 if name
- * is present in the table; returns 0 and leaves *out untouched otherwise.
- * A missing name is never a default value -- it is the caller's job to
- * raise a structured error, not this function's job to paper over. */
+/* Writes *out and returns 1 when found; otherwise returns 0 without writing. */
 int chez_uv_constant(const char *name, long *out);
 
-/* Errno enumeration, built from libuv's own UV_ERRNO_MAP X-macro so the
- * name list tracks the pinned libuv header automatically rather than being
- * copied out by hand. Names are the bare UV_ERRNO_MAP token ("EOF",
- * "ECONNRESET", ...), never prefixed with UV_. */
+/* Errno names are bare UV_ERRNO_MAP tokens such as "ECONNRESET". */
 int chez_uv_errno_count(void);
 const char *chez_uv_errno_name(int i);
 int chez_uv_errno_value(int i);
 
-/* Debug allocation counters. Compiled to no-ops unless
- * CHEZ_LIBUV_DEBUG_COUNTERS is defined; the live queries then always
- * return 0. Single-threaded test use only. */
+/* Counters are single-threaded diagnostics. Without CHEZ_LIBUV_DEBUG_COUNTERS,
+ * updates are no-ops and live queries return zero. */
 void chez_uv_count_loop_new(void);
 void chez_uv_count_loop_free(void);
 long chez_uv_live_loop(void);

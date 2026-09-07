@@ -393,10 +393,8 @@ define GEN_CONFIG_SLS
 	  '  (export shim-path uv-library-paths uv-supported-version-range)' \
 	  '  (import (rnrs))' \
 	  '  (define shim-path "$(abspath $(SHIM))")' \
-	  '  ;; libuv'"'"'s shared object, loaded explicitly before the shim. On' \
-	  '  ;; Linux a dlopen'"'"'d library'"'"'s dependencies are NOT in the global' \
-	  '  ;; symbol namespace, so binding uv_* entry points through the shim' \
-	  '  ;; alone fails there while working on macOS (ADR-0002).' \
+	  '  ;; Load libuv before the shim so uv_* symbols enter the global namespace;' \
+	  '  ;; a shim dependency alone does not do this on Linux.' \
 	  '  (define uv-library-paths (quote ($(foreach l,$(UV_DLLS),"$(l)"))))' \
 	  '  (define uv-supported-version-range (quote (#x$(UV_RANGE_LO_HEX) . #x$(UV_RANGE_HI_HEX)))))' \
 	  > $(CONFIG_SLS)
