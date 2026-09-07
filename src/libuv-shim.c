@@ -13,12 +13,7 @@ int chez_uv_shim_compiled_version(void) {
   return UV_VERSION_HEX;
 }
 
-/* ADR-0005: every value below comes from the real macro, enum, sizeof(), or
- * offsetof() -- never a transcribed literal. The name column is this
- * binding's own vocabulary; native.sls looks entries up by name at init
- * time and never assumes an index, an order, or a platform-independent
- * value (spike/FINDINGS.md's sockaddr_in finding is exactly why: the same
- * name resolves to a different offset on Darwin and Linux). */
+/* Values are compiler-derived and looked up by name; table order is not ABI. */
 struct chez_uv_constant_entry {
   const char *name;
   long value;
@@ -35,9 +30,6 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "UV_TCP",         UV_TCP },
   { "UV_TIMER",       UV_TIMER },
 
-  /* uv_req_type tags, needed to call uv_req_size() -- the request-side
-   * counterpart of UV_TCP/UV_TIMER above. They come from the enum, not from
-   * the position of a #define, for the same reason as everything else here. */
   { "UV_WRITE",       UV_WRITE },
   { "UV_CONNECT",     UV_CONNECT },
   { "UV_SHUTDOWN",    UV_SHUTDOWN },
@@ -65,11 +57,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "OFFSETOF_SOCKADDR_IN_SIN_FAMILY",
     (long)offsetof(struct sockaddr_in, sin_family) },
 
-  /* struct addrinfo field offsets (design spec v0.2 S5.2). glibc orders
-   * ai_addr before ai_canonname; Darwin reverses them. Any declared-layout
-   * guess is therefore wrong on one platform, which is why chain walking
-   * on the Scheme side reads every field through these offsets and never
-   * through an ftype. */
+  /* glibc and Darwin order addrinfo fields differently. */
   { "OFFSETOF_ADDRINFO_AI_FLAGS",
     (long)offsetof(struct addrinfo, ai_flags) },
   { "OFFSETOF_ADDRINFO_AI_FAMILY",
@@ -89,10 +77,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "OFFSETOF_SOCKADDR_IN6_SIN6_PORT",
     (long)offsetof(struct sockaddr_in6, sin6_port) },
 
-  /* getaddrinfo hint vocabulary (design spec v0.2 S5.2): socket types,
-   * protocols, and the OR-combinable AI_/NI_ flag bits from <netdb.h>.
-   * AI_ADDRCONFIG and AI_V4MAPPED are deliberately absent -- outside the
-   * closed validation sets they would be unreachable dead weight. */
+  /* Closed DNS input vocabulary. */
   { "SOCK_STREAM", SOCK_STREAM },
   { "SOCK_DGRAM",  SOCK_DGRAM },
   { "SOCK_RAW",    SOCK_RAW },
@@ -107,7 +92,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "NI_NAMEREQD",    NI_NAMEREQD },
   { "NI_DGRAM",       NI_DGRAM },
 
-  /* v0.3 process + pipe (THE SPEC §5.3; ADR-0005). */
+  /* Process, pipe, and signal constants. */
   { "UV_PROCESS",    UV_PROCESS },
   { "UV_NAMED_PIPE", UV_NAMED_PIPE },
   { "SIZEOF_UV_PROCESS_OPTIONS_T", (long)sizeof(uv_process_options_t) },
@@ -154,7 +139,6 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIGUSR2", SIGUSR2 },
   { "SIGCONT", SIGCONT },
   { "SIGSTOP", SIGSTOP },
-  /* v0.4 signal (design spec 2026-08-22 §5.5; ADR-0017). */
   { "UV_SIGNAL", UV_SIGNAL },
 };
 
@@ -172,12 +156,8 @@ int chez_uv_constant(const char *name, long *out) {
   return 0;
 }
 
-/* Errno enumeration via libuv's own X-macro (ADR-0005): the name list
- * tracks the pinned libuv header automatically rather than being copied out
- * by hand. Names are the bare UV_ERRNO_MAP token, e.g. "EOF", "ECONNRESET"
- * -- never "UV_EOF". Values go through the UV_<code> enum member, never a
- * literal, since libuv derives several of them (e.g. UV_ECANCELED) from the
- * host errno.h rather than a portable constant (spike/FINDINGS.md Q-1). */
+/* Derive errno names and values from libuv's UV_ERRNO_MAP. Names are bare
+ * tokens such as "EOF"; values may depend on the host errno definitions. */
 struct chez_uv_errno_entry {
   const char *name;
   int value;
