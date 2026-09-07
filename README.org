@@ -32,8 +32,11 @@ and flow control (read/write buffer sizing, the write-queue congestion
 gauge, peer addresses — see ~docs/api.md~'s Flow control section). No
 filesystem, no UDP, no zero-copy I/O
 ([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]]). CI
-covers macOS and Linux on both dependency-acquisition paths; Windows is
-deferred, not designed out
+covers Linux on both dependency-acquisition paths, with Valgrind as the
+memory gate
+([[file:.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md][ADR-0003]]);
+macOS is supported and tested, but locally rather than on a paid runner.
+Windows is deferred, not designed out
 ([[file:.plans/decisions/0004-windows-deferred-design-clean.md][ADR-0004]]).
 
 * Install
