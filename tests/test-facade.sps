@@ -439,6 +439,18 @@
   (list "127.0.0.1" fport)
   (let-values (((a p) (uv-tcp-peer-address fclient))) (list a p)))
 
+;; uv-write*! reached through the facade IS the real validating stream verb:
+;; on the still-open client it refuses an empty segment list with its own
+;; named reason (libuv needs nbufs >= 1) before touching libuv, so this proves
+;; the re-export end to end without perturbing the completed exchange above.
+(test-equal "the facade's uv-write*! is the real verb, refusing an empty segment list"
+  '(uv-write*! empty-segment-list)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-write*! fclient '() (lambda (err) #f))
+    'no-raise))
+
 (uv-loop-teardown! fl)
 
 (test-equal "the facade's tcp loop tore down and closed every handle"

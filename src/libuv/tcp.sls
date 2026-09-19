@@ -8,7 +8,7 @@
           uv-listen! uv-accept! uv-tcp-connect!
           uv-tcp-nodelay!
           ;; stream operations
-          uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+          uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)

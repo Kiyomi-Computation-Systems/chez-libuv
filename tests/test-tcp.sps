@@ -1983,6 +1983,222 @@
 
 (uv-loop-teardown! dl)
 
+;; =========================================================================
+;; --- VECTORED WRITE (uv-write*!, the name ADR-0009 reserved) -------------
+;; =========================================================================
+;; The scatter-gather counterpart of uv-write!: ONE request block whose
+;; payload holds the N copied spans and an N-entry uv_buf_t[], handed to
+;; uv_write with nbufs = N (native.sls's uv-write-native already threads the
+;; count -- uv-write! is the caller that pins it at 1). Completion and the
+;; free-before-on-complete discipline are uv-write!'s, unchanged: the whole
+;; thing is one foreign-alloc, freed as a unit by the shared write-done
+;; dispatcher (ADR-0009's amendment). A segment is a whole bytevector or an
+;; explicit (bv start end) span. libuv refuses nbufs < 1 (unix/stream.c:1309),
+;; so an empty segment list is refused HERE, at the boundary, with a named
+;; reason rather than forwarded as a platform EINVAL.
+(define wv-loop (make-uv-loop))
+(define wv-server (make-uv-tcp wv-loop))
+(define wv-port (bind-loopback! wv-server))
+(define wv-peer 'never-accepted)
+
+(uv-listen! wv-server 128
+            (lambda (err)
+              (collect)
+              (when (and (not err) (eq? wv-peer 'never-accepted))
+                (set! wv-peer (uv-accept! wv-server)))))
+
+(define wv-client (make-uv-tcp wv-loop))
+(define wv-connect-err 'connect-cb-never-fired)
+(connect-loopback! wv-client wv-port
+                   (lambda (err) (collect) (set! wv-connect-err err)))
+
+(test-equal "seed: the vectored-write pair connected and was accepted"
+  'satisfied
+  (run-until/ticking wv-loop
+                     (lambda () (and (not (eq? wv-peer 'never-accepted))
+                                     (not (eq? wv-connect-err 'connect-cb-never-fired))))
+                     4000))
+
+;; --- argument validation, all of it BEFORE any allocation ----------------
+;; The same right-to-left trap as uv-write!'s span rows (AGENTS.md): a `let*`
+;; sequences the before/after counter reads, so a refusal that allocated
+;; nothing is distinguishable from one that allocated and then leaked. Every
+;; row below asserts BOTH the (who reason) pair and "(0 0) 0" -- write-req
+;; unmoved, registry unmoved.
+(define (wv-refusal thunk)
+  (let* ((before-count (live-count 'write-req))
+         (before-registry (registry-count))
+         (outcome (guard (e ((uv-invalid-argument? e)
+                             (list (uv-invalid-argument-who e)
+                                   (uv-invalid-argument-reason e)))
+                            (#t 'wrong-condition))
+                    (thunk)
+                    'no-raise))
+         (after-count (live-count 'write-req))
+         (after-registry (registry-count)))
+    (list outcome
+          (list before-count after-count)
+          (- after-registry before-registry))))
+
+(test-equal "a segments argument that is not a list is refused before allocation"
+  '((uv-write*! segments-not-a-list) (0 0) 0)
+  (wv-refusal (lambda () (uv-write*! wv-client 'not-a-list (lambda (err) #f)))))
+
+(test-equal "an empty segment list is refused before allocation (libuv needs nbufs >= 1)"
+  '((uv-write*! empty-segment-list) (0 0) 0)
+  (wv-refusal (lambda () (uv-write*! wv-client '() (lambda (err) #f)))))
+
+(test-equal "a segment that is neither a bytevector nor a span is refused before allocation"
+  '((uv-write*! segment-not-a-bytevector) (0 0) 0)
+  (wv-refusal
+   (lambda ()
+     (uv-write*! wv-client (list (string->utf8 "ok") "not-a-segment")
+                 (lambda (err) #f)))))
+
+(test-equal "a segment span out of range is refused before allocation"
+  '((uv-write*! segment-span-out-of-range) (0 0) 0)
+  (wv-refusal
+   (lambda ()
+     (uv-write*! wv-client (list (list (string->utf8 "hello") 3 99))
+                 (lambda (err) #f)))))
+
+(test-equal "a non-procedure on-complete is refused, naming who and why"
+  '(uv-write*! on-complete-not-a-procedure)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-write*! wv-client (list (make-bytevector 1 0)) 'not-a-procedure)
+    'no-raise))
+
+;; --- the block layout of an in-flight vectored write ---------------------
+;; The scalar "a written span" rows above read a single-buf block while it is
+;; in flight; this reads a TWO-buf block the same way. The offset arithmetic
+;; is redone from the SAME constants uv-write*! sizes it with, not read out of
+;; the binding, and the loop is deliberately NOT run between the write and the
+;; assertions: the request is still queued inside libuv, so its block is alive
+;; and its uv_buf_t[] still describes the two copied spans. A whole bytevector
+;; and an explicit span together, so both segment shapes are exercised.
+(define wv-a (string->utf8 "ABCD"))          ; whole bytevector  -> (a 0 4)
+(define wv-b (string->utf8 "0123456789"))    ; explicit (b 2 7)  -> "23456"
+(define wv-layout-err 'vectored-write-never-fired)
+
+(define wv-req
+  (uv-write*! wv-client (list wv-a (list wv-b 2 7))
+              (lambda (err) (collect) (set! wv-layout-err err))))
+
+(define wv-buf0
+  (+ (req-ptr wv-req) (* 16 (div (+ (uv-req-size (uv-write-req-type)) 15) 16))))
+(define wv-buf1 (+ wv-buf0 (sizeof-uv-buf-t)))
+
+(test-equal "the two uv_buf_t entries carry each segment's own length, not its bytevector's"
+  '(4 5)
+  (list (uv-buf-len wv-buf0) (uv-buf-len wv-buf1)))
+
+;; Both payload pointers address memory inside the request's own block, the
+;; first past the two-entry buf array, the second packed right after the
+;; first's four bytes -- never the Scheme heap, never a second allocation.
+(test-equal "both payloads lie inside the request's own block, packed in order"
+  'inside-and-ordered
+  (let ((base0 (uv-buf-base wv-buf0))
+        (base1 (uv-buf-base wv-buf1)))
+    (if (and (> base0 wv-buf1) (= base1 (+ base0 4)))
+        'inside-and-ordered
+        (list 'unexpected base0 base1))))
+
+;; The bytes themselves: a copy that read each segment from offset 0 would put
+;; "01234" in the second buf instead of the requested "23456" -- same lengths,
+;; same completion, wrong payload, invisible until the round-trip below reads
+;; the peer's end.
+(test-equal "each buf holds the requested span's bytes, not the head of its bytevector"
+  (list (string->utf8 "ABCD") (string->utf8 "23456"))
+  (list (copy-out (uv-buf-base wv-buf0) (uv-buf-len wv-buf0))
+        (copy-out (uv-buf-base wv-buf1) (uv-buf-len wv-buf1))))
+
+(test-equal "seed: the two segments are ONE in-flight write request, not two"
+  1 (live-count 'write-req))
+
+(test-equal "the vectored write completes once, without error, and frees its block"
+  '(satisfied no-error 0)
+  (let ((outcome (run-until/ticking
+                  wv-loop
+                  (lambda () (not (eq? wv-layout-err 'vectored-write-never-fired)))
+                  4000)))
+    (list outcome (err->symbol wv-layout-err) (live-count 'write-req))))
+
+(uv-loop-teardown! wv-loop)
+
+(test-equal "the vectored-write layout loop tore down cleanly"
+  registry-count-at-start (registry-count))
+
+;; --- a vectored write, round-tripped through a reading peer --------------
+;; The point of the verb. Three segments -- a whole bytevector, an explicit
+;; span, and another whole bytevector -- go out in ONE call and arrive at the
+;; peer as their exact concatenation, in order. The two-write ordering row
+;; earlier proved two SEPARATE uv-write! calls arrive A-then-B; this proves
+;; the SAME bytes arrive from a single request whose completion fires exactly
+;; once (three separate writes would fire three times, and the row below pins
+;; it at one).
+(define rt-loop (make-uv-loop))
+(define rt-server (make-uv-tcp rt-loop))
+(define rt-port (bind-loopback! rt-server))
+(define rt-peer 'never-accepted)
+(define rt-col (make-byte-collector))
+
+(uv-listen! rt-server 128
+            (lambda (err)
+              (collect)
+              (when (and (not err) (eq? rt-peer 'never-accepted))
+                (set! rt-peer (uv-accept! rt-server))
+                (uv-read-start! rt-peer
+                                (lambda (bv s e) (collect-span! rt-col bv s e) (collect))
+                                (lambda () #f)
+                                (lambda (c) #f)))))
+
+(define rt-client (make-uv-tcp rt-loop))
+(define rt-connect-err 'connect-cb-never-fired)
+(connect-loopback! rt-client rt-port
+                   (lambda (err) (collect) (set! rt-connect-err err)))
+
+(run-until/ticking rt-loop
+                   (lambda () (and (not (eq? rt-peer 'never-accepted))
+                                   (not (eq? rt-connect-err 'connect-cb-never-fired))))
+                   4000)
+
+;; Seeded by index, like every other payload in this suite: two runs compare
+;; the same bytes. Only [100,600) of the middle segment is sent, so a span
+;; that shipped the whole bytevector would arrive 400 bytes too long here.
+(define rt-a (seeded-bytes 700 41))
+(define rt-b (seeded-bytes 900 42))
+(define rt-c (seeded-bytes 333 43))
+(define rt-b-span
+  (let ((mid (make-bytevector 500)))
+    (bytevector-copy! rt-b 100 mid 0 500)     ; (source src-start target tgt-start count)
+    mid))
+(define rt-expected (bv-append (bv-append rt-a rt-b-span) rt-c))
+(define rt-fires 0)
+(define rt-err 'vectored-write-never-fired)
+
+(uv-write*! rt-client
+            (list rt-a (list rt-b 100 600) rt-c)
+            (lambda (err) (collect) (set! rt-fires (+ 1 rt-fires)) (set! rt-err err)))
+
+(test-equal "the three segments arrive as their exact concatenation, in order"
+  'identical
+  (begin (run-until/ticking
+          rt-loop
+          (lambda () (and (>= (collector-count rt-col) (bytevector-length rt-expected))
+                          (positive? rt-fires)))
+          8000)
+         (compare-bytes rt-expected (collector-bytes rt-col))))
+
+(test-equal "the vectored write's completion fired exactly once, cleanly"
+  '(1 no-error) (list rt-fires (err->symbol rt-err)))
+
+(uv-loop-teardown! rt-loop)
+
+(test-equal "the vectored-write round-trip loop tore down cleanly"
+  registry-count-at-start (registry-count))
+
 ;; --- balance -------------------------------------------------------------
 (collect)
 
