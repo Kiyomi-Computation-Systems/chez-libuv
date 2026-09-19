@@ -6,7 +6,7 @@
           uv-tcp-bind! uv-tcp-getsockname-port
           uv-tcp-sockname-address uv-tcp-peer-address
           uv-listen! uv-accept! uv-tcp-connect!
-          uv-tcp-nodelay!
+          uv-tcp-nodelay! uv-tcp-keepalive!
           ;; stream operations
           uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -37,18 +37,49 @@
         (count-tcp-new!)
         tcp)))
 
+  ;; bind-flags->bits : (listof symbol) symbol -> exact-integer
+  ;; Fold a bind-flag list into the unsigned bitmask uv_tcp_bind's third
+  ;; argument takes. 'reuseport is the only flag today; any other symbol is a
+  ;; named refusal. 'reuseport on a libuv without UV_TCP_REUSEPORT surfaces as
+  ;; &uv-constant-unavailable from uv-tcp-reuseport (see (libuv private
+  ;; constants)), never as a silent bind with the flag dropped.
+  (define (bind-flags->bits flags who)
+    (unless (list? flags)
+      (raise (make-uv-invalid-argument who 'flags-not-a-list)))
+    (fold-left
+     (lambda (bits flag)
+       (case flag
+         ((reuseport) (bitwise-ior bits (uv-tcp-reuseport)))
+         (else (raise (make-uv-invalid-argument who 'unknown-bind-flag)))))
+     0 flags))
+
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer -> unspecified
-  ;; The sockaddr is synchronous scratch and is freed on every exit path.
-  (define (uv-tcp-bind! tcp ip port)
+  ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer (listof symbol)
+  ;;               -> unspecified
+  ;; The optional flag list accepts '(reuseport) for SO_REUSEPORT load balancing
+  ;; across processes or loops. Flags are resolved to a bitmask BEFORE any
+  ;; allocation, so a malformed flag list (or one naming reuseport on a libuv
+  ;; that lacks it) leaves no scratch behind. The sockaddr is synchronous
+  ;; scratch and is freed on every exit path.
+  (define uv-tcp-bind!
+    (case-lambda
+      ((tcp ip port) (bind! tcp ip port '()))
+      ((tcp ip port flags) (bind! tcp ip port flags))))
+
+  (define (bind! tcp ip port flags)
     (require-open-tcp tcp 'uv-tcp-bind!)
     (require-address ip 'uv-tcp-bind!)
     (require-port port 'uv-tcp-bind!)
-    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-      (guard (e (#t (free! addr) (raise e)))
-        (fill-sockaddr! addr ip port 'uv-tcp-bind!)
-        (uv-check (uv-tcp-bind (handle-pointer tcp 'uv-tcp-bind!) addr 0)
-                  'uv-tcp-bind!))
-      (free! addr)))
+    ;; Resolve flags first, in its own let: a raise here (bad flag, or reuseport
+    ;; on a libuv without it) must happen before alloc-zeroed, or the scratch
+    ;; leaks -- the guard below covers only the allocated window.
+    (let ((flag-bits (bind-flags->bits flags 'uv-tcp-bind!)))
+      (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+        (guard (e (#t (free! addr) (raise e)))
+          (fill-sockaddr! addr ip port 'uv-tcp-bind!)
+          (uv-check (uv-tcp-bind (handle-pointer tcp 'uv-tcp-bind!) addr flag-bits)
+                    'uv-tcp-bind!))
+        (free! addr))))
 
   ;; uv-tcp-getsockname-port : uv-tcp -> exact-nonnegative-integer
   ;; Read the in/out length and the network-order port before freeing scratch.
@@ -165,4 +196,33 @@
       (raise (make-uv-invalid-argument 'uv-tcp-nodelay! 'enable-not-a-boolean)))
     (uv-check (uv-tcp-nodelay (handle-pointer tcp 'uv-tcp-nodelay!)
                               (if enable? 1 0))
-              'uv-tcp-nodelay!)))
+              'uv-tcp-nodelay!))
+
+  ;; uv-tcp-keepalive! : uv-tcp boolean -> unspecified
+  ;; uv-tcp-keepalive! : uv-tcp boolean exact-positive-integer -> unspecified
+  ;; TCP SO_KEEPALIVE. The idle delay is in whole seconds and is REQUIRED when
+  ;; enabling: uv_tcp_keepalive answers UV_EINVAL for idle < 1 once the socket
+  ;; has an fd, but returns 0 for that same call on a not-yet-connected handle
+  ;; (unix/tcp.c) -- so the delay is pinned to one contract here rather than
+  ;; left to depend on whether the fd exists yet. Disabling ignores the delay,
+  ;; exactly as libuv does. Require a boolean for the same reason as nodelay.
+  (define uv-tcp-keepalive!
+    (case-lambda
+      ((tcp enable?)
+       (require-open-tcp tcp 'uv-tcp-keepalive!)
+       (unless (boolean? enable?)
+         (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'enable-not-a-boolean)))
+       (when enable?
+         (raise (make-uv-invalid-argument 'uv-tcp-keepalive!
+                                          'delay-required-when-enabling)))
+       (uv-check (uv-tcp-keepalive (handle-pointer tcp 'uv-tcp-keepalive!) 0 0)
+                 'uv-tcp-keepalive!))
+      ((tcp enable? delay)
+       (require-open-tcp tcp 'uv-tcp-keepalive!)
+       (unless (boolean? enable?)
+         (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'enable-not-a-boolean)))
+       (unless (and (integer? delay) (exact? delay) (positive? delay))
+         (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'delay-out-of-range)))
+       (uv-check (uv-tcp-keepalive (handle-pointer tcp 'uv-tcp-keepalive!)
+                                   (if enable? 1 0) delay)
+                 'uv-tcp-keepalive!)))))

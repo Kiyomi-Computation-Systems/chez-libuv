@@ -37,7 +37,7 @@
 
           ;; TCP and streams
           uv-tcp-init uv-tcp-bind uv-tcp-getsockname uv-tcp-getpeername-native
-          uv-tcp-nodelay
+          uv-tcp-nodelay uv-tcp-keepalive
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop
@@ -279,6 +279,9 @@
     (foreign-procedure "uv_tcp_getpeername" (uptr uptr uptr) int))
   (define uv-tcp-nodelay
     (foreign-procedure "uv_tcp_nodelay" (uptr int) int))
+  ;; idle delay is an unsigned seconds count; libuv ignores it when on is 0.
+  (define uv-tcp-keepalive
+    (foreign-procedure "uv_tcp_keepalive" (uptr int unsigned-int) int))
   (define uv-accept
     (foreign-procedure "uv_accept" (uptr uptr) int))
   (define uv-ip4-addr

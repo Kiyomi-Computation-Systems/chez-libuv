@@ -42,13 +42,14 @@ libraries exist for narrower imports.
 | Export | |
 |---|---|
 | `make-uv-tcp` | A new TCP handle on a loop |
-| `uv-tcp-bind!` | Bind to an address and port; IPv4 or IPv6 literal |
+| `uv-tcp-bind!` | Bind to an address and port; IPv4 or IPv6 literal. Optional flag list: `'(reuseport)` binds with `SO_REUSEPORT` load balancing (libuv ≥ 1.49; the kernel distributes connections across sockets sharing the port). On a libuv without the flag it raises `&uv-constant-unavailable`; on a platform whose libuv lacks TCP reuseport (e.g. macOS) libuv answers an errno |
 | `uv-tcp-getsockname-port` | The real port the kernel chose, for a bind to port 0 |
 | `uv-tcp-sockname-address` | This end's own address and port, as `(values address-string-or-#f port)`. Unlike the peer side it needs no connection — a bound handle has a local name |
 | `uv-listen!` | Listen; `on-connection` is called with the error or `#f` |
 | `uv-accept!` | A new open handle for the queued connection |
 | `uv-tcp-connect!` | Connect; answers the in-flight request record |
 | `uv-tcp-nodelay!` | `TCP_NODELAY`. Takes a boolean, not an int |
+| `uv-tcp-keepalive!` | `SO_KEEPALIVE`. `(tcp #f)` disables; `(tcp #t idle-seconds)` enables — the idle delay is in whole seconds and is required (and must be positive) when enabling. `uv_tcp_keepalive` |
 | `uv-tcp-peer-address` | `(values address-string-or-#f port)` for the remote end. `uv_tcp_getpeername` |
 
 `uv-write!`, `uv-shutdown!`, `uv-read-start!` and `uv-read-stop!` moved to

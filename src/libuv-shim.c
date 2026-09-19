@@ -140,6 +140,17 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIGCONT", SIGCONT },
   { "SIGSTOP", SIGSTOP },
   { "UV_SIGNAL", UV_SIGNAL },
+
+  /* Version-gated bind flag. UV_TCP_REUSEPORT (TCP SO_REUSEPORT with load
+   * balancing) is an enum constant, so it is invisible to #ifdef; it is guarded
+   * by libuv's version instead, which arrived in 1.49.0 (UV_VERSION_HEX
+   * 0x013100). Below that the name is simply absent from this table and
+   * chez_uv_constant returns 0 for it, which surfaces in Scheme as
+   * &uv-constant-unavailable at the point of use (ADR-0005) -- a named refusal,
+   * never a silent bind with the flag dropped. */
+#if UV_VERSION_HEX >= 0x013100
+  { "UV_TCP_REUSEPORT", UV_TCP_REUSEPORT },
+#endif
 };
 
 #define CHEZ_UV_CONSTANT_COUNT \

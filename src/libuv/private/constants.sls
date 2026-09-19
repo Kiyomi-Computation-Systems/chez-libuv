@@ -26,6 +26,7 @@
 
           sock-stream sock-dgram sock-raw
           ipproto-tcp ipproto-udp
+          uv-tcp-reuseport
           ai-passive ai-canonname ai-numerichost ai-numericserv
           ni-numerichost ni-numericserv ni-namereqd ni-dgram
 
@@ -265,6 +266,15 @@
 
   (define (ipproto-tcp) (snapshot-ref 'IPPROTO_TCP))
   (define (ipproto-udp) (snapshot-ref 'IPPROTO_UDP))
+
+  ;; uv-tcp-reuseport : -> exact-integer
+  ;; The UV_TCP_REUSEPORT bind flag. Looked up LAZILY via constant-ref rather
+  ;; than the eager snapshot, and deliberately absent from snapshot-names: a
+  ;; libuv older than 1.49.0 supports the rest of this binding but lacks the
+  ;; flag, and putting it in the snapshot would fail the whole init there. This
+  ;; way that libuv works normally and only a caller who actually asks for
+  ;; reuseport gets &uv-constant-unavailable naming UV_TCP_REUSEPORT.
+  (define (uv-tcp-reuseport) (constant-ref 'UV_TCP_REUSEPORT))
 
   (define (ai-passive)     (snapshot-ref 'AI_PASSIVE))
   (define (ai-canonname)   (snapshot-ref 'AI_CANONNAME))

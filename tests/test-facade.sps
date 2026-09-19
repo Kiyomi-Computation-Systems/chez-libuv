@@ -439,6 +439,15 @@
   (list "127.0.0.1" fport)
   (let-values (((a p) (uv-tcp-peer-address fclient))) (list a p)))
 
+;; uv-tcp-keepalive! reached through the facade: enabling with an idle delay on
+;; the still-connected client exercises the re-export end to end (the fd path,
+;; where a bad delay would surface as an errno) rather than a bare mention.
+(test-equal "the facade's uv-tcp-keepalive! enables on the connected client"
+  'set
+  (guard (e (#t (list 'raised (facade-err->symbol e))))
+    (uv-tcp-keepalive! fclient #t 60)
+    'set))
+
 ;; uv-write*! reached through the facade IS the real validating stream verb:
 ;; on the still-open client it refuses an empty segment list with its own
 ;; named reason (libuv needs nbufs >= 1) before touching libuv, so this proves
