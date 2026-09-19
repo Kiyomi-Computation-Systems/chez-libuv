@@ -24,7 +24,7 @@
           uv-tcp-bind! uv-tcp-getsockname-port
           uv-tcp-sockname-address uv-tcp-peer-address
           uv-listen! uv-accept! uv-tcp-connect!
-          uv-write! uv-write*! uv-shutdown! uv-tcp-nodelay!
+          uv-write! uv-write*! uv-shutdown! uv-tcp-nodelay! uv-tcp-keepalive!
           uv-read-start! uv-read-stop!
           uv-stream-write-queue-size
 

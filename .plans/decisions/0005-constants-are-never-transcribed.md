@@ -62,3 +62,17 @@ by name, not merely "some test somewhere."
 - Every constant lookup costs one FFI round trip at init time rather than
   zero at compile time — accepted, since it happens once, behind
   `ensure-native-loaded!`, not on any hot path.
+
+> **Extended 2026-09-19 (issue #21).** The same table also carries
+> *version-gated* constants that a supported libuv may legitimately lack.
+> `UV_TCP_REUSEPORT` (TCP `SO_REUSEPORT`, libuv ≥ 1.49.0) is the first: its
+> shim-table entry is guarded by `#if UV_VERSION_HEX >= 0x013100` — it is an
+> enum value, invisible to `#ifdef`, so a version guard is the only compile-time
+> gate — and, crucially, it is looked up through the **lazy** `constant-ref`
+> path (`uv-tcp-reuseport`), NOT added to `snapshot-names`. A snapshot entry
+> would fail the whole `constants-init!` on an older libuv, breaking a binding
+> that otherwise works; the lazy path instead raises `&uv-constant-unavailable`
+> naming `UV_TCP_REUSEPORT` only for a caller who actually asks for the flag.
+> This is the same structured-failure discipline as above, applied at the point
+> of use rather than at init — the pattern for any future optional/gated
+> constant.

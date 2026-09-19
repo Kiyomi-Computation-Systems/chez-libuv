@@ -2199,6 +2199,178 @@
 (test-equal "the vectored-write round-trip loop tore down cleanly"
   registry-count-at-start (registry-count))
 
+;; --- TCP KEEPALIVE (uv-tcp-keepalive!) -----------------------------------
+;; Self-contained loop, torn down at the end, so the balance rows below are
+;; untouched (the vectored-write section above is the pattern). Two rows drive
+;; the fd path on a CONNECTED loopback handle -- enabling with a positive idle
+;; and disabling both succeed there. libuv would answer UV_EINVAL for idle < 1
+;; on that live fd but return 0 for the same call on a not-yet-connected handle
+;; (unix/tcp.c), so the delay is pinned to ONE contract at the boundary --
+;; required and positive when enabling -- rather than left to the fd's state.
+;; The gating rows need no connection: a fresh open handle passes the kind gate
+;; and the argument is refused before libuv is called.
+(define ka-loop (make-uv-loop))
+(define ka-server (make-uv-tcp ka-loop))
+(define ka-port (bind-loopback! ka-server))
+(define ka-peer 'never-accepted)
+
+(uv-listen! ka-server 128
+            (lambda (err)
+              (collect)
+              (when (and (not err) (eq? ka-peer 'never-accepted))
+                (set! ka-peer (uv-accept! ka-server)))))
+
+(define ka-client (make-uv-tcp ka-loop))
+(define ka-connect-err 'connect-cb-never-fired)
+(connect-loopback! ka-client ka-port
+                   (lambda (err) (collect) (set! ka-connect-err err)))
+
+(run-until/ticking ka-loop
+                   (lambda () (and (not (eq? ka-peer 'never-accepted))
+                                   (not (eq? ka-connect-err 'connect-cb-never-fired))))
+                   4000)
+
+(test-equal "uv-tcp-keepalive! enables on a connected handle with an idle delay"
+  'set
+  (guard (e (#t (list 'raised (err->symbol e))))
+    (uv-tcp-keepalive! ka-client #t 1)
+    'set))
+
+(test-equal "uv-tcp-keepalive! disables on a connected handle"
+  'set
+  (guard (e (#t (list 'raised (err->symbol e))))
+    (uv-tcp-keepalive! ka-client #f)
+    'set))
+
+;; A fresh open tcp handle: the kind and open gates pass, so each row below is
+;; the argument check firing before any native call.
+(define ka-fresh (make-uv-tcp ka-loop))
+
+(test-equal "uv-tcp-keepalive! rejects a non-boolean enable, naming who and why"
+  '(uv-tcp-keepalive! enable-not-a-boolean)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-keepalive! ka-fresh 'yes 1)
+    'no-raise))
+
+(test-equal "uv-tcp-keepalive! requires a delay when enabling, naming who and why"
+  '(uv-tcp-keepalive! delay-required-when-enabling)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-keepalive! ka-fresh #t)
+    'no-raise))
+
+(test-equal "uv-tcp-keepalive! rejects a zero idle delay when enabling"
+  '(uv-tcp-keepalive! delay-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-keepalive! ka-fresh #t 0)
+    'no-raise))
+
+(test-equal "uv-tcp-keepalive! rejects a negative idle delay when enabling"
+  '(uv-tcp-keepalive! delay-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-keepalive! ka-fresh #t -5)
+    'no-raise))
+
+(test-equal "uv-tcp-keepalive! refuses a handle of another kind, naming who and why"
+  '(uv-tcp-keepalive! not-a-uv-tcp)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-keepalive! (make-uv-timer ka-loop) #t 1)
+    'no-raise))
+
+(uv-loop-teardown! ka-loop)
+
+(test-equal "the keepalive loop tore down cleanly"
+  registry-count-at-start (registry-count))
+
+;; --- REUSEPORT BIND FLAG (uv-tcp-bind! ... '(reuseport)) -----------------
+;; The flag is threaded to uv_tcp_bind and libuv decides by PLATFORM: TCP
+;; SO_REUSEPORT load balancing exists on Linux 3.9+, the *BSDs, Solaris 11.4
+;; and AIX 7.2.5+, but NOT macOS -- there libuv answers UV_ENOTSUP for the
+;; same call (uv.h's uv_tcp_flags comment). So the outcome is BRANCH-PAIRED,
+;; the shape design spec v0.2 S9 prescribes (cf. the getnameinfo cancel row):
+;;   supported => the flagged bind SUCCEEDS and a SECOND handle binds the SAME
+;;                port, the thing only a real reuseport bind allows;
+;;   unsupported => the flagged bind is refused with an errno, which is itself
+;;                proof the flag reached libuv (a plain bind of the same params
+;;                succeeds -- recorded informationally below).
+;; A dropped flag would bind plainly and read 'bound on every platform, so the
+;; same-port duplicate is what makes the supported branch mean "the flag did
+;; something". On the vendored libuv (>= 1.49.0, Linux CI) that branch runs;
+;; on an older SYSTEM libuv this binding otherwise supports, uv-tcp-reuseport
+;; raises &uv-constant-unavailable at the point of use instead (ADR-0005, the
+;; lazy constant-ref path -- pinned by test-native's bogus-name row, not
+;; reachable here). Flags resolve to a bitmask before any allocation, so the
+;; two malformed-flags rows leave nothing behind.
+(define rp-loop (make-uv-loop))
+(define rp-a (make-uv-tcp rp-loop))
+
+(define rp-flagged-bind
+  (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+            (#t (list 'wrong-condition e)))
+    (uv-tcp-bind! rp-a "127.0.0.1" 0 '(reuseport))
+    'bound))
+
+;; Only meaningful on a supporting platform; 'platform-unsupported keeps the
+;; paired assertion's count stable across platforms either way.
+(define rp-second-same-port
+  (if (eq? rp-flagged-bind 'bound)
+      (let ((rp-port (uv-tcp-getsockname-port rp-a)))
+        (guard (e (#t (list 'raised (err->symbol e))))
+          (uv-tcp-bind! (make-uv-tcp rp-loop) "127.0.0.1" rp-port '(reuseport))
+          'bound))
+      'platform-unsupported))
+
+(test-equal "uv-tcp-bind! threads '(reuseport): same-port duplicate where supported, else an errno"
+  'paired-outcome
+  (cond ((and (eq? rp-flagged-bind 'bound) (eq? rp-second-same-port 'bound))
+         'paired-outcome)
+        ((and (symbol? rp-flagged-bind)
+              (not (eq? rp-flagged-bind 'bound))
+              (eq? rp-second-same-port 'platform-unsupported))
+         'paired-outcome)
+        (else (list 'unpaired rp-flagged-bind rp-second-same-port))))
+
+(test-assert "[informational] reuseport flagged-bind outcome recorded"
+  (begin (display "  [informational] uv-tcp-bind! '(reuseport) => ")
+         (display rp-flagged-bind)
+         (when (not (eq? rp-flagged-bind 'bound))
+           (display "; plain bind => ")
+           (display (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+                             (#t 'wrong-condition))
+                      (uv-tcp-bind! (make-uv-tcp rp-loop) "127.0.0.1" 0)
+                      'bound)))
+         (newline) #t))
+
+(test-equal "uv-tcp-bind! rejects an unknown bind flag, naming who and why"
+  '(uv-tcp-bind! unknown-bind-flag)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-bind! (make-uv-tcp rp-loop) "127.0.0.1" 0 '(no-such-flag))
+    'no-raise))
+
+(test-equal "uv-tcp-bind! rejects a non-list flags argument, naming who and why"
+  '(uv-tcp-bind! flags-not-a-list)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-tcp-bind! (make-uv-tcp rp-loop) "127.0.0.1" 0 'reuseport)
+    'no-raise))
+
+(uv-loop-teardown! rp-loop)
+
+(test-equal "the reuseport loop tore down cleanly"
+  registry-count-at-start (registry-count))
+
 ;; --- balance -------------------------------------------------------------
 (collect)
 
