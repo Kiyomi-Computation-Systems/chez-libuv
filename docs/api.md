@@ -58,12 +58,13 @@ unchanged, so existing importers compile without touching an import line.
 ## Streams — `(libuv stream)`
 
 Extracted from `(libuv tcp)` in v0.3 (design spec §4.6) so the gating
-predicate is stream-*kind*, not tcp-kind: these four verbs accept any open
-tcp or pipe handle.
+predicate is stream-*kind*, not tcp-kind: these verbs accept any open tcp or
+pipe handle.
 
 | Export | |
 |---|---|
 | `uv-write!` | Write a bytevector or a span of one. The payload is copied |
+| `uv-write*!` | Vectored write: one request over a list of segments, each a bytevector or a `(bv start end)` span. All segments are copied into one block and sent as `uv_write` with `nbufs = N`. One completion for the whole write. The list must be non-empty |
 | `uv-shutdown!` | Shut the write side down; the read side stays open |
 | `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required |
 | `uv-read-stop!` | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
@@ -195,7 +196,9 @@ therefore *raises* rather than succeeding as a no-op. Guard it:
 sized for its request plus its payload — a **zero-length write allocates a
 full request block while contributing zero payload bytes** — so payload
 bytes alone are not a memory bound and request count alone is not either.
-A consumer that wants a deterministic bound tracks both:
+A `uv-write*!` is the same for accounting: **one** request block and one
+completion, whose payload is the sum of its segments' spans. A consumer
+that wants a deterministic bound tracks both:
 
 - **outstanding payload bytes**, and
 - **outstanding request count**,

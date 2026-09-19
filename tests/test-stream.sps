@@ -1,6 +1,6 @@
 #!r6rs
 ;;; SRFI-64 suite for (libuv stream) -- THE SPEC §9.3's gating matrix: the
-;;; four stream verbs (uv-write!, uv-shutdown!, uv-read-start!,
+;;; five stream verbs (uv-write!, uv-write*!, uv-shutdown!, uv-read-start!,
 ;;; uv-read-stop!) accept any STREAM handle -- tcp or pipe -- refuse a
 ;;; non-stream kind with 'not-a-uv-stream, and refuse a closed stream with
 ;;; &uv-handle-closed carrying ITS kind. tcp's own write/read/shutdown
@@ -52,6 +52,8 @@
 
 (test-assert "uv-write! refuses a timer"
   (refuses-timer? (lambda () (uv-write! timer (make-bytevector 1 0) nop))))
+(test-assert "uv-write*! refuses a timer"
+  (refuses-timer? (lambda () (uv-write*! timer (list (make-bytevector 1 0)) nop))))
 (test-assert "uv-shutdown! refuses a timer"
   (refuses-timer? (lambda () (uv-shutdown! timer nop))))
 (test-assert "uv-read-start! refuses a timer"
@@ -83,6 +85,10 @@
   (guard (e (#t (and (uv-handle-closed? e)
                      (eq? 'pipe (uv-handle-closed-kind e)))))
     (uv-write! pipe (make-bytevector 1 0) nop) #f))
+(test-assert "uv-write*! on a closed pipe raises &uv-handle-closed kind 'pipe"
+  (guard (e (#t (and (uv-handle-closed? e)
+                     (eq? 'pipe (uv-handle-closed-kind e)))))
+    (uv-write*! pipe (list (make-bytevector 1 0)) nop) #f))
 
 ;; --- tcp still works through the re-export (regression canary) ----------
 (test-assert "uv-write! still accepts an open tcp (kind gate only -- EBADF-class errno is fine)"
@@ -96,6 +102,10 @@
   (guard (e (#t (and (uv-invalid-argument? e)
                      (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
     (uv-write! proc (make-bytevector 1 0) (lambda (err) #f)) #f))
+(test-assert "uv-write*! refuses a process handle"
+  (guard (e (#t (and (uv-invalid-argument? e)
+                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+    (uv-write*! proc (list (make-bytevector 1 0)) (lambda (err) #f)) #f))
 (uv-loop-teardown! loop2)
 
 ;; --- a CLOSED handle of the WRONG kind (Task 7's mutation probe 2 forward
@@ -110,6 +120,10 @@
   (guard (e (#t (and (uv-invalid-argument? e)
                      (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
     (uv-write! timer (make-bytevector 1 0) nop) #f))
+(test-assert "uv-write*! on a CLOSED timer raises 'not-a-uv-stream, not &uv-handle-closed"
+  (guard (e (#t (and (uv-invalid-argument? e)
+                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+    (uv-write*! timer (list (make-bytevector 1 0)) nop) #f))
 
 (uv-loop-teardown! loop)
 (collect)

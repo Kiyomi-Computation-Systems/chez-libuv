@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -96,6 +96,23 @@ Vectored (scatter-gather) writes are deferred: under a copying design,
 multiple source buffers are equivalent to one concatenated copy, so there is
 no correctness reason to support them yet. The name `uv-write*!` is reserved
 for that API when it is added.
+
+> **Realized 2026-09-19 (issue #18).** The reserved name now exists.
+> `uv-write*!` (`src/libuv/stream.sls`) copies its N segments into one request
+> block laid out `[ req | uv_buf_t[N] | payloads ]` and issues `uv_write` with
+> `nbufs = N` — `uv-write-native` already threaded the count
+> (`src/libuv/private/native.sls`), and `uv-write!` is the caller that pins it
+> at 1. This ADR's own reasoning is why the addition is cheap: under a copying
+> design a vectored write is still *one* owned block, so the completion and
+> the free-**before**-`on-complete` discipline are `uv-write!`'s unchanged, and
+> both this ADR's amended free order and ADR-0018's submit-immediately rule
+> hold verbatim for the new verb. A segment is a whole bytevector or an
+> explicit `(bv start end)` span; libuv refuses `nbufs < 1`
+> (`vendor/libuv/src/unix/stream.c:1309`), so an empty segment list is refused
+> at the boundary with a named reason rather than forwarded as a platform
+> `EINVAL`. The driving consumer is the chez-http-server response path (status
+> line + headers + body chunks in one write) the deferral paragraph above
+> anticipated.
 
 ## Consequences
 

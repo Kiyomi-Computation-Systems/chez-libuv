@@ -2,7 +2,7 @@
 ;;; Stream operations shared by TCP and pipe handles. Validate arguments before
 ;;; allocation; native start failures must leave no registered request behind.
 (library (libuv stream)
-  (export uv-write! uv-shutdown! uv-read-start! uv-read-stop!
+  (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
   (import (rnrs)
           (libuv private conditions)
@@ -57,6 +57,75 @@
                                         1)
                        'uv-write!))
            req)))))
+
+  ;; parse-write-segment : segment -> (list bytevector start len)
+  ;; A whole bytevector is the span [0, len); an explicit (bv start end) span
+  ;; is range-checked exactly as uv-write! checks its own. Anything else is a
+  ;; malformed segment, named before the caller's list is copied anywhere.
+  (define (parse-write-segment seg)
+    (cond
+      ((bytevector? seg) (list seg 0 (bytevector-length seg)))
+      ((and (list? seg) (= 3 (length seg)) (bytevector? (car seg)))
+       (let ((bv (car seg)) (start (cadr seg)) (end (caddr seg)))
+         (unless (and (integer? start) (exact? start)
+                      (integer? end) (exact? end)
+                      (<= 0 start) (<= start end)
+                      (<= end (bytevector-length bv)))
+           (raise (make-uv-invalid-argument 'uv-write*! 'segment-span-out-of-range)))
+         (list bv start (- end start))))
+      (else
+       (raise (make-uv-invalid-argument 'uv-write*! 'segment-not-a-bytevector)))))
+
+  ;; uv-write*! : uv-stream (listof segment) procedure -> uv-request
+  ;;   segment = bytevector | (bytevector start end)
+  ;; The scatter-gather write ADR-0009 reserved this name for. Each segment's
+  ;; [start, end) span is copied into request-owned foreign memory; one block
+  ;; holds the N copied spans and an N-entry uv_buf_t[], and uv_write is issued
+  ;; with nbufs = N. Completion and the free-before-on-complete discipline are
+  ;; uv-write!'s, unchanged: the block is freed as a unit by the shared
+  ;; write-done dispatcher. libuv rejects nbufs < 1, so an empty segment list
+  ;; is refused here rather than forwarded as a platform EINVAL.
+  (define (uv-write*! stream segments on-complete)
+    (require-open-stream stream 'uv-write*!)
+    (require-callback on-complete 'uv-write*! 'on-complete-not-a-procedure)
+    (unless (list? segments)
+      (raise (make-uv-invalid-argument 'uv-write*! 'segments-not-a-list)))
+    (when (null? segments)
+      (raise (make-uv-invalid-argument 'uv-write*! 'empty-segment-list)))
+    ;; Normalize and range-check every segment before anything is allocated, so
+    ;; a malformed list leaves no block and no registration behind.
+    (let* ((specs (map parse-write-segment segments))
+           (n (length specs))
+           (total (fold-left (lambda (acc s) (+ acc (caddr s))) 0 specs))
+           (bufs-offset (align-16 (uv-req-size (uv-write-req-type))))
+           (payload-offset (+ bufs-offset (* n (sizeof-uv-buf-t))))
+           ;; (max total 1) keeps the payload region addressable even when every
+           ;; span is empty, so no uv_buf_t base is ever a null or dangling one.
+           (block (alloc-zeroed (+ payload-offset (max total 1))))
+           (payload-base (+ block payload-offset)))
+      ;; Pack non-empty spans consecutively from the region start; point every
+      ;; empty span's base at that same start (always valid, region >= 1) so no
+      ;; base lands one-past-the-end of the block.
+      (let place ((specs specs) (i 0) (running 0))
+        (when (pair? specs)
+          (let* ((spec (car specs))
+                 (bv (car spec)) (start (cadr spec)) (len (caddr spec))
+                 (buf (+ block bufs-offset (* i (sizeof-uv-buf-t))))
+                 (base (if (zero? len) payload-base (+ payload-base running))))
+            (when (positive? len) (copy-in! base bv start len))
+            (uv-buf-set! buf base len)
+            (place (cdr specs) (+ i 1) (+ running len)))))
+      (let ((req (%make-uv-req-record block 'write stream on-complete)))
+        (registry-register! block 'write-req (handle-loop stream) req)
+        (count-write-req-new!)
+        (guard (e (#t (abandon-request! req) (count-write-req-free!)
+                      (raise e)))
+          (uv-check (uv-write-native block
+                                     (handle-pointer stream 'uv-write*!)
+                                     (+ block bufs-offset)
+                                     n)
+                    'uv-write*!))
+        req)))
 
   ;; uv-shutdown! : uv-stream procedure -> uv-request
   (define (uv-shutdown! stream on-shutdown)
