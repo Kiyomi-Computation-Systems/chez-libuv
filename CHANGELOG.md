@@ -3,6 +3,84 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.6.0 — 2026-09-19
+
+Threading, and the TCP surfaces v0.5's review left open. A loop thread can now
+block in `uv-run` without freezing garbage collection for every other Scheme
+thread, and a worker thread has one thread-safe way to hand work back to the
+loop thread — the minimum that makes a second Scheme thread usable alongside a
+libuv loop. The rule that a loop and its handles belong to one thread is now
+**enforced**, not merely documented. Alongside: vectored writes, TCP keepalive
+and a reuseport bind flag, and the local-address accessor that mirrors the peer
+side. A single-threaded program is unchanged beyond the released collect
+interlock. The threading design is
+`.plans/2026-09-19-chez-libuv-threading-design.md`
+([ADR-0019](.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)).
+
+### Added
+
+- `(libuv async)`: `make-uv-async` and `uv-async-send!` — libuv's one
+  cross-thread wakeup. `make-uv-async` creates a `uv_async` handle on its loop's
+  owning thread; `uv-async-send!` is callable from **any** thread
+  (`uv_async_send` is libuv's sole thread-safe call) and is the one verb exempt
+  from the affinity check below. Sends coalesce — N sends may yield a single
+  wake — so the wake callback should drain a caller-side queue rather than
+  assume one item per send. `uv-async?` and the handle join the registry, the
+  teardown sweep, and the allocation counters like every other handle;
+  `uv_async_cb` is the fourteenth locked `__collect_safe` trampoline
+  ([ADR-0008](.plans/decisions/0008-static-trampolines-and-handle-registry.md)).
+  Re-exported from `(libuv)`.
+- `&uv-wrong-thread` (subtype of `&uv-error`; fields `who`, `expected` owner
+  thread id, `actual` caller thread id), raised when a handle verb runs off its
+  loop's owning thread. Re-exported from `(libuv)`.
+- `(libuv tcp)`: `uv-write*!`, vectored (scatter-gather) writes — N segments,
+  each a bytevector or an explicit `(bv start end)` span, copied into one
+  request block and issued as a single `uv_write` with `nbufs = N`. The name
+  [ADR-0009](.plans/decisions/0009-copy-at-the-boundary.md) reserved; one owned
+  block, so the completion and submit-immediately discipline are `uv-write!`'s
+  unchanged.
+- `(libuv tcp)`: `uv-tcp-keepalive!` (wraps `uv_tcp_keepalive`; `(tcp #f)`
+  disables, `(tcp #t idle-seconds)` enables with a required positive
+  whole-second delay), and an optional flag list on `uv-tcp-bind!` —
+  `'(reuseport)` for `SO_REUSEPORT` load balancing. `UV_TCP_REUSEPORT` arrived
+  in libuv 1.49.0 and is looked up lazily
+  ([ADR-0005](.plans/decisions/0005-constants-are-never-transcribed.md)
+  extended), so an older libuv works normally and raises
+  `&uv-constant-unavailable` only for a caller that actually requests the flag,
+  and only on a platform where libuv supports it (Linux/BSD, not macOS).
+- `(libuv tcp)`: `uv-tcp-sockname-address` → `(values address-string-or-#f
+  port)`, the local-end mirror of `uv-tcp-peer-address`, closing a deferral open
+  since v0.2 ([ADR-0012](.plans/decisions/0012-address-vocabulary.md) amended).
+- [ADR-0019](.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md):
+  the threading model. ADR-0008 gains the fourteenth-trampoline and
+  `__collect_safe` amendments; ADR-0010 a threaded-test companion.
+- `make test-memory-docker` — the Linux Valgrind leak gate
+  ([ADR-0003](.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md))
+  runnable from a macOS box — and `make test-threading`, the threaded stress
+  tier kept off the default gate (ADR-0010 companion; forks OS threads, is
+  timing-dependent).
+
+### Changed
+
+- `uv_run` is now `__collect_safe`: a thread blocked in it is deactivated for
+  the poll, so it no longer holds Chez's collect interlock and other Scheme
+  threads collect freely. Twelve of the thirteen trampolines it can invoke carry
+  the attribute; `walk` alone stays plain (it fires only from the synchronous
+  `uv_walk`). A single-threaded program is unaffected beyond the released
+  interlock; the cost is ~60 ns per callback.
+- A libuv loop and its handles are enforced loop-thread-only: every operational
+  handle verb asserts it runs on the loop's owning thread and raises
+  `&uv-wrong-thread` otherwise, at one central site before any registry
+  mutation. The owner is set at `make-uv-loop` and transferred to the caller at
+  `uv-run` entry, so a loop may be created on one thread and handed to a
+  dedicated loop thread (the worker-pool pattern). Cross-thread use previously
+  corrupted the process-global registry silently; it is now a named refusal.
+  `uv-async-send!` is the one exemption.
+- CI drops the macOS job — LeakSanitizer is unavailable there and macOS is
+  covered by the local `make test` / `make test-memory` — and each test suite is
+  now capped individually, so a hang is reported as `HUNG` rather than
+  mislabelled a failing assertion.
+
 ## 0.5.0 — 2026-08-30
 
 Flow control: three per-connection memory surfaces made visible and
