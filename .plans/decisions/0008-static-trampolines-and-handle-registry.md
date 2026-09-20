@@ -95,6 +95,24 @@ process initialization, and never unlocked, for the life of the process.
 > tests/test-native.sps) widen to the thirteen-name literal, watched to fail
 > first; the RED evidence lands in the v0.4 stage mutation log.
 
+> **Amendment (2026-09-19, issue #19): the `__collect_safe` attribute.**
+> `uv_run` is rebound `__collect_safe` so a loop thread blocked in it is
+> deactivated and does not freeze GC for other Scheme threads (spike/threading/
+> T1/T2, `2026-09-19-chez-libuv-threading-design.md`). CSUG §4.3/4.8 makes this
+> all-or-nothing for the callables `uv_run` can invoke: **twelve** of the
+> thirteen trampolines carry `__collect_safe` — alloc, read, connection,
+> write-done, close, timer, shutdown, connect, getaddrinfo, getnameinfo, exit,
+> signal. **`walk` alone stays plain**, because it fires only from `uv_walk`
+> (`raw-walk`, a synchronous plain foreign call on an active thread), never from
+> `uv_run` — and the rule is "if and only if": a collect-safe callable entered
+> from an active thread is a mismatch. This does not change the trampoline set,
+> the count, `lock-object`, or the store-and-reraise policy — verified by the
+> whole suite (incl. test-lifecycle's raise-in-callback rows) staying green and
+> the Linux Valgrind gate reading 0 errors after the conversion. The single-
+> thread cost is ~60 ns/callback for the reactivate/deactivate pair
+> (chez-http-server E5f). The threaded property this buys is guarded by the
+> off-the-default-gate `tests/test-threading-stress.sps` (`make test-threading`).
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never
