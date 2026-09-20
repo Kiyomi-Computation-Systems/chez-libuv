@@ -27,7 +27,10 @@
           uv-invalid-argument-who uv-invalid-argument-reason
 
           &uv-callback-error make-uv-callback-error uv-callback-error?
-          uv-callback-error-cause)
+          uv-callback-error-cause
+
+          &uv-wrong-thread make-uv-wrong-thread uv-wrong-thread?
+          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual)
   (import (rnrs))
 
   (define-condition-type &uv-error &error
@@ -73,4 +76,13 @@
   ;; &uv-callback-error field: object
   (define-condition-type &uv-callback-error &uv-error
     make-uv-callback-error uv-callback-error?
-    (cause uv-callback-error-cause)))
+    (cause uv-callback-error-cause))
+
+  ;; &uv-wrong-thread fields: symbol exact-integer exact-integer
+  ;; Raised when a loop/handle verb runs off the loop's owning thread (#20).
+  ;; who is the verb; expected is the owner thread id; actual is the caller's.
+  (define-condition-type &uv-wrong-thread &uv-error
+    make-uv-wrong-thread uv-wrong-thread?
+    (who      uv-wrong-thread-who)
+    (expected uv-wrong-thread-expected)
+    (actual   uv-wrong-thread-actual)))

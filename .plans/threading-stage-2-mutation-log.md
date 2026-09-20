@@ -35,3 +35,11 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
 - **Green:** `src/libuv-shim.c` adds `{ "UV_ASYNC", UV_ASYNC }`;
   `constants.sls` adds `UV_ASYNC` to `snapshot-names`, exports and defines
   `(uv-async-type)`. Rebuilt shim; test-native 260/260, exit 0.
+
+### B — `&uv-wrong-thread` condition (Task 2.2a)
+
+- **Red:** `test-conditions.sps` new section →
+  `Exception: attempt to reference unbound identifier make-uv-wrong-thread`.
+- **Green:** `conditions.sls` adds `&uv-wrong-thread` (subtype of `&uv-error`;
+  fields who/expected/actual) + exports. Pure suite: test-conditions 115/115,
+  exit 0 (purity preserved — no native import added).
