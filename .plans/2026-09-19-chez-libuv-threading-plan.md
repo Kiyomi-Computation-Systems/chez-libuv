@@ -29,7 +29,7 @@
 
 | File | Stage 1 (#19) | Stage 2 (#20) |
 |---|---|---|
-| `src/libuv/private/native.sls` | `uv_run` + 13 callables `__collect_safe` | `uv_async_init`/`send` bindings; 14th trampoline |
+| `src/libuv/private/native.sls` | `uv_run` + 12 callables `__collect_safe` (walk excluded) | `uv_async_init`/`send` bindings; 14th trampoline |
 | `src/libuv/private/constants.sls` | — | `UV_ASYNC`, `SIZEOF_UV_ASYNC_T` (snapshot) |
 | `src/libuv-shim.c` | — | `UV_ASYNC`, `sizeof(uv_async_t)` table entries |
 | `src/libuv/private/conditions.sls` | — | `&uv-wrong-thread` |
@@ -42,7 +42,13 @@
 
 ---
 
-# Stage 1 — #19 `__collect_safe`
+# Stage 1 — #19 `__collect_safe` — DONE (PR #25)
+
+Shipped: `uv_run` + the 12 `uv_run`-invoked trampolines `__collect_safe` (walk
+plain); `tests/test-threading-stress.sps` red→green off the default gate
+(`make test-threading`, `STRESS_TESTS`); store-and-reraise re-validated by
+test-lifecycle row 7; all 16 default suites green, ASan clean, Linux Valgrind
+0 errors; ADR-0008 amended. The task breakdown below is retained as the record.
 
 ### Task 1.0 — Branch
 `git checkout main && git pull --ff-only && git checkout -b feat/uv-run-collect-safe`.
@@ -62,7 +68,9 @@ in the **stress tier** (not the default gate).
 
 ### Task 1.2 — Green: the conversion
 - `native.sls`: `uv_run` → `(foreign-procedure __collect_safe "uv_run" (uptr int) int)`.
-- `native.sls:653–747`: add `__collect_safe` to all 13 `foreign-callable` forms.
+- `native.sls:653–747`: add `__collect_safe` to the 12 `foreign-callable` forms
+  `uv_run` invokes — every one except `walk`, which fires only from the
+  synchronous plain `uv_walk` (CSUG §4.3/4.8's "if and only if").
 - No wrapper change (loop.sls:50 stands).
 Run `make test`; every existing suite must stay green (the conversion is
 invisible single-threaded except for the released interlock).
@@ -146,7 +154,8 @@ surface, unblocks threaded consumers.
 
 ## Self-review checklist
 
-- [ ] `uv_run` and **all 13→14** trampolines `__collect_safe`; no plain/safe mix.
+- [ ] `uv_run` and the **12** trampolines it invokes `__collect_safe` (walk
+      excluded → 12, becomes 13-of-14 in Stage 2); no plain/safe mix at any call site.
 - [ ] Store-and-reraise oracle green pre- and post-conversion (escape unchanged).
 - [ ] Affinity check on one central site (`require-open-handle`); `uv-async-send!`
       is the only exempt verb, and the exemption is explicit and commented.

@@ -1,9 +1,11 @@
 # Design Spec: chez-libuv threading — `__collect_safe` (#19) → `uv_async` (#20)
 
 - **Status:** Draft (2026-09-19). Spike complete (`spike/threading/`); this
-  design is grounded in its measurements. The T2b/E5c ticker discrepancy is
-  **reconciled** (§5.3, chez-http-server E5d–E5f) — both measurements were
-  correct; the ticker is not a workaround and is withdrawn.
+  design is grounded in its measurements. **Stage 1 (#19) shipped in PR #25** —
+  `uv_run` + 12 trampolines `__collect_safe` (walk excluded; the draft's "all
+  13" is corrected throughout). The T2b/E5c ticker discrepancy is **reconciled**
+  (§5.3, chez-http-server E5d–E5f) — both measurements were correct; the ticker
+  is not a workaround and is withdrawn.
 - **Scope:** post-v0.5.0. Two issues, one arc: #19 (rebind `uv_run`
   `__collect_safe`) is the foundation; #20 (`uv_async` cross-thread wakeup +
   enforced per-loop thread affinity) builds on it.
@@ -35,11 +37,13 @@ the minimum that makes a second Scheme thread *usable* alongside a libuv loop.
 
 ## 2. Decisions summary
 
-1. **D1 — `uv_run` becomes `__collect_safe`, and so do all 13 trampolines.**
-   CSUG §4.3/4.8: a `__collect_safe` foreign procedure that can invoke callables
-   requires *each* callable to be `__collect_safe`. `uv_run` invokes every
-   trampoline, so the conversion is all-or-nothing. Spike T1 proves it is safe
-   single-threaded (§5.1).
+1. **D1 — `uv_run` becomes `__collect_safe`, and so do the 12 trampolines it
+   invokes.** CSUG §4.3/4.8: a `__collect_safe` foreign procedure that can invoke
+   callables requires *each* callable to be `__collect_safe`. `uv_run` invokes 12
+   of the 13 trampolines — every one except `walk` (which fires only from the
+   synchronous plain `uv_walk`) — so the conversion is all-or-nothing across
+   those 12. Spike T1 proves it is safe single-threaded (§5.1); shipped and
+   Valgrind-clean in PR #25.
 2. **D2 — the "arm a short-period timer" workaround is withdrawn, not shipped.**
    The T2b/E5c discrepancy is now understood (§5.3): the ticker opens GC windows
    only when each tick's Scheme path burns ~1000 Chez trap ticks, an accident of
@@ -64,7 +68,7 @@ the minimum that makes a second Scheme thread *usable* alongside a libuv loop.
 | Change | Files | Kind |
 |---|---|---|
 | `uv_run` `__collect_safe` | `native.sls` (the `uv_run` foreign-procedure) | 1 line, semantic |
-| 13 trampolines `__collect_safe` | `native.sls` (`foreign-callable` forms, native.sls:653–747) | mechanical, but changes every callback's execution context |
+| 12 trampolines `__collect_safe` (walk stays plain) | `native.sls` (`foreign-callable` forms, native.sls:653–747) | mechanical, but changes every callback's execution context |
 | per-loop owner + affinity check | `handles.sls` (loop record + `require-open-handle`), `loop.sls` (`uv-run` sets owner) | new invariant on every verb |
 | `&uv-wrong-thread` condition | `conditions.sls`, facade | additive |
 | `uv_async` binding + trampoline | `native.sls`, new `(libuv async)` module, facade | additive (14th type) |
@@ -105,30 +109,38 @@ registry until `uv_run` is collect-safe.
 
 - `native.sls`: `(define uv-loop-run (foreign-procedure __collect_safe "uv_run"
   (uptr int) int))`.
-- All 13 `foreign-callable` forms (native.sls:653–747) gain the `__collect_safe`
-  keyword: `alloc, read, connection, write-done, close, timer, connect,
-  shutdown, getaddrinfo, getnameinfo, exit, walk, signal`. A collect-safe
-  foreign call may only invoke collect-safe callables (T2b's mode-matched
-  callables were the spike's stand-in for this rule).
+- **12 of the 13** `foreign-callable` forms (native.sls:653–747) gain the
+  `__collect_safe` keyword: `alloc, read, connection, write-done, close, timer,
+  shutdown, connect, getaddrinfo, getnameinfo, exit, signal` — every callback
+  `uv_run` can invoke. A collect-safe foreign call may only invoke collect-safe
+  callables (T2b's mode-matched callables were the spike's stand-in for this).
+- **`walk` stays plain — this corrects the draft's "all 13".** CSUG §4.3/4.8 is
+  *if and only if*: `walk` fires only from `uv_walk` (`raw-walk`, a synchronous
+  plain foreign call on an *active* thread), never from `uv_run`, so making it
+  collect-safe would be entering a collect-safe callable from an active thread —
+  a mismatch. It converts if and only if `uv_walk` does, and `uv_walk` has no
+  reason to (it does not block). Verified: implemented as 12+plain, the whole
+  suite (incl. test-process's `uv_walk` path) stays green and the Linux Valgrind
+  gate reads 0 errors (PR #25).
 - The `uv-run` wrapper (loop.sls:50) is unchanged in shape; the `dynamic-wind`
-  that sets/clears `loop-running` still holds. `walk` fires synchronously inside
-  `uv_walk` (not from `uv_run`), but it converts too — the invariant is one
-  trampoline per callback type, and a collect-safe callable is safe to invoke
-  from either a collect-safe or an ordinary foreign call.
+  that sets/clears `loop-running` still holds.
 
-### 5.2 What T1 did NOT cover — implementation-stage obligations
+### 5.2 What T1 did NOT cover — now settled in PR #25
 
-- **Store-and-reraise under collect-safe.** ADR-0008's store-and-reraise policy
-  and the Q2 continuation-escape were measured *plain*. A `raise` from inside a
-  now-collect-safe trampoline, caught by the `guard` outside `uv_run`, must be
-  re-measured. The policy itself (store the condition, let `uv_run` return, re-
-  raise from Scheme) is expected to hold — it deliberately does *not* unwind
-  through C — but the reactivation boundary is new and gets a dedicated test.
-- **`(collect)` inside a collect-safe callback** worked in T1 (every fire). The
-  binding does not itself call `(collect)`; only tests/consumers do (design
-  spec S11). Keep that property under the Valgrind gate.
-- **The full 13-trampoline build under `make test-memory`.** The spike probes
-  are standalone FFI; the real conversion must pass the Linux Valgrind gate
+- **Store-and-reraise under collect-safe — SETTLED.** ADR-0008's policy and the
+  Q2 continuation-escape were measured *plain*. `test-lifecycle`'s row 7 (a
+  timer callback that `(collect)`s, closes its handle, and `raise`s, driven by
+  `uv-run 'default`) is exactly that escape from inside a now-collect-safe
+  trampoline, caught by the `guard` outside `uv_run` — and it stayed green after
+  the conversion. The policy (store the condition, let `uv_run` return, re-raise
+  from Scheme) holds across the new reactivation boundary; no separate oracle
+  was needed.
+- **`(collect)` inside a collect-safe callback** worked in T1 (every fire) and
+  in row 7 above; the binding does not itself call `(collect)` (only
+  tests/consumers do, design spec S11), and the property is under the Valgrind
+  gate.
+- **The full 12-trampoline build under `make test-memory`.** The spike probes
+  are standalone FFI; the real conversion passed the Linux Valgrind gate
   (ADR-0003) with the whole suite.
 
 ### 5.3 Why a plain `uv_run` blocks GC, and why the ticker is not a workaround (reconciled)
@@ -294,7 +306,7 @@ wall-clock). Two tiers:
   the spike scripts or in a `test-threading-stress.sps` that is not on the
   `make test` critical path, so the deterministic suite stays flake-free (cf.
   the Probe C hashtable-iteration flake, v0.5 lessons).
-- **Memory gate.** The 13-trampoline conversion and the async handle both pass
+- **Memory gate.** The 12-trampoline conversion and the async handle both pass
   `make test-memory` / `make test-memory-docker` (ADR-0003, Linux Valgrind).
 
 ## 10. ADRs
@@ -302,18 +314,21 @@ wall-clock). Two tiers:
 - **New ADR (threading model).** Records: `__collect_safe` on `uv_run` + all
   trampolines; loop-thread-only-except-`uv-async-send!`; enforced per-loop
   affinity + owner-transfer-at-`uv-run`; the no-mutex-on-registry rationale.
-- **ADR-0008 amended.** 14th trampoline (`async`); note that all trampolines are
-  now `__collect_safe` and why (CSUG §4.3/4.8).
+- **ADR-0008 amended** (done in PR #25 for #19: the 12 `uv_run`-invoked
+  trampolines are `__collect_safe`, `walk` excluded and why — CSUG §4.3/4.8).
+  Stage 2 adds the 14th trampoline (`async`).
 - **ADR-0010 companion.** Threaded tests are the documented exception to
   loopback-only single-thread testing; the stress tier is off the default gate.
 
 ## 11. Milestone sequence
 
 0. **Spike — DONE** (`spike/threading/`, this design rests on it).
-1. **Stage 1 — #19.** Rebind `uv_run` + 13 trampolines `__collect_safe`; re-test
-   store-and-reraise under collect-safe; full suite + Valgrind gate. Ships alone
-   (it is a correctness change with no new surface) and unblocks any threaded
-   consumer.
+1. **Stage 1 — #19 — DONE (PR #25).** `uv_run` + the 12 trampolines it invokes
+   (walk excluded) rebound `__collect_safe`; store-and-reraise under collect-safe
+   re-validated (test-lifecycle row 7 green); full suite + ASan + Linux Valgrind
+   gate clean; `tests/test-threading-stress.sps` red→green off the default gate.
+   Shipped alone (a correctness change, no new surface); unblocks threaded
+   consumers.
 2. **Stage 2 — #20.** `UV_ASYNC` constant + `sizeof`; `make-uv-async` /
    `uv-async-send!`; the 14th trampoline; the per-loop owner + `&uv-wrong-thread`
    + centralized affinity check; deterministic tests + stress tier; the new ADR.
@@ -337,4 +352,7 @@ call's duration (releasing Chez's collect interlock). Any callable it invokes
 runs with the thread *reactivated* for the callback body, and must therefore
 itself be `__collect_safe`. Mixing — a collect-safe `uv_run` invoking a plain
 callable, or vice versa — is the error the spike's mode-matched callables avoid.
-The conversion is all-or-nothing across `uv_run` and its 13 (soon 14) callbacks.
+The conversion is all-or-nothing across `uv_run` and the 12 callbacks it invokes
+(soon 13, with `async`). `walk` is the lone trampoline it does not invoke, so
+`walk` stays plain — a collect-safe callable must not be entered from the active
+thread a plain `uv_walk` runs on.
