@@ -239,7 +239,12 @@
 
   ;; uv_run's integer is an activity result, not an errno. uv_loop_close's is.
   (define uv-loop-init  (foreign-procedure "uv_loop_init"  (uptr) int))
-  (define uv-loop-run   (foreign-procedure "uv_run"        (uptr int) int))
+  ;; __collect_safe (#19): a thread blocked here is deactivated, so it does not
+  ;; hold Chez's collect interlock and other Scheme threads can GC. This forces
+  ;; every callable uv_run can invoke to be __collect_safe too (CSUG §4.3/4.8) —
+  ;; the twelve trampolines below carry the attribute; `walk` alone does not,
+  ;; because it fires only from the plain, synchronous uv_walk, never from here.
+  (define uv-loop-run   (foreign-procedure __collect_safe "uv_run" (uptr int) int))
   (define uv-loop-stop  (foreign-procedure "uv_stop"       (uptr) void))
   (define uv-loop-alive (foreign-procedure "uv_loop_alive" (uptr) int))
   (define uv-loop-now   (foreign-procedure "uv_now"        (uptr) unsigned-64))
@@ -650,67 +655,72 @@
 
   ;; Callback signatures mirror libuv exactly; notably nread is ssize_t.
   (define alloc-callable
-    (foreign-callable (lambda (handle suggested buf)
+    (foreign-callable __collect_safe (lambda (handle suggested buf)
                         ((dispatcher-ref 'alloc) handle suggested buf))
                       (uptr size_t uptr) void))
 
   (define read-callable
-    (foreign-callable (lambda (stream nread buf)
+    (foreign-callable __collect_safe (lambda (stream nread buf)
                         ((dispatcher-ref 'read) stream nread buf))
                       (uptr ssize_t uptr) void))
 
   (define connection-callable
-    (foreign-callable (lambda (server status)
+    (foreign-callable __collect_safe (lambda (server status)
                         ((dispatcher-ref 'connection) server status))
                       (uptr int) void))
 
   (define write-done-callable
-    (foreign-callable (lambda (req status)
+    (foreign-callable __collect_safe (lambda (req status)
                         ((dispatcher-ref 'write-done) req status))
                       (uptr int) void))
 
   (define close-callable
-    (foreign-callable (lambda (handle) ((dispatcher-ref 'close) handle))
+    (foreign-callable __collect_safe (lambda (handle) ((dispatcher-ref 'close) handle))
                       (uptr) void))
 
   (define timer-callable
-    (foreign-callable (lambda (handle) ((dispatcher-ref 'timer) handle))
+    (foreign-callable __collect_safe (lambda (handle) ((dispatcher-ref 'timer) handle))
                       (uptr) void))
 
   (define shutdown-callable
-    (foreign-callable (lambda (req status)
+    (foreign-callable __collect_safe (lambda (req status)
                         ((dispatcher-ref 'shutdown) req status))
                       (uptr int) void))
 
   (define connect-callable
-    (foreign-callable (lambda (req status)
+    (foreign-callable __collect_safe (lambda (req status)
                         ((dispatcher-ref 'connect) req status))
                       (uptr int) void))
 
   ;; DNS string pointers are borrowed and may be NULL; policy copies them later.
   (define getaddrinfo-callable
-    (foreign-callable (lambda (req status res)
+    (foreign-callable __collect_safe (lambda (req status res)
                         ((dispatcher-ref 'getaddrinfo) req status res))
                       (uptr int uptr) void))
 
   (define getnameinfo-callable
-    (foreign-callable (lambda (req status hostname service)
+    (foreign-callable __collect_safe (lambda (req status hostname service)
                         ((dispatcher-ref 'getnameinfo)
                          req status hostname service))
                       (uptr int uptr uptr) void))
 
   (define exit-callable
-    (foreign-callable (lambda (handle exit-status term-signal)
+    (foreign-callable __collect_safe (lambda (handle exit-status term-signal)
                         ((dispatcher-ref 'exit) handle exit-status term-signal))
                       (uptr integer-64 int) void))
 
+  ;; NOT __collect_safe, deliberately: walk fires only from uv_walk (raw-walk
+  ;; below), a plain synchronous foreign call on an ACTIVE thread — never from
+  ;; the collect-safe uv_run. CSUG §4.3/4.8 is "if and only if": a collect-safe
+  ;; callable entered from an active thread is a mismatch, so walk stays plain
+  ;; exactly as long as uv_walk does.
   (define walk-callable
     (foreign-callable (lambda (handle arg)
                         ((dispatcher-ref 'walk) handle arg))
                       (uptr uptr) void))
 
   (define signal-callable
-    (foreign-callable (lambda (handle signum)
+    (foreign-callable __collect_safe (lambda (handle signum)
                         ((dispatcher-ref 'signal) handle signum))
                       (uptr int) void))
 

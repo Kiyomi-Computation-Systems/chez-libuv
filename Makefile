@@ -119,7 +119,12 @@ MEMORY_SUITE_TIMEOUT ?= 900
 
 ROOT_TESTS   := tests/test-process-setuid.sps
 
-TESTS        := $(filter-out $(ROOT_TESTS),$(wildcard tests/test-*.sps))
+# STRESS_TESTS fork real OS threads and are timing-dependent (ADR-0010
+# companion): kept OFF the default gate via `make test-threading`, exactly as
+# ROOT_TESTS are gated behind `make test-root`.
+STRESS_TESTS := tests/test-threading-stress.sps
+
+TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test-*.sps))
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
@@ -138,7 +143,7 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-memory test-memory-docker vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
 
@@ -449,6 +454,21 @@ test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, agg
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL SUITES PASSED"; \
 	else echo "SUITE FAILED"; fi; \
+	exit $$fail
+
+test-threading: build deps check-pins ## Run the threaded GC-freedom stress suite (off the default gate; forks OS threads, timing-dependent)
+	@fail=0; \
+	for t in $(STRESS_TESTS); do \
+	  echo "=== $$t ==="; \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
+	    $(TIMEOUT_BIN) $(if $(TIMEOUT_BIN),$(SUITE_TIMEOUT),) $(CHEZ) --program $$t; \
+	  rc=$$?; \
+	  if [ $$rc -eq 124 ] && [ -n "$(TIMEOUT_BIN)" ]; then \
+	    echo "HUNG: $$t exceeded $(SUITE_TIMEOUT)s and was killed" >&2; fail=1; \
+	  elif [ $$rc -ne 0 ]; then fail=1; fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "STRESS SUITES PASSED"; \
+	else echo "STRESS SUITE FAILED"; fi; \
 	exit $$fail
 
 # Refusal is the SUITE's job (it checks euid itself and exits 1 with a
