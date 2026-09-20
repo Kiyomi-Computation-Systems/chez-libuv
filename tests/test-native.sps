@@ -1273,11 +1273,11 @@
 (define (live-count kind)
   (cdr (assq kind (live-counts))))
 
-;; Task 2 (v0.4) added the signal row to live-counts.
-(test-equal "live-counts reports all twelve allocation classes"
+;; Task 2 (v0.4) added the signal row; #20 added async as the thirteenth.
+(test-equal "live-counts reports all thirteen allocation classes"
   '(loop tcp timer write-req connect-req
     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options
-    signal)
+    signal async)
   (map car (live-counts)))
 
 ;; Superseded by the twelve-class row above, kept for provenance:
@@ -1331,7 +1331,8 @@
         (list 'read-buffer count-read-buffer-new! count-read-buffer-free!)
         (list 'spawn-options
               count-spawn-options-new! count-spawn-options-free!)
-        (list 'signal count-signal-new! count-signal-free!)))
+        (list 'signal count-signal-new! count-signal-free!)
+        (list 'async  count-async-new!  count-async-free!)))
 
 (for-each
  (lambda (entry)
@@ -1506,9 +1507,9 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the thirteen callback types the design commits to"
+(test-equal "dispatcher-names names the fourteen callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo exit walk signal)
+    getaddrinfo getnameinfo exit walk signal async)
   dispatcher-names)
 
 (test-equal "before installation, dispatchers-installed? is false"
@@ -1554,7 +1555,16 @@
     ((dispatcher-ref 'signal) 0 0)
     #f))
 
-(test-equal "dispatcher-ref rejects a name that is not one of the thirteen"
+;; The async slot, #20's fourteenth: uv_async_cb's (handle) arity. Same arity
+;; as close/timer, distinct callback TYPE, own slot (ADR-0008's per-type rule).
+(test-assert "the async slot holds the raising uninstalled stub"
+  (guard (e (#t (and (uv-error? e)
+                     (string=? (condition-message e)
+                               "callback dispatchers have not been installed"))))
+    ((dispatcher-ref 'async) 0)
+    #f))
+
+(test-equal "dispatcher-ref rejects a name that is not one of the fourteen"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1565,7 +1575,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the thirteen is refused, naming who and why"
+(test-equal "an install missing one of the fourteen is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

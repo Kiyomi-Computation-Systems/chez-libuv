@@ -60,3 +60,29 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
   test-async 4/4. Full `make test` = 17/17 suites (the check is invisible to
   every existing single-threaded suite: owner == caller always). check-purity
   still holds.
+
+### D — uv_async wakeup, 14th trampoline, make-uv-async/uv-async-send! (Tasks 2.3–2.4)
+
+- **Red (frozen literals, ADR-0008 amendment procedure):** widened the
+  dispatcher-names literal to 14 (+`async`) in test-loop.sps and test-native.sps,
+  the live-counts class list to 13 (+`async`) and the counter matrix (+`async`
+  row) in test-native.sps, and added an "async slot holds the raising
+  uninstalled stub" row. test-loop → `FAIL dispatcher-names names the fourteen…`;
+  test-native → `unbound identifier count-async-free!`.
+- **Green:** shim async counters (both arms + header); native.sls async counter
+  procs + `async` in dispatcher-names + `uv_async_init`/`uv_async_send` bindings
+  + the 14th `__collect_safe` trampoline (`async-callable`, locked,
+  `async-cb-entry`) + `uv-async-init-native`; handles.sls `uv-async-record` +
+  `async` in handle-kinds + `count-async-free!` arm; handle.sls `uv-async?`;
+  new `(libuv async)` (`make-uv-async` loop-thread-only via `require-loop-thread`,
+  `uv-async-send!` exempt, `async-dispatch` late-installed); facade re-exports.
+  Rebuilt shim. test-native 266, test-loop 138.
+- **Behaviour tests (test-async.sps, default gate, deterministic — no fork):**
+  construction + counter balance across close; same-thread send delivers a wake
+  callback receiving its own handle; N sends → 1..N callbacks (coalescing
+  tolerated); `make-uv-async` off-owner raises `&uv-wrong-thread`;
+  `uv-async-send!` succeeds while the loop is owned elsewhere (the exemption,
+  proved fork-free); send on a closed async → `&uv-handle-closed`; send on a
+  non-async → `&uv-invalid-argument`. test-async 12/12.
+- **Gate:** full `make test` 17/17; macOS ASan gate RC 0, no sanitizer errors
+  (leak claim deferred to Linux Valgrind per ADR-0003).

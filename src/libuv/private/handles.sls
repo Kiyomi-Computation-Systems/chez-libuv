@@ -28,6 +28,8 @@
           %make-uv-signal-record uv-signal-record?
           signal-on-signal set-signal-on-signal!
           signal-mode set-signal-mode!
+          %make-uv-async-record uv-async-record?
+          async-on-wake set-async-on-wake!
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -68,7 +70,7 @@
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
                 count-pipe-free! count-process-free!
-                count-signal-free!
+                count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-free!
                 uv-buf-set! copy-out
@@ -202,6 +204,14 @@
      (lambda (pargs->new)
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
+  ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
+  (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
+    (parent uv-handle-record)
+    (fields (mutable on-wake async-on-wake set-async-on-wake!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop on-wake) ((pargs->new ptr 'async loop) on-wake)))))
+
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
   (define-record-type (uv-req-record %make-uv-req-record uv-req?)
@@ -249,7 +259,7 @@
   (define (valid-pointer? ptr)
     (and (integer? ptr) (exact? ptr) (positive? ptr)))
 
-  (define handle-kinds '(timer tcp pipe process signal))
+  (define handle-kinds '(timer tcp pipe process signal async))
 
   (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
@@ -476,6 +486,7 @@
       ((pipe)    (count-pipe-free!))
       ((process) (count-process-free!))
       ((signal)  (count-signal-free!))
+      ((async)   (count-async-free!))
       (else #f)))
 
   ;; Direct free is valid only for a spawn failure libuv already unlinked.

@@ -14,7 +14,7 @@
         (srfi :64)
         (libuv)
         (only (libuv private handles) loop-owner-thread set-loop-owner-thread!)
-        (only (libuv private native) current-thread-id))
+        (only (libuv private native) current-thread-id live-counts))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -81,6 +81,122 @@
     (let ((owned (eqv? (loop-owner-thread loop) (current-thread-id))))
       (uv-loop-teardown! loop)
       owned)))
+
+;; --- uv_async construction, send, and the callback (design §6.1) --------
+;; uv_async_send is thread-safe and may be called from the loop thread too, so
+;; the send->wake path is exercised deterministically here without a fork. The
+;; cross-thread proofs are in tests/test-threading-stress.sps.
+
+(define (live-async-count)
+  (cdr (assq 'async (live-counts))))
+
+(test-equal "make-uv-async yields an open async handle"
+  '(#t #t)
+  (let* ((loop (make-uv-loop))
+         (a (make-uv-async loop (lambda (h) #f))))
+    (let ((r (list (uv-async? a) (uv-handle-open? a))))
+      (uv-close! a)
+      (uv-loop-teardown! loop)
+      r)))
+
+(test-equal "an async handle balances its allocation counter across close"
+  '(1 0)
+  (let* ((loop (make-uv-loop))
+         (a (make-uv-async loop (lambda (h) #f)))
+         (after-create (live-async-count)))
+    (uv-close! a)
+    (uv-loop-teardown! loop)
+    (list after-create (live-async-count))))
+
+;; A same-thread send wakes the loop; the callback runs and receives the very
+;; handle it was registered for. The callback closes the async so uv-run
+;; 'default returns (an open async keeps the loop alive).
+(test-equal "uv-async-send! delivers a wake callback that receives its handle"
+  '(fired same-handle)
+  (let* ((loop (make-uv-loop))
+         (fired #f)
+         (got-same #f)
+         (a #f))
+    (set! a (make-uv-async loop
+                           (lambda (h)
+                             (set! fired #t)
+                             (set! got-same (eq? h a))
+                             (uv-close! h))))
+    (uv-async-send! a)
+    (uv-run loop 'default)
+    (uv-loop-teardown! loop)
+    (list (if fired 'fired 'not-fired)
+          (if got-same 'same-handle 'other-handle))))
+
+;; Coalescing: N sends before an iteration may collapse to one callback. The
+;; design forbids assuming one-callback-per-send, so tolerate 1..N.
+(test-equal "N sends before an iteration yield between 1 and N callbacks"
+  'coalesced-ok
+  (let* ((loop (make-uv-loop))
+         (n 8)
+         (count 0)
+         (a (make-uv-async loop (lambda (h) (set! count (+ count 1))))))
+    (let send ((i 0)) (when (< i n) (uv-async-send! a) (send (+ i 1))))
+    (uv-run loop 'once)
+    (uv-close! a)
+    (uv-loop-teardown! loop)
+    (if (and (>= count 1) (<= count n)) 'coalesced-ok (list 'count count))))
+
+;; --- gating: construction is checked, send is exempt --------------------
+
+(test-equal "make-uv-async from a non-owning thread raises &uv-wrong-thread"
+  'wrong-thread
+  (let ((loop (make-uv-loop)))
+    (set-loop-owner-thread! loop foreign-owner)
+    (let ((outcome (guard (e ((uv-wrong-thread? e) 'wrong-thread)
+                             (#t 'other-condition))
+                     (make-uv-async loop (lambda (h) #f))
+                     'no-raise)))
+      (set-loop-owner-thread! loop (current-thread-id))
+      (uv-loop-teardown! loop)
+      outcome)))
+
+;; The exemption, proved without a fork: with the loop owned elsewhere, a
+;; normal verb would raise, but uv-async-send! still succeeds — it is the one
+;; call libuv makes thread-safe.
+(test-equal "uv-async-send! is exempt from the affinity check"
+  'sent
+  (let* ((loop (make-uv-loop))
+         (a (make-uv-async loop (lambda (h) #f))))
+    (set-loop-owner-thread! loop foreign-owner)
+    (let ((outcome (guard (e ((uv-wrong-thread? e) 'wrongly-refused)
+                             (#t 'other-condition))
+                     (uv-async-send! a)
+                     'sent)))
+      (set-loop-owner-thread! loop (current-thread-id))
+      (uv-close! a)
+      (uv-loop-teardown! loop)
+      outcome)))
+
+(test-equal "uv-async-send! on a closed async raises &uv-handle-closed"
+  'closed
+  (let* ((loop (make-uv-loop))
+         (a (make-uv-async loop (lambda (h) #f))))
+    (uv-close! a)
+    (let ((outcome (guard (e ((uv-handle-closed? e) 'closed) (#t 'other-condition))
+                     (uv-async-send! a)
+                     'no-raise)))
+      (uv-loop-teardown! loop)
+      outcome)))
+
+(test-equal "uv-async-send! rejects a non-async handle"
+  '(uv-async-send! not-a-uv-async)
+  (let* ((loop (make-uv-loop))
+         (timer (make-uv-timer loop)))
+    (let ((outcome (guard (e ((uv-invalid-argument? e)
+                              (list (uv-invalid-argument-who e)
+                                    (uv-invalid-argument-reason e)))
+                             (#t 'other-condition))
+                     (uv-async-send! timer)
+                     'no-raise)))
+      (uv-close! timer)
+      (uv-loop-teardown! loop)
+      outcome)))
 
 (test-end "async")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))
