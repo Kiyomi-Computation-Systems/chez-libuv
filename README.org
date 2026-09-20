@@ -19,18 +19,23 @@ a caller who knows libuv recognises the Scheme surface immediately.
 It is transport only: it parses nothing, understands no protocol above raw
 bytes, and provides no connection-state or backpressure policy of its own —
 those belong to the layers built on top of these primitives. The full
-design, with eighteen accepted decision records, lives under
+design, with nineteen accepted decision records, lives under
 [[file:.plans/][.plans/]].
 
 * Status
 
-*v0.5.0* — event loop, TCP (bind, listen, accept, connect, reads with
-backpressure, writes, shutdown), timers, DNS (~getaddrinfo~,
-~getnameinfo~, ~cancel~), child processes (the full ~uv_spawn~ stdio
-vocabulary) with minimal pipes, signal watching (continuous and oneshot),
-and flow control (read/write buffer sizing, the write-queue congestion
-gauge, peer addresses — see ~docs/api.md~'s Flow control section). No
-filesystem, no UDP, no zero-copy I/O
+*v0.6.0* — event loop, TCP (bind with an optional reuseport flag, listen,
+accept, connect, reads with backpressure, scalar and vectored writes,
+shutdown, nodelay, keepalive, local and peer addresses), timers, DNS
+(~getaddrinfo~, ~getnameinfo~, ~cancel~), child processes (the full
+~uv_spawn~ stdio vocabulary) with minimal pipes, signal watching
+(continuous and oneshot), flow control (read/write buffer sizing, the
+write-queue congestion gauge — see ~docs/api.md~'s Flow control section),
+and threading: a loop thread blocks in ~uv-run~ without freezing garbage
+collection for other Scheme threads, with a ~uv_async~ cross-thread wakeup
+and enforced per-loop thread affinity
+([[file:.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md][ADR-0019]]).
+No filesystem, no UDP, no zero-copy I/O
 ([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]]). CI
 covers Linux on both dependency-acquisition paths, with Valgrind as the
 memory gate
