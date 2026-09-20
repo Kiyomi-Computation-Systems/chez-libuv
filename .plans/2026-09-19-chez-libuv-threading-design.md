@@ -1,9 +1,20 @@
 # Design Spec: chez-libuv threading — `__collect_safe` (#19) → `uv_async` (#20)
 
-- **Status:** Draft (2026-09-19). Spike complete (`spike/threading/`); this
+- **Status:** Implemented (2026-09-19). Spike complete (`spike/threading/`); this
   design is grounded in its measurements. The T2b/E5c ticker discrepancy is
   **reconciled** (§5.3, chez-http-server E5d–E5f) — both measurements were
   correct; the ticker is not a workaround and is withdrawn.
+- **Implementation notes.** Stage 1 (#19) landed as **twelve** `__collect_safe`
+  trampolines + `walk` plain (13 types; the "all 13" phrasing below predates that
+  refinement — `walk` fires only from the synchronous `uv_walk`, so it stays
+  plain, ADR-0008). Stage 2 (#20) adds `async` as the 14th type, itself
+  `__collect_safe` (13 of 14 now carry it). Two deviations from this spec, both
+  justified in `.plans/threading-stage-2-mutation-log.md`: **no
+  `SIZEOF_UV_ASYNC_T`** (the handle is sized at runtime via
+  `(uv-handle-size (uv-async-type))`, the signal precedent), and the enforced
+  surface is **`require-open-handle` + `make-uv-async`** (not `require-open-loop`,
+  which `uv-run` calls before the owner transfers). The model is recorded in
+  [ADR-0019](decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md).
 - **Scope:** post-v0.5.0. Two issues, one arc: #19 (rebind `uv_run`
   `__collect_safe`) is the foundation; #20 (`uv_async` cross-thread wakeup +
   enforced per-loop thread affinity) builds on it.
@@ -310,13 +321,14 @@ wall-clock). Two tiers:
 ## 11. Milestone sequence
 
 0. **Spike — DONE** (`spike/threading/`, this design rests on it).
-1. **Stage 1 — #19.** Rebind `uv_run` + 13 trampolines `__collect_safe`; re-test
-   store-and-reraise under collect-safe; full suite + Valgrind gate. Ships alone
-   (it is a correctness change with no new surface) and unblocks any threaded
-   consumer.
-2. **Stage 2 — #20.** `UV_ASYNC` constant + `sizeof`; `make-uv-async` /
-   `uv-async-send!`; the 14th trampoline; the per-loop owner + `&uv-wrong-thread`
-   + centralized affinity check; deterministic tests + stress tier; the new ADR.
+1. **Stage 1 — #19 — DONE** (PRs #24/#25, on `main`). Rebound `uv_run` + twelve
+   trampolines `__collect_safe` (`walk` plain); re-tested store-and-reraise;
+   full suite + Valgrind gate green.
+2. **Stage 2 — #20 — DONE** (`feat/uv-async-thread-affinity`). `UV_ASYNC`
+   constant; `make-uv-async` / `uv-async-send!`; the 14th trampoline; the
+   per-loop owner + `&uv-wrong-thread` + centralized affinity check
+   (`require-open-handle`); deterministic tests (`test-async.sps`) + stress tier;
+   [ADR-0019](decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md).
 
 Stage 1 is independently valuable and lower-risk; Stage 2 depends on it.
 

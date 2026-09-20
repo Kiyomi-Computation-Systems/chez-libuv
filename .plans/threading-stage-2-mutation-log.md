@@ -100,3 +100,12 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
 - **R6RS fix:** the worker-pool `let` initially placed `(set! async …)` before
   `(define (worker …))` → `invalid context for definition`. Reordered defines
   first. Stress suite 6/6, stable across repeated runs.
+
+### F — docs (Task 2.5)
+
+- ADR-0008: fourteenth-trampoline amendment (`async`, `__collect_safe`, 13 of 14
+  carry it; `walk` still plain). New **ADR-0019** records the threading model
+  (collect-safe `uv_run`, enforced per-loop affinity, owner-transfer-at-`uv-run`,
+  the `uv-async-send!` exemption, no-mutex-on-registry, the scope boundary).
+  ADR-0010 gains a threaded-test companion. Design/plan marked DONE with the two
+  deviations recorded; plan self-review checklist ticked. Doc-only.

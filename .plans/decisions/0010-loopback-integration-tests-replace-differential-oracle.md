@@ -56,3 +56,25 @@ entire exchange.
 - Because the oracle is the kernel and libuv's documented contract rather
   than a second program, adding a new test never requires vendoring or
   invoking anything beyond what this project already builds.
+
+## Companion (2026-09-19, issue #20): threaded tests
+
+The threading arc ([ADR-0019](0019-threading-model-collect-safe-and-per-loop-affinity.md))
+adds behaviour that only exists across threads, which sits uneasily with the
+"one process, bounded iterations, no wall-clock" discipline above. It is split
+in two so the default gate stays deterministic:
+
+- **Deterministic invariants stay on the default gate** (`tests/test-async.sps`).
+  The per-loop affinity check is exercised without a second thread by pointing a
+  loop's owner field at a foreign thread id; `uv_async_send` is exercised from
+  the loop thread itself (libuv permits it), so the send→wake path, coalescing
+  tolerance, and the construction/exemption gating are all bounded and race-free.
+- **Genuinely multi-threaded, timing-dependent proofs live off the default and
+  memory gates** (`tests/test-threading-stress.sps`, `make test-threading`),
+  exactly as `ROOT_TESTS` are gated behind `make test-root`. These fork real OS
+  threads — a worker refused with `&uv-wrong-thread`, owner transfer to a second
+  thread, and a worker pool posting through one async handle — and are the
+  documented exception to the single-thread rule. They are kept off Valgrind
+  because they are timing-dependent, not because threads and Valgrind conflict;
+  the leak surface (one async handle's alloc/init/close) is covered by the
+  deterministic suite under the memory gate instead.

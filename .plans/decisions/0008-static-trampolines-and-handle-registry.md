@@ -113,6 +113,24 @@ process initialization, and never unlocked, for the life of the process.
 > (chez-http-server E5f). The threaded property this buys is guarded by the
 > off-the-default-gate `tests/test-threading-stress.sps` (`make test-threading`).
 
+> **Amendment (2026-09-19, issue #20): fourteen trampolines.**
+> The set grows thirteen → fourteen: `async`, for uv_async_cb
+> `(uv_async_t*) -> void`. Like `signal` before it, it forces nothing new about
+> the rule — it **shares `close`/`timer`'s `(uptr) -> void` arity** and still
+> gets its own locked slot, one trampoline per callback TYPE. Unlike `walk`,
+> `async` fires from `uv_run`, so it carries `__collect_safe` like the rest:
+> **thirteen** of the fourteen trampolines are now `__collect_safe`, and `walk`
+> alone stays plain (it fires only from the synchronous `uv_walk`; the #19
+> amendment's "if and only if" reasoning is unchanged). The `async` slot is
+> installed from `(libuv async)`'s library body via `install-dispatch-procedure!`
+> — the late-install seam's fourth application — so a process image that never
+> imports `(libuv async)` keeps the contained raising stub. The two frozen
+> literals (tests/test-loop.sps, tests/test-native.sps) widen to the
+> fourteen-name literal, watched to fail first; the RED evidence lands in
+> `.plans/threading-stage-2-mutation-log.md`. `uv_async_send` is the one libuv
+> call that is thread-safe, and `uv-async-send!` is correspondingly the one verb
+> exempt from the per-loop thread-affinity check ([ADR-0019](0019-threading-model-collect-safe-and-per-loop-affinity.md)).
+
 Each trampoline's body is mechanical and uninstrumented: look up the
 type-keyed dispatcher slot for that callback — one of the eight fixed names
 (alloc, read, connection, write-done, close, timer, shutdown, connect), never
