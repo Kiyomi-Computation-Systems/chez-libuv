@@ -8,7 +8,7 @@
           uv-loop-close! uv-loop-teardown! call-with-uv-loop
 
           ;; handles
-          uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
+          uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal? uv-async?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop uv-close!
           uv-send-buffer-size uv-send-buffer-size!
@@ -43,6 +43,9 @@
           make-uv-signal
           uv-signal-start! uv-signal-start-oneshot! uv-signal-stop!
 
+          ;; async (cross-thread wakeup)
+          make-uv-async uv-async-send!
+
           ;; version
           uv-version uv-version-compatible?
 
@@ -71,7 +74,10 @@
           uv-invalid-argument-who uv-invalid-argument-reason
 
           &uv-callback-error make-uv-callback-error uv-callback-error?
-          uv-callback-error-cause)
+          uv-callback-error-cause
+
+          &uv-wrong-thread make-uv-wrong-thread uv-wrong-thread?
+          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual)
   (import (rnrs)
           (libuv loop)
           (libuv handle)
@@ -81,6 +87,7 @@
           (libuv pipe)
           (libuv process)
           (libuv signal)
+          (libuv async)
           (libuv dns)
           (libuv private conditions)
           (rename (only (libuv private native)

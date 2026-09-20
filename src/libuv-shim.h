@@ -67,4 +67,8 @@ void chez_uv_count_signal_new(void);
 void chez_uv_count_signal_free(void);
 long chez_uv_live_signal(void);
 
+void chez_uv_count_async_new(void);
+void chez_uv_count_async_free(void);
+long chez_uv_live_async(void);
+
 #endif /* CHEZ_LIBUV_SHIM_H */

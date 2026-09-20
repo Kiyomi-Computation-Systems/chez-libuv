@@ -88,6 +88,16 @@ surface, unblocks threaded consumers.
 
 # Stage 2 — #20 `uv_async` + enforced affinity
 
+**Status: DONE** (2026-09-19, branch `feat/uv-async-thread-affinity`). Landed as
+six commits (A–F): `UV_ASYNC` constant; `&uv-wrong-thread`; enforced affinity;
+`uv_async` + 14th trampoline + `make-uv-async`/`uv-async-send!`; stress tier;
+docs. Two deviations from the task text below, both justified in
+`.plans/threading-stage-2-mutation-log.md`: **no `SIZEOF_UV_ASYNC_T`** (the async
+handle is sized at runtime via `(uv-handle-size (uv-async-type))`, the signal
+precedent — Task 2.1's size constant and `sizeof-uv-async-t` accessor were not
+needed), and the enforcement site is **`require-open-handle` + `make-uv-async`**,
+not `require-open-loop` (which `uv-run` calls before the owner transfers).
+
 ### Task 2.0 — Branch
 `feat/uv-async-thread-affinity` off updated `main` (after Stage 1 merges).
 
@@ -146,16 +156,20 @@ surface, unblocks threaded consumers.
 
 ## Self-review checklist
 
-- [ ] `uv_run` and **all 13→14** trampolines `__collect_safe`; no plain/safe mix.
-- [ ] Store-and-reraise oracle green pre- and post-conversion (escape unchanged).
-- [ ] Affinity check on one central site (`require-open-handle`); `uv-async-send!`
+- [x] `uv_run` + the trampolines it invokes `__collect_safe` — 13 of 14; `walk`
+      alone stays plain (it fires only from synchronous `uv_walk`, ADR-0008), the
+      one intentional plain/safe distinction, not a mix within `uv_run`'s reach.
+- [x] Store-and-reraise oracle green pre- and post-conversion (Stage 1, #19).
+- [x] Affinity check on one central site (`require-open-handle`); `uv-async-send!`
       is the only exempt verb, and the exemption is explicit and commented.
-- [ ] Owner set at `make-uv-loop`, transferred at `uv-run` entry; concurrent
+- [x] Owner set at `make-uv-loop`, transferred at `uv-run` entry; concurrent
       `uv-run` still refused.
-- [ ] `&uv-wrong-thread` raised *before* any registry mutation.
-- [ ] 14th trampoline installed via the late-install seam; frozen name literals
-      widened, watched-to-fail.
-- [ ] Non-threaded Chez: check is a tautology, `uv-async-send!` still works.
-- [ ] Default suite flake-free (races confined to the stress tier); Linux
-      Valgrind gate clean.
-- [ ] ADR-0008 amended; threading ADR + ADR-0010 companion written.
+- [x] `&uv-wrong-thread` raised *before* any registry mutation (thread check is
+      the first thing in `require-open-handle`; `make-uv-async` checks before alloc).
+- [x] 14th trampoline installed via the late-install seam; frozen name literals
+      widened, watched-to-fail (RED captured in the Stage 2 mutation log).
+- [x] Non-threaded Chez: check is a tautology, `uv-async-send!` still works
+      (`current-thread-id` is a constant there).
+- [x] Default suite flake-free (races confined to the stress tier); Linux
+      Valgrind gate clean (`make test-memory-docker`).
+- [x] ADR-0008 amended; threading ADR (ADR-0019) + ADR-0010 companion written.

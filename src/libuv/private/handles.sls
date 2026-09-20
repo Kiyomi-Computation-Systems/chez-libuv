@@ -16,6 +16,7 @@
           loop-pending-error
           loop-has-pending-error? clear-loop-pending-error!
           loop-deferred-error-list set-loop-deferred-error-list!
+          loop-owner-thread set-loop-owner-thread! require-loop-thread
           loop-open? require-open-loop require-loop loop-pointer
 
           ;; handle records
@@ -27,6 +28,8 @@
           %make-uv-signal-record uv-signal-record?
           signal-on-signal set-signal-on-signal!
           signal-mode set-signal-mode!
+          %make-uv-async-record uv-async-record?
+          async-on-wake set-async-on-wake!
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -67,12 +70,13 @@
                 uv-loop-stop uv-close-native free!
                 count-timer-free! count-tcp-free!
                 count-pipe-free! count-process-free!
-                count-signal-free!
+                count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-free!
                 uv-buf-set! copy-out
                 uv-errno-condition
                 uv-walk-native
+                current-thread-id
                 dispatcher-names install-callback-dispatchers!)
           (only (libuv private constants) uv-eof))
 
@@ -81,16 +85,32 @@
 
   ;; Pointer fields are zeroed at their freeing sites; deferred errors are
   ;; newest first and reversed at the public boundary.
+  ;; owner-thread is the id of the only thread allowed to run this loop's verbs
+  ;; (#20). It is set to the creating thread here and transferred to the caller
+  ;; at uv-run entry (loop.sls), so a loop may be created on one thread and run
+  ;; on another. eqv? against current-thread-id gates every handle verb.
   (define-record-type (uv-loop-record %make-uv-loop-record uv-loop?)
     (fields (mutable ptr             loop-ptr             set-loop-ptr!)
             (mutable state           loop-state           set-loop-state!)
             (mutable running         loop-running?        set-loop-running!)
             (mutable pending-error   loop-pending-error   set-loop-pending-error!)
             (mutable deferred-errors loop-deferred-error-list
-                                     set-loop-deferred-error-list!))
+                                     set-loop-deferred-error-list!)
+            (mutable owner-thread    loop-owner-thread    set-loop-owner-thread!))
     (protocol
      (lambda (new)
-       (lambda (ptr) (new ptr 'open #f no-pending '())))))
+       (lambda (ptr) (new ptr 'open #f no-pending '() (current-thread-id))))))
+
+  ;; require-loop-thread : uv-loop symbol -> unspecified
+  ;; The single affinity predicate. Raised BEFORE any registry mutation, so a
+  ;; wrong-thread verb is a named refusal, never the registry corruption it
+  ;; would otherwise cause. On a non-threaded Chez owner and caller are both the
+  ;; single constant id, so this never raises (design D5).
+  (define (require-loop-thread loop who)
+    (let ((owner (loop-owner-thread loop))
+          (caller (current-thread-id)))
+      (unless (eqv? owner caller)
+        (raise (make-uv-wrong-thread who owner caller)))))
 
   (define (loop-has-pending-error? loop)
     (not (eq? (loop-pending-error loop) no-pending)))
@@ -184,6 +204,14 @@
      (lambda (pargs->new)
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
+  ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
+  (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
+    (parent uv-handle-record)
+    (fields (mutable on-wake async-on-wake set-async-on-wake!))
+    (protocol
+     (lambda (pargs->new)
+       (lambda (ptr loop on-wake) ((pargs->new ptr 'async loop) on-wake)))))
+
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
   (define-record-type (uv-req-record %make-uv-req-record uv-req?)
@@ -201,8 +229,16 @@
       (raise (make-uv-invalid-argument who 'not-a-uv-handle)))
     handle)
 
+  ;; The single central affinity site: every operational verb enters through
+  ;; require-open-handle, so the loop-thread check here covers them all with no
+  ;; per-verb sprinkling (design §6.3). The thread check comes first — a verb
+  ;; from the wrong thread is refused before its handle's open state is even
+  ;; consulted. uv-async-send! is the one verb that does NOT come through here
+  ;; (it is libuv's sole thread-safe call); it validates kind and open state on
+  ;; its own path in (libuv async).
   (define (require-open-handle handle who)
     (require-handle handle who)
+    (require-loop-thread (handle-loop handle) who)
     (unless (eq? (handle-state handle) 'open)
       (raise (make-uv-handle-closed (handle-kind handle))))
     handle)
@@ -223,7 +259,7 @@
   (define (valid-pointer? ptr)
     (and (integer? ptr) (exact? ptr) (positive? ptr)))
 
-  (define handle-kinds '(timer tcp pipe process signal))
+  (define handle-kinds '(timer tcp pipe process signal async))
 
   (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
@@ -450,6 +486,7 @@
       ((pipe)    (count-pipe-free!))
       ((process) (count-process-free!))
       ((signal)  (count-signal-free!))
+      ((async)   (count-async-free!))
       (else #f)))
 
   ;; Direct free is valid only for a spawn failure libuv already unlinked.

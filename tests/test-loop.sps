@@ -196,9 +196,9 @@
 ;; whose import chain never reaches handles.sls and whose process therefore
 ;; still has empty slots. Moving those rows there rather than deleting them
 ;; is what keeps the uninstalled behaviour covered at all.
-(test-equal "dispatcher-names names the thirteen callback types the design commits to"
+(test-equal "dispatcher-names names the fourteen callback types the design commits to"
   '(alloc read connection write-done close timer shutdown connect
-    getaddrinfo getnameinfo exit walk signal)
+    getaddrinfo getnameinfo exit walk signal async)
   dispatcher-names)
 
 (test-equal "importing (libuv private handles) has already installed the dispatchers"

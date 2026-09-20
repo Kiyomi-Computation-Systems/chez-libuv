@@ -1,7 +1,7 @@
 #!r6rs
 ;;; Shared handle state and explicit asynchronous close ownership.
 (library (libuv handle)
-  (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal?
+  (export uv-handle? uv-timer? uv-tcp? uv-pipe? uv-process? uv-signal? uv-async?
           uv-handle-open? uv-handle-closing? uv-handle-state
           uv-handle-loop
           uv-send-buffer-size uv-send-buffer-size!
@@ -47,6 +47,9 @@
 
   (define (uv-signal? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'signal)))
+
+  (define (uv-async? handle)
+    (and (uv-handle? handle) (eq? (handle-kind handle) 'async)))
 
   ;; Buffer-size operations support TCP and pipes on Unix, but only TCP on
   ;; Windows; libuv reports unsupported platform cases.

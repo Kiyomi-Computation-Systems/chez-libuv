@@ -140,6 +140,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIGCONT", SIGCONT },
   { "SIGSTOP", SIGSTOP },
   { "UV_SIGNAL", UV_SIGNAL },
+  { "UV_ASYNC",  UV_ASYNC },
 
   /* Version-gated bind flag. UV_TCP_REUSEPORT (TCP SO_REUSEPORT with load
    * balancing) is an enum constant, so it is invisible to #ifdef; it is guarded
@@ -215,6 +216,7 @@ static long live_pipe            = 0;
 static long live_process         = 0;
 static long live_spawn_options   = 0;
 static long live_signal          = 0;
+static long live_async           = 0;
 
 void chez_uv_count_loop_new(void)  { live_loop += 1; }
 void chez_uv_count_loop_free(void) { live_loop -= 1; }
@@ -263,6 +265,10 @@ long chez_uv_live_spawn_options(void)       { return live_spawn_options; }
 void chez_uv_count_signal_new(void)  { live_signal += 1; }
 void chez_uv_count_signal_free(void) { live_signal -= 1; }
 long chez_uv_live_signal(void)       { return live_signal; }
+
+void chez_uv_count_async_new(void)  { live_async += 1; }
+void chez_uv_count_async_free(void) { live_async -= 1; }
+long chez_uv_live_async(void)       { return live_async; }
 
 #else
 
@@ -313,5 +319,9 @@ long chez_uv_live_spawn_options(void)       { return 0; }
 void chez_uv_count_signal_new(void)  { }
 void chez_uv_count_signal_free(void) { }
 long chez_uv_live_signal(void)       { return 0; }
+
+void chez_uv_count_async_new(void)  { }
+void chez_uv_count_async_free(void) { }
+long chez_uv_live_async(void)       { return 0; }
 
 #endif /* CHEZ_LIBUV_DEBUG_COUNTERS */

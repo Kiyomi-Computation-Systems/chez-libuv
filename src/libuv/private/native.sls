@@ -55,6 +55,9 @@
           require-callback
           signal-symbol->int term-signal->value
 
+          ;; thread identity (per-loop affinity, #20)
+          current-thread-id
+
           ;; callback dispatch
           dispatcher-names dispatcher-ref dispatchers-installed?
           install-callback-dispatchers!
@@ -69,6 +72,9 @@
           uv-signal-start-oneshot-native uv-signal-stop
           uv-os-getpid-native
 
+          ;; async (#20)
+          uv-async-init-native uv-async-send
+
           ;; debug counters
           live-counts
           count-loop-new!        count-loop-free!
@@ -82,7 +88,8 @@
           count-pipe-new!         count-pipe-free!
           count-process-new!      count-process-free!
           count-spawn-options-new! count-spawn-options-free!
-          count-signal-new!      count-signal-free!)
+          count-signal-new!      count-signal-free!
+          count-async-new!       count-async-free!)
   (import (rnrs)
           (only (chezscheme)
                 load-shared-object foreign-procedure foreign-ref foreign-set!
@@ -90,7 +97,8 @@
                 foreign-callable foreign-callable-entry-point lock-object
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
-                file-regular? make-mutex with-mutex getenv)
+                file-regular? make-mutex with-mutex getenv
+                threaded? get-thread-id)
           (libuv private config)
           (libuv private conditions)
           (libuv private constants))
@@ -219,6 +227,12 @@
   (define count-signal-free!
     (foreign-procedure "chez_uv_count_signal_free" () void))
   (define live-signal (foreign-procedure "chez_uv_live_signal" () long))
+
+  (define count-async-new!
+    (foreign-procedure "chez_uv_count_async_new" () void))
+  (define count-async-free!
+    (foreign-procedure "chez_uv_count_async_free" () void))
+  (define live-async (foreign-procedure "chez_uv_live_async" () long))
 
   (define uv-version (foreign-procedure "uv_version" () int))
 
@@ -528,6 +542,13 @@
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
 
+  ;; current-thread-id : -> exact-integer
+  ;; The identity per-loop affinity (#20) compares against. On a non-threaded
+  ;; Chez there is exactly one thread, so a constant makes the affinity check a
+  ;; tautology (design D5); get-thread-id is only meaningful on a threaded build.
+  (define (current-thread-id)
+    (if (threaded?) (get-thread-id) 0))
+
   ;; signal-symbol->int : (or symbol 0) symbol -> exact-integer
   ;; Accept only the closed symbolic vocabulary plus kill(pid, 0).
   (define (signal-symbol->int sig who)
@@ -602,12 +623,13 @@
           (cons 'pipe          (live-pipe))
           (cons 'process       (live-process))
           (cons 'spawn-options (live-spawn-options))
-          (cons 'signal        (live-signal))))
+          (cons 'signal        (live-signal))
+          (cons 'async         (live-async))))
 
   ;; One process-global slot and locked trampoline per callback type.
   (define dispatcher-names
     '(alloc read connection write-done close timer shutdown connect
-      getaddrinfo getnameinfo exit walk signal))
+      getaddrinfo getnameinfo exit walk signal async))
 
   (define dispatchers (make-eq-hashtable))
   (define dispatchers-installed #f)
@@ -724,6 +746,13 @@
                         ((dispatcher-ref 'signal) handle signum))
                       (uptr int) void))
 
+  ;; uv_async_cb (uv_async_t*) -> void. Same arity as close/timer, distinct
+  ;; callback TYPE, so its own locked slot (ADR-0008's per-type rule). It fires
+  ;; from uv_run, so it is __collect_safe like the rest.
+  (define async-callable
+    (foreign-callable __collect_safe (lambda (handle) ((dispatcher-ref 'async) handle))
+                      (uptr) void))
+
   (define raw-walk
     (foreign-procedure "uv_walk" (uptr uptr uptr) void))
 
@@ -737,7 +766,8 @@
                     write-done-callable close-callable timer-callable
                     shutdown-callable connect-callable
                     getaddrinfo-callable getnameinfo-callable
-                    exit-callable walk-callable signal-callable)))
+                    exit-callable walk-callable signal-callable
+                    async-callable)))
 
   ;; Entry-point addresses remain private and leave only through wrappers below.
   (define close-cb-entry      (foreign-callable-entry-point close-callable))
@@ -755,6 +785,7 @@
   (define exit-cb-entry (foreign-callable-entry-point exit-callable))
   (define walk-cb-entry (foreign-callable-entry-point walk-callable))
   (define signal-cb-entry (foreign-callable-entry-point signal-callable))
+  (define async-cb-entry  (foreign-callable-entry-point async-callable))
 
   ;; uv-timer-start-native : uptr exact-nonnegative-integer
   ;;                         exact-nonnegative-integer -> exact-integer
@@ -829,6 +860,17 @@
 
   (define uv-os-getpid-native
     (foreign-procedure "uv_os_getpid" () int))
+
+  ;; uv_async_init bakes the wake callback at init time (unlike timer/signal,
+  ;; which take it at start). uv_async_send is libuv's ONE thread-safe call.
+  (define raw-async-init
+    (foreign-procedure "uv_async_init" (uptr uptr uptr) int))
+  (define uv-async-send
+    (foreign-procedure "uv_async_send" (uptr) int))
+
+  ;; uv-async-init-native : uptr uptr -> exact-integer
+  (define (uv-async-init-native loop-ptr handle-ptr)
+    (raw-async-init loop-ptr handle-ptr async-cb-entry))
 
   ;; version-supported? : exact-integer -> boolean
   (define (version-supported? v)

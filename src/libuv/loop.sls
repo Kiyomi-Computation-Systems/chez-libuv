@@ -57,8 +57,15 @@
        (let ((mode-int (run-mode->int mode 'uv-run))
              (ptr (loop-pointer loop 'uv-run)))
          (set-loop-deferred-error-list! loop '())
+         ;; Transfer ownership to the calling thread: a loop created on one
+         ;; thread and run on another (the worker-pool handoff) becomes owned by
+         ;; whichever thread runs it. Concurrent uv-run is already refused above,
+         ;; so at most one thread runs the loop at a time and the transfer is
+         ;; unambiguous (design §6.2).
          (let ((rc (dynamic-wind
-                    (lambda () (set-loop-running! loop #t))
+                    (lambda ()
+                      (set-loop-owner-thread! loop (current-thread-id))
+                      (set-loop-running! loop #t))
                     (lambda () (uv-loop-run ptr mode-int))
                     (lambda () (set-loop-running! loop #f)))))
            (deliver-pending-callback-error! loop)

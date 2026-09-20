@@ -270,6 +270,42 @@
     (raise (make-uv-callback-error 'sentinel-cause-object))
     'no-raise))
 
+;; --- &uv-wrong-thread (who expected actual) --------------------------------
+;; #20 (threading arc): raised when a loop/handle verb runs off the loop's
+;; owning thread. who is the verb symbol; expected is the owner thread id;
+;; actual is the caller's. expected and actual are both integers, so distinct
+;; nonzero sentinels catch an expected/actual swap that a type check cannot.
+
+(test-equal "wrong-thread predicate accepts its own instance"
+  #t
+  (guard (e ((uv-wrong-thread? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
+    'no-raise))
+
+(test-equal "wrong-thread carries who was called off-thread"
+  'sentinel-who-wt
+  (guard (e ((uv-wrong-thread? e) (uv-wrong-thread-who e)) (#t 'wrong-condition))
+    (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
+    'no-raise))
+
+(test-equal "wrong-thread carries the expected (owner) thread id"
+  515151
+  (guard (e ((uv-wrong-thread? e) (uv-wrong-thread-expected e)) (#t 'wrong-condition))
+    (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
+    'no-raise))
+
+(test-equal "wrong-thread carries the actual (calling) thread id"
+  626262
+  (guard (e ((uv-wrong-thread? e) (uv-wrong-thread-actual e)) (#t 'wrong-condition))
+    (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
+    'no-raise))
+
+(test-equal "wrong-thread is a uv-error"
+  #t
+  (guard (e ((uv-error? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
+    'no-raise))
+
 ;; --- Subtype + sibling discrimination matrix -------------------------------
 ;; Every &uv-* type (other than the root) must satisfy uv-error? AND its own
 ;; predicate, and must NOT satisfy any sibling's predicate. Looping over the
@@ -303,7 +339,10 @@
               uv-invalid-argument?)
         (list 'uv-callback-error
               (make-uv-callback-error 'matrix-cause)
-              uv-callback-error?)))
+              uv-callback-error?)
+        (list 'uv-wrong-thread
+              (make-uv-wrong-thread 'matrix-who 909090 818181)
+              uv-wrong-thread?)))
 
 ;; Every instance must satisfy uv-error?, the family-wide predicate.
 (for-each
