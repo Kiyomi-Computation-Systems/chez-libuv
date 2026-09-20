@@ -86,3 +86,17 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
   non-async → `&uv-invalid-argument`. test-async 12/12.
 - **Gate:** full `make test` 17/17; macOS ASan gate RC 0, no sanitizer errors
   (leak claim deferred to Linux Valgrind per ADR-0003).
+
+### E — async worker-pool stress tier (Task 2.4, ADR-0010 companion)
+
+- Extended `test-threading-stress.sps` (off the default + memory gates) with
+  three real-thread blocks: (1) a genuine worker thread's handle verb is refused
+  with `&uv-wrong-thread`; (2) a loop run by thread B is owned by B (real owner
+  transfer); (3) a K=4 × M=25 worker pool posts 100 items through one async
+  handle whose callback drains the whole queue each wake — every item delivered
+  despite coalescing, queue fully drained. The straggler send-after-close race
+  is expected and caught (`uv-handle-closed?`) in the worker; nothing is lost
+  because close ⟺ all delivered.
+- **R6RS fix:** the worker-pool `let` initially placed `(set! async …)` before
+  `(define (worker …))` → `invalid context for definition`. Reordered defines
+  first. Stress suite 6/6, stable across repeated runs.
