@@ -66,6 +66,9 @@ in the **stress tier** (not the default gate).
 - No wrapper change (loop.sls:50 stands).
 Run `make test`; every existing suite must stay green (the conversion is
 invisible single-threaded except for the released interlock).
+**Cost note (measured, chez-http-server E5f):** the reactivate/deactivate pair
+adds ~60 ns per callback (177–192 ns → 235–249 ns on `uv_idle`), negligible for
+I/O-bound callbacks — see design §5.4.
 
 ### Task 1.3 — Gate
 `make test` (16 suites) + `make test-memory` (ASan) + `make test-memory-docker`

@@ -1,7 +1,9 @@
 # Design Spec: chez-libuv threading — `__collect_safe` (#19) → `uv_async` (#20)
 
 - **Status:** Draft (2026-09-19). Spike complete (`spike/threading/`); this
-  design is grounded in its measurements.
+  design is grounded in its measurements. The T2b/E5c ticker discrepancy is
+  **reconciled** (§5.3, chez-http-server E5d–E5f) — both measurements were
+  correct; the ticker is not a workaround and is withdrawn.
 - **Scope:** post-v0.5.0. Two issues, one arc: #19 (rebind `uv_run`
   `__collect_safe`) is the foundation; #20 (`uv_async` cross-thread wakeup +
   enforced per-loop thread affinity) builds on it.
@@ -9,7 +11,8 @@
   thread-per-core design (2026-09-19 decision). Not speculative.
 - **Related:** ADR-0008 (static trampolines + registry), ADR-0002 (direct FFI),
   ADR-0010 (loopback-only tests), spike/FINDINGS.md Q1 (the deferred gate),
-  spike/threading/FINDINGS.md (this arc's evidence).
+  spike/threading/FINDINGS.md (this arc's evidence), chez-http-server spike
+  E5c–E5f (the trap-tick reconciliation, §5.3).
 
 ## 1. Goal and non-goals
 
@@ -37,9 +40,11 @@ the minimum that makes a second Scheme thread *usable* alongside a libuv loop.
    requires *each* callable to be `__collect_safe`. `uv_run` invokes every
    trampoline, so the conversion is all-or-nothing. Spike T1 proves it is safe
    single-threaded (§5.1).
-2. **D2 — the interim "arm a short-period timer" workaround is NOT adopted as a
-   supported fallback.** Spike T2b measured it ineffective here (§5.2). #19 (D1)
-   is the prerequisite; there is no lighter substitute in the shipped guidance.
+2. **D2 — the "arm a short-period timer" workaround is withdrawn, not shipped.**
+   The T2b/E5c discrepancy is now understood (§5.3): the ticker opens GC windows
+   only when each tick's Scheme path burns ~1000 Chez trap ticks, an accident of
+   the dispatch path, never a guarantee. #19 (D1) is the only reliable
+   prerequisite; there is no lighter substitute in the shipped guidance.
 3. **D3 — cross-thread safety is ENFORCED per-loop thread affinity, not a prose
    rule.** Every handle/loop verb asserts it runs on the loop's owning thread and
    raises a structured `&uv-wrong-thread` otherwise. `uv-async-send!` is the one
@@ -84,9 +89,10 @@ twice.
 - **T2b — auto-GC stalls (~100×), and the ticker workaround does not save it.**
   Allocation-triggered GC waits rather than erroring: 591 ms (plain) vs 6 ms
   (safe). A 1 ms repeating timer — under `UV_RUN_DEFAULT` *and* under a
-  `UV_RUN_ONCE` loop — stayed at ~448 ms, i.e. ≈ plain. This contradicts the
-  chez-http-server spike's "92 ms with a 1 ms timer"; recorded as a measurement
-  to reconcile, and the reason for D2.
+  `UV_RUN_ONCE` loop — stayed at ~448 ms, i.e. ≈ plain. This *appeared* to
+  contradict the chez-http-server spike's "92 ms with a 1 ms timer" — now
+  **reconciled** (§5.3): both are correct, and the difference is how much Scheme
+  the loop thread runs per tick. The reason for D2 either way.
 
 **Consequence for sequencing.** Since a plain `uv_run` blocks *all* other-thread
 GC, no worker thread can even allocate usefully today. #20's registry hazard is
@@ -125,13 +131,66 @@ registry until `uv_run` is collect-safe.
   are standalone FFI; the real conversion must pass the Linux Valgrind gate
   (ADR-0003) with the whole suite.
 
-### 5.3 The workaround, and why it is not shipped (D2)
+### 5.3 Why a plain `uv_run` blocks GC, and why the ticker is not a workaround (reconciled)
 
-#19 proposed documenting "a second Scheme thread needs a short-period timer
-armed". T2b measured both forms of it ineffective (~448 ms vs 6 ms). Until that
-is reconciled with the chez-http-server harness, the docs say the opposite: a
-second allocating thread requires `__collect_safe` (this work), full stop. No
-half-measure is advertised as safe.
+The T2b/E5c discrepancy is resolved (chez-http-server E5d–E5f, 2026-09-19; both
+measurements are correct). The variable is **how much Scheme the loop thread
+runs per tick**.
+
+**Mechanism (Chez 10.4.1 sources).** `S_fire_collector` only sets
+`$collect-request-pending` and every thread's `something-pending` flag
+(c/schsig.c:574–594) — nothing more. A thread acts on it at its next `$event`,
+which fires when that thread's *trap counter* reaches zero; the counter starts
+at `default-timer-ticks` = 1000 (s/cmacros.ss:2118, c/thread.c:355), and
+`$event` then calls `$collect-rendezvous` (s/library.ss:1219–1236). A thread
+inside a plain foreign call never trips its counter, and `mutex-acquire` is a
+plain lock that neither deactivates the thread nor trips it (s/prims.ss:2007,
+c/thread.c:388–404). Only a thread *created* while a request is already pending
+is told to check immediately (c/thread.c:181–183). So a loop thread in a plain
+`uv_run` reaches a collection rendezvous only after its callbacks have burned
+~1000 trap ticks — which a light callback never does inside a 400-fire window.
+
+**The ticker helps only by accident.** E5d swept the single knob — how many
+non-inlined, non-allocating procedure calls the loop thread runs per 1 ms tick,
+same worker (the result is the same whether the calls run between `UV_RUN_ONCE`
+polls or inside the callback under `UV_RUN_DEFAULT`):
+
+| loop-thread work per tick | worker alloc load (ms) |
+|---|---|
+| nothing (T2b's harness) | 439–447 |
+| 100 procedure calls | 82–85 |
+| 300 procedure calls | 29–32 |
+| 1 000 procedure calls | 9–19 |
+| 2 000 procedure calls | 9–20 |
+| uncontended `with-mutex`, no calls | 437–438 |
+| `(sleep 0)` between polls | 9–12 |
+| `uv_run` + callables `__collect_safe` | 6–10 |
+
+**Through the binding** (E5e: worker unchanged, loop thread in a single
+`(uv-run loop 'default)` so only the dispatch path runs per fire — trampoline →
+registry → `dispatch-guarded` → closure): 1 ms timer 44–92 ms, 300 ms timer
+10 223–10 240 ms, baseline 26–29 ms. The dispatch path happens to spend about a
+trap budget per fire, which is why the chez-http-server E5c saw only ~3× where
+T2b's empty callback saw ~75×.
+
+**Verdict (D2).** The 1 ms ticker is not a workaround: it opens GC windows only
+when each tick's Scheme path burns on the order of a thousand trap ticks — an
+accident of the dispatch path, not a guarantee an application can rely on.
+`(sleep 0)` between polls or `__collect_safe` are the only reliable rows.
+#19's proposal to document the ticker is **withdrawn**; `__collect_safe` is the
+prerequisite for a second allocating thread, full stop. (chez-http-server's
+options paper, spike report, ADR-0003 and ADR-0008 are corrected to match.)
+
+### 5.4 Cost of the conversion, single-threaded
+
+E5f measured plain vs `__collect_safe` on `uv_run` and the callable (5 M
+`uv_idle` callbacks per trial, the poll amortized over 256 handles, three trials
+× two runs): **177–192 ns → 235–249 ns per callback**, ~60 ns for the
+reactivate/deactivate pair. Negligible for any I/O-bound callback; recorded so
+Stage 1 notes the floor rather than rediscovering it. The reconciliation
+programs live in chez-http-server's spike record
+(`.plans/research/spike/e5{d,e,f}-*.sps`, outputs under `out/`) and can be
+imported under `spike/threading/` here if we want them co-located.
 
 ## 6. #20 — `uv_async` and enforced per-loop thread affinity
 
@@ -267,8 +326,9 @@ Stage 1 is independently valuable and lower-risk; Stage 2 depends on it.
   needed for the wakeup path.
 - Multiple async handles per loop, priority wakeups — the consumer can multiplex
   over one async handle + its own queue; revisit only if measured necessary.
-- Reconciling T2b with the chez-http-server harness (whether the timer
-  workaround can be made to work at all) — parked; D2 does not depend on it.
+- Importing the chez-http-server reconciliation programs (E5d–E5f) under
+  `spike/threading/` — optional co-location; the evidence and mechanism are
+  captured in §5.3 regardless.
 
 ## Appendix A — the collect-safe rule, stated for the implementer
 
