@@ -55,6 +55,9 @@
           require-callback
           signal-symbol->int term-signal->value
 
+          ;; thread identity (per-loop affinity, #20)
+          current-thread-id
+
           ;; callback dispatch
           dispatcher-names dispatcher-ref dispatchers-installed?
           install-callback-dispatchers!
@@ -90,7 +93,8 @@
                 foreign-callable foreign-callable-entry-point lock-object
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
-                file-regular? make-mutex with-mutex getenv)
+                file-regular? make-mutex with-mutex getenv
+                threaded? get-thread-id)
           (libuv private config)
           (libuv private conditions)
           (libuv private constants))
@@ -527,6 +531,13 @@
   (define (require-callback proc who reason)
     (unless (procedure? proc)
       (raise (make-uv-invalid-argument who reason))))
+
+  ;; current-thread-id : -> exact-integer
+  ;; The identity per-loop affinity (#20) compares against. On a non-threaded
+  ;; Chez there is exactly one thread, so a constant makes the affinity check a
+  ;; tautology (design D5); get-thread-id is only meaningful on a threaded build.
+  (define (current-thread-id)
+    (if (threaded?) (get-thread-id) 0))
 
   ;; signal-symbol->int : (or symbol 0) symbol -> exact-integer
   ;; Accept only the closed symbolic vocabulary plus kill(pid, 0).

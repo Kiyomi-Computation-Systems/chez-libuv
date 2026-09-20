@@ -71,7 +71,10 @@
           uv-invalid-argument-who uv-invalid-argument-reason
 
           &uv-callback-error make-uv-callback-error uv-callback-error?
-          uv-callback-error-cause)
+          uv-callback-error-cause
+
+          &uv-wrong-thread make-uv-wrong-thread uv-wrong-thread?
+          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual)
   (import (rnrs)
           (libuv loop)
           (libuv handle)

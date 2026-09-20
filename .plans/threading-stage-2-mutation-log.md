@@ -43,3 +43,20 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
 - **Green:** `conditions.sls` adds `&uv-wrong-thread` (subtype of `&uv-error`;
   fields who/expected/actual) + exports. Pure suite: test-conditions 115/115,
   exit 0 (purity preserved — no native import added).
+
+### C — enforced per-loop thread affinity (Task 2.2b)
+
+- **Scaffolding (no behaviour yet):** `native.sls` `current-thread-id`
+  (`threaded?`-guarded `get-thread-id`); `handles.sls` loop `owner-thread`
+  field (set to the creating thread in the protocol) + `require-loop-thread`;
+  `loop.sls` transfers the owner to the caller at `uv-run` entry; facade
+  re-exports `&uv-wrong-thread`.
+- **Red:** `test-async.sps` affinity section with `require-loop-thread` NOT yet
+  wired into `require-open-handle` → the two refusal rows FAIL (verb returns
+  `'no-raise`); the positive control and the uv-run-transfer row pass. 2 passed
+  / 2 failed.
+- **Green:** wired `(require-loop-thread (handle-loop handle) who)` into
+  `require-open-handle` (thread check first, before the open-state check).
+  test-async 4/4. Full `make test` = 17/17 suites (the check is invisible to
+  every existing single-threaded suite: owner == caller always). check-purity
+  still holds.
