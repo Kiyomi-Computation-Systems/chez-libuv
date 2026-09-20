@@ -492,6 +492,20 @@
       'distinct-positive
       'wrong))
 
+;; #20 async (issue #20, threading arc): UV_ASYNC must be a snapshotted,
+;; distinct handle type tag, exactly like UV_SIGNAL above. Sized at runtime via
+;; (uv-handle-size (uv-async-type)); no SIZEOF_UV_ASYNC_T (signal precedent).
+(test-equal "UV_ASYNC is snapshotted and distinct from the other handle type tags"
+  'distinct-positive
+  (if (and (integer? (uv-async-type))
+           (exact? (uv-async-type))
+           (positive? (uv-async-type))
+           (not (memv (uv-async-type)
+                      (list (uv-timer-type) (uv-tcp-type) (uv-signal-type)
+                            (uv-process-type) (uv-named-pipe-type)))))
+      'distinct-positive
+      'wrong))
+
 ;; --- constants: a name the shim does not have (ADR-0005) ----------------
 ;; The failure must be structured and must NAME the missing constant. A
 ;; default value, a zero, or a bare #f here is the exact silent-transcription

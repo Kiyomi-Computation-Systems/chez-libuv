@@ -140,6 +140,7 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIGCONT", SIGCONT },
   { "SIGSTOP", SIGSTOP },
   { "UV_SIGNAL", UV_SIGNAL },
+  { "UV_ASYNC",  UV_ASYNC },
 
   /* Version-gated bind flag. UV_TCP_REUSEPORT (TCP SO_REUSEPORT with load
    * balancing) is an enum constant, so it is invisible to #ifdef; it is guarded
