@@ -26,11 +26,25 @@ libraries exist for narrower imports.
 | `uv-loop-teardown!` | Close every handle, drain, then close the loop |
 | `call-with-uv-loop` | The above as a scope; tears down on every exit path |
 
+**One thread per loop**
+([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)).
+A loop and its handles belong to one thread: the one that created the loop,
+then whichever thread most recently entered `uv-run` on it — so a loop can be
+built on one thread and handed to a dedicated loop thread, which keeps it
+after `uv-run` returns. Every verb that operates on an open handle, plus
+`make-uv-async` and `uv-update-time!`, raises `&uv-wrong-thread` from any
+other thread before it touches anything. Verbs outside that check — among
+them `uv-close!`, the other constructors, `uv-stop!`, and loop queries such
+as `uv-now` — are loop-thread-only all the same, just unchecked. The one
+exemption is `uv-async-send!`, which is how another thread reaches the loop
+([Async](#async--libuv-async)). While the loop thread waits in `uv-run`, other
+Scheme threads allocate and collect freely.
+
 ## Handles — `(libuv handle)`
 
 | Export | |
 |---|---|
-| `uv-handle?` `uv-timer?` `uv-tcp?` `uv-pipe?` `uv-process?` `uv-signal?` | Type predicates |
+| `uv-handle?` `uv-timer?` `uv-tcp?` `uv-pipe?` `uv-process?` `uv-signal?` `uv-async?` | Type predicates |
 | `uv-handle-open?` `uv-handle-closing?` | State predicates. Never raise, on anything |
 | `uv-handle-state` | `'open` \| `'closing` \| `'closed`. There is no `uv-handle-closed?` — that name is the condition predicate |
 | `uv-handle-loop` | The owning loop; answers for a closed handle too |
@@ -429,6 +443,36 @@ behaviours worth knowing before the design spec:
 | `uv-timer-again!` | Restart a repeating timer |
 | `uv-timer-repeat` `uv-timer-set-repeat!` | Read and set the repeat interval |
 
+## Async — `(libuv async)`
+
+libuv's one cross-thread wakeup, and the way a worker thread hands work back
+to the loop thread. `uv-async-send!` is the one exception to the thread rule
+under [the loop](#the-loop--libuv-loop), above.
+
+| Export | |
+|---|---|
+| `make-uv-async` | A new async handle on a loop: `(loop on-wake)`. Loop thread only: `&uv-wrong-thread` from any other. `on-wake` runs on the loop thread and receives the async handle itself |
+| `uv-async-send!` | Wake the loop so it runs `on-wake`. Callable from **any** thread: `uv_async_send` is libuv's one thread-safe call, and this is the one verb exempt from the thread rule. Sends coalesce — N sends may yield one `on-wake` — so `on-wake` should drain a queue of your own, and tolerate finding it empty, rather than assume one item per send |
+| `uv-async?` | Type predicate (defined in `(libuv handle)`) |
+
+Three behaviours worth knowing before the
+[threading design](../.plans/2026-09-19-chez-libuv-threading-design.md) (§6):
+
+- **An open async keeps the loop alive.** Like any active handle it keeps
+  `uv-run 'default` from returning (short of `uv-stop!`), and there is no
+  `uv_unref` binding to exempt it (the design's §12 defers one), so close the
+  async to let the loop finish.
+- **The handle must outlive every send** — libuv's contract, and the
+  caller's to keep. `uv-async-send!` raises `&uv-handle-closed` for a handle
+  already closing or closed, but that check cannot stop the loop thread from
+  closing — and freeing — the handle between the check and the send, so make
+  sure no thread can still send before calling `uv-close!`. One way: send
+  only while holding a mutex and seeing an open flag, and have the loop
+  thread clear the flag under the same mutex before it closes.
+- **A close drops wakes still pending.** `on-wake` never runs once
+  `uv-close!` has started, even for a send made before it, so after closing,
+  drain the queue once more yourself.
+
 ## Versions — `(libuv)`
 
 | Export | |
@@ -457,10 +501,11 @@ discriminant is a symbol).
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
 | `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the owner's thread id, `actual` the caller's ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 
-v0.3, v0.4 and v0.5 added no new condition types — every `(libuv
-process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv handle)`
-failure raises one of the three above (`&uv-errno-error`,
-`&uv-handle-closed`, `&uv-invalid-argument`); the closed set of
+v0.3, v0.4 and v0.5 added no new condition types, and v0.6 added one — every
+`(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv
+handle)`/`(libuv async)` failure raises one of the three above
+(`&uv-errno-error`, `&uv-handle-closed`, `&uv-invalid-argument`), or
+`&uv-wrong-thread` off the loop's thread; the closed set of
 `&uv-invalid-argument` reason symbols (`'stdio-spec-unknown`,
 `'pipe-already-used`, `'signal-unknown`, `'signal-unwatchable`,
 `'signal-mode-fixed`, `'buffer-size-fixed`, `'buffer-size-out-of-range`
