@@ -33,6 +33,17 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
+;; describe : object -> string
+;; A raised object's message, for a row to carry as evidence. Total: if
+;; printing it raises too (a record writer that raises, say), the answer is a
+;; fixed string, because a raise escaping the handler that called this would
+;; skip whatever follows -- a worker that never signals hangs its join.
+(define (describe e)
+  (guard (err (#t "<the raised object could not be printed>"))
+    (let ((p (open-output-string)))
+      (if (condition? e) (display-condition e p) (write e p))
+      (get-output-string p))))
+
 (test-begin "threading-stress")
 
 ;; On a non-threaded Chez there is no second thread to starve; the whole premise
@@ -61,9 +72,7 @@
        (sleep (make-time 'time-duration 20000000 0)) ; 20 ms
        (let loop ((i 0))
          (when (< i N)
-           (let ((outcome (guard (e (#t (let ((p (open-output-string)))
-                                          (display-condition e p)
-                                          (get-output-string p))))
+           (let ((outcome (guard (e (#t (describe e)))
                             (let build ((k 0) (acc '()))
                               (if (< k 500) (build (+ k 1) (cons k acc)) acc))
                             (collect)
@@ -170,10 +179,6 @@
     (define cap 1000000)                 ; a worker still unrefused after this many
                                          ; posts stops, and fails the refusal row
                                          ; (the busiest measured: ~20000)
-    (define (describe e)
-      (let ((p (open-output-string)))
-        (if (condition? e) (display-condition e p) (write e p))
-        (get-output-string p)))
     ;; run-pool : -> (list closed refusals delivery drained)
     ;; One pool, from make-uv-loop to teardown. Each verdict is a sentinel
     ;; symbol when its property held, and otherwise the evidence.
@@ -189,6 +194,7 @@
         (define accepted (make-vector k 0))  ; per worker: posts queued; each
                                              ; worker writes only its own slot
         (define queued-at-close #f)
+        (define stopped-early 0)             ; workers that stopped unrefused
         (define dm (make-mutex))             ; guards results, for the join
         (define all-done (make-condition))
         (define results '())                 ; (worker-id . outcome), one each
@@ -211,10 +217,14 @@
         ;; Drains every wake until CLOSE-AFTER items are delivered; then closes
         ;; at the first wake that finds items queued, without draining them
         ;; first -- so the drain after uv-close! is always what delivers them.
+        ;; A worker that stopped before being refused makes the next wake close
+        ;; at once: the round has already failed, and waiting for posts that
+        ;; may never come would leave uv-run blocked, a hang, not a failing row.
         (define (on-wake h)
           (let ((closing? (with-mutex qm
-                            (and (>= delivered close-after)
-                                 (pair? queue)
+                            (and (or (positive? stopped-early)
+                                     (and (>= delivered close-after)
+                                          (pair? queue)))
                                  (begin (set! open? #f)
                                         (set! queued-at-close (length queue))
                                         #t)))))
@@ -222,6 +232,11 @@
             (deliver! (with-mutex qm (take-queue!)))))
         ;; Any raise is a failure, recorded as evidence rather than left to kill
         ;; the thread: under this discipline the handle never refuses a send.
+        ;; A worker that stops unrefused (it raised, or reached CAP) wakes the
+        ;; loop thread, under the discipline, so the round closes and uv-run
+        ;; returns. That wake can itself raise only when the discipline is
+        ;; already broken -- the handle closing under an open flag -- and the
+        ;; outcome has already recorded the failure, so it is dropped.
         (define (worker id)
           (let ((outcome
                  (guard (e (#t (list 'raised (describe e))))
@@ -231,6 +246,12 @@
                             (vector-set! accepted id (+ seq 1))
                             (push (+ seq 1)))
                            (else 'refused))))))
+            (unless (eq? outcome 'refused)
+              (guard (e (#t #f))
+                (with-mutex qm
+                  (when open?
+                    (set! stopped-early (+ stopped-early 1))
+                    (uv-async-send! async)))))
             (with-mutex dm
               (set! results (cons (cons id outcome) results))
               (condition-signal all-done))))
@@ -247,6 +268,11 @@
         (let ((run (guard (e (#t (list 'raised (describe e))))
                      (uv-run loop 'default)  ; drains wakes until the close
                      'returned)))
+          ;; Already clear if the closing wake ran. If uv-run raised first, this
+          ;; refuses the workers now, before the join and before teardown
+          ;; closes the async, instead of letting each post to CAP into a loop
+          ;; that no longer drains.
+          (with-mutex qm (set! open? #f))
           (with-mutex dm                     ; join every worker before teardown
             (let join ()
               (unless (= (length results) k)

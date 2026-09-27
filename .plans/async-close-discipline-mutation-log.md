@@ -97,7 +97,7 @@ Three test-design choices make the rows able to fail:
   a worker that is never refused (a failure, reported as `never-refused`).
 - **The close waits for a wake that finds items queued**, and does not drain
   them first, so the drain after `uv-close!` always has work. Without that
-  condition about 2.5% of natural closes found the queue empty (M9 below),
+  condition about 3% of natural closes found the queue empty (M9 below),
   which would leave the final drain unexercised in that round.
 - **The pool runs 30 rounds**, fresh each time, and each row requires its
   property in every round. A discipline slip loses its race only in some
@@ -120,8 +120,8 @@ Four rows, each a sentinel on success and the evidence otherwise:
 
 - `make test`: all 17 suites pass. `make test-threading`: 8 expected passes
   (the old block contributed 2 rows; this one contributes 4).
-- The final suite, macOS: 30/30 runs green, and 50/50 on the text before its
-  last, comment-only, edits.
+- The final suite, macOS: 30/30 runs green. Before the review follow-up, 50/50
+  and 30/30.
 - The final suite, Linux: 30/30 at 8 vCPU, 30/30 under `--cpus=2`.
 - The final suite with `rounds` set to 1, against **W1** and **W2** — the
   widened windows that broke the old block in 20/20 and 19/20 rounds: 5/5
@@ -134,10 +134,12 @@ Four rows, each a sentinel on success and the evidence otherwise:
 ## Mutations
 
 Each mutation was applied to a scratch copy of the final
-`tests/test-threading-stress.sps` and run against the unmodified library. Counts
-are failing runs out of runs; every failure was a `FAIL` line naming the row,
-never a crash or a hang, and no run printed a thread exception. The unmutated
-copy, run alongside: 50/50 green.
+`tests/test-threading-stress.sps` (after the review follow-up below) and run
+against the unmodified library. Counts are failing runs out of runs; every
+failure was a `FAIL` line naming the row, never a crash or a hang, and no run
+printed a thread exception. The unmutated copy, run alongside: 30/30 green.
+Before the review follow-up the same sweep failed the same rows, except that
+M6 also failed row 3 in 4 of 30 runs.
 
 Rows: **1** closed with posts still queued · **2** every worker refused, no
 send raised · **3** every accepted item delivered exactly once · **4** the
@@ -148,28 +150,71 @@ shared queue is fully drained.
 | M1 | the drain after `uv-close!` skipped on the closing wake: `(unless closing? (deliver! …))` | drain once more after the close | 3: 10/10 · 4: 10/10 |
 | M2 | `open?` cleared after `uv-close!`, not before it | clear the flag, then close | 2: 30/30 · 3: 30/30 |
 | M3 | `uv-async-send!` moved out of `qm`: check and enqueue under it, send after | send while holding the lock | 2: 30/30 · 3: 30/30 |
-| M4 | `open?` never cleared | refuse senders before the close | 2: 10/10 · 3: 10/10 · 4: 10/10 |
+| M4 | `open?` not cleared by the closing wake | refuse senders before the close | 2: 30/30 · 3: 30/30 · 4: 30/30 |
 | M5 | `take-queue!` does not reset the queue | a drain takes each item once | 3: 10/10 · 4: 10/10 |
-| M6 | the join removed | wait for every worker before teardown | 2: 30/30 · 3: 4/30 |
-| M7 | the item consed onto `queue` outside `qm` (flag check and send still under it) | enqueue under the lock | 2: 30/30 · 3: 30/30 · 4: 29/30 |
+| M6 | the join removed | wait for every worker before teardown | 2: 30/30 |
+| M7 | the item consed onto `queue` outside `qm` (flag check and send still under it) | enqueue under the lock | 2: 30/30 · 3: 30/30 · 4: 30/30 |
 | M8 | close condition `(pair? queue)` negated to `(null? queue)` | close only with items queued | 1: 10/10 |
-| M9 | close condition `(pair? queue)` removed | close only with items queued | 1: 11/20 |
+| M9 | close condition `(pair? queue)` removed | close only with items queued | 1: 14/20 |
 
 How the probabilistic ones fail:
 
-- **M2, M3.** A send that meets the close sees the handle `closing` and
+- **M2, M3, M4.** A send that meets the close sees the handle `closing` and
   raises `&uv-handle-closed` (row 2). Its item was already queued, so the
   final drain delivers an item its worker never counted as accepted (row 3).
+  Under M4 the flag is cleared only after `uv-run` returns (the follow-up's
+  post-run clear), and workers keep posting until then.
 - **M6.** The rows read `results` before every worker has recorded its
-  outcome (row 2), and in 4/30 runs `accepted` before a worker's last write
-  (row 3).
-- **M9.** Without the condition, a close finds the queue empty in about 2.5%
-  of rounds (16 of 30 runs failed across two batches, at 30 rounds a run).
+  outcome (row 2). Before the follow-up, 4 of 30 runs also read `accepted`
+  before a worker's last write (row 3).
+- **M9.** Without the condition, a close finds the queue empty in about 3% of
+  rounds (30 of 50 runs failed across three batches, at 30 rounds a run).
 
-**Why 30 rounds.** With `rounds` set to 1, final text: M2 10/20, M3 2/20, M6
-8/20. Earlier single-pool shapes of the same block measured M2 8/20 and 7/20,
-M3 6/20 and 2/20, M6 8/20 and 11/20. At 10 rounds, M3 was caught in 18/20
-runs; at 30, every probabilistic mutation above was caught in every run.
+**Why 30 rounds.** With `rounds` set to 1, final text: M2 10/20, M3 5/20, M6
+6/20, M4 20/20. Earlier shapes of the same block measured M2 8/20, 7/20 and
+10/20, M3 6/20 and 2/20, M6 8/20, 11/20 and 8/20. At 10 rounds, M3 was caught
+in 18/20 runs; at 30, every probabilistic mutation above was caught in every
+run.
+
+---
+
+## Review follow-up — failure paths
+
+A `/code-review` pass found three ways the block's own plumbing could hang or
+blow up where it should fail a row, plus a duplicated helper. Each was
+reproduced against the reviewed commit, fixed, and re-run. The probes are
+scratch copies of the suite with one failure injected. "Before" is the
+reviewed text: the mechanism below, absent.
+
+| Probe: the failure injected | Before | After |
+|---|---|---|
+| `cap` 10, so no close can come (4 × 10 < 400) | hangs; killed at 30 s (rc 124), no `FAIL` line | row 2 fails by name, 0.74 s |
+| every worker raises at item 50 | hangs; rc 124 | row 2 fails by name, 0.73 s |
+| worker 0 raises an object whose printer raises | the worker dies (`Exception occurred with non-condition value cannot-print`), the join waits; rc 124 | row 2 fails by name, 0.73 s |
+| `on-wake` raises after 100 deliveries | rows 1–4 fail only after every worker posts to `cap`: 1.49 s, 189 MB peak (1 round); 23.5 s, 595 MB (30 rounds) | rows 1, 3, 4 fail by name: 0.70 s, 49 MB (1 round); 0.79 s, 49 MB (30 rounds) |
+
+A normal run: 0.72 s, 52 MB peak.
+
+- **A worker that stops unrefused wakes the loop.** It raised, or it reached
+  `cap`; either way it bumps `stopped-early` and wakes the loop thread, under
+  the discipline, and `on-wake` closes at once when `stopped-early` is
+  positive. The review named only the cap. The second probe showed that a
+  worker that raised leaves the loop waiting the same way. The wake is
+  guarded and its failure dropped: it can raise only when the discipline is
+  already broken (the handle closing under an open flag, as in M2 and M4),
+  and the worker's outcome has recorded the failure by then.
+- **The flag is cleared after `uv-run` returns**, under `qm`, before the join.
+  The closing wake has already cleared it on the normal path. After a raise
+  it refuses the workers before teardown closes the async.
+- **`describe` is total and shared.** A raise while printing the raised
+  object yields a fixed string. It moved to top level, and the GC-freedom
+  block uses it too; that block's worker had the same exposure, since a raise
+  escaping its handler skipped `worker-done`. With that block's `(collect)`
+  made to raise, both of its rows fail by name.
+
+These mechanisms matter only once something else has already failed, so no
+row can observe them on a healthy library. The probes above are their
+evidence.
 
 ---
 
@@ -206,3 +251,12 @@ draining altogether.
   observed only with W2.
 - **`async.sls`'s own decisions** are `tests/test-async.sps`'s to guard. This
   block claims none of them.
+- **The failure-path plumbing** (the early-stop wake, the post-run clear, the
+  total `describe`) is covered by the review follow-up's probes, not by the
+  suite: removing any of it changes nothing a healthy run can see.
+- **Deferred from the review:** the close discipline is the caller's to
+  implement (`async.sls` fences nothing), so every consumer re-implements it;
+  a library-level sender fence would move it below the API. Two invariants
+  here remain comments ("with qm held", "each worker writes only its own
+  slot"). Row 1 is guaranteed by the close condition it sits beside, so it
+  checks that condition, not the library.
