@@ -256,7 +256,7 @@ draining altogether.
   suite: removing any of it changes nothing a healthy run can see.
 - **Deferred from the review:** the close discipline is the caller's to
   implement (`async.sls` fences nothing), so every consumer re-implements it;
-  a library-level sender fence would move it below the API. Two invariants
-  here remain comments ("with qm held", "each worker writes only its own
-  slot"). Row 1 is guaranteed by the close condition it sits beside, so it
-  checks that condition, not the library.
+  a library-level sender fence would move it below the API (→ #33). Two
+  invariants here remain comments ("with qm held", "each worker writes only
+  its own slot"). Row 1 is guaranteed by the close condition it sits beside,
+  so it checks that condition, not the library.
