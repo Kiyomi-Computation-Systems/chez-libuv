@@ -3,6 +3,48 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.0 — 2026-09-27
+
+One new loop verb, and the reference documentation 0.6.0's threading work
+shipped without. libuv reads its clock once per loop iteration and arms every
+timer from that cached value, so a callback that holds the loop leaves the
+clock behind, and a deadline armed after it starts from before the callback
+ran. A server that computes in a request handler and then arms a write timeout
+saw it fire early: a response cut off mid-write, and a keep-alive connection
+closed as soon as its response was written. `uv-update-time!` is libuv's
+answer, `uv_update_time`. Purely additive: no existing call changes behaviour.
+
+### Added
+
+- `(libuv loop)`: `uv-update-time!` refreshes the loop's cached "now" (`uv-now`)
+  from libuv's clock. A callback that held the loop calls it before arming a
+  deadline; without it the deadline counts from before the callback ran. It is
+  legal while the loop runs and runs nothing — no callback fires, not even a
+  timer already due. It is loop-thread-only and **checked**: `&uv-wrong-thread`
+  from any other thread. It is the first loop-level verb inside the enforced
+  affinity surface, because unlike `uv-now` it writes the cache the loop thread
+  rewrites every iteration
+  ([ADR-0019](.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
+  dated note). Re-exported from `(libuv)`.
+
+### Notes
+
+- `docs/api.md` now documents what 0.6.0 shipped without a reference entry: the
+  `(libuv async)` module, a one-thread-per-loop rule naming which verbs are
+  checked and which are loop-thread-only but unchecked, and the
+  `&uv-wrong-thread` condition. `uv-async?` is listed with the other type
+  predicates in `(libuv handle)`, where it has always lived; importing
+  `(libuv async)` alone does not bring it in.
+- Two `uv_async` lifetime rules are now written down, both libuv's contract
+  and both unchanged since 0.6.0. The handle must outlive every
+  `uv-async-send!`: the send's open check cannot stop the loop thread from
+  closing the handle between the check and the send. And `on-wake` never runs
+  once `uv-close!` has started, even for a send made before it, so drain your
+  own queue once more after closing. `docs/api.md`'s Async section shows one
+  safe shape.
+- The `uv-timer-start!` entry now says a timeout counts from the cached
+  `uv-now`, and points at `uv-update-time!`.
+
 ## 0.6.0 — 2026-09-19
 
 Threading, and the TCP surfaces v0.5's review left open. A loop thread can now

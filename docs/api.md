@@ -501,7 +501,7 @@ discriminant is a symbol).
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
 | `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the owner's thread id, `actual` the caller's ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 
-v0.3, v0.4 and v0.5 added no new condition types, and v0.6 added one — every
+v0.3, v0.4, v0.5 and v0.7 added no new condition types, and v0.6 added one — every
 `(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv
 handle)`/`(libuv async)` failure raises one of the three above
 (`&uv-errno-error`, `&uv-handle-closed`, `&uv-invalid-argument`), or

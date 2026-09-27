@@ -24,9 +24,11 @@ design, with nineteen accepted decision records, lives under
 
 * Status
 
-*v0.6.0* — event loop, TCP (bind with an optional reuseport flag, listen,
-accept, connect, reads with backpressure, scalar and vectored writes,
-shutdown, nodelay, keepalive, local and peer addresses), timers, DNS
+*v0.7.0* — event loop (with ~uv-update-time!~ to refresh its cached clock
+after a callback that held it, before arming a deadline), TCP (bind with an
+optional reuseport flag, listen, accept, connect, reads with backpressure,
+scalar and vectored writes, shutdown, nodelay, keepalive, local and peer
+addresses), timers, DNS
 (~getaddrinfo~, ~getnameinfo~, ~cancel~), child processes (the full
 ~uv_spawn~ stdio vocabulary) with minimal pipes, signal watching
 (continuous and oneshot), flow control (read/write buffer sizing, the
