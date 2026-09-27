@@ -3,7 +3,7 @@
 ;;; explicitly; callers close or tear them down rather than relying on GC.
 (library (libuv loop)
   (export make-uv-loop uv-loop? uv-loop-open?
-          uv-run uv-stop! uv-loop-alive? uv-now
+          uv-run uv-stop! uv-loop-alive? uv-now uv-update-time!
           uv-loop-live-handles uv-loop-deferred-errors
           uv-loop-close! uv-loop-teardown! call-with-uv-loop)
   (import (rnrs)
@@ -82,10 +82,21 @@
     (not (zero? (uv-loop-alive (loop-pointer loop 'uv-loop-alive?)))))
 
   ;; uv-now : uv-loop -> exact-nonnegative-integer
-  ;; This is libuv's cached time and changes only when the loop updates it.
+  ;; This is libuv's cached time. It changes only when the loop updates it,
+  ;; once per iteration, or when uv-update-time! does.
   (define (uv-now loop)
     (require-open-loop loop 'uv-now)
     (uv-loop-now (loop-pointer loop 'uv-now)))
+
+  ;; uv-update-time! : uv-loop -> unspecified
+  ;; Refresh the cached time from libuv's clock. Timers are armed from that
+  ;; cache, so a callback that held the loop calls this before arming a
+  ;; deadline, or the deadline starts from before the callback ran (#28).
+  ;; Legal while the loop runs, and it runs nothing. Like uv-now it is a
+  ;; loop-level verb, outside the thread-affinity check (ADR-0019).
+  (define (uv-update-time! loop)
+    (require-open-loop loop 'uv-update-time!)
+    (uv-loop-update-time (loop-pointer loop 'uv-update-time!)))
 
   ;; uv-loop-live-handles : uv-loop -> (listof uv-handle)
   (define (uv-loop-live-handles loop)

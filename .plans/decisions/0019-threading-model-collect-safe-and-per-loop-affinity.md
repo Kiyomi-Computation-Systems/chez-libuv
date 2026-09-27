@@ -90,6 +90,14 @@ outside it, keeping their existing guards:
   transferring ownership — a check there would break the create-on-A/run-on-B
   handoff this ADR exists to enable.
 
+> **Extended 2026-09-27 (issue #28).** `uv-update-time!` is a loop-level verb
+> and joins `uv-now` outside the enforced surface: it carries `uv-now`'s
+> open-loop check and nothing more. It writes the loop's cached time, which the
+> loop thread also writes every iteration, so it belongs on the loop's thread
+> like every verb here. That rule is documented, not enforced — the same
+> standing as `uv-now` and `uv-stop!`, and the same clean follow-up if a
+> consumer ever needs it checked.
+
 ## Consequences
 
 - A single-threaded program is unchanged except that the collect interlock is

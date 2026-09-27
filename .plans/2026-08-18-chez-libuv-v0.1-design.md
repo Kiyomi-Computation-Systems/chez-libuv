@@ -335,7 +335,8 @@ letting the iteration finish, not a Q2 measurement. See
 **Legal from inside a callback:** `uv-close!`, `uv-read-start!` /
 `uv-read-stop!`, `uv-write!`, `uv-shutdown!`, accepting a connection
 (required inside `on-connection`), creating a new handle, timer operations,
-`uv-stop!`, `uv-now`.
+`uv-stop!`, `uv-now`, `uv-update-time!` (issue #28 — calling it from a
+callback that held the loop is its purpose).
 
 **Illegal from inside a callback:** `uv-run`, `uv-loop-close!`,
 `uv-loop-teardown!` — each raises `&uv-invalid-argument` if called while the

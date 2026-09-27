@@ -44,7 +44,9 @@
               ;; complete-request!'s free! sees the same kind of pointer the
               ;; Stage 4 dispatchers will hand it.
               alloc-zeroed)
-        (only (chezscheme) collect))
+        ;; sleep and make-time pace the uv-update-time! rows' wait for the
+        ;; clock to advance; that wait is bounded by a poll count, not by them.
+        (only (chezscheme) collect sleep make-time))
 
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
@@ -183,6 +185,170 @@
 
 (test-equal "uv-now does not go backwards across a run"
   'monotone (if (>= now-after now-before) 'monotone 'went-backwards))
+
+;; --- uv-update-time! (issue #28) ----------------------------------------
+;; uv-now is a CACHE: libuv refreshes it once per loop iteration, so a
+;; callback that holds the loop leaves it behind, and a timer armed after that
+;; callback is due relative to a "now" from before the callback ran.
+;; uv-update-time! refreshes the cache on demand.
+;;
+;; THE REFERENCE CLOCK is a second loop with nothing on it: uv_run on a loop
+;; that is not alive refreshes that loop's cached time before returning
+;; (unix/core.c and win/core.c both), so `reference-now` reads the clock
+;; uv-update-time! reads, but through uv-run -- never through the binding
+;; under test. Every assertion below is an ORDERING of readings of that one
+;; monotonic clock. None measures an elapsed duration, so a slow host can only
+;; widen the gaps they rely on, never close them.
+(define reference-loop (make-uv-loop))
+
+(define (reference-now)
+  (uv-run reference-loop 'nowait)
+  (uv-now reference-loop))
+
+;; Hold this thread until libuv's clock reads strictly past `threshold`, and
+;; answer that first reading -- or 'clock-never-advanced once `cap` polls have
+;; passed. The sleep only keeps the wait from spinning; the cap bounds it.
+(define one-millisecond (make-time 'time-duration 1000000 0))
+
+(define (await-clock-past threshold cap)
+  (let poll ((i 0))
+    (let ((now (reference-now)))
+      (cond ((> now threshold) now)
+            ((>= i cap) 'clock-never-advanced)
+            (else (sleep one-millisecond) (poll (+ i 1)))))))
+
+;; Outside a run. The cached now is read, the clock is let past it, and the
+;; refreshed now must land between the reference readings either side of the
+;; call. A refresh that did nothing leaves uv-now at the stale reading, which
+;; the wait has already put strictly below `ut-before`.
+(define ut-loop (make-uv-loop))
+(define ut-stale (uv-now ut-loop))
+(define ut-before (await-clock-past ut-stale 1000))
+(define ut-outcome
+  (guard (e (#t (list 'raised e)))
+    (uv-update-time! ut-loop)
+    'returned))
+(define ut-fresh (uv-now ut-loop))
+(define ut-after (reference-now))
+
+(test-equal "precondition: libuv's clock moved past the loop's stale cached now"
+  'advanced (if (number? ut-before) 'advanced ut-before))
+
+(test-equal "uv-update-time! returns on an open loop"
+  'returned ut-outcome)
+
+(test-equal "uv-update-time! refreshes uv-now to libuv's current clock"
+  'caught-up
+  (if (and (number? ut-before) (<= ut-before ut-fresh ut-after))
+      'caught-up
+      (list 'stale ut-stale 'before ut-before 'fresh ut-fresh 'after ut-after)))
+
+;; Inside a run: the issue's own scenario. A callback holds the loop until
+;; libuv's clock is `hold-ms` past the loop's cached now, calls
+;; uv-update-time! -- with the loop RUNNING, which is the whole use case --
+;; then arms a deadline `hold-ms` out: chez-http-server's handler followed by
+;; its write deadline. libuv arms a timer from the cached now (timer.c:
+;; loop->time + timeout) and never fires one before loop->time reaches it, so
+;; a deadline armed from the refreshed clock fires at a now at least `hold-ms`
+;; past the reference reading taken before the refresh.
+;;
+;; THE TRAFFIC TIMER IS WHAT MAKES THAT ROW ABLE TO FAIL. libuv computes its
+;; poll timeout from the cached now as well, so on a loop whose only wakeup is
+;; the deadline, a deadline armed from the stale now still sleeps its full
+;; `hold-ms` and looks right. Measured: with the refresh mutated to a no-op
+;; and no traffic, the row passed at 26 ms. The issue's server is never that
+;; quiet -- I/O wakes its loop, the clock is re-read, and the stale deadline is
+;; found already overdue. A 1 ms repeating timer plays that traffic, so a
+;; stale-armed deadline fires at the first wake after the hold instead. The
+;; precondition row below checks the traffic really did land while the
+;; deadline was pending. Like run-until/ticking's ticker, its callback skips
+;; (collect): it is fixture, not code under test.
+(define hold-ms 25)
+(define sc-loop (make-uv-loop))
+(define sc-trigger (make-uv-timer sc-loop))
+(define sc-deadline (make-uv-timer sc-loop))
+(define sc-traffic (make-uv-timer sc-loop))
+(define sc-armed-from 'trigger-never-fired)
+(define sc-outcome 'trigger-never-fired)
+(define sc-fired-at 'deadline-never-fired)
+(define sc-wakes-while-pending 0)
+
+(uv-timer-start! sc-trigger
+                 (lambda (timer)
+                   (collect)
+                   (set! sc-armed-from
+                         (await-clock-past (+ (uv-now sc-loop) hold-ms) 1000))
+                   (set! sc-outcome
+                         (guard (e (#t (list 'raised e)))
+                           (uv-update-time! sc-loop)
+                           'returned))
+                   (uv-timer-start! sc-deadline
+                                    (lambda (timer)
+                                      (collect)
+                                      (set! sc-fired-at (uv-now sc-loop)))
+                                    hold-ms 0))
+                 0 0)
+
+(uv-timer-start! sc-traffic
+                 (lambda (timer)
+                   (when (and (number? sc-armed-from)
+                              (not (number? sc-fired-at)))
+                     (set! sc-wakes-while-pending
+                           (+ sc-wakes-while-pending 1))))
+                 1 1)
+
+;; Stepped and capped, and guarded, so a raise here fails the row below with
+;; its evidence instead of aborting the suite (AGENTS.md). The traffic wakes
+;; the loop about once a millisecond, so the deadline takes some `hold-ms`
+;; steps; the cap is ten times that.
+(define sc-drive
+  (guard (e (#t (list 'raised e)))
+    (let step ((i 0))
+      (cond ((number? sc-fired-at) 'deadline-fired)
+            ((>= i (* 10 hold-ms)) 'iterations-exhausted)
+            (else (uv-run sc-loop 'once) (step (+ i 1)))))))
+
+(uv-timer-stop! sc-traffic)
+
+(test-equal "the scenario ran through to the deadline's callback"
+  'deadline-fired sc-drive)
+
+(test-equal "precondition: traffic woke the loop while the deadline was pending"
+  'woke
+  (if (positive? sc-wakes-while-pending) 'woke sc-wakes-while-pending))
+
+(test-equal "uv-update-time! returns when called from a callback while the loop runs"
+  'returned sc-outcome)
+
+(test-equal "a deadline armed after uv-update-time! runs from the refreshed clock, not the stale one"
+  'from-refreshed-clock
+  (if (and (number? sc-armed-from) (number? sc-fired-at)
+           (>= sc-fired-at (+ sc-armed-from hold-ms)))
+      'from-refreshed-clock
+      (list 'armed-from sc-armed-from 'fired-at sc-fired-at)))
+
+(display "  [informational] uv-update-time! scenario: deadline fired ")
+(display (if (and (number? sc-armed-from) (number? sc-fired-at))
+             (- sc-fired-at sc-armed-from)
+             (list sc-armed-from sc-fired-at)))
+(display " ms after the pre-refresh reading (deadline ")
+(display hold-ms)
+(display " ms; ")
+(display sc-wakes-while-pending)
+(display " traffic wakes while it was pending)")
+(newline)
+
+(test-equal "uv-update-time! rejects a non-loop argument, naming who and why"
+  '(uv-update-time! not-a-uv-loop)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-update-time! 'not-a-loop)
+    'no-raise))
+
+(uv-loop-teardown! sc-loop)
+(uv-loop-close! ut-loop)
+(uv-loop-close! reference-loop)
 
 ;; --- the thirteen callback dispatcher slots and the close hook (ADR-0008) -
 ;; Both are process-global and install-once, and as of Stage 3 both are
@@ -579,6 +745,7 @@
        (cons "uv-stop!"                (lambda () (uv-stop! dead-loop)))
        (cons "uv-loop-alive?"          (lambda () (uv-loop-alive? dead-loop)))
        (cons "uv-now"                  (lambda () (uv-now dead-loop)))
+       (cons "uv-update-time!"         (lambda () (uv-update-time! dead-loop)))
        (cons "uv-loop-live-handles"    (lambda () (uv-loop-live-handles dead-loop)))
        (cons "uv-loop-deferred-errors" (lambda () (uv-loop-deferred-errors dead-loop)))))
 

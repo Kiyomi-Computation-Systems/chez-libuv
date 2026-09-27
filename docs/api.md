@@ -18,7 +18,8 @@ libraries exist for narrower imports.
 | `uv-run` | Run it: `'default`, `'once`, or `'nowait`. `#t` if work remains |
 | `uv-stop!` | Stop the loop; legal from inside a callback |
 | `uv-loop-alive?` | Whether the loop has anything left to do |
-| `uv-now` | libuv's cached "now", in ms, updated once per iteration |
+| `uv-now` | libuv's cached "now", in ms, updated once per iteration or by `uv-update-time!` |
+| `uv-update-time!` | Refresh that cached "now" from the clock. Timers are armed from it, so a callback that held the loop calls this before arming a deadline, or the deadline starts from before the callback ran. Legal while the loop runs; runs nothing. `uv_update_time` |
 | `uv-loop-live-handles` | Fresh list of the handle records registered on this loop |
 | `uv-loop-deferred-errors` | Everything callbacks raised this run *after* the first |
 | `uv-loop-close!` | Close the loop. `'EBUSY` while handles are still open |

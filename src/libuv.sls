@@ -3,7 +3,7 @@
 (library (libuv)
   (export ;; event loop
           make-uv-loop uv-loop? uv-loop-open?
-          uv-run uv-stop! uv-loop-alive? uv-now
+          uv-run uv-stop! uv-loop-alive? uv-now uv-update-time!
           uv-loop-live-handles uv-loop-deferred-errors
           uv-loop-close! uv-loop-teardown! call-with-uv-loop
 
