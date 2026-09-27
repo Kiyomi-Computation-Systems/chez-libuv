@@ -101,6 +101,14 @@ Plan:   `.plans/2026-09-19-chez-libuv-threading-plan.md` (Stage 2).
   `(define (worker …))` → `invalid context for definition`. Reordered defines
   first. Stress suite 6/6, stable across repeated runs.
 
+> **Corrected 2026-09-27.** "Expected and caught … nothing is lost" was wrong.
+> `uv-async-send!`'s open-state check cannot stop the close from freeing the
+> handle between that check and the native send, so a straggler could send on
+> freed memory or raise an uncaught `&uv-invalid-argument`, and the block,
+> which never joined its workers, stayed green either way. Measured with a
+> widened window, and the block rebuilt on the close discipline, in
+> `async-close-discipline-mutation-log.md`.
+
 ### F — docs (Task 2.5)
 
 - ADR-0008: fourteenth-trampoline amendment (`async`, `__collect_safe`, 13 of 14
