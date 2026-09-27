@@ -30,6 +30,9 @@
   ;; uv-timer-start! : uv-timer procedure exact-nonnegative-integer
   ;;                   exact-nonnegative-integer -> unspecified
   ;; Store the callback before arming: a zero-delay timer may fire immediately.
+  ;; libuv counts timeout-ms from the loop's CACHED now (uv-now), which a
+  ;; callback that held the loop has left behind; such a caller refreshes it
+  ;; with uv-update-time! before arming, or the timer comes due early (#28).
   (define (uv-timer-start! timer on-timeout timeout-ms repeat-ms)
     (require-open-handle timer 'uv-timer-start!)
     (unless (procedure? on-timeout)

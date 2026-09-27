@@ -90,13 +90,16 @@ outside it, keeping their existing guards:
   transferring ownership — a check there would break the create-on-A/run-on-B
   handoff this ADR exists to enable.
 
-> **Extended 2026-09-27 (issue #28).** `uv-update-time!` is a loop-level verb
-> and joins `uv-now` outside the enforced surface: it carries `uv-now`'s
-> open-loop check and nothing more. It writes the loop's cached time, which the
-> loop thread also writes every iteration, so it belongs on the loop's thread
-> like every verb here. That rule is documented, not enforced — the same
-> standing as `uv-now` and `uv-stop!`, and the same clean follow-up if a
-> consumer ever needs it checked.
+> **Extended 2026-09-27 (issue #28).** `uv-update-time!` is the first
+> loop-level verb inside the enforced surface: `require-open-loop`, then
+> `require-loop-thread` — `make-uv-async`'s order — and both before the write.
+> It *writes* `loop->time`, which the loop thread rewrites every iteration, so
+> an off-thread call is a write-write race: a stale sample stored over a newer
+> one moves the clock backwards, and on Windows whichever racing call sampled
+> first can trip libuv's `new_time >= loop->time` assert (win/core.c). A new
+> verb has no callers to break, so it starts checked. `uv-now` (a reader) and
+> `uv-stop!` keep their standing above; changing a released verb's contract
+> remains the follow-up this section names.
 
 ## Consequences
 

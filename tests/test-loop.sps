@@ -43,7 +43,12 @@
               ;; ADR-0011 rows below build are real foreign allocations, so
               ;; complete-request!'s free! sees the same kind of pointer the
               ;; Stage 4 dispatchers will hand it.
-              alloc-zeroed)
+              alloc-zeroed
+              ;; The uv-update-time! affinity rows compare against it.
+              current-thread-id)
+        ;; The uv-update-time! rows step their loops with the shared capped
+        ;; stepper rather than a hand-rolled one.
+        (only (uv-testing) run-until)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
         (only (chezscheme) collect sleep make-time))
@@ -192,18 +197,19 @@
 ;; callback is due relative to a "now" from before the callback ran.
 ;; uv-update-time! refreshes the cache on demand.
 ;;
-;; THE REFERENCE CLOCK is a second loop with nothing on it: uv_run on a loop
-;; that is not alive refreshes that loop's cached time before returning
-;; (unix/core.c and win/core.c both), so `reference-now` reads the clock
-;; uv-update-time! reads, but through uv-run -- never through the binding
-;; under test. Every assertion below is an ORDERING of readings of that one
+;; THE REFERENCE CLOCK is a fresh loop per reading: uv_loop_init reads libuv's
+;; clock into the new loop's cache (unix/loop.c and win/core.c both), so
+;; `reference-now` reads the clock uv-update-time! reads without going through
+;; the binding under test -- and without RUNNING any loop, so the scenario
+;; below can take readings from inside another loop's callback without nesting
+;; uv-run. Every assertion here is an ORDERING of readings of that one
 ;; monotonic clock. None measures an elapsed duration, so a slow host can only
 ;; widen the gaps they rely on, never close them.
-(define reference-loop (make-uv-loop))
-
 (define (reference-now)
-  (uv-run reference-loop 'nowait)
-  (uv-now reference-loop))
+  (let* ((clock (make-uv-loop))
+         (now (uv-now clock)))
+    (uv-loop-close! clock)
+    now))
 
 ;; Hold this thread until libuv's clock reads strictly past `threshold`, and
 ;; answer that first reading -- or 'clock-never-advanced once `cap` polls have
@@ -243,31 +249,101 @@
       'caught-up
       (list 'stale ut-stale 'before ut-before 'fresh ut-fresh 'after ut-after)))
 
+;; Runs nothing. A timer due at once is armed, and uv-update-time! must refresh
+;; the clock without firing it: the loop fires timers, a refresh does not. A
+;; refresh built on uv_run -- even NOWAIT, which never blocks -- would fire it.
+;; The follow-up row runs the loop and watches the same timer fire, so the
+;; zero read across the refresh is a timer that was due and live, not one that
+;; could never have fired.
+(define rn-loop (make-uv-loop))
+(define rn-timer (make-uv-timer rn-loop))
+(define rn-fires 0)
+(uv-timer-start! rn-timer
+                 (lambda (timer) (collect) (set! rn-fires (+ rn-fires 1)))
+                 0 0)
+(define rn-outcome
+  (guard (e (#t (list 'raised e)))
+    (uv-update-time! rn-loop)
+    'returned))
+(define rn-fires-across-refresh rn-fires)
+(define rn-drive
+  (guard (e (#t (list 'raised e)))
+    (run-until rn-loop (lambda () (positive? rn-fires)) 32)))
+
+(test-equal "uv-update-time! fires no timer, even one already due"
+  'not-fired
+  (if (and (eq? rn-outcome 'returned) (zero? rn-fires-across-refresh))
+      'not-fired
+      (list 'outcome rn-outcome 'fires rn-fires-across-refresh)))
+
+(test-equal "...and that timer was live: the loop fires it once it runs"
+  'satisfied rn-drive)
+
+;; Loop thread only (ADR-0019, extended for #28). The owner field is pointed at
+;; a thread id no real thread holds -- test-async.sps's technique, so no second
+;; thread is needed -- and the refusal must come BEFORE the write: the clock is
+;; let past the cached now first, so a check placed after the refresh would
+;; leave uv-now moved even though the call raised. The positive control, the
+;; same verb on the owning thread, is the refresh rows above.
+(define foreign-owner 999999)
+(define wt-loop (make-uv-loop))
+(define wt-stale (uv-now wt-loop))
+(define wt-advanced (await-clock-past wt-stale 1000))
+(set-loop-owner-thread! wt-loop foreign-owner)
+(define wt-refusal
+  (guard (e ((uv-wrong-thread? e)
+             (list (uv-wrong-thread-who e)
+                   (uv-wrong-thread-expected e)
+                   (uv-wrong-thread-actual e)))
+            (#t 'wrong-condition))
+    (uv-update-time! wt-loop)
+    'no-raise))
+(set-loop-owner-thread! wt-loop (current-thread-id))
+(define wt-now-after-refusal (uv-now wt-loop))
+
+(test-equal "uv-update-time! off the owning thread raises &uv-wrong-thread naming who, owner and caller"
+  (list 'uv-update-time! foreign-owner (current-thread-id))
+  wt-refusal)
+
+(test-equal "a refused uv-update-time! leaves the cached now untouched"
+  'untouched
+  (if (and (number? wt-advanced) (= wt-now-after-refusal wt-stale))
+      'untouched
+      (list 'stale wt-stale 'clock wt-advanced 'after wt-now-after-refusal)))
+
 ;; Inside a run: the issue's own scenario. A callback holds the loop until
 ;; libuv's clock is `hold-ms` past the loop's cached now, calls
 ;; uv-update-time! -- with the loop RUNNING, which is the whole use case --
-;; then arms a deadline `hold-ms` out: chez-http-server's handler followed by
-;; its write deadline. libuv arms a timer from the cached now (timer.c:
+;; then arms a deadline `deadline-ms` out: chez-http-server's handler followed
+;; by its write deadline. libuv arms a timer from the cached now (timer.c:
 ;; loop->time + timeout) and never fires one before loop->time reaches it, so
-;; a deadline armed from the refreshed clock fires at a now at least `hold-ms`
-;; past the reference reading taken before the refresh.
+;; a deadline armed from the refreshed clock fires at a now at least
+;; `deadline-ms` past the reference reading taken before the refresh.
 ;;
-;; THE TRAFFIC TIMER IS WHAT MAKES THAT ROW ABLE TO FAIL. libuv computes its
-;; poll timeout from the cached now as well, so on a loop whose only wakeup is
-;; the deadline, a deadline armed from the stale now still sleeps its full
-;; `hold-ms` and looks right. Measured: with the refresh mutated to a no-op
-;; and no traffic, the row passed at 26 ms. The issue's server is never that
-;; quiet -- I/O wakes its loop, the clock is re-read, and the stale deadline is
-;; found already overdue. A 1 ms repeating timer plays that traffic, so a
-;; stale-armed deadline fires at the first wake after the hold instead. The
-;; precondition row below checks the traffic really did land while the
-;; deadline was pending. Like run-until/ticking's ticker, its callback skips
-;; (collect): it is fixture, not code under test.
+;; The hold is at least the deadline, so that a deadline armed from the STALE
+;; now would already be overdue when the callback returns -- the issue's own
+;; condition ("the write deadline had already passed when the loop's timers
+;; next ran"). The two are separate constants, so a precondition row checks
+;; the hold really carried the clock that far rather than trusting a comment.
+;;
+;; THE TRAFFIC TIMER IS WHAT MAKES THE DEADLINE ROW ABLE TO FAIL. libuv
+;; computes its poll timeout from the cached now as well, so on a loop whose
+;; only wakeup is the deadline, a deadline armed from the stale now still
+;; sleeps its full timeout and looks right. Measured: with the refresh mutated
+;; to a no-op and no traffic, the row passed at 26 ms. The issue's server is
+;; never that quiet -- I/O wakes its loop, the clock is re-read, and the stale
+;; deadline is found already overdue. A 1 ms repeating timer plays that
+;; traffic, so a stale-armed deadline fires at the first wake after the hold
+;; instead. A second precondition row checks the traffic really did land while
+;; the deadline was pending. Like run-until/ticking's ticker, its callback
+;; skips (collect): it is fixture, not code under test.
 (define hold-ms 25)
+(define deadline-ms 25)
 (define sc-loop (make-uv-loop))
 (define sc-trigger (make-uv-timer sc-loop))
 (define sc-deadline (make-uv-timer sc-loop))
 (define sc-traffic (make-uv-timer sc-loop))
+(define sc-stale 'trigger-never-fired)
 (define sc-armed-from 'trigger-never-fired)
 (define sc-outcome 'trigger-never-fired)
 (define sc-fired-at 'deadline-never-fired)
@@ -276,8 +352,9 @@
 (uv-timer-start! sc-trigger
                  (lambda (timer)
                    (collect)
+                   (set! sc-stale (uv-now sc-loop))
                    (set! sc-armed-from
-                         (await-clock-past (+ (uv-now sc-loop) hold-ms) 1000))
+                         (await-clock-past (+ sc-stale hold-ms) 1000))
                    (set! sc-outcome
                          (guard (e (#t (list 'raised e)))
                            (uv-update-time! sc-loop)
@@ -286,7 +363,7 @@
                                     (lambda (timer)
                                       (collect)
                                       (set! sc-fired-at (uv-now sc-loop)))
-                                    hold-ms 0))
+                                    deadline-ms 0))
                  0 0)
 
 (uv-timer-start! sc-traffic
@@ -297,21 +374,25 @@
                            (+ sc-wakes-while-pending 1))))
                  1 1)
 
-;; Stepped and capped, and guarded, so a raise here fails the row below with
-;; its evidence instead of aborting the suite (AGENTS.md). The traffic wakes
-;; the loop about once a millisecond, so the deadline takes some `hold-ms`
-;; steps; the cap is ten times that.
+;; Guarded, so a raise here fails the row below with its evidence instead of
+;; aborting the suite (AGENTS.md). The traffic wakes the loop about once a
+;; millisecond, so the deadline takes some `deadline-ms` steps; the cap is ten
+;; times that.
 (define sc-drive
   (guard (e (#t (list 'raised e)))
-    (let step ((i 0))
-      (cond ((number? sc-fired-at) 'deadline-fired)
-            ((>= i (* 10 hold-ms)) 'iterations-exhausted)
-            (else (uv-run sc-loop 'once) (step (+ i 1)))))))
+    (run-until sc-loop (lambda () (number? sc-fired-at)) (* 10 deadline-ms))))
 
 (uv-timer-stop! sc-traffic)
 
 (test-equal "the scenario ran through to the deadline's callback"
-  'deadline-fired sc-drive)
+  'satisfied sc-drive)
+
+(test-equal "precondition: the hold carried the clock past where a stale-armed deadline falls due"
+  'overdue-if-stale
+  (if (and (number? sc-stale) (number? sc-armed-from)
+           (>= sc-armed-from (+ sc-stale deadline-ms)))
+      'overdue-if-stale
+      (list 'stale sc-stale 'armed-from sc-armed-from 'deadline-ms deadline-ms)))
 
 (test-equal "precondition: traffic woke the loop while the deadline was pending"
   'woke
@@ -323,7 +404,7 @@
 (test-equal "a deadline armed after uv-update-time! runs from the refreshed clock, not the stale one"
   'from-refreshed-clock
   (if (and (number? sc-armed-from) (number? sc-fired-at)
-           (>= sc-fired-at (+ sc-armed-from hold-ms)))
+           (>= sc-fired-at (+ sc-armed-from deadline-ms)))
       'from-refreshed-clock
       (list 'armed-from sc-armed-from 'fired-at sc-fired-at)))
 
@@ -332,6 +413,8 @@
              (- sc-fired-at sc-armed-from)
              (list sc-armed-from sc-fired-at)))
 (display " ms after the pre-refresh reading (deadline ")
+(display deadline-ms)
+(display " ms, hold ")
 (display hold-ms)
 (display " ms; ")
 (display sc-wakes-while-pending)
@@ -347,8 +430,9 @@
     'no-raise))
 
 (uv-loop-teardown! sc-loop)
+(uv-loop-teardown! rn-loop)
+(uv-loop-close! wt-loop)
 (uv-loop-close! ut-loop)
-(uv-loop-close! reference-loop)
 
 ;; --- the thirteen callback dispatcher slots and the close hook (ADR-0008) -
 ;; Both are process-global and install-once, and as of Stage 3 both are

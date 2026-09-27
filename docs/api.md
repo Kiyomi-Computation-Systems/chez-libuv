@@ -19,7 +19,7 @@ libraries exist for narrower imports.
 | `uv-stop!` | Stop the loop; legal from inside a callback |
 | `uv-loop-alive?` | Whether the loop has anything left to do |
 | `uv-now` | libuv's cached "now", in ms, updated once per iteration or by `uv-update-time!` |
-| `uv-update-time!` | Refresh that cached "now" from the clock. Timers are armed from it, so a callback that held the loop calls this before arming a deadline, or the deadline starts from before the callback ran. Legal while the loop runs; runs nothing. `uv_update_time` |
+| `uv-update-time!` | Refresh that cached "now" from the clock. Timers are armed from it, so a callback that held the loop calls this before arming a deadline, or the deadline starts from before the callback ran. Legal while the loop runs; runs nothing. Loop thread only: `&uv-wrong-thread` from any other. `uv_update_time` |
 | `uv-loop-live-handles` | Fresh list of the handle records registered on this loop |
 | `uv-loop-deferred-errors` | Everything callbacks raised this run *after* the first |
 | `uv-loop-close!` | Close the loop. `'EBUSY` while handles are still open |
@@ -424,7 +424,7 @@ behaviours worth knowing before the design spec:
 | Export | |
 |---|---|
 | `make-uv-timer` | A new timer on a loop |
-| `uv-timer-start!` | Arm it: `(timer on-timeout timeout-ms repeat-ms)`; `on-timeout` receives the timer record itself |
+| `uv-timer-start!` | Arm it: `(timer on-timeout timeout-ms repeat-ms)`; `on-timeout` receives the timer record itself. The timeout counts from the loop's cached `uv-now`, not the wall clock: after a callback that held the loop, call `uv-update-time!` first or the timer is due early |
 | `uv-timer-stop!` | Disarm it |
 | `uv-timer-again!` | Restart a repeating timer |
 | `uv-timer-repeat` `uv-timer-set-repeat!` | Read and set the repeat interval |
@@ -455,6 +455,7 @@ discriminant is a symbol).
 | `&uv-constant-unavailable` | `name` | The shim has no constant under that name |
 | `&uv-invalid-argument` | `who` `reason` | A caller error, refused before anything was allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
+| `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the owner's thread id, `actual` the caller's ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 
 v0.3, v0.4 and v0.5 added no new condition types — every `(libuv
 process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv handle)`

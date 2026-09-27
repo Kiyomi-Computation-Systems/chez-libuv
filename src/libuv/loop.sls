@@ -92,10 +92,13 @@
   ;; Refresh the cached time from libuv's clock. Timers are armed from that
   ;; cache, so a callback that held the loop calls this before arming a
   ;; deadline, or the deadline starts from before the callback ran (#28).
-  ;; Legal while the loop runs, and it runs nothing. Like uv-now it is a
-  ;; loop-level verb, outside the thread-affinity check (ADR-0019).
+  ;; Legal while the loop runs, and it runs nothing. Unlike uv-now it is
+  ;; affinity-checked, before the write: it writes the cache the loop thread
+  ;; rewrites every iteration, so from another thread it is a write-write race
+  ;; that can move the clock backwards (ADR-0019).
   (define (uv-update-time! loop)
     (require-open-loop loop 'uv-update-time!)
+    (require-loop-thread loop 'uv-update-time!)
     (uv-loop-update-time (loop-pointer loop 'uv-update-time!)))
 
   ;; uv-loop-live-handles : uv-loop -> (listof uv-handle)
