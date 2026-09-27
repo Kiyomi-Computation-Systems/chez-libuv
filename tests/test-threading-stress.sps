@@ -21,13 +21,14 @@
         (libuv timer)
         (libuv handle)
         (libuv async)
-        (only (libuv private conditions) uv-wrong-thread? uv-handle-closed?)
+        (only (libuv private conditions) uv-wrong-thread?)
         (only (libuv private handles) loop-owner-thread)
         (only (chezscheme)
               collect threaded? fork-thread
               make-mutex make-condition condition-wait condition-signal with-mutex
               get-thread-id sleep make-time real-time
-              open-output-string get-output-string display-condition))
+              open-output-string get-output-string display-condition
+              make-list iota))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -137,44 +138,149 @@
       #t b-owns)))
 
 ;; --- worker pool posting work via uv-async-send! (design §6.1) ----------
-;; K workers each push M items to a shared queue and wake the loop thread. The
-;; wake callback drains the WHOLE queue each time, so coalescing (N sends -> 1
-;; callback) never loses an item. When all are delivered it closes the async so
-;; uv-run returns. This is the driver's real shape and the #20 payoff.
+;; K workers push items to a shared queue and wake the loop thread. The wake
+;; callback drains the WHOLE queue each time, so coalescing (N sends -> 1
+;; callback) never loses an item. This is the driver's real shape and the #20
+;; payoff, shutdown included: the loop thread closes the async while the
+;; workers are still posting.
+;;
+;; uv-async-send!'s open-state check is a courtesy (async.sls): it cannot stop
+;; the loop thread from closing -- and freeing -- the handle between that check
+;; and the native send, so every send must be over before uv-close! starts.
+;; The close discipline this block exercises (docs/api.md, Async):
+;;   - a worker holds QM while it checks OPEN?, queues its item, and sends;
+;;   - the loop thread clears OPEN? under QM, then calls uv-close!, so no send
+;;     is between check and native call at the close, and none starts after;
+;;   - then it drains once more: on-wake never runs once a close has started,
+;;     even for a send made before it, so the items queued since the last
+;;     drain would otherwise be stranded.
+;; Workers post until the cleared flag refuses them, and the main thread joins
+;; every worker before teardown, so no send can outlive the handle or the loop.
+;;
+;; A slip in this discipline loses its race only some of the time: a flag
+;; cleared after uv-close!, a send outside QM, or a missing join was caught by
+;; only 2 to 11 of 20 single-pool runs (measured; see
+;; .plans/async-close-discipline-mutation-log.md). So the pool runs ROUNDS
+;; times, fresh each time, and a row passes only if it held in every round.
 (when (threaded?)
   (let ()
+    (define rounds 30)
     (define k 4)
-    (define per-worker 25)
-    (define expected (* k per-worker))
-    (define loop (make-uv-loop))
-    (define qm (make-mutex))
-    (define queue '())
-    (define delivered 0)
-    (define async #f)
-    (define (drain! h)
-      (let ((batch (with-mutex qm
-                     (let ((b queue)) (set! queue '()) b))))
-        (set! delivered (+ delivered (length batch)))
-        (when (>= delivered expected) (uv-close! h))))
-    ;; The item is queued before the send, and the callback closes the async
-    ;; only once every item is delivered — so a straggler's final send can race
-    ;; the close. That send is redundant (its item is already drained), so a
-    ;; closed-handle refusal here is expected and ignored; nothing is lost.
-    (define (worker id)
-      (let push ((i 0))
-        (when (< i per-worker)
-          (with-mutex qm (set! queue (cons (cons id i) queue)))
-          (guard (e ((uv-handle-closed? e) #t)) (uv-async-send! async))
-          (push (+ i 1)))))
-    (set! async (make-uv-async loop drain!))
-    (let spawn ((id 0))
-      (when (< id k) (fork-thread (lambda () (worker id))) (spawn (+ id 1))))
-    (uv-run loop 'default)                  ; blocks, draining wakes, until closed
-    (uv-loop-teardown! loop)
-    (test-equal "a worker pool delivers every posted item through one async handle"
-      expected delivered)
-    (test-equal "the shared queue is fully drained"
-      #t (null? queue))))
+    (define close-after 400)             ; deliveries before the close begins
+    (define cap 1000000)                 ; a worker still unrefused after this many
+                                         ; posts stops, and fails the refusal row
+                                         ; (the busiest measured: ~20000)
+    (define (describe e)
+      (let ((p (open-output-string)))
+        (if (condition? e) (display-condition e p) (write e p))
+        (get-output-string p)))
+    ;; run-pool : -> (list closed refusals delivery drained)
+    ;; One pool, from make-uv-loop to teardown. Each verdict is a sentinel
+    ;; symbol when its property held, and otherwise the evidence.
+    (define (run-pool)
+      (let ()
+        (define loop (make-uv-loop))
+        (define qm (make-mutex))             ; guards open?, queue, every send
+        (define open? #t)
+        (define queue '())                   ; (worker-id . seq), newest first
+        (define async #f)
+        (define delivered 0)
+        (define seen (make-vector k '()))    ; per worker: every seq delivered
+        (define accepted (make-vector k 0))  ; per worker: posts queued; each
+                                             ; worker writes only its own slot
+        (define queued-at-close #f)
+        (define dm (make-mutex))             ; guards results, for the join
+        (define all-done (make-condition))
+        (define results '())                 ; (worker-id . outcome), one each
+        ;; post! : pair -> boolean. #t: queued, and the loop woken. #f:
+        ;; refused -- the loop thread has begun closing; nothing was queued.
+        (define (post! item)
+          (with-mutex qm
+            (and open?
+                 (begin (set! queue (cons item queue))
+                        (uv-async-send! async)
+                        #t))))
+        (define (take-queue!)                ; with qm held
+          (let ((b queue)) (set! queue '()) b))
+        (define (deliver! batch)
+          (for-each (lambda (item)
+                      (let ((id (car item)))
+                        (vector-set! seen id (cons (cdr item) (vector-ref seen id)))))
+                    batch)
+          (set! delivered (+ delivered (length batch))))
+        ;; Drains every wake until CLOSE-AFTER items are delivered; then closes
+        ;; at the first wake that finds items queued, without draining them
+        ;; first -- so the drain after uv-close! is always what delivers them.
+        (define (on-wake h)
+          (let ((closing? (with-mutex qm
+                            (and (>= delivered close-after)
+                                 (pair? queue)
+                                 (begin (set! open? #f)
+                                        (set! queued-at-close (length queue))
+                                        #t)))))
+            (when closing? (uv-close! h))
+            (deliver! (with-mutex qm (take-queue!)))))
+        ;; Any raise is a failure, recorded as evidence rather than left to kill
+        ;; the thread: under this discipline the handle never refuses a send.
+        (define (worker id)
+          (let ((outcome
+                 (guard (e (#t (list 'raised (describe e))))
+                   (let push ((seq 0))
+                     (cond ((= seq cap) (list 'never-refused seq))
+                           ((post! (cons id seq))
+                            (vector-set! accepted id (+ seq 1))
+                            (push (+ seq 1)))
+                           (else 'refused))))))
+            (with-mutex dm
+              (set! results (cons (cons id outcome) results))
+              (condition-signal all-done))))
+        ;; 'exact when worker ID's delivered seqs are 0 .. accepted-1, each once.
+        (define (delivery-verdict id)
+          (let ((n (vector-ref accepted id))
+                (got (list-sort < (vector-ref seen id))))
+            (if (equal? got (iota n))
+                'exact
+                (list 'worker id 'accepted n 'delivered (length got)))))
+        (set! async (make-uv-async loop on-wake))
+        (let spawn ((id 0))
+          (when (< id k) (fork-thread (lambda () (worker id))) (spawn (+ id 1))))
+        (let ((run (guard (e (#t (list 'raised (describe e))))
+                     (uv-run loop 'default)  ; drains wakes until the close
+                     'returned)))
+          (with-mutex dm                     ; join every worker before teardown
+            (let join ()
+              (unless (= (length results) k)
+                (condition-wait all-done dm)
+                (join))))
+          (uv-loop-teardown! loop)
+          (list
+           (cond ((not (eq? run 'returned)) (list 'uv-run run))
+                 ((and queued-at-close (positive? queued-at-close))
+                  'closed-with-posts-queued)
+                 (else (list 'queued-at-close queued-at-close)))
+           (let ((outcomes (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
+                                               results))))
+             (if (equal? outcomes (make-list k 'refused))
+                 'every-worker-refused
+                 outcomes))
+           (let ((verdicts (map delivery-verdict (iota k))))
+             (if (equal? verdicts (make-list k 'exact)) 'exactly-once verdicts))
+           (if (null? queue) 'empty (list 'stranded (length queue)))))))
+    (let ((pools (let more ((i 0) (acc '()))
+                   (if (= i rounds)
+                       (reverse acc)
+                       (more (+ i 1) (cons (run-pool) acc))))))
+      (define (every-round n) (map (lambda (pool) (list-ref pool n)) pools))
+      ;; The precondition the rows below depend on: each close met items still
+      ;; queued, so the final drain had work and the queue was once non-empty.
+      (test-equal "the loop thread closed the async with posts still queued"
+        (make-list rounds 'closed-with-posts-queued) (every-round 0))
+      (test-equal "every worker posted until the close refused it, and no send raised"
+        (make-list rounds 'every-worker-refused) (every-round 1))
+      (test-equal "a worker pool delivers every accepted item exactly once through one async handle"
+        (make-list rounds 'exactly-once) (every-round 2))
+      (test-equal "the shared queue is fully drained"
+        (make-list rounds 'empty) (every-round 3)))))
 
 (test-end "threading-stress")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))
