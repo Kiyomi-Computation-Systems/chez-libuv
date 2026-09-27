@@ -27,7 +27,7 @@
           uv-loop-size uv-handle-size uv-req-size
 
           uv-loop-init uv-loop-run uv-loop-stop
-          uv-loop-alive uv-loop-now uv-loop-close
+          uv-loop-alive uv-loop-now uv-loop-update-time uv-loop-close
 
           ;; timers and close
           uv-timer-init uv-timer-start-native uv-timer-stop uv-timer-again
@@ -262,6 +262,9 @@
   (define uv-loop-stop  (foreign-procedure "uv_stop"       (uptr) void))
   (define uv-loop-alive (foreign-procedure "uv_loop_alive" (uptr) int))
   (define uv-loop-now   (foreign-procedure "uv_now"        (uptr) unsigned-64))
+  ;; Plain, not __collect_safe: it reads the clock and returns, never blocks.
+  (define uv-loop-update-time
+    (foreign-procedure "uv_update_time" (uptr) void))
   (define uv-loop-close (foreign-procedure "uv_loop_close" (uptr) int))
 
   (define uv-timer-init

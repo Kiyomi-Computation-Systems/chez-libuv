@@ -91,6 +91,12 @@
 (test-equal "uv-now is re-exported and answers with a positive timestamp"
   'positive (if (positive? (uv-now l)) 'positive 'not-positive))
 
+(test-equal "uv-update-time! is re-exported and callable on an open loop"
+  'returned
+  (guard (e (#t (list 'raised e)))
+    (uv-update-time! l)
+    'returned))
+
 (test-equal "uv-loop-live-handles is re-exported"
   '() (uv-loop-live-handles l))
 
