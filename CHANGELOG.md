@@ -3,6 +3,78 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.3 — 2026-09-28
+
+`uv-async-send!` can no longer send on a handle that a close has freed. It
+checked that the handle was open and then called `uv_async_send`, and a
+close on the loop thread could free the handle in between; only the caller
+could prevent that, by following the discipline `docs/api.md` describes. A
+send that races a close is now refused. `uv-close!` is now one step, even
+inside an engine. And a Chez built without threads, where the binding never
+loaded, is refused at import with a message saying so. No API changes, and
+the shim needs no rebuild.
+
+### Fixed
+
+- `uv-async-send!` no longer races `uv-close!` (#33). Each async handle has
+  a lock that both take, so a send from any thread either completes before
+  a close begins or raises `&uv-handle-closed` without touching the handle.
+  That holds when the close frees the handle a moment later, and when
+  either runs inside an engine. The race was there from 0.6.0, when
+  `uv-async-send!` arrived.
+  - The lock is held only around one native call, with interrupts
+    disabled, so no engine is ever suspended holding it and no collection
+    ever waits on it. A send may be made with interrupts disabled, or from
+    a collect-request handler.
+  - Measured on macOS arm64 while a wake is already pending (libuv's fast
+    path, with no system call): a send costs about 30 ns, up from 8, and
+    allocates nothing. Senders sharing one handle take turns on its lock:
+    about 90 ns a send with four.
+  - `uv-close!` still runs on the loop thread only, and delivery is still
+    the caller's: a close drops wakes still pending. `docs/api.md`'s Async
+    section shows how to know which queued items will be handled.
+- `uv-close!` is one step, even inside an engine, for every kind of handle.
+  Checking that the handle is open, marking it closing and calling
+  `uv_close` now happen with no point between them where an engine can be
+  suspended. An engine on the loop thread could split the old close two
+  ways:
+  - between the check and the mark, so that two closes of one handle both
+    called `uv_close`. Running the loop afterwards crashed with
+    `invalid memory reference` on macOS and hung on Linux.
+  - between the mark and `uv_close`, so that a handle read as closing
+    before libuv had begun to close it. A teardown then hung (an async) or
+    failed with EBUSY (a timer).
+
+### Changed
+
+- A threaded Chez Scheme is required (#41). The binding has used Chez's
+  thread system since 0.1, and a Chez configured with `--nothreads` has
+  none, so the binding never loaded there: the import failed with a bare
+  "missing import for make-mutex". It now stops before loading anything,
+  with a message that begins "chez-libuv needs a threaded Chez Scheme"
+  (`docs/building.md` shows it whole). Chez builds threaded by default, so
+  every Chez that ran an earlier release is unaffected.
+
+### Notes
+
+- ADR-0019 is amended twice. Its decision 5 said the threading work was
+  free on a non-threaded Chez. That was reasoned, never run, and never
+  true. Its decision 3 now describes the send fence.
+- New checks hold all three changes:
+  - `tests/test-async-fence.sps` suspends a send and a close at every point
+    where an engine can, and checks from another thread that the lock is
+    free at each. It forks threads, but none of its verdicts depends on
+    timing, so it runs on the default gate and the memory gate (ADR-0010
+    amended).
+  - `tests/test-timer.sps` checks, at every such point in a close of a
+    timer and of an async, that the handle's state agrees with libuv's.
+  - `make check-nothreads-docker` builds a `--nothreads` Chez in Docker and
+    requires each public library to be refused by name.
+    `tests/test-require-threaded.sps` holds, on every `make test`, the
+    import order that lets the refusal win.
+- The evidence is in `.plans/async-send-fence-mutation-log.md` and
+  `.plans/require-threaded-mutation-log.md`.
+
 ## 0.7.2 — 2026-09-28
 
 No library changes: nothing under `src/` changed, and the shim needs no
