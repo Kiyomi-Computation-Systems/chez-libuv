@@ -79,7 +79,7 @@ pipe handle.
 
 | Export | |
 |---|---|
-| `uv-write!` | Write a bytevector or a span of one. The payload is copied |
+| `uv-write!` | Write a bytevector or a span of one. The payload is copied during the call, at `memcpy` speed. On a threaded Chez, the copy also holds off other threads' garbage collections while it runs: roughly 0.05 to 0.35 ms per MiB of payload, depending on the platform and on whether the pages are fresh. That matters only for single writes of tens of MiB |
 | `uv-write*!` | Vectored write: one request over a list of segments, each a bytevector or a `(bv start end)` span. All segments are copied into one block and sent as `uv_write` with `nbufs = N`. One completion for the whole write. The list must be non-empty |
 | `uv-shutdown!` | Shut the write side down; the read side stays open |
 | `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required |
@@ -166,12 +166,17 @@ arrives:
 | 16384 | ~3.1 MiB | ~160 MiB |
 | 65536 | ~12.4 MiB | ~625 MiB |
 
-**The costs on the other side did not show up.** Moving 16 MiB through one
-socket: a 4 KiB buffer produced 16× as many `on-data` deliveries as a 64 KiB
-one, exactly as expected — and cost 3 garbage collections against the larger
-buffer's 3, with sub-millisecond GC time at every size and no monotonic
-trend. Throughput varied 9% across a 16× size range, also non-monotonically.
-Neither column can distinguish the sizes at this scale.
+**The costs on the other side are small.** Moving 16 MiB through one
+socket, a 4 KiB buffer produced 16× as many `on-data` deliveries as a 64 KiB
+one, exactly as expected. Garbage collection stayed at two or three
+collections at every size, each sub-millisecond.
+
+The first measurement found no throughput difference either, but about 97%
+of its CPU time was byte-at-a-time copying, which cost the same at every
+size and hid the difference. Issue #35 replaced that copying with `memcpy`.
+Measured again after #35 (drain time only, same image), 16 MiB drained in a
+median 13.6 / 10.0 / 8.6 ms at 4096 / 16384 / 65536. So a 4 KiB buffer takes
+about 1.6× as long as 64 KiB, roughly 1.3 µs per extra delivery.
 
 Note also that *total bytes* allocated cannot vary with buffer size: each
 delivery allocates exactly `nread` bytes, so a given transfer produces the
@@ -190,8 +195,9 @@ count at all.
 **In practice.** Many connections carrying small messages — the case this
 milestone was built for — is where a smaller buffer is close to free and the
 saving is linear; 4096 or 16384 are reasonable there. Bulk transfer keeps
-64 KiB, where the memory is amortised over far fewer connections anyway. If
-you retain deliveries across reads, treat the object-count question as open.
+64 KiB, where the memory is amortised over far fewer connections and where
+the per-delivery time above shows. If you retain deliveries across reads,
+treat the object-count question as open.
 
 This still is not a change to the default: v0.5 pinned 65536 with a test
 rather than moving it, so that a later milestone can move it deliberately

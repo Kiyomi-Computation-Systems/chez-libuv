@@ -20,13 +20,17 @@
         (libuv private constants)
         (libuv private conditions)
         (libuv private config)
+        ;; The bulk rows' libc reference and timing (issue #35).
+        (uv-bulk)
         ;; foreign-alloc / foreign-set! / foreign-ref / foreign-free build
         ;; and mutate real C buffers for the string- and memory-helper tests
         ;; below; current-directory anchors the synthetic absolute paths used
-        ;; by the resolve-shim-path matrix. None collides with an (rnrs)
-        ;; export (unlike file-exists? and exit, which do).
+        ;; by the resolve-shim-path matrix; make-engine, bytevector-truncate!
+        ;; and collect drive the copy-in! truncation scan. None collides with
+        ;; an (rnrs) export (unlike file-exists? and exit, which do).
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
-              foreign-sizeof current-directory getenv))
+              foreign-sizeof current-directory getenv
+              make-engine bytevector-truncate! collect))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -758,10 +762,15 @@
     (zero-out! 0 64)
     'no-raise))
 
-;; The rejection must happen BEFORE any write. An inexact length is the case
-;; that discriminates: `(< i 3.0)` is perfectly true, so an unvalidated
-;; zero-out! would zero three bytes and only then (never) complain. The
-;; buffer is seeded #xff, asserted #xff, then must still be #xff afterwards.
+;; The rejection must happen BEFORE any write. The buffer is seeded #xff,
+;; asserted #xff, then must still be #xff afterwards. Since #35 no single
+;; mutation of zero-out! can break "wrote nothing": the shim's memset
+;; receives the length through a size_t argument, and Chez refuses 3.0 there
+;; before C runs. The check-before-call ORDER is pinned instead by the
+;; rejection row's who, which a raise from the FFI would not carry. This row
+;; still fails if zero-out! goes back to a Scheme loop that writes before it
+;; validates -- `(< i 3.0)` is true, so such a loop zeroes three bytes -- the
+;; shape it was written against (stage-1 M52; bulk-copy mutation log).
 (let ((addr (foreign-alloc 64)))
   (let fill ((i 0))
     (when (< i 64) (foreign-set! 'unsigned-8 addr i #xff) (fill (+ i 1))))
@@ -917,21 +926,25 @@
 
 ;; copy-in! / copy-out are the two halves of ADR-0009's copy-at-the-boundary
 ;; rule. Round-trip through real foreign memory, including a non-zero start
-;; offset so an implementation ignoring `start` is caught.
+;; offset so an implementation ignoring `start` is caught. The helpers run
+;; inside the rows, so one that raises fails a row by name instead of
+;; aborting the suite (AGENTS.md).
 (let ((addr (alloc-zeroed 8))
       (src (u8-list->bytevector (list 10 20 30 40 50))))
-  (copy-in! addr src 1 3)
   (test-equal "copy-in! copies the requested span, honouring start"
     (u8-list->bytevector (list 20 30 40))
-    (copy-out addr 3))
+    (begin
+      (copy-in! addr src 1 3)
+      (copy-out addr 3)))
   (test-equal "copy-in! writes nothing past the copied length"
     0 (foreign-ref 'unsigned-8 addr 3))
   ;; copy-out must copy, not alias: mutating the source afterwards must not
   ;; change the bytevector already handed back.
-  (let ((out (copy-out addr 3)))
-    (foreign-set! 'unsigned-8 addr 0 #x7f)
-    (test-equal "copy-out copies: mutating the foreign source afterwards leaves the result unchanged"
-      (u8-list->bytevector (list 20 30 40)) out))
+  (test-equal "copy-out copies: mutating the foreign source afterwards leaves the result unchanged"
+    (u8-list->bytevector (list 20 30 40))
+    (let ((out (copy-out addr 3)))
+      (foreign-set! 'unsigned-8 addr 0 #x7f)
+      out))
   (free! addr))
 
 (test-equal "copy-in! rejects a span that runs past the end of the bytevector"
@@ -974,6 +987,252 @@
             (#t 'wrong-condition))
     (copy-out 4096 'four)
     'no-raise))
+
+;; copy-in!'s sign checks are all that stands between a negative argument and
+;; the shim's memcpy: Chez's size_t accepts -2^63..2^64-1 and wraps a
+;; negative value into a huge one (bulk-copy mutation log). Each row keeps
+;; the span bound (<= (+ start len) (bytevector-length bv)) satisfied, so the
+;; sign check is the only possible rejection. The negative length is below
+;; size_t's range, so a copy-in! without its length check fails this row by
+;; name when the FFI refuses the argument; a length of -1 would instead wrap
+;; to SIZE_MAX and run memcpy off the heap.
+(test-equal "copy-in! rejects a negative start even when start+len is in range"
+  '(uv-copy-in! span-out-of-range)
+  (let ((addr (alloc-zeroed 8)))
+    (let ((r (guard (e ((uv-invalid-argument? e)
+                        (list (uv-invalid-argument-who e)
+                              (uv-invalid-argument-reason e)))
+                       (#t 'wrong-condition))
+               (copy-in! addr (u8-list->bytevector (list 1 2 3)) -1 1)
+               'no-raise)))
+      (free! addr)
+      r)))
+
+(test-equal "copy-in! rejects a negative length even when start+len is in range"
+  '(uv-copy-in! span-out-of-range)
+  (let ((addr (alloc-zeroed 8)))
+    (let ((r (guard (e ((uv-invalid-argument? e)
+                        (list (uv-invalid-argument-who e)
+                              (uv-invalid-argument-reason e)))
+                       (#t 'wrong-condition))
+               (copy-in! addr (u8-list->bytevector (list 1 2 3))
+                         (expt 2 63) (- -1 (expt 2 63)))
+               'no-raise)))
+      (free! addr)
+      r)))
+
+(test-equal "copy-out rejects a negative length"
+  '(uv-copy-out length-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (copy-out 4096 -1)
+    'no-raise))
+
+;; --- bulk, not byte-at-a-time (issue #35) --------------------------------
+;; copy-in!, copy-out and zero-out! each move their span in ONE call into the
+;; shim. They used to loop in Scheme, one foreign-set! or foreign-ref per
+;; byte, and a 4 MiB uv-write! held its loop ~250 ms: half zeroing its block,
+;; half copying the payload in. Each row times its helper against libc's own
+;; memcpy or memset over the same bytes and wants it within bulk-bar of libc;
+;; tests/uv-bulk.sls says why libc is the reference and records the margins.
+;; test-stream.sps times the write verbs the same way.
+(define bulk-size (* 4 1024 1024))
+
+(define (within-bar-name what reference)
+  (string-append what " at libc speed: within " (number->string bulk-bar)
+                 "x of " reference " over the same bytes"))
+
+(test-equal "libc's memcpy and memset resolve, for the bulk rows' reference"
+  #t libc-available?)
+
+(let ((dst (foreign-alloc bulk-size))
+      (src (make-bytevector bulk-size 7)))
+  (test-equal (within-bar-name "copy-in! moves a span" "memcpy")
+    'bulk
+    (bulk-verdict 'copy-in! bulk-size
+                  (lambda () (copy-in! dst src 0 bulk-size))
+                  (lambda () (libc-memcpy-to-foreign! dst src bulk-size))))
+  (test-equal (within-bar-name "copy-out moves a span" "allocating and memcpy")
+    'bulk
+    (bulk-verdict 'copy-out bulk-size
+                  (lambda () (copy-out dst bulk-size))
+                  (lambda () (foreign->bytevector dst bulk-size))))
+  (test-equal (within-bar-name "zero-out! clears a span" "memset")
+    'bulk
+    (bulk-verdict 'zero-out! bulk-size
+                  (lambda () (zero-out! dst bulk-size))
+                  (lambda () (libc-memset! dst 0 bulk-size))))
+  (foreign-free dst))
+
+;; The rows above only time. These check a bulk move's CONTENT at a size where
+;; a truncated or mis-based move shows (the rows further up use a 3-byte
+;; span). Each seeds and reads back foreign memory through libc, never
+;; through the other helper, and compares against bytes the helper under test
+;; was never handed, so a move in the wrong direction cannot bring its own
+;; reference into agreement. The patterns run 1..251 with period 251, a
+;; prime, so no byte is 0 and a shift of under 251 bytes mismatches. Each row
+;; has its own multiplier and keeps its reference live, because copy-out's
+;; result is a fresh bytevector that Chez does not zero: storage recycled
+;; from a dead bytevector carrying the same pattern would let a copy-out that
+;; stopped short pass (bulk-copy mutation log).
+(define big-size (* 1024 1024))
+
+;; patterned-bytes : exact-nonnegative-integer multiplier offset -> bytevector
+;; Byte i is pattern byte (i + offset).
+(define (patterned-bytes n mult offset)
+  (let ((bv (make-bytevector n)))
+    (let loop ((i 0))
+      (when (< i n)
+        (bytevector-u8-set! bv i (+ 1 (mod (* (+ i offset) mult) 251)))
+        (loop (+ i 1))))
+    bv))
+
+;; first-difference : bytevector bytevector -> 'identical | list
+(define (first-difference got want)
+  (cond ((not (= (bytevector-length got) (bytevector-length want)))
+         (list 'length (bytevector-length got)))
+        ((bytevector=? got want) 'identical)
+        (else
+         (let loop ((i 0))
+           (if (= (bytevector-u8-ref got i) (bytevector-u8-ref want i))
+               (loop (+ i 1))
+               (list 'first-difference-at i))))))
+
+(test-equal "copy-in! writes every byte of a 1 MiB span taken from a non-zero start"
+  'identical
+  (let ((dst (alloc-zeroed big-size)))
+    (copy-in! dst (patterned-bytes (+ big-size 8) 7 0) 3 big-size)
+    (let ((r (first-difference (foreign->bytevector dst big-size)
+                               (patterned-bytes big-size 7 3))))
+      (free! dst)
+      r)))
+
+(test-equal "copy-out reads every byte of a 1 MiB span"
+  'identical
+  (let ((src (foreign-alloc big-size))
+        (want (patterned-bytes big-size 11 0)))
+    (libc-memcpy-to-foreign! src want big-size)
+    (let ((r (first-difference (copy-out src big-size) want)))
+      (foreign-free src)
+      r)))
+
+(let ((addr (foreign-alloc big-size)))
+  (libc-memset! addr #xff big-size)
+  (test-equal "the 1 MiB zero-out! probe really was seeded non-zero first"
+    'identical
+    (first-difference (foreign->bytevector addr big-size)
+                      (make-bytevector big-size #xff)))
+  (test-equal "zero-out! clears every byte of a 1 MiB span"
+    'identical
+    (begin
+      (zero-out! addr big-size)
+      (first-difference (foreign->bytevector addr big-size)
+                        (make-bytevector big-size 0))))
+  (foreign-free addr))
+
+;; An empty span at the very END of its bytevector is the edge a bulk move
+;; reaches with a one-past-the-end source address: it must be accepted, and
+;; it must write nothing. The call runs inside the row, so a regression that
+;; refuses the span fails the row by name instead of aborting the suite
+;; (AGENTS.md). The destination is checked under two seeds, because a byte
+;; wrongly copied from past the bytevector's end could equal any one seed.
+(define (empty-span-at-end-writes-nothing? seed)
+  (let ((dst (foreign-alloc 4)))
+    (libc-memset! dst seed 4)
+    (let ((r (guard (e ((uv-invalid-argument? e)
+                        (list 'refused (uv-invalid-argument-reason e))))
+               (copy-in! dst (u8-list->bytevector (list 1 2 3)) 3 0)
+               (if (bytevector=? (foreign->bytevector dst 4)
+                                 (make-bytevector 4 seed))
+                   'nothing-written
+                   (list 'wrote-over seed)))))
+      (foreign-free dst)
+      r)))
+
+(test-equal "copy-in! of an empty span at the end of its bytevector writes nothing"
+  '(nothing-written nothing-written)
+  (let* ((under-zeros (empty-span-at-end-writes-nothing? #x00))
+         (under-ones (empty-span-at-end-writes-nothing? #xff)))
+    (list under-zeros under-ones)))
+
+;; The shim's zero-length moves rely on Chez passing an EMPTY bytevector's
+;; storage as a real, non-null address: C99 wants valid pointers even for a
+;; zero length, and only #f passes NULL. The CSUG does not say what an empty
+;; bytevector passes, so this pins it rather than a comment.
+(test-equal "an empty bytevector reaches C as a non-null pointer"
+  '(non-null non-null non-null)
+  (map (lambda (bv) (if (zero? (libc-bytevector-address bv)) 'null 'non-null))
+       (list (make-bytevector 0) #vu8() (string->utf8 ""))))
+
+;; copy-in! checks its span against the bytevector, then hands the
+;; bytevector to memcpy. If an interrupt handler ran between the two -- an
+;; engine's timer expiry is one -- and truncated the bytevector, memcpy would
+;; read past its new end, and a uv-write! would send the Chez heap that
+;; follows to the peer. The old per-byte loop re-checked every index; now
+;; copy-in! makes the final check and the copy one interrupt-free step.
+;;
+;; The scan runs copy-in! in an engine at rising fuel. On the first expiry it
+;; truncates the source to 16 bytes, collects, and fills the heap with #x77,
+;; then resumes. Every run must either be refused (the expiry came before the
+;; check) or copy only the source's #x11 (the copy came first). The scan stops
+;; at the first run that finishes before any expiry, since more fuel changes
+;; nothing after that. The scan runs outside any row, so every raise inside
+;; the engine becomes an outcome and fails the second row by name instead of
+;; aborting the suite (AGENTS.md).
+(define (truncation-outcome fuel)
+  (let* ((n 4096)
+         (bv (make-bytevector n #x11))
+         (dst (alloc-zeroed n))
+         (expired #f)
+         (spray '())
+         (answer
+          (let run ((eng (make-engine
+                          (lambda ()
+                            (guard (e ((uv-invalid-argument? e) 'refused)
+                                      (#t 'raised-otherwise))
+                              (copy-in! dst bv 0 n)
+                              'returned))))
+                    (ticks fuel))
+            (eng ticks
+                 (lambda (left v) v)
+                 (lambda (next)
+                   (unless expired
+                     (set! expired #t)
+                     (bytevector-truncate! bv 16)
+                     (collect)
+                     (set! spray
+                       (let fill ((i 0) (acc '()))
+                         (if (= i 2000)
+                             acc
+                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc))))))
+                   (run next 100000)))))
+         (copied (foreign->bytevector dst n)))
+    (free! dst)
+    (cond ((memq answer '(refused raised-otherwise)) answer)
+          ((not (bytevector=? copied (make-bytevector n #x11))) 'read-past-the-end)
+          (expired 'copied-before-the-truncation)
+          (else 'finished-before-any-expiry))))
+
+(define truncation-scan
+  (let loop ((fuel 1) (seen '()))
+    (let ((outcome (truncation-outcome fuel)))
+      (if (or (eq? outcome 'finished-before-any-expiry) (= fuel 512))
+          (reverse (cons outcome seen))
+          (loop (+ fuel 1) (cons outcome seen))))))
+
+(test-equal "the truncation scan spanned the check: some runs refused, the last untouched"
+  '(#t #t)
+  (list (and (memq 'refused truncation-scan) #t)
+        (eq? 'finished-before-any-expiry
+             (list-ref truncation-scan (- (length truncation-scan) 1)))))
+
+(test-equal "copy-in! never copies past the end of a bytevector truncated during the call"
+  '()
+  (filter (lambda (o)
+            (not (memq o '(refused copied-before-the-truncation
+                           finished-before-any-expiry))))
+          truncation-scan))
 
 ;; --- uv_buf_t ftype vs the shim's real layout (design spec S4 rule 4) ---
 ;; uv-buf-ftype-layout MEASURES the declared ftype -- offsets via
@@ -1150,8 +1409,13 @@
 ;; host-endian, so the two answers cannot be confused. tests/test-tcp.sps
 ;; makes the same check end to end against a real bound port; this one makes
 ;; it without a socket, on bytes this suite chose.
+;; The bytes are written one at a time with foreign-set!, not with copy-in!,
+;; so a broken copy-in! fails its own rows rather than aborting these.
 (let ((cell (alloc-zeroed 4)))
-  (copy-in! cell (u8-list->bytevector (list #xb4 #x39 #x00 #x50)) 0 4)
+  (foreign-set! 'unsigned-8 cell 0 #xb4)
+  (foreign-set! 'unsigned-8 cell 1 #x39)
+  (foreign-set! 'unsigned-8 cell 2 #x00)
+  (foreign-set! 'unsigned-8 cell 3 #x50)
   (test-equal "read-net-u16 decodes two bytes in NETWORK order, not host order"
     #xb439 (read-net-u16 cell 0))
   (test-equal "read-net-u16 reads at the offset it is given"

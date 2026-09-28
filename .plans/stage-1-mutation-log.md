@@ -612,6 +612,15 @@ method; baseline after the fixes is **136 assertions** in `test-native`.
   rejecting" is the assertion that proves the guard runs *ahead of* the loop
   rather than merely existing; a negative length alone would have been vacuous,
   since the loop writes nothing for it either way.
+
+  > **Superseded 2026-09-28 (#35).** `zero-out!` is now one `memset` through
+  > the shim. Chez's `size_t` argument conversion refuses 3.0 before C runs,
+  > so M52 now fails only "rejects an inexact length" and "rejects a negative
+  > length". "wrote nothing before rejecting" holds by construction.
+  >
+  > The check-before-call order is pinned by those two rows' who instead. It
+  > still fails if `zero-out!` goes back to a Scheme loop that writes before
+  > it validates. `.plans/bulk-copy-mutation-log.md` (M52, M52x) has the runs.
 - **M53 is the mutation the review predicted would be uncaught, and was.**
   Before this round the `&uv-version-incompatible` raise arm lived inline in
   `ensure-native-loaded!`, where it runs zero times per process against a

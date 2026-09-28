@@ -179,6 +179,21 @@ conflated volume with count, and the count turns out not to matter here.
 16× size range, and non-monotonic — 16384 measured *slower* than 4096. That
 is noise, not signal.
 
+> **Redone 2026-09-28 (chez-libuv #35/#36 review).** This leg measured the
+> byte-at-a-time copies more than the buffer. In the same image, its CPU fell
+> from ~1.6–1.75 s to 42–55 ms once `copy-in!`, `copy-out` and `zero-out!`
+> became one `memcpy`/`memset` each, so ~97% of it had been per-byte copying
+> that cost the same at every size.
+>
+> Measuring drain time only, as the limits below ask, 16 MiB drained in a
+> median 13.6 / 10.0 / 8.6 ms at 4096 / 16384 / 65536. A 4 KiB buffer takes
+> ~1.6× as long as 64 KiB, about 1.3 µs per extra delivery. GC counts stay
+> at two or three at every size.
+>
+> The pump harness is now bound by its own ticker, ~516 ms at every size, so
+> its throughput column still says nothing. docs/api.md carries the
+> corrected figures.
+
 **So the only term that clearly differentiates is Leg A's memory floor**, and
 it differentiates by 16×: 40 MiB versus 625 MiB at ten thousand connections.
 

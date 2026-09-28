@@ -1,7 +1,9 @@
-/* Thin ABI shim for compiler-derived constants, layouts, errnos, and optional
- * allocation counters. It does not wrap uv_* operations. */
+/* Thin ABI shim for compiler-derived constants, layouts, errnos, optional
+ * allocation counters, and bulk byte moves. It does not wrap uv_* operations. */
 #ifndef CHEZ_LIBUV_SHIM_H
 #define CHEZ_LIBUV_SHIM_H
+
+#include <stddef.h>
 
 /* A struct tag introduced only in a prototype has prototype scope. */
 struct uv_handle_s;
@@ -16,6 +18,17 @@ int chez_uv_constant(const char *name, long *out);
 int chez_uv_errno_count(void);
 const char *chez_uv_errno_name(int i);
 int chez_uv_errno_value(int i);
+
+/* Bulk byte moves for copy-at-the-boundary (ADR-0009; ADR-0002 as amended for
+ * issue #35): one memcpy or memset where Scheme can only move a byte at a
+ * time. The Scheme callers check types and signs, and copy-in!'s span against
+ * its bytevector; a foreign extent cannot be checked, so each caller passes a
+ * live block of at least len bytes. These trust all of it. An unsigned char
+ * pointer here is a bytevector's own storage. */
+void chez_uv_copy_in(void *dst, const unsigned char *src, size_t start,
+                     size_t len);
+void chez_uv_copy_out(unsigned char *dst, const void *src, size_t len);
+void chez_uv_zero(void *dst, size_t len);
 
 /* Counters are single-threaded diagnostics. Without CHEZ_LIBUV_DEBUG_COUNTERS,
  * updates are no-ops and live queries return zero. */

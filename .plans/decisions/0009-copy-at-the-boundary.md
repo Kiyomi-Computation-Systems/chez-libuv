@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -126,6 +126,73 @@ for that API when it is added.
 - An extra copy on every read and every write, accepted as v0.1's cost;
   nothing has yet demonstrated this matters for the workloads this binding
   targets.
+
+  > **Amended 2026-09-27 (issue #35).** Something has, but the cost came from
+  > how the copies were written, not from copying. Both directions ran as
+  > byte-at-a-time Scheme loops at ~29 ns a byte, and so did the zeroing
+  > `alloc-zeroed` gives every write block before the payload overwrites it.
+  >
+  > chez-http-server's M5 exit saw a 4 MiB `uv-write!` hold its loop 254 ms.
+  > Measured here, the call took 247–251 ms: 122 ms zeroing plus 125 ms
+  > copying. At the measured 28.6 ns a byte, a 16 KiB read's copy works out
+  > to ~0.47 ms (computed, not timed).
+  >
+  > Each helper is now one `memcpy` or `memset` through the shim
+  > ([ADR-0002](0002-direct-ffi-with-constants-only-shim.md), amended the same
+  > day). The same 4 MiB write now takes 0.41–0.54 ms.
+  >
+  > Copying at the boundary is unchanged, and the moves add no `lock-object`.
+  > The bytevector crosses as a `u8*` argument to a plain call, not a
+  > `__collect_safe` one. A plain call keeps its thread active, and the
+  > stop-the-world collector waits for every active thread
+  > ([ADR-0019](0019-threading-model-collect-safe-and-per-loop-affinity.md)
+  > fact 1), so the storage cannot move before the call returns.
+  >
+  > **The price of that plain call** (recorded 2026-09-28, after review): on
+  > a threaded Chez, every other thread's collection waits for the whole
+  > move. The old per-byte loop never made other threads wait, because it
+  > reached safe points, though its own thread took seconds.
+  >
+  > Measured while an allocating thread ran beside a write-shaped move, on
+  > macOS arm64:
+  >
+  > | move | that thread's collections waited |
+  > |---|---|
+  > | 4 MiB | under 0.7 ms |
+  > | 64 MiB | 3–9 ms |
+  > | 256 MiB | 13 ms warm, 87 ms on fresh pages |
+  >
+  > The glibc image's slower `memcpy` stretches these times.
+  >
+  > Chunking the move would bound the wait only with small chunks. A loop of
+  > plain foreign calls notices a pending collect request about once every
+  > 490 calls, so 1 MiB chunks bound nothing. 64 KiB chunks bound the wait to
+  > ~1 ms for ~10% more copy time, and each chunk would have to repeat
+  > `copy-in!`'s span check.
+  >
+  > The moves stay unchunked: the wait matters only for single writes of tens
+  > of MiB, which a consumer writing under backpressure already splits.
+  > docs/api.md's `uv-write!` row states the cost. Making the call
+  > `__collect_safe` is not an option: a concurrent collection then moves the
+  > bytevector mid-copy and corrupts it.
+  >
+  > **The span check and the copy are one step** (added 2026-09-28, after
+  > review). `copy-in!` checks its span against the bytevector's length
+  > inside the same `with-interrupts-disabled` region as the `memcpy`. Were
+  > an interrupt handler to run between the two, an engine's timer for
+  > instance, and truncate the bytevector, the copy would read past its new
+  > end, and a `uv-write!` would send the heap behind it to the peer. The old
+  > loop re-checked every index.
+  >
+  > **What pins all this:**
+  >
+  > - `tests/test-native.sps` holds each helper within 3x of libc's own
+  >   `memcpy` or `memset` over the same bytes, and runs the truncation scan.
+  > - `tests/test-stream.sps` holds each write verb within 3x of libc
+  >   allocating, zeroing and copying the same bytes.
+  > - `tests/test-threading-stress.sps` pins the plain binding.
+  >
+  > `.plans/bulk-copy-mutation-log.md` has the evidence.
 - The span-shaped `(bv start end)` read API and the reserved `uv-write*!`
   name exist so that adding zero-copy later is additive to the public API,
   not a breaking redesign of it.

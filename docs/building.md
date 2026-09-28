@@ -7,7 +7,9 @@
 paths of the libuv shared libraries to load before it, and the supported
 version range. **That file is generated and gitignored**, not part of the
 repository, so a fresh clone has to run `make build` before
-`(import (libuv))` can resolve. This is also why no source-only
+`(import (libuv))` can resolve. Run it again after every upgrade. The
+shim's exports change between releases, and a shim built from older sources
+fails the import with `&uv-shim-unavailable`. This is also why no source-only
 distribution (an Akku package included) can work without a build step:
 `config.sls` is a per-machine build product.
 

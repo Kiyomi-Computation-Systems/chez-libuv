@@ -25,7 +25,8 @@
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
-        (only (chezscheme) collect))
+        (uv-bulk)
+        (only (chezscheme) collect foreign-alloc foreign-free))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -77,6 +78,48 @@
 (test-assert "[informational] unconnected-pipe errno recorded"
   (begin (display "  [informational] unconnected pipe write: ")
          (display unconnected-errno) (newline) #t))
+
+;; --- the write verbs move their payload in bulk (issue #35) -------------
+;; A write to the unconnected pipe runs the verb's whole synchronous prefix --
+;; the checks, the block's allocation and zeroing, the payload copy, the
+;; uv_buf_t, the registry -- then libuv answers the errno above and the block
+;; is abandoned. That prefix is what held the loop ~250 ms per 4 MiB before
+;; #35, and half of it was alloc-zeroed, which test-native's helper rows do
+;; not reach. Each row times the verb against libc allocating, zeroing and
+;; copying the same bytes (tests/uv-bulk.sls) and wants it within bulk-bar;
+;; a regression to a byte loop anywhere in the prefix lands 100x or more away.
+(define bulk-size (* 4 1024 1024))
+(define bulk-payload (make-bytevector bulk-size 7))
+(define bulk-segments                   ; 16 spans of 256 KiB
+  (map (lambda (i) (list bulk-payload (* i 262144) (* (+ i 1) 262144)))
+       (list 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)))
+
+(define (libc-write-block)
+  (let* ((header 256)
+         (block (foreign-alloc (+ header bulk-size))))
+    (libc-memset! block 0 (+ header bulk-size))
+    (libc-memcpy-to-foreign! (+ block header) bulk-payload bulk-size)
+    (foreign-free block)))
+
+(define (refused-by-the-pipe thunk)
+  (lambda () (guard (e ((uv-errno-error? e) 'refused)) (thunk))))
+
+(test-equal (string-append "uv-write! moves its payload at libc speed: within "
+                           (number->string bulk-bar)
+                           "x of allocating, zeroing and copying it")
+  'bulk
+  (bulk-verdict 'uv-write! bulk-size
+                (refused-by-the-pipe
+                 (lambda () (uv-write! pipe bulk-payload nop)))
+                libc-write-block))
+(test-equal (string-append "uv-write*! moves its segments at libc speed: within "
+                           (number->string bulk-bar)
+                           "x of allocating, zeroing and copying them")
+  'bulk
+  (bulk-verdict 'uv-write*! bulk-size
+                (refused-by-the-pipe
+                 (lambda () (uv-write*! pipe bulk-segments nop)))
+                libc-write-block))
 
 ;; --- closed-stream refusals ---------------------------------------------
 (uv-close! pipe)
