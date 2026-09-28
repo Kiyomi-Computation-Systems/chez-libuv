@@ -472,8 +472,12 @@ Three behaviours worth knowing before the
   that `uv-async-send!` and `uv-close!` both take, so a send from any thread
   either completes before a close begins or raises `&uv-handle-closed`
   without touching the handle. That holds when the close frees the handle a
-  moment later, and for a send running inside an engine. Sends to one handle
-  from several threads take turns on its lock.
+  moment later, and when either runs inside an engine. The lock is held only
+  around one native call, with interrupts disabled, so no engine is ever
+  suspended holding it and no collection ever waits on it. A send may
+  therefore be made with interrupts disabled, or from a collect-request
+  handler. Sends to one handle from several threads take turns on its lock.
+  `uv-close!` itself still runs on the loop thread only.
 - **A close drops wakes still pending.** `on-wake` never runs once
   `uv-close!` has started, even for a send made before it, so after closing,
   drain the queue once more yourself. A refusal tells a sender only that its

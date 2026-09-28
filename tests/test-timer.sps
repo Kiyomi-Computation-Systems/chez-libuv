@@ -50,6 +50,26 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
+;; The simple runner prints only a failing row's title. Rows that return
+;; their evidence when they fail, like the close sweeps below, get it printed
+;; too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
+;; describe : object -> string
+;; A raised object's message, for a row to carry as evidence. Total, so a
+;; guard that calls it cannot raise in turn and abort the suite.
+(define (describe e)
+  (guard (err (#t "<the raised object could not be printed>"))
+    (call-with-string-output-port
+     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
+
 (define (live-count kind) (cdr (assq kind (live-counts))))
 
 ;; Captured before this suite allocates anything, so every "back to baseline"
@@ -900,21 +920,25 @@
     (install-dispatch-procedure! 'read 'not-a-procedure)
     'no-raise))
 
-;; --- two closes interleaved by an engine start one native close ----------
-;; uv-close! moves an open handle to closing and starts libuv's close; a
-;; second call finds it closing and does nothing. A green-thread scheduler on
-;; the loop thread can run two closes of one handle in two engines, so the
-;; check and the move must be one step. Split by an engine, both calls see the
-;; handle open, both call uv_close, and the loop then walks a corrupted
-;; closing list: measured before the fix, "invalid memory reference" on macOS
-;; and a hang on Linux.
+;; --- a close suspended at any point is one step -------------------------
+;; uv-close! checks that a handle is open, marks it closing, and calls
+;; libuv's uv_close. A green-thread scheduler on the loop thread can suspend
+;; a close anywhere in that and run another close of the same handle
+;; meanwhile, so all three must be one step. Measured before the fix:
+;; - split between the check and the mark, two closes both began and both
+;;   called uv_close, and the loop then walked a corrupted closing list
+;;   ("invalid memory reference" on macOS, a hang on Linux);
+;; - split between the mark and uv_close, the handle read closing while
+;;   libuv had not begun to close it, and a teardown in that window hung (an
+;;   async) or failed with EBUSY (a timer).
 ;;
 ;; An engine runs (uv-close! h on-close-first) for FUEL ticks. Where it is
-;; suspended, a second close with on-close-second runs, then the engine
-;; resumes. A close that begins stores its on-close, so the first close's
-;; callback replacing the second's means both began. Such a row answers its
-;; evidence and leaks its loop: running that loop would walk the corrupted
-;; list.
+;; suspended, the sweep first compares the handle's state with libuv's
+;; uv_is_closing: the close has either not begun, or begun natively too.
+;; Then a second close with on-close-second runs, and the engine resumes. A
+;; close that begins stores its on-close, so the first close's callback
+;; replacing the second's means both began. Such a row answers its evidence
+;; and leaks its loop: running that loop would walk the corrupted list.
 
 (define close-sweep-max-fuel 60)
 
@@ -927,9 +951,7 @@
          (on-close-second (lambda () #f))
          (first (make-engine
                  (lambda ()
-                   (guard (c (#t (list 'raised
-                                       (call-with-string-output-port
-                                        (lambda (p) (display-condition c p))))))
+                   (guard (c (#t (list 'raised (describe c))))
                      (uv-close! h on-close-first)
                      'closed)))))
     (first fuel
@@ -937,22 +959,27 @@
              (uv-loop-teardown! loop)
              (if (eq? v 'closed) 'finished (list fuel 'finished v)))
            (lambda (suspended)
-             (uv-close! h on-close-second)
-             (let* ((second-began (eq? (handle-on-close h) on-close-second))
-                    (v (suspended 1000000 (lambda (ticks v) v)
-                                  (lambda (more) 'still-running))))
-               (cond ((not (eq? v 'closed)) (list fuel 'resumed v))
-                     ((and second-began (eq? (handle-on-close h) on-close-first))
-                      (list fuel 'both-closes-began))
-                     (else
-                      (uv-loop-teardown! loop)
-                      (if second-began 'second-began 'first-began))))))))
+             (let* ((state (handle-state h))
+                    (native (uv-is-closing (handle-ptr h)))
+                    (split (and (not (eq? (eq? state 'closing)
+                                          (not (zero? native))))
+                                (list fuel 'split-close state native))))
+               (uv-close! h on-close-second)
+               (let* ((second-began (eq? (handle-on-close h) on-close-second))
+                      (v (suspended 1000000 (lambda (ticks v) v)
+                                    (lambda (more) 'still-running))))
+                 (cond ((not (eq? v 'closed)) (list fuel 'resumed v))
+                       ((and second-began (eq? (handle-on-close h) on-close-first))
+                        (list fuel 'both-closes-began))
+                       (else
+                        (uv-loop-teardown! loop)
+                        (cond (split)
+                              (second-began 'second-began)
+                              (else 'first-began))))))))))
 
 ;; close-sweep : (uv-loop -> uv-handle) -> (list-of (or symbol list))
 (define (close-sweep make-handle)
-  (guard (e (#t (list (list 'sweep-raised
-                            (call-with-string-output-port
-                             (lambda (p) (display-condition e p)))))))
+  (guard (e (#t (list (list 'sweep-raised (describe e)))))
     (let run ((fuel 1) (acc '()))
       (if (> fuel close-sweep-max-fuel)
           (reverse acc)
@@ -962,10 +989,13 @@
   (filter (lambda (row) (not (memq row '(finished first-began second-began))))
           sweep))
 
-;; The sweep is live only if it caught the first close before its move (a
-;; 'second-began row) and its fuel outlasted the whole verb.
+;; The sweep is live only if it caught the first close before its step (a
+;; 'second-began row) and its fuel outlasted the whole verb, so every point
+;; in between was visited. A split step would add suspension points inside
+;; it, and the rows above would see them; the one-step close has none after
+;; its step (fuel map in the async-send-fence mutation log).
 (define (close-sweep-reach sweep)
-  (list (if (memq 'second-began sweep) 'second-began 'never-caught-before-the-move)
+  (list (if (memq 'second-began sweep) 'second-began 'never-caught-before-the-step)
         (let ((last-row (list-ref sweep (- (length sweep) 1))))
           (if (eq? last-row 'finished) 'finished last-row))))
 
@@ -973,13 +1003,13 @@
 (define async-close-sweep
   (close-sweep (lambda (loop) (make-uv-async loop (lambda (h) #f)))))
 
-(test-equal "two closes of one timer, interleaved at any point, start one native close"
+(test-equal "a timer's close suspended anywhere is one step, and a second close starts no second one"
   '() (close-sweep-violations timer-close-sweep))
-(test-equal "the timer close sweep caught a close before its move and ran one to the end"
+(test-equal "the timer close sweep caught a close before its step and ran one to the end"
   '(second-began finished) (close-sweep-reach timer-close-sweep))
-(test-equal "two closes of one async, interleaved at any point, start one native close"
+(test-equal "an async's close suspended anywhere is one step, and a second close starts no second one"
   '() (close-sweep-violations async-close-sweep))
-(test-equal "the async close sweep caught a close before its move and ran one to the end"
+(test-equal "the async close sweep caught a close before its step and ran one to the end"
   '(second-began finished) (close-sweep-reach async-close-sweep))
 
 ;; --- balance -------------------------------------------------------------

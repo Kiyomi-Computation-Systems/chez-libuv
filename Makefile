@@ -121,7 +121,9 @@ ROOT_TESTS   := tests/test-process-setuid.sps
 
 # STRESS_TESTS fork real OS threads and are timing-dependent (ADR-0010
 # companion): kept OFF the default gate via `make test-threading`, exactly as
-# ROOT_TESTS are gated behind `make test-root`.
+# ROOT_TESTS are gated behind `make test-root`. tests/test-async-fence.sps
+# forks threads too, but none of its verdicts depends on timing, so it stays
+# in TESTS (ADR-0010, amended 2026-09-28).
 STRESS_TESTS := tests/test-threading-stress.sps
 
 TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test-*.sps))

@@ -388,12 +388,13 @@
 ;; binding fenced its sends. Now every worker must end refused with
 ;; &uv-handle-closed, and nothing else may raise.
 ;;
-;; At its natural width the race was seen 0 times in 2000 rounds, so this
-;; block is not what catches a missing fence: tests/test-async-fence.sps
-;; holds each side of the fence on the default gate, and the widened-window
-;; runs are in .plans/async-send-fence-mutation-log.md. This block shows the
-;; fence under real contention: four senders and the closer, with no
-;; deadlock and no other raise.
+;; What the rows catch depends on load (.plans/async-send-fence-mutation-
+;; log.md). On a loaded machine the refusal row caught main's unfenced send
+;; in every run, and on an idle one in none. It always catches a wrong
+;; refusal. It never sees the closer's half of the fence: the closer row in
+;; tests/test-async-fence.sps holds that, and holds both halves on the
+;; default gate. The first row is the precondition: the loop thread closed
+;; the async while the workers sent.
 (let ()
   (define rounds 30)
   (define k 4)
@@ -408,14 +409,14 @@
       (define dm (make-mutex))             ; guards results, for the join
       (define all-done (make-condition))
       (define results '())                 ; one outcome per worker
-      (define stopped-unrefused 0)         ; workers that ended unrefused
       ;; Closes at the CLOSE-AT'th wake, or at once if a worker has ended
       ;; unrefused: the round has failed, and the wakes it waits for may
       ;; never come, which would leave uv-run blocked.
       (define (on-wake h)
         (set! wakes (+ wakes 1))
         (when (or (= wakes close-at)
-                  (positive? (with-mutex dm stopped-unrefused)))
+                  (with-mutex dm
+                    (exists (lambda (o) (not (eq? o 'refused))) results)))
           (uv-close! h)))
       ;; A worker that ends unrefused sends one more wake so the loop thread
       ;; sees it. The fence makes that safe even if the close has begun.
@@ -429,8 +430,6 @@
                        (begin (uv-async-send! async) (send (+ n 1))))))))
           (with-mutex dm
             (set! results (cons outcome results))
-            (unless (eq? outcome 'refused)
-              (set! stopped-unrefused (+ stopped-unrefused 1)))
             (condition-signal all-done))
           (unless (eq? outcome 'refused)
             (guard (e (#t #f)) (uv-async-send! async)))))
@@ -441,8 +440,9 @@
                    (uv-run loop 'default)  ; returns once the close completes
                    'returned)))
         ;; If uv-run returned early, close now, so the workers are refused
-        ;; instead of sending to CAP into a loop nothing runs.
-        (when (uv-handle-open? async) (uv-close! async))
+        ;; instead of sending to CAP into a loop nothing runs. A handle
+        ;; already closing or closed makes this a no-op.
+        (uv-close! async)
         (with-mutex dm
           (let join ()
             (unless (= (length results) k)

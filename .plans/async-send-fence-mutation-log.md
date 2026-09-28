@@ -9,8 +9,17 @@ against a second party:
   fence (`with-send-fence`), which the send and the close both take.
 - **Close against close.** Two `uv-close!` calls on one handle, interleaved by
   an engine, could both see it open and both call `uv_close`. Found while
-  restructuring the close for the fence; the open → closing move is now one
-  step with interrupts disabled, for every kind of handle.
+  restructuring the close for the fence. The open check, the move to closing
+  and `uv_close` are now one step with interrupts disabled, for every kind of
+  handle.
+
+**Read "The reworked fence", at the end, first.** The first fence shape,
+`with-mutex` around `with-interrupts-disabled`, passed everything in the
+first half of this log. PR #43's review then found that it held the fence
+across an engine suspension, and that a collection could deadlock on it. It
+was replaced. The first half stays as the record of what the first shape's
+tests could and could not see; where a claim there no longer holds, the last
+section says so.
 
 Every probe and mutation ran on a scratch copy outside the repo. macOS runs:
 Chez 10.4.1 (`tarm64osx`), libuv 1.52.1 via pkg-config, the dev build. Linux
@@ -215,3 +224,202 @@ pending flag is already set, so no send makes a syscall), 5 runs each.
 These are close to the #33 review's prototype (47–48 and 114–120 ns on
 macOS). A send that takes libuv's slow path makes a `write` or `kevent`,
 which costs far more than the fence.
+
+---
+
+## The reworked fence (after PR #43's review, 2026-09-28)
+
+### What the review found in the first shape
+
+The first shape was `(with-mutex fence (with-interrupts-disabled body))`.
+Measured by the review's finders and verifiers (probes in its scratch
+directories), on Chez 10.4.1:
+
+- **The fence was held across an engine suspension.** `with-mutex` releases
+  in a `dynamic-wind` exit thunk, after the winder is gone and after
+  `with-interrupts-disabled` has re-enabled interrupts. Its entry is a trap
+  check, so an engine whose fuel ran out there was suspended holding the
+  fence: the send at fuel 12 in the sweep's setup, the close at fuel 10–15
+  depending on the setup.
+  - An engine abandoned there kept the fence for good. The loop thread's
+    `uv-close!` stayed blocked past 3 s, and so did a worker's send.
+  - Resuming the engine on another thread raised "mutex-release: thread does
+    not own mutex".
+- **A collection could deadlock on it.** Give a caller its own
+  `with-interrupts-disabled` around a send, or send from a
+  `collect-request-handler`. Such a caller waited for the fence while still
+  active, while the holder was parked at a collection rendezvous at that same
+  exit edge. The process hung, where main (no lock) finished.
+- **Other gaps:**
+  - no row made a real sender wait on the fence;
+  - nothing checked the release after a success or a close;
+  - `uv_close` ran outside the close's atomic step, a window main had too;
+  - `make-mutex` ran after `uv_async_init`, outside its guard;
+  - the send read its pointer raw.
+
+### The new shape
+
+`(disable-interrupts) (mutex-acquire fence) body (mutex-release fence)
+(enable-interrupts)`, with no `dynamic-wind`.
+
+- The close's open check, move to closing and `uv_close` are one step: inside
+  the fence for an async, and with interrupts disabled for every kind.
+- The steps check the state and the pointer and answer a status. The caller
+  raises after the release.
+
+The measured facts it rests on:
+
+- **`with-interrupts-disabled` and `critical-section` both expand to a
+  `dynamic-wind`.** Their closures allocate once they capture locals.
+- **`enable-interrupts` does not take a pending engine timer itself.** An
+  engine whose fuel ran out with interrupts disabled is suspended at the next
+  trap check (probe: it finished instead, since no trap check followed).
+- **Fuel maps, where the engine is suspended:**
+
+  | | first shape (328dc8a) | new shape |
+  |---|---|---|
+  | `uv-async-send!` | 1–11 before the call; **12 after the call, fence held**; 13+ finished | 1–7 before the call; 8+ finished |
+  | `uv-close!` (async) | 1–9 open; **10–12 closing**; 13+ finished | 1–5 open; 6+ finished |
+
+  In the new shape nothing in either verb can be suspended after its step.
+- **A waiter stays active.** It blocks in `mutex-acquire` with interrupts
+  disabled. The holder is always inside a step that never waits, so the wait
+  is short and no collection is ever waiting on the holder.
+
+### Red on the first shape, green on the new
+
+The new rows, run against 328dc8a:
+
+- **test-async-fence:**
+  - "no send is suspended by an engine while it holds the fence":
+    `((12 sent-before-close held))`;
+  - "no close is suspended …": `((15 closing held))`;
+  - the pointer row: `((raised "Exception: invalid memory reference…")
+    (uv-close! null-handle-pointer))`.
+- **test-timer:** every suspension after the close's mark was a split,
+  `(12 split-close closing 0) (13 …)` for a timer and `15–17` for an async.
+
+On the new shape the fence suite passes 11 rows and test-timer 132.
+
+The reach rows at first also required a suspension after the step, where the
+first shape held the fence. The new shape has none (the fuel map above), so
+the reach rows now require a suspension before the step and a run to the end.
+
+### Mutations
+
+Every mutant ran on macOS and Linux native.
+
+| | mutation | result, both platforms |
+|---|---|---|
+| N0 | none (control) | fence 11 pass; timer 132 pass |
+| N1 | the first shape: `with-mutex` around `with-interrupts-disabled` | "no send … holds the fence" `((12 sent-before-close held))` and "no close …" `((15 closing held))`; test-timer passes, since that shape kept the close's step whole |
+| N2 | release after re-enabling interrupts | 11 pass: equivalent on 10.4.1, since nothing between the two calls is a trap check |
+| N3 | acquire before disabling interrupts | 11 pass: equivalent, for the same reason |
+| N4 | the send skips the mutex, keeping interrupts disabled | "uv-async-send! waits …": `(returned-while-held sent)` |
+| N5 | the async close skips the fence | "uv-close! waits …": `(closing torn-down)`, or `(closed torn-down)` on Linux |
+| N6 | the refusal raised inside the fence | handler row `held`; release row `(free free held held)`; the close-sweep reach row fails too, because a raise inside the fence leaves interrupts disabled |
+| N7 | no pointer check in the send | pointer row: `(raised "…invalid memory reference…")` |
+| N8 | no pointer check in the close | pointer row: `(raised "…invalid memory reference…")` for the close |
+| N9 | `uv_close` outside the step (the old split) | test-timer: timer and async rows, `(11 split-close closing 0) (12 …)` |
+| N10 | the timer path's step with interrupts on (the first half's C3) | test-timer: `(11 both-closes-began) (12 split-close closing 0) …`, plus the balance rows from the leaked loop |
+| N11 | the async close with plain `with-mutex` (the first half's C1) | "no close …" `((17 closing held))`; test-timer's async row `(14 both-closes-began) …` |
+| N12 | a repeated close leaves the fence held | release row `(free free free held)` |
+| N13 | a successful send leaves the fence held | "uv-async-send! waits …" `(waiting sent fence-left-held)`; release row `(held held held held)` |
+| N14 | the probe answers `free` without trying | only the probe-liveness row: `(free free)` |
+| N15 / N16 / N17 | send sweep capped at 3; close sweep capped at 3; both sweeps started at fuel 30 (they share `sweep-rows`) | the matching reach rows fail by name; N17 fails both |
+| R1 / R2 | test-timer's close sweep capped at 5; started at fuel 20 | both reach rows: `(second-began second-began)` / `(never-caught-before-the-step finished)` |
+
+N0, N4, N5 and N13 fork threads, and each gave its predicted result in 5 of 5
+runs on each platform.
+
+Two runs needed fixing before they counted:
+
+- **N13 first hung, in 3 of 8 runs, instead of failing.** A stack sample
+  showed main alone, blocked in `mutex-acquire`: the cleanup's `uv-close!`
+  was waiting on a fence left held by the sender thread, which had exited.
+  The probe had answered `free`, because it ran on a fresh thread. Chez
+  treats a thread whose id matches a mutex's recorded owner as its owner, and
+  a new thread can be given an exited thread's id. Measured: 20, 19 and 20 of
+  20 new threads (macOS twice, then Linux) took, without blocking, a mutex a
+  dead thread still held.
+  - The probe is now one thread that lives as long as the suite, so no holder
+    can share its id. The sender row also reports a held fence instead of
+    closing into it.
+  - Since then N13 fails by name in 10 of 10 runs.
+- **N14's first version made the probe release a mutex it did not hold.**
+  It proved nothing. The version above makes the probe simply answer `free`.
+
+### The review's deadlock reproducers
+
+| reproducer | first shape | new shape |
+|---|---|---|
+| one sender allocates; another sends inside its own `with-interrupts-disabled` | hung 3/3, killed at 30 s | finished 3/3 in 3 s, up to 38M sends |
+| two senders plus an allocator, with a `collect-request-handler` that sends | hung 3/3, killed at 30 s | finished 3/3, 188 collections |
+
+### The widened window, again
+
+The careless pool, with a 2 ms sleep inside the send's step:
+
+| send path | macOS | Linux under Valgrind, 3 rounds |
+|---|---|---|
+| new fence, widened | 10/10 rounds clean, 3 runs | exit 0, 0 errors |
+| closer unfenced, widened | **hangs** | exit 9, 3 × invalid read in the freed 128-byte block |
+
+On macOS the stale send faults inside the step. The new shape has no
+`dynamic-wind`, so a fault there leaves the fence held and interrupts
+disabled, and the pool deadlocks instead of reporting the fault. A fault can
+reach a step only once a handle's memory is already gone, which is what the
+fence prevents; the default gate catches this mutant (N5) without a fault.
+
+The alternative is a `dynamic-wind` whose entry disables interrupts and takes
+the fence, and whose exit releases it and re-enables them. That would contain
+a fault, at about 80 B a send, half the first shape's allocation. The trade
+was made for no allocation.
+
+### Cost
+
+1M sends on one async, on libuv's no-syscall fast path, 5 runs each.
+
+| | main | first shape | new shape |
+|---|---|---|---|
+| ns per send, macOS, 1 thread | 8.0–8.6 | 41–42 | 29.6–29.8 |
+| ns per send, macOS, 4 threads | 2.7–4.6 | 103–114 | 87–99 |
+| ns per send, Linux Docker, 1 thread | 7.9–8.0 | 97–108 | 74–80 |
+| ns per send, Linux Docker, 4 threads | 3.1–4.3 | 168–178 | 87–98 |
+| bytes per send (`sstats-bytes`) | 0 | 160 | 0 |
+| collections per 1M sends | 0 | 19 | 0 |
+
+`bytes-allocated` under-counts here, because each thread has its own
+allocation area. `(statistics)` confirmed the review's 160 B.
+
+### Removed: the collection row
+
+The first shape's M5 row said "a sender waiting for the send fence does not
+keep another thread from collecting". It required a waiter to be
+deactivated. The new shape deliberately waits with interrupts disabled, which
+is safe only because the holder never waits. The hazard that row guarded, a
+collection blocked by the fence, is now held more directly: the sweeps show
+the fence is never held where a thread could be stopped for a collection. The
+reproducers above show the end-to-end case.
+
+### Uncovered by design
+
+- **The mutex is made before `uv_async_init`.** Only a failing allocation
+  could show it. The review's verifier interposed malloc to fail
+  `S_make_mutex`: with the old order, teardown hung, and `uv-loop-close!`
+  answered EBUSY. The order is now record and mutex, then init, then
+  registration.
+- **N2 and N3 are equivalent on Chez 10.4.1.**
+- **A fault inside a step is not contained.** See "The widened window,
+  again".
+
+### Corrections to the first half
+
+- **The M5 row's premise is superseded.** It required the fence to be taken
+  with interrupts enabled; the new shape takes it with them disabled.
+- **C1's "not a safety property" was wrong.** The async close's interrupt-free
+  step is what keeps two closes of one async apart. N11, the same mutation,
+  now fails both suites.
+- **C3 is no longer uncovered.** With `uv_close` inside the step, N10 fails
+  test-timer's timer row.
+- **The first "Cost" section is superseded** by the table above.

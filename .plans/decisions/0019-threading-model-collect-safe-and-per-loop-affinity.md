@@ -73,27 +73,37 @@ drains a caller-side queue rather than assuming one item per send.
 > Each async handle now carries a send fence, a mutex that `uv-async-send!`
 > and `uv-close!` both take (`with-send-fence` in `(libuv private handles)`).
 > The send's open check and native call run inside it, and so does the
-> close's open → closing step. So a send either completes before a close
-> begins, or is refused with `&uv-handle-closed` without touching the handle.
-> That holds from any thread and inside engines. Three details decide whether
-> the mutex fences anything:
+> close's whole step: the open check, the move to closing, and `uv_close`. So
+> a send either completes before a close begins, or is refused with
+> `&uv-handle-closed` without touching the handle. That holds from any thread
+> and inside engines. Two rules make the mutex a fence:
 >
-> - The body runs with interrupts disabled. `with-mutex` is a `dynamic-wind`,
->   so an engine suspended inside it releases the mutex, and resumes after
->   whatever ran meanwhile, on a stale check.
-> - The mutex is taken with interrupts enabled. A thread blocked taking it
->   is then deactivated, so other threads can still collect.
-> - Nothing raises inside it. A `with-exception-handler` handler runs in the
->   raise's dynamic extent, so a refusal raised inside would reach the
->   caller's handler with the fence held.
+> - **It is taken and released only with interrupts disabled.** So no engine
+>   is ever suspended holding it, and no collection ever stops a thread that
+>   holds it. A thread that finds it taken waits inside the same
+>   interrupt-free step. It stays active while it waits, but the holder is
+>   running a step that never waits, so the wait is short and no collection
+>   can be waiting on the holder. The first shape reviewed, `with-mutex`
+>   around `with-interrupts-disabled`, broke this rule. `with-mutex` releases
+>   in a `dynamic-wind` exit thunk, at a point where an engine can still be
+>   suspended. An engine dropped there kept the fence for good, and a
+>   collection could park the holder while a caller with interrupts disabled
+>   waited on it, deadlocking the process. PR #43's review measured both.
+> - **Nothing raises inside.** The steps check the state and the pointer,
+>   answer a status, and the caller raises after the release. A
+>   `with-exception-handler` handler runs in the raise's dynamic extent, so a
+>   refusal raised inside would reach it with the fence held.
 >
-> `tests/test-async-fence.sps` holds each detail, with an engine-fuel sweep
-> and three rows that fork a second thread. The mutations and the
-> widened-window runs are in `.plans/async-send-fence-mutation-log.md`.
-> Decision 4 stands: this lock guards one handle's lifetime across the one
-> call libuv makes thread-safe, not the registry. The cost, on libuv's
-> no-syscall fast path: about 42 ns a send on macOS arm64, up from 8, and
-> senders sharing one handle now take turns.
+> `tests/test-async-fence.sps` holds both. Its engine sweeps probe the fence
+> from another thread at every point where a send or a close can be
+> suspended, and other rows make a real sender and a real closer wait on a
+> held fence, and check its release on every way out. The mutations, the
+> deadlock reproducers and the widened-window runs are in
+> `.plans/async-send-fence-mutation-log.md`. Decision 4 stands: this lock
+> guards one handle's lifetime across the one call libuv makes thread-safe,
+> not the registry. The cost, on libuv's no-syscall fast path: about 30 ns a
+> send on macOS arm64, up from 8, with no allocation. Senders sharing one
+> handle take turns: about 90 ns a send with four.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
