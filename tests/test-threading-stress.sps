@@ -21,7 +21,7 @@
         (libuv timer)
         (libuv handle)
         (libuv async)
-        (only (libuv private conditions) uv-wrong-thread?)
+        (only (libuv private conditions) uv-wrong-thread? uv-handle-closed?)
         (only (libuv private handles) loop-owner-thread)
         (only (libuv private native) copy-in! copy-out)
         (only (chezscheme)
@@ -224,18 +224,20 @@
 ;; payoff, shutdown included: the loop thread closes the async while the
 ;; workers are still posting.
 ;;
-;; uv-async-send!'s open-state check is a courtesy (async.sls): it cannot stop
-;; the loop thread from closing -- and freeing -- the handle between that check
-;; and the native send, so every send must be over before uv-close! starts.
-;; The close discipline this block exercises (docs/api.md, Async):
-;;   - a worker holds QM while it checks OPEN?, queues its item, and sends;
-;;   - the loop thread clears OPEN? under QM, then calls uv-close!, so no send
-;;     is between check and native call at the close, and none starts after;
+;; Since #33 the binding keeps every send off a closing handle by itself (the
+;; careless pool below). It cannot tell a worker which of its items arrive:
+;; a close drops a wake still pending, and a refused send may follow an item
+;; its worker already queued. Exact delivery is the caller's, and this block
+;; exercises the discipline for it (docs/api.md, Async):
+;;   - a worker holds QM while it checks OPEN?, queues its item, and sends,
+;;     so it queues an item only while the loop thread will still drain it;
+;;   - the loop thread clears OPEN? under QM, then calls uv-close!, so no item
+;;     is queued after the close, and none is queued by a worker it refused;
 ;;   - then it drains once more: on-wake never runs once a close has started,
 ;;     even for a send made before it, so the items queued since the last
 ;;     drain would otherwise be stranded.
 ;; Workers post until the cleared flag refuses them, and the main thread joins
-;; every worker before teardown, so no send can outlive the handle or the loop.
+;; every worker before teardown.
 ;;
 ;; A slip in this discipline loses its race only some of the time: a flag
 ;; cleared after uv-close!, a send outside QM, or a missing join was caught by
@@ -377,6 +379,88 @@
       (make-list rounds 'exactly-once) (every-round 2))
     (test-equal "the shared queue is fully drained"
       (make-list rounds 'empty) (every-round 3))))
+
+;; --- a careless pool: sends that race the close (#33) ----------------------
+;; The pool above sends only under its own lock. This one takes no lock: K
+;; workers send until refused, and the loop thread closes the async from
+;; on-wake while they are still sending. #32 measured this shape reaching the
+;; freed handle (.plans/async-close-discipline-mutation-log.md) before the
+;; binding fenced its sends. Now every worker must end refused with
+;; &uv-handle-closed, and nothing else may raise.
+;;
+;; What the rows catch depends on load (.plans/async-send-fence-mutation-
+;; log.md). On a loaded machine the refusal row caught main's unfenced send
+;; in every run, and on an idle one in none. It always catches a wrong
+;; refusal. It never sees the closer's half of the fence: the closer row in
+;; tests/test-async-fence.sps holds that, and holds both halves on the
+;; default gate. The first row is the precondition: the loop thread closed
+;; the async while the workers sent.
+(let ()
+  (define rounds 30)
+  (define k 4)
+  (define close-at 50)                 ; the wake that closes the async
+  (define cap 1000000)                 ; sends before a worker stops unrefused
+  ;; run-careless-round : -> (list run outcomes)
+  (define (run-careless-round)
+    (let ()
+      (define loop (make-uv-loop))
+      (define async #f)
+      (define wakes 0)
+      (define dm (make-mutex))             ; guards results, for the join
+      (define all-done (make-condition))
+      (define results '())                 ; one outcome per worker
+      ;; Closes at the CLOSE-AT'th wake, or at once if a worker has ended
+      ;; unrefused: the round has failed, and the wakes it waits for may
+      ;; never come, which would leave uv-run blocked.
+      (define (on-wake h)
+        (set! wakes (+ wakes 1))
+        (when (or (= wakes close-at)
+                  (with-mutex dm
+                    (exists (lambda (o) (not (eq? o 'refused))) results)))
+          (uv-close! h)))
+      ;; A worker that ends unrefused sends one more wake so the loop thread
+      ;; sees it. The fence makes that safe even if the close has begun.
+      (define (worker)
+        (let ((outcome
+               (guard (e ((uv-handle-closed? e) 'refused)
+                         (#t (list 'raised (describe e))))
+                 (let send ((n 0))
+                   (if (= n cap)
+                       (list 'never-refused n)
+                       (begin (uv-async-send! async) (send (+ n 1))))))))
+          (with-mutex dm
+            (set! results (cons outcome results))
+            (condition-signal all-done))
+          (unless (eq? outcome 'refused)
+            (guard (e (#t #f)) (uv-async-send! async)))))
+      (set! async (make-uv-async loop on-wake))
+      (let spawn ((i 0))
+        (when (< i k) (fork-thread worker) (spawn (+ i 1))))
+      (let ((run (guard (e (#t (list 'raised (describe e))))
+                   (uv-run loop 'default)  ; returns once the close completes
+                   'returned)))
+        ;; If uv-run returned early, close now, so the workers are refused
+        ;; instead of sending to CAP into a loop nothing runs. A handle
+        ;; already closing or closed makes this a no-op.
+        (uv-close! async)
+        (with-mutex dm
+          (let join ()
+            (unless (= (length results) k)
+              (condition-wait all-done dm)
+              (join))))
+        (uv-loop-teardown! loop)
+        (list run
+              (if (equal? results (make-list k 'refused))
+                  'every-worker-refused
+                  results)))))
+  (let ((round-results (let more ((i 0) (acc '()))
+                         (if (= i rounds)
+                             (reverse acc)
+                             (more (+ i 1) (cons (run-careless-round) acc))))))
+    (test-equal "a careless pool's loop closes its async while workers send"
+      (make-list rounds 'returned) (map car round-results))
+    (test-equal "every careless sender is refused with &uv-handle-closed, and nothing else raises"
+      (make-list rounds 'every-worker-refused) (map cadr round-results))))
 
 (test-end "threading-stress")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))

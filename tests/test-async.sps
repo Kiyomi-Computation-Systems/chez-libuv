@@ -9,7 +9,9 @@
 ;;; (a real worker raising, owner transfer to a real thread, a worker pool
 ;;; posting via uv-async-send!) live in tests/test-threading-stress.sps, off
 ;;; the default gate (ADR-0010 companion), because they fork threads and are
-;;; timing-dependent.
+;;; timing-dependent. The send fence's rows fork threads but depend on no
+;;; timing, and run on the default gate in tests/test-async-fence.sps
+;;; (ADR-0010, amended 2026-09-28).
 (import (rnrs)
         (srfi :64)
         (libuv)

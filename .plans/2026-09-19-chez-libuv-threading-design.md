@@ -163,6 +163,12 @@ c/thread.c:388–404). Only a thread *created* while a request is already pendin
 is told to check immediately (c/thread.c:181–183). So a loop thread in a plain
 `uv_run` reaches a collection rendezvous only after its callbacks have burned
 ~1000 trap ticks — which a light callback never does inside a 400-fire window.
+*Corrected 2026-09-28 (#33): measured on Chez 10.4.1, a thread blocked in
+`mutex-acquire` with interrupts enabled IS deactivated, and another thread's
+`(collect)` succeeds; with interrupts disabled it stays active, and the
+`(collect)` is refused. The conclusion about a loop thread in a plain
+`uv_run` stands. ADR-0019's decision-3 amendment relies on the corrected
+behaviour.*
 
 **The ticker helps only by accident.** E5d swept the single knob — how many
 non-inlined, non-allocating procedure calls the loop thread runs per 1 ms tick,
@@ -220,6 +226,10 @@ loop-thread-only. So:
 - **`uv-async-send! : uv-async -> unspecified`** — callable from *any* thread.
   The **only** verb exempt from the affinity check (§6.3). It touches no
   registry state; it calls `uv_async_send`, which libuv makes thread-safe.
+  *Amended 2026-09-28 (#33): libuv's thread-safety covers the call, not the
+  handle's lifetime. A close could free the handle between the send's open
+  check and its call, so sends and closes now share a per-handle fence, held
+  only with interrupts disabled; see ADR-0019's decision-3 amendment.*
 - The async callback is the **14th locked trampoline** (D4), signature
   `uv_async_cb (uv_async_t*) -> void` — same arity as `timer`/`close` but a
   distinct callback *type*, so it gets its own slot (ADR-0008's rule, as the

@@ -30,6 +30,7 @@
           signal-mode set-signal-mode!
           %make-uv-async-record uv-async-record?
           async-on-wake set-async-on-wake!
+          async-fence with-send-fence valid-pointer?
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -64,6 +65,11 @@
           ;; loop-queue query
           handle-in-loop-queue? walk-dispatch)
   (import (rnrs)
+          ;; Ahead of (chezscheme): the mutex primitives exist only in a
+          ;; threaded Chez (#41; tests/test-require-threaded.sps).
+          (libuv private require-threaded)
+          (only (chezscheme) make-mutex mutex-acquire mutex-release
+                disable-interrupts enable-interrupts)
           (libuv private conditions)
           (only (libuv private native)
                 uv-cancel
@@ -204,12 +210,15 @@
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
   ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
+  ;; fence is the handle's send fence (#33); see with-send-fence.
   (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
     (parent uv-handle-record)
-    (fields (mutable on-wake async-on-wake set-async-on-wake!))
+    (fields (mutable on-wake async-on-wake set-async-on-wake!)
+            (immutable fence async-fence))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop on-wake) ((pargs->new ptr 'async loop) on-wake)))))
+       (lambda (ptr loop on-wake)
+         ((pargs->new ptr 'async loop) on-wake (make-mutex))))))
 
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
@@ -233,8 +242,8 @@
   ;; per-verb sprinkling (design §6.3). The thread check comes first — a verb
   ;; from the wrong thread is refused before its handle's open state is even
   ;; consulted. uv-async-send! is the one verb that does NOT come through here
-  ;; (it is libuv's sole thread-safe call); it validates kind and open state on
-  ;; its own path in (libuv async).
+  ;; (it is libuv's sole thread-safe call); it validates kind on its own path in
+  ;; (libuv async), and checks open state inside the send fence.
   (define (require-open-handle handle who)
     (require-handle handle who)
     (require-loop-thread (handle-loop handle) who)
@@ -242,7 +251,10 @@
       (raise (make-uv-handle-closed (handle-kind handle))))
     handle)
 
-  ;; The checked accessor is the only route from a handle record to native code.
+  ;; The checked accessor is the only route from a handle record to native code,
+  ;; except in the fence's steps (uv-async-send!, begin-close!), where nothing
+  ;; may raise: they make the same check with valid-pointer? and answer a
+  ;; status instead.
   (define (handle-pointer handle who)
     (let ((ptr (handle-ptr handle)))
       (unless (valid-pointer? ptr)
@@ -510,16 +522,72 @@
     (uv-walk-native (loop-ptr loop) 0)
     (and (memv (handle-ptr handle) walk-query-cell) #t))
 
+  ;; (with-send-fence async body ...) runs BODY holding ASYNC's send fence
+  ;; (#33), the lock that orders uv-async-send! against uv-close!. The send's
+  ;; open check and native call run inside it, and so does the close's whole
+  ;; step (begin-close!). So no close begins while a send is between its check
+  ;; and its call, and no send gets past the check once a close has begun.
+  ;;
+  ;; The fence is taken and released only with interrupts disabled, so no
+  ;; thread ever holds it where an engine can suspend it or a collection can
+  ;; stop it. Held across either, an abandoned engine would keep it for good,
+  ;; and a collection could wait for a thread that waits for the fence. That
+  ;; rules out with-mutex: it releases in a dynamic-wind exit thunk, after the
+  ;; winder is gone, at a point where an engine can be suspended (the review
+  ;; of #43). tests/test-async-fence.sps probes every such point from another
+  ;; thread.
+  ;; - A thread that finds the fence taken waits for it inside the same
+  ;;   interrupt-free step, so it stays active while it waits. The holder is
+  ;;   always running a BODY, which never waits on anything, so the wait is
+  ;;   short, and no collection can be waiting on the holder meanwhile.
+  ;; - BODY must not raise or block: a raise would leave the fence held and
+  ;;   interrupts disabled. The bodies check what could fault, the state and
+  ;;   the pointer, and answer a status; their callers raise after.
+  (define-syntax with-send-fence
+    (syntax-rules ()
+      ((_ async body1 body2 ...)
+       (let ((fence (async-fence async)))
+         (disable-interrupts)
+         (mutex-acquire fence)
+         (let ((result (begin body1 body2 ...)))
+           (mutex-release fence)
+           (enable-interrupts)
+           result)))))
+
   ;; Starting close is idempotent and asynchronous. A repeated call cannot
   ;; replace the original on-close callback.
   (define (real-close-handle! handle on-close)
     (require-handle handle 'uv-close!)
     (unless (or (not on-close) (procedure? on-close))
       (raise (make-uv-invalid-argument 'uv-close! 'on-close-not-a-procedure)))
-    (when (eq? (handle-state handle) 'open)
-      (set-handle-on-close! handle on-close)
-      (set-handle-state! handle 'closing)
-      (uv-close-native (handle-pointer handle 'uv-close!))))
+    (when (eq? (begin-close! handle on-close) 'no-pointer)
+      (raise (make-uv-invalid-argument 'uv-close! 'null-handle-pointer))))
+
+  ;; begin-close! : uv-handle (or procedure #f)
+  ;;                -> (or 'closing 'not-open 'no-pointer)
+  ;; Starts an open handle's close in one step: the open check, the move to
+  ;; closing, and libuv's uv_close, with interrupts disabled throughout.
+  ;; Split by an engine, two closes of one handle could both see it open and
+  ;; both call uv_close, or the handle could read closing while libuv had not
+  ;; begun to close it (test-timer.sps's close sweep). An async takes the step
+  ;; inside its send fence, so the close also waits for a send past its open
+  ;; check, and every later send sees the handle closing. Nothing here may
+  ;; raise (see with-send-fence): the caller raises for 'no-pointer.
+  (define (begin-close! handle on-close)
+    (define (close-if-open!)
+      (let ((ptr (handle-ptr handle)))
+        (cond ((not (eq? (handle-state handle) 'open)) 'not-open)
+              ((not (valid-pointer? ptr)) 'no-pointer)
+              (else (set-handle-on-close! handle on-close)
+                    (set-handle-state! handle 'closing)
+                    (uv-close-native ptr)
+                    'closing))))
+    (if (uv-async-record? handle)
+        (with-send-fence handle (close-if-open!))
+        (begin (disable-interrupts)
+               (let ((status (close-if-open!)))
+                 (enable-interrupts)
+                 status))))
 
   (define close-handle-proc
     (lambda (handle on-close)

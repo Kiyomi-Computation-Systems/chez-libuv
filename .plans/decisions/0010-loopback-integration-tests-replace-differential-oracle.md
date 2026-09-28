@@ -111,3 +111,22 @@ Why the ratio does not reintroduce the flakiness the rule exists to prevent:
 
 The threaded proof that the copies stay plain lives off the gates, in
 `tests/test-threading-stress.sps`, per the Companion above.
+
+## Amended 2026-09-28 (issue #33): threads without timing on the default gate
+
+`tests/test-async-fence.sps` forks OS threads and runs on the default and
+memory gates. The send fence it holds shows only across threads: Chez
+mutexes are recursive, so only a thread that does not hold the fence can see
+it held, or wait on it. Left on the stress tier, the check would run only at
+release time. It stays within this ADR's discipline because:
+
+- **No verdict on a correct build depends on timing.** Each row waits for an
+  event: a thread's post, or the end of the thread that would make it. A
+  thread that raises posts that instead, so no wait outlives a failure.
+- **Where a row has a time bound, the bound only limits a broken build.** The
+  rows that hold the fence give a verb 20 ms to return while it is held. A
+  correct verb cannot, so the bound always runs out; a verb that ignores the
+  fence returns at once and ends the wait early.
+
+The timing-dependent proofs stay on the stress tier: pools of senders racing
+a close, and collections against a loop thread blocked in `uv_run`.

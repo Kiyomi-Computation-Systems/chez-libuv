@@ -15,35 +15,48 @@
   ;; make-uv-async : uv-loop procedure -> uv-async
   ;; Loop-thread-only: it initialises native state and mutates the registry.
   ;; require-loop-thread runs before any allocation, so a wrong-thread create is
-  ;; a named refusal, not a corrupted registry.
+  ;; a named refusal, not a corrupted registry. The record, and with it the
+  ;; send fence (a native mutex), is made before uv_async_init links the handle
+  ;; into the loop, so nothing that can fail runs between that link and the
+  ;; registration that lets teardown close the handle.
   (define (make-uv-async loop on-wake)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-async)
     (require-loop-thread loop 'make-uv-async)
     (require-callback on-wake 'make-uv-async 'on-wake-not-a-procedure)
-    (let ((ptr (alloc-zeroed (uv-handle-size (uv-async-type)))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-async-init-native (loop-pointer loop 'make-uv-async) ptr)
-                  'make-uv-async))
-      (let ((async (%make-uv-async-record ptr loop on-wake)))
-        (registry-register! ptr 'async loop async)
-        (count-async-new!)
-        async)))
+    (let* ((ptr (alloc-zeroed (uv-handle-size (uv-async-type))))
+           (async (guard (e (#t (free! ptr) (raise e)))
+                    (let ((async (%make-uv-async-record ptr loop on-wake)))
+                      (uv-check (uv-async-init-native
+                                 (loop-pointer loop 'make-uv-async) ptr)
+                                'make-uv-async)
+                      async))))
+      (registry-register! ptr 'async loop async)
+      (count-async-new!)
+      async))
 
   ;; uv-async-send! : uv-async -> unspecified
   ;; The ONE verb exempt from the loop-thread affinity check (design §6.3):
   ;; uv_async_send is thread-safe, so a worker thread wakes the loop with it. It
-  ;; does not touch the registry. Kind and open state are validated as a
-  ;; courtesy for the already-closed case; the caller must ensure the async
-  ;; outlives its senders (libuv's own lifetime contract — close happens on the
-  ;; loop thread and is the consumer's responsibility to sequence).
+  ;; does not touch the registry. The open check and the native send run inside
+  ;; the handle's send fence, which uv-close! takes too (#33), so a send either
+  ;; completes before a close begins or is refused with &uv-handle-closed, never
+  ;; made on a freed handle. Nothing may raise inside the fence, so the step
+  ;; checks the pointer as handle-pointer would and answers a status, and the
+  ;; refusal is raised after the release.
   (define (uv-async-send! async)
     (unless (uv-async-record? async)
       (raise (make-uv-invalid-argument 'uv-async-send! 'not-a-uv-async)))
-    (unless (eq? (handle-state async) 'open)
-      (raise (make-uv-handle-closed 'async)))
-    (uv-check (uv-async-send (handle-pointer async 'uv-async-send!))
-              'uv-async-send!))
+    (let ((status (with-send-fence async
+                    (let ((ptr (handle-ptr async)))
+                      (cond ((not (eq? (handle-state async) 'open)) 'closed)
+                            ((not (valid-pointer? ptr)) 'no-pointer)
+                            (else (uv-async-send ptr)))))))
+      (case status
+        ((closed) (raise (make-uv-handle-closed 'async)))
+        ((no-pointer)
+         (raise (make-uv-invalid-argument 'uv-async-send! 'null-handle-pointer)))
+        (else (uv-check status 'uv-async-send!)))))
 
   ;; Never deliver a wake to a handle already closing; the callback runs on the
   ;; loop thread, so it may safely touch the loop and its handles.
