@@ -551,9 +551,12 @@
 
   ;; begin-close! : uv-handle (or procedure #f) -> boolean
   ;; Moves an open handle to closing and answers #t, or answers #f if the
-  ;; handle was not open. An async makes the move inside its send fence, so
-  ;; the close waits for a send already past its open check, and every later
-  ;; send sees the handle closing.
+  ;; handle was not open. The check and the move are one step, with
+  ;; interrupts disabled: split by an engine, two closes of one handle would
+  ;; both see it open and both call uv_close (test-timer.sps's close sweep).
+  ;; An async makes the move inside its send fence, so the close also waits
+  ;; for a send already past its open check, and every later send sees the
+  ;; handle closing.
   (define (begin-close! handle on-close)
     (define (open->closing!)
       (and (eq? (handle-state handle) 'open)
@@ -562,7 +565,7 @@
                   #t)))
     (if (uv-async-record? handle)
         (with-send-fence handle (open->closing!))
-        (open->closing!)))
+        (with-interrupts-disabled (open->closing!))))
 
   (define close-handle-proc
     (lambda (handle on-close)

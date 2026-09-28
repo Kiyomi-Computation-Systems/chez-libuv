@@ -1,9 +1,16 @@
 # Async send fence (#33): mutation log
 
-Evidence for `fix/async-send-fence` (#33). `uv-async-send!` checked that the
-handle was open, read its pointer, then called `uv_async_send`. A close on the
-loop thread could free the block in between. Each async handle now has a send
-fence (`with-send-fence`), which the send and the close both take.
+Evidence for `fix/async-send-fence`. Two fixes to one code path, `uv-close!`
+against a second party:
+
+- **Send against close (#33).** `uv-async-send!` checked that the handle was
+  open, read its pointer, then called `uv_async_send`. A close on the loop
+  thread could free the block in between. Each async handle now has a send
+  fence (`with-send-fence`), which the send and the close both take.
+- **Close against close.** Two `uv-close!` calls on one handle, interleaved by
+  an engine, could both see it open and both call `uv_close`. Found while
+  restructuring the close for the fence; the open → closing move is now one
+  step with interrupts disabled, for every kind of handle.
 
 Every probe and mutation ran on a scratch copy outside the repo. macOS runs:
 Chez 10.4.1 (`tarm64osx`), libuv 1.52.1 via pkg-config, the dev build. Linux
@@ -161,6 +168,37 @@ place in main's shape.
   each). So the stress block is a check that the fence holds under
   contention: four senders and a closer, with no deadlock and no other
   raise. It is not the witness for a missing fence.
+
+## Close against close
+
+Probe (scratch): an engine runs `(uv-close! h cb-first)`. Where it is
+suspended, `(uv-close! h cb-second)` runs, then the engine resumes. The
+second close's move is detected by its callback being stored; the first
+close replacing it means both moved, so `uv_close` ran twice.
+
+- **On main:** fuel 4 double-closes a timer and an async alike.
+- **Running the loop after a double close** (timer, fuel 4, 2 runs each):
+  - macOS: one close callback, then `invalid memory reference`;
+  - Linux: `uv_run` hangs, killed at 20 s.
+- **On this branch** the probe was clean before the explicit fix:
+  - the async by design, since its move runs inside the fence's
+    interrupt-free body;
+  - the timer by accident: `begin-close!`'s helper happens to compile with no
+    suspension point between the check and the move.
+
+`tests/test-timer.sps` now sweeps this for a timer and an async, with a
+reach row for each. A row that sees a double close answers its evidence and
+leaks its loop rather than run it.
+
+| | mutation | result, both platforms |
+|---|---|---|
+| D1 | main's close shape: inline check, then two `set!`s | both sweep rows fail by name; the three balance rows fail too, from the leaked loops |
+| C3 | the timer path without its explicit `with-interrupts-disabled` | 132 pass: an equivalent mutation, as the accident above predicts |
+
+The explicit `with-interrupts-disabled` guarantees what the helper's code
+generation gives today by accident. No mutation can observe that choice on
+Chez 10.4.1 at the default optimize level, so it is uncovered by design. D1
+shows the sweep catches a move that is split.
 
 ## Cost
 

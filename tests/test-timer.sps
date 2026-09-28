@@ -40,7 +40,11 @@
         (only (libuv private native)
               live-counts dispatcher-ref uv-is-closing alloc-zeroed free!)
         (uv-testing)
-        (only (chezscheme) collect))
+        ;; The close-against-close sweep below needs a second kind of handle
+        ;; (an async closes by its own path, inside its send fence) and an
+        ;; engine to interleave the two closes.
+        (only (libuv async) make-uv-async)
+        (only (chezscheme) collect make-engine display-condition))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -895,6 +899,88 @@
             (#t 'wrong-condition))
     (install-dispatch-procedure! 'read 'not-a-procedure)
     'no-raise))
+
+;; --- two closes interleaved by an engine start one native close ----------
+;; uv-close! moves an open handle to closing and starts libuv's close; a
+;; second call finds it closing and does nothing. A green-thread scheduler on
+;; the loop thread can run two closes of one handle in two engines, so the
+;; check and the move must be one step. Split by an engine, both calls see the
+;; handle open, both call uv_close, and the loop then walks a corrupted
+;; closing list: measured before the fix, "invalid memory reference" on macOS
+;; and a hang on Linux.
+;;
+;; An engine runs (uv-close! h on-close-first) for FUEL ticks. Where it is
+;; suspended, a second close with on-close-second runs, then the engine
+;; resumes. A close that begins stores its on-close, so the first close's
+;; callback replacing the second's means both began. Such a row answers its
+;; evidence and leaks its loop: running that loop would walk the corrupted
+;; list.
+
+(define close-sweep-max-fuel 60)
+
+;; close-then-close : (uv-loop -> uv-handle) exact-positive-integer
+;;                    -> (or symbol list)
+(define (close-then-close make-handle fuel)
+  (let* ((loop (make-uv-loop))
+         (h (make-handle loop))
+         (on-close-first (lambda () #f))
+         (on-close-second (lambda () #f))
+         (first (make-engine
+                 (lambda ()
+                   (guard (c (#t (list 'raised
+                                       (call-with-string-output-port
+                                        (lambda (p) (display-condition c p))))))
+                     (uv-close! h on-close-first)
+                     'closed)))))
+    (first fuel
+           (lambda (ticks v)
+             (uv-loop-teardown! loop)
+             (if (eq? v 'closed) 'finished (list fuel 'finished v)))
+           (lambda (suspended)
+             (uv-close! h on-close-second)
+             (let* ((second-began (eq? (handle-on-close h) on-close-second))
+                    (v (suspended 1000000 (lambda (ticks v) v)
+                                  (lambda (more) 'still-running))))
+               (cond ((not (eq? v 'closed)) (list fuel 'resumed v))
+                     ((and second-began (eq? (handle-on-close h) on-close-first))
+                      (list fuel 'both-closes-began))
+                     (else
+                      (uv-loop-teardown! loop)
+                      (if second-began 'second-began 'first-began))))))))
+
+;; close-sweep : (uv-loop -> uv-handle) -> (list-of (or symbol list))
+(define (close-sweep make-handle)
+  (guard (e (#t (list (list 'sweep-raised
+                            (call-with-string-output-port
+                             (lambda (p) (display-condition e p)))))))
+    (let run ((fuel 1) (acc '()))
+      (if (> fuel close-sweep-max-fuel)
+          (reverse acc)
+          (run (+ fuel 1) (cons (close-then-close make-handle fuel) acc))))))
+
+(define (close-sweep-violations sweep)
+  (filter (lambda (row) (not (memq row '(finished first-began second-began))))
+          sweep))
+
+;; The sweep is live only if it caught the first close before its move (a
+;; 'second-began row) and its fuel outlasted the whole verb.
+(define (close-sweep-reach sweep)
+  (list (if (memq 'second-began sweep) 'second-began 'never-caught-before-the-move)
+        (let ((last-row (list-ref sweep (- (length sweep) 1))))
+          (if (eq? last-row 'finished) 'finished last-row))))
+
+(define timer-close-sweep (close-sweep make-uv-timer))
+(define async-close-sweep
+  (close-sweep (lambda (loop) (make-uv-async loop (lambda (h) #f)))))
+
+(test-equal "two closes of one timer, interleaved at any point, start one native close"
+  '() (close-sweep-violations timer-close-sweep))
+(test-equal "the timer close sweep caught a close before its move and ran one to the end"
+  '(second-began finished) (close-sweep-reach timer-close-sweep))
+(test-equal "two closes of one async, interleaved at any point, start one native close"
+  '() (close-sweep-violations async-close-sweep))
+(test-equal "the async close sweep caught a close before its move and ran one to the end"
+  '(second-began finished) (close-sweep-reach async-close-sweep))
 
 ;; --- balance -------------------------------------------------------------
 (uv-loop-teardown! l)
