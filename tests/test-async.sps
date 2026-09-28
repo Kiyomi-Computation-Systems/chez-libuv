@@ -22,9 +22,7 @@
 (test-begin "async")
 
 ;; A thread id no real thread in this process will hold, used to simulate a
-;; loop owned by another thread without actually forking one. Deterministic on
-;; any Chez: on a non-threaded build current-thread-id is a constant (0) and
-;; this is still != it, so the check still fires (design D5).
+;; loop owned by another thread without actually forking one.
 (define foreign-owner 999999)
 
 ;; --- enforced per-loop thread affinity (design §6) ----------------------

@@ -72,6 +72,33 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 behind `current-thread-id`, which returns a constant on a non-threaded build, so
 the affinity check is a tautology there and `uv-async-send!` still works.
 
+> **Amended 2026-09-28 (issue #41): a threaded Chez is required.** Decision 5
+> was never true.
+>
+> - Since v0.1, `(libuv private native)` has imported `make-mutex` and
+>   `with-mutex`. Chez builds those only into threaded builds: they are
+>   `[feature pthreads]` in its `s/primdata.ss`.
+> - Measured on a `--nothreads` Chez 10.4.1: 14 of the 17 default suites
+>   died at import with "missing import for make-mutex". The stress suite's
+>   "skipped" branch could not run there either, because the suite imports
+>   `fork-thread` itself.
+> - The claim was reasoned, never run. Every Chez this project uses is
+>   threaded, which is Chez 10's default.
+>
+> Rather than restore non-threaded support, the binding requires a threaded
+> Chez and refuses any other by name. `(libuv private require-threaded)`
+> raises its message while it is being expanded, so it must be imported
+> ahead of every `(chezscheme)` import; Chez processes a library's imports
+> in order, and a thread primitive imported first fails with the old
+> message. Two checks hold this:
+>
+> - `tests/test-require-threaded.sps` holds the order on every `make test`;
+> - `make check-nothreads-docker` proves the refusal on a real `--nothreads`
+>   Chez.
+>
+> `current-thread-id` is now `get-thread-id`, and the non-threaded branches
+> are gone. For #33 this means the send fence is a plain mutex.
+
 ### Scope boundary
 
 The enforced surface is **operational handle verbs** (everything entering through

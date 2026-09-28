@@ -179,6 +179,22 @@ None is obvious from reading the code.
 
 ### CI and platform
 
+* **Every Chez here is threaded, so nothing checks a claim about the other
+  kind unless something runs one.** Chez builds `make-mutex`, `with-mutex` and
+  the rest of its thread system only into threaded builds. The binding has
+  imported them since v0.1, so it never loaded on a `--nothreads` Chez, while
+  ADR-0019 called the threading work "free" there. That claim was reasoned,
+  never run (#41).
+  - A threaded Chez is now required, and a non-threaded one is refused by
+    name. That works only because `(libuv private require-threaded)` is
+    imported ahead of every `(chezscheme)` import. Chez processes imports in
+    order, so a thread primitive imported first still fails with the bare
+    "missing import for make-mutex".
+  - When a library in `src/` gains a `(chezscheme)` import, import the
+    refusal before it. `tests/test-require-threaded.sps` holds the order, and
+    `make check-nothreads-docker` proves the message on a real `--nothreads`
+    Chez.
+
 * **glibc under strict `-std=c99` hides POSIX types that macOS exposes
   unconditionally.** `uv/unix.h` needs `pthread_rwlock_t`; every local macOS
   build passed and the first Linux compile failed. The Makefile adds

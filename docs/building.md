@@ -52,6 +52,14 @@ include `src`:
 CHEZSCHEMELIBDIRS=src chez --program your-script.sps
 ```
 
+The Chez must be threaded, which is Chez's default build. The binding uses
+Chez's thread system, and a Chez configured with `--nothreads` does not
+have one. On such a Chez the import stops before loading anything:
+
+```
+Exception in chez-libuv: chez-libuv needs a threaded Chez Scheme, and (threaded?) is #f in this one. Chez builds threaded unless configured with --nothreads (require-threaded-chez) at line …, char … of …/libuv/private/require-threaded.sls
+```
+
 For interactive use:
 
 ```sh
@@ -243,6 +251,23 @@ ship**; Homebrew installs it as `timeout`, or as `gtimeout` when coreutils
 is installed with prefixed names. Without either, the target prints a note
 and runs exactly as before — you get the same suite results, just no HUNG
 diagnosis.
+
+```sh
+make check-nothreads-docker
+```
+
+builds Chez with `--nothreads` in a container and imports each public
+library there. The refusal itself must stop every import: the first
+exception printed must be its message, not the bare `missing import for
+make-mutex` a non-threaded Chez raises at the first thread primitive it
+meets. The message only wins when
+`(libuv private require-threaded)` is imported ahead of every `(chezscheme)`
+import, and `make test` holds that order (`tests/test-require-threaded.sps`).
+This target is the only thing that runs a non-threaded Chez, so run it after
+touching either. Like `make test-memory-docker`, it is off the default gate:
+the first run builds Chez and takes a few minutes, and the image is cached
+by version after that. It mounts only `src/`, so it needs no build and runs
+from any checkout.
 
 ```sh
 sudo make test-root

@@ -50,7 +50,9 @@ Windows is deferred, not designed out
 
 Prerequisites:
 
-- *Chez Scheme* 10.4.1 or later (the binary is ~chez~)
+- *Chez Scheme* 10.4.1 or later, threaded: Chez's default build, so
+  anything not configured with ~--nothreads~ (the binary is ~chez~). A
+  non-threaded Chez is refused at import, with a message saying so.
 - *libuv 1.44.0* or later in the 1.x series — either a system package
   ~pkg-config~ can see (e.g. ~brew install libuv~), or nothing at all: the
   build falls back to a pinned, vendored libuv submodule automatically.

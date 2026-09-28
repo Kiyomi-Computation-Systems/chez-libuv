@@ -104,8 +104,7 @@
   ;; require-loop-thread : uv-loop symbol -> unspecified
   ;; The single affinity predicate. Raised BEFORE any registry mutation, so a
   ;; wrong-thread verb is a named refusal, never the registry corruption it
-  ;; would otherwise cause. On a non-threaded Chez owner and caller are both the
-  ;; single constant id, so this never raises (design D5).
+  ;; would otherwise cause.
   (define (require-loop-thread loop who)
     (let ((owner (loop-owner-thread loop))
           (caller (current-thread-id)))

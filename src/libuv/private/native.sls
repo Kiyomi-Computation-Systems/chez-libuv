@@ -91,6 +91,9 @@
           count-signal-new!      count-signal-free!
           count-async-new!       count-async-free!)
   (import (rnrs)
+          ;; Ahead of (chezscheme): make-mutex and with-mutex exist only in a
+          ;; threaded Chez (#41; tests/test-require-threaded.sps).
+          (libuv private require-threaded)
           (only (chezscheme)
                 load-shared-object foreign-procedure foreign-entry?
                 foreign-ref foreign-set!
@@ -100,7 +103,7 @@
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
                 file-regular? make-mutex with-mutex getenv
-                threaded? get-thread-id)
+                get-thread-id)
           (libuv private config)
           (libuv private conditions)
           (libuv private constants))
@@ -576,11 +579,10 @@
       (raise (make-uv-invalid-argument who reason))))
 
   ;; current-thread-id : -> exact-integer
-  ;; The identity per-loop affinity (#20) compares against. On a non-threaded
-  ;; Chez there is exactly one thread, so a constant makes the affinity check a
-  ;; tautology (design D5); get-thread-id is only meaningful on a threaded build.
+  ;; The identity per-loop affinity (#20) compares against. The binding needs
+  ;; a threaded Chez (#41), so this is always the real thread id.
   (define (current-thread-id)
-    (if (threaded?) (get-thread-id) 0))
+    (get-thread-id))
 
   ;; signal-symbol->int : (or symbol 0) symbol -> exact-integer
   ;; Accept only the closed symbolic vocabulary plus kill(pid, 0).
