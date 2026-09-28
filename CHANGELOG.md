@@ -3,6 +3,67 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.1 — 2026-09-28
+
+Writes and reads no longer hold the event loop for a time proportional to
+their size at Scheme speed. Every write, every read delivery and every
+spawned argument copied its bytes one at a time through the FFI, and every
+request block was zeroed the same way. A 4 MiB `uv-write!` held its loop
+about 250 ms: half zeroing the block, half copying the payload into it. Each
+move is now one `memcpy` or `memset` in the shim, and the same write takes
+about half a millisecond. No API changes, but **run `make build` again after
+upgrading**: the shim gained three exports.
+
+This release also repairs the memory gate itself, which had been checking
+the wrong process; see Notes.
+
+### Fixed
+
+- Bytes cross the FFI boundary in bulk (#35). `uv-write!`, `uv-write*!`,
+  every `on-data` delivery and `uv-spawn!`'s string arguments copy each span
+  with one `memcpy`. Every handle and request block is zeroed with one
+  `memset`.
+  - Measured on macOS arm64: a 4 MiB `uv-write!` call went from 247–251 ms to
+    0.41–0.54 ms, and a 16 KiB one from 1.0 ms to about 0.03 ms. Copying a
+    16 KiB read had cost about 0.47 ms at the measured per-byte rate.
+  - The argument checks are unchanged and still run before the copy.
+    `copy-in!`'s span check and its copy are one uninterruptible step, so
+    even an interrupt handler that truncates the bytevector cannot make it
+    read past the end.
+
+### Changed
+
+- A shim built from older sources now fails `(import (libuv))` with
+  `&uv-shim-unavailable` naming the shim. It used to fail with a bare
+  `no entry for "chez_uv_…"` assertion. Rebuild after every upgrade, patch
+  releases like this one included.
+- `make test-memory` checks the Chez process again, on both arms, and the new
+  `make check-memory-gate` proves it can fail (#37). It plants a heap
+  overrun and a leak and requires the gate to report them. CI and
+  `make test-memory-docker` run it first.
+
+### Notes
+
+- **v0.6.0 and v0.7.0 shipped on a memory gate that could not fail.**
+  - From 2026-08-30 (#14) the Linux gate ran `valgrind timeout scheme …`:
+    Valgrind checked `timeout`, and Chez ran unchecked.
+  - The macOS ASan arm never loaded ASan at all.
+  - v0.5.0 was really gated.
+  - Rerun live for this release, all 17 suites pass with no memory errors in
+    the binding. The only reports come from forked `uv_spawn` children and are
+    fork artifacts
+    ([ADR-0003](.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md),
+    dated note).
+- `docs/api.md` corrects the read-buffer tradeoff. The measurement behind
+  "the buffer size makes no throughput difference" spent about 97% of its CPU
+  in the per-byte copying this release removes. Measured again, a 4 KiB read
+  buffer drains about 1.6× slower than 64 KiB. The practical advice stands:
+  small buffers for many small-message connections, 64 KiB for bulk.
+- `docs/api.md`'s `uv-write!` entry now says the copy happens during the
+  call. On a threaded Chez it holds off other threads' garbage collections
+  while it runs: roughly 0.05–0.35 ms per MiB, which matters only for single
+  writes of tens of MiB.
+
 ## 0.7.0 — 2026-09-27
 
 One new loop verb, and the reference documentation 0.6.0's threading work
