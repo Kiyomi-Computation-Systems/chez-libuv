@@ -262,12 +262,15 @@ exception printed must be its message, not the bare `missing import for
 make-mutex` a non-threaded Chez raises at the first thread primitive it
 meets. The message only wins when
 `(libuv private require-threaded)` is imported ahead of every `(chezscheme)`
-import, and `make test` holds that order (`tests/test-require-threaded.sps`).
-This target is the only thing that runs a non-threaded Chez, so run it after
+import. `make test` holds that order (`tests/test-require-threaded.sps`).
+The same suite expands the refusal's own source with `(threaded?)` answering
+`#f`, so a refusal that stops refusing fails the default gate too. This
+target is the only thing that runs a real non-threaded Chez, so run it after
 touching either. Like `make test-memory-docker`, it is off the default gate:
 the first run builds Chez and takes a few minutes, and the image is cached
 by version after that. It mounts only `src/`, so it needs no build and runs
-from any checkout.
+from any checkout. The mount is copied inside as root and checked as an
+unprivileged user, so the checkout's owner and permissions do not matter.
 
 ```sh
 sudo make test-root

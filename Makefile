@@ -824,10 +824,13 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 # "missing import for make-mutex". (libuv private require-threaded) replaces
 # it with a message naming the requirement, but only where it is imported
 # ahead of every (chezscheme) import, an order tests/test-require-threaded.sps
-# holds on every `make test`. This target proves the message itself on a real
-# --nothreads Chez: importing each public library must exit non-zero, and the
-# first exception it prints must carry NOTHREADS_MARKER (docker/check-nothreads.sh).
-# Nothing else here runs a non-threaded Chez.
+# holds on every `make test`. That suite also expands the refusal's source
+# with (threaded?) answering #f, so a refusal that stopped refusing fails the
+# default gate. What only a real --nothreads Chez can show is that Chez's own
+# answer is #f there, and that the refusal beats the real missing import. So
+# this target imports each public library on one: each must exit non-zero, and
+# the first exception it prints must carry NOTHREADS_MARKER
+# (docker/check-nothreads.sh).
 #
 # Off the default gate, like test-memory-docker: the image builds Chez from
 # source (a few minutes, cached by version after the first run). Only src/ is
@@ -852,12 +855,17 @@ check-nothreads-docker: ## Verify a non-threaded Chez is refused by name at impo
 	  -t $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) \
 	  -f docker/nothreads.Dockerfile docker/
 	@echo "=== importing each public library on a --nothreads Chez ==="
-	$(DOCKER) run --rm \
+	@# As test-memory-docker does: root copies the read-only mount, and the
+	@# unprivileged dev user runs the check on that copy. Reading the mount as
+	@# dev directly fails on a Linux host whose checkout is owned by another
+	@# uid inside a 0700 home -- every import then reads as "not found".
+	$(DOCKER) run --rm --user root \
 	  -v "$(CURDIR)/src":/src:ro \
 	  -v "$(CURDIR)/docker/check-nothreads.sh":/check-nothreads.sh:ro \
 	  -e NOTHREADS_MARKER="$(NOTHREADS_MARKER)" \
 	  $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) \
-	  sh /check-nothreads.sh
+	  sh -ec 'cp -a /src /work-src && chown -R dev:dev /work-src \
+	    && su dev -c "sh /check-nothreads.sh /work-src"'
 
 
 prod: ## Rebuild the shim with optimizations and verify the release artifact

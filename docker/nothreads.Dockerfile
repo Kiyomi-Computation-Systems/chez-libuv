@@ -35,7 +35,9 @@ RUN curl -fsSL -o /tmp/chez.tar.gz \
  && make install \
  && rm -rf "/tmp/csv${CHEZ_VERSION}" /tmp/chez.tar.gz
 
-# The check only reads the mounted sources and writes to /tmp.
+# The check runs as dev. `make check-nothreads-docker` starts the container
+# as root only to copy the read-only src/ mount and chown the copy to dev,
+# so the host checkout's owner and modes do not matter.
 RUN useradd --create-home --uid 1000 dev
 USER dev
 WORKDIR /home/dev

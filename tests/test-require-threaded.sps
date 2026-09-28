@@ -11,13 +11,20 @@
 ;;; ahead of the refusal still fails with the old message (measured on a
 ;;; --nothreads 10.4.1). So every library in src/ that imports from
 ;;; (chezscheme) must import (libuv private require-threaded) before it. This
-;;; suite reads each library's import form and holds that order; `make
-;;; check-nothreads-docker` proves the refusal itself on a --nothreads Chez.
+;;; suite reads each library's import form and holds that order.
+;;;
+;;; It also holds the refusal itself, here, on a threaded Chez: it expands a
+;;; copy of the refusal's source in which each call (threaded?) answers #f,
+;;; as a --nothreads Chez does, and requires the refusal's message. `make
+;;; check-nothreads-docker` runs the real thing on a --nothreads Chez, off the
+;;; default gate.
 ;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 (import (rnrs)
         (srfi :64)
-        (only (chezscheme) directory-list file-directory?))
+        (only (chezscheme)
+              directory-list file-directory?
+              eval interaction-environment display-condition))
 
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
@@ -58,9 +65,13 @@
             ((member name thread-libraries) (if guarded? 'ordered 'unguarded))
             (else (scan (cdr specs) guarded?)))))))
 
+;; sls-file? : string -> boolean
+;; A library source: named *.sls, and not a dotfile (see the row below).
 (define (sls-file? name)
   (let ((n (string-length name)))
-    (and (> n 4) (string=? (substring name (- n 4) n) ".sls"))))
+    (and (> n 4)
+         (not (char=? (string-ref name 0) #\.))
+         (string=? (substring name (- n 4) n) ".sls"))))
 
 ;; sls-files : string -> (list-of string)
 ;; Every .sls file under dir, depth first, in a stable order.
@@ -137,6 +148,15 @@
   'ordered
   (import-order '((only (libuv private require-threaded)) (chezscheme))))
 
+;; Editors leave dotfiles with the same suffix beside the sources. Emacs's
+;; lock file for an unsaved native.sls is a dangling symlink named
+;; .#native.sls, and macOS writes ._native.sls resource forks on some
+;; volumes. Reading one crashed the whole suite.
+(test-equal "the scan reads .sls sources and skips the dotfiles beside them"
+  '(read skipped skipped skipped skipped)
+  (map (lambda (name) (if (sls-file? name) 'read 'skipped))
+       '("native.sls" ".#native.sls" "._native.sls" "native.sls~" "#native.sls#")))
+
 ;; --- the real tree ------------------------------------------------------------
 ;; Run from the repo root, as `make test` does.
 
@@ -181,6 +201,70 @@
      'ordered
      (verdict (cdr e))))
  covered)
+
+;; --- the refusal, as a --nothreads Chez would expand it ----------------------
+;; No Chez here takes the refusing branch, so a refusal that stopped asking
+;; (threaded?), asked it backwards, only printed, or lost its message would
+;; pass every row above. These expand the refusal's own source with eval:
+;; once as it is, and once with each call (threaded?) replaced by #f.
+
+(define refusal-marker "chez-libuv needs a threaded Chez Scheme")
+
+(define refusal-form
+  (let ((e (find (lambda (e) (equal? (form-name (cdr e)) guard-library))
+                 libraries)))
+    (and e (cdr e))))
+
+;; as-nonthreaded : datum -> datum
+;; Replaces each ELEMENT (threaded?) with #f. A call is always an element;
+;; (only (chezscheme) threaded?) merely ends in a tail of the same shape.
+(define (as-nonthreaded x)
+  (if (list? x)
+      (map (lambda (e) (if (equal? e '(threaded?)) #f (as-nonthreaded e))) x)
+      x))
+
+(define (threaded-calls x)
+  (if (list? x)
+      (fold-left + 0 (map (lambda (e)
+                            (if (equal? e '(threaded?)) 1 (threaded-calls e)))
+                          x))
+      0))
+
+(define (describe e)
+  (guard (err (#t "<the raised object could not be printed>"))
+    (call-with-string-output-port
+      (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
+
+(define (starts-with? prefix s)
+  (and (string? s)
+       (<= (string-length prefix) (string-length s))
+       (string=? prefix (substring s 0 (string-length prefix)))))
+
+;; expand-under : (or datum #f) (list-of symbol) -> (or symbol string)
+;; Evaluates the library form under a fresh name. 'loaded, 'refused-by-name
+;; for a syntax violation from chez-libuv whose message starts with the
+;; marker, or else the text of what was raised.
+(define (expand-under form name)
+  (guard (e ((and (syntax-violation? e)
+                  (who-condition? e) (eq? (condition-who e) 'chez-libuv)
+                  (message-condition? e)
+                  (starts-with? refusal-marker (condition-message e)))
+             'refused-by-name)
+            (#t (describe e)))
+    (eval (cons 'library (cons name (cddr form))) (interaction-environment))
+    'loaded))
+
+(test-equal "the refusal asks (threaded?)"
+  'asks
+  (if (and refusal-form (> (threaded-calls refusal-form) 0)) 'asks 'never-asks))
+
+(test-equal "on this threaded Chez, the refusal lets its library load"
+  'loaded
+  (expand-under refusal-form '(require-threaded as-it-is)))
+
+(test-equal "where (threaded?) is #f, the refusal raises its message at expansion"
+  'refused-by-name
+  (expand-under (as-nonthreaded refusal-form) '(require-threaded as-nonthreaded)))
 
 (test-end "require-threaded")
 

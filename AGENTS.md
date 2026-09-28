@@ -191,9 +191,9 @@ None is obvious from reading the code.
     order, so a thread primitive imported first still fails with the bare
     "missing import for make-mutex".
   - When a library in `src/` gains a `(chezscheme)` import, import the
-    refusal before it. `tests/test-require-threaded.sps` holds the order, and
-    `make check-nothreads-docker` proves the message on a real `--nothreads`
-    Chez.
+    refusal before it. `tests/test-require-threaded.sps` holds the order,
+    and holds the refusal by expanding it with `(threaded?)` answering `#f`.
+    `make check-nothreads-docker` proves both on a real `--nothreads` Chez.
 
 * **glibc under strict `-std=c99` hides POSIX types that macOS exposes
   unconditionally.** `uv/unix.h` needs `pthread_rwlock_t`; every local macOS

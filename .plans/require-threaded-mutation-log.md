@@ -142,7 +142,93 @@ Against the same `src/`, the original file and the new one both report 10 passes
 
 ## Not covered
 
-- **The refusal's text on a threaded Chez.** By construction it is never shown there. Only `make check-nothreads-docker` sees it.
-- **The Docker check is off the default gate and not in CI**, like `make test-memory-docker`: it builds Chez from source. The order it depends on is held on every `make test` by the static suite. Run the target after touching either the refusal or a library's import form.
+- **What only a real `--nothreads` Chez shows.** Two facts are checked only there: Chez's own `(threaded?)` answers `#f`, and the refusal beats the real `missing import`. The default gate simulates the first by answering `#f` itself, and holds the second's precondition, the import order. See the review follow-ups below.
+- **The Docker check is off the default gate and not in CI**, like `make test-memory-docker`: it builds Chez from source. Run it after touching the refusal or a library's import form.
 - **Libraries outside `src/`** (`tests/uv-bulk.sls`) are not held by the order rule. They load only in suites, which need a threaded Chez anyway.
 - **Windows** is not built here (ADR-0004).
+
+---
+
+## Review follow-ups (2026-09-28)
+
+A `/code-review` of #42 raised seven findings, and four were fixed. The other three were skipped by choice, and none of them is a defect in the refusal or in its checks:
+
+- `nothreads.Dockerfile` is single-stage;
+- the docs copy of the refusal's message is unchecked;
+- the pure suite also runs under the memory gate.
+
+### 1. The scan crashed on editor lock files
+
+Anything named `*.sls` was read. Emacs's lock file for an unsaved `native.sls` is a dangling symlink named `.#native.sls`, and macOS writes `._*.sls` resource forks on some volumes. Either one crashed the suite.
+
+- **RED, end to end.** A scratch copy of `src/` held a real dangling `.#native.sls` symlink. The suite died with `Exception in call-with-input-file: failed for src/libuv/private/.#native.sls` (exit 255, no FAIL line).
+- **RED, by name.** Before the fix, the new row `the scan reads .sls sources and skips the dotfiles beside them` failed. It checks `native.sls`, `.#native.sls`, `._native.sls`, `native.sls~` and `#native.sls#`.
+- **GREEN.** `sls-file?` now skips dotfiles. The suite passes, including in the scratch copy with the lock symlink present.
+- **F1.** With the dot check removed, that row fails by name.
+
+### 2. The refusal was checked only off the default gate
+
+The order rows could not see a refusal that stopped refusing: message changed, `(if #t …)`, inverted, or print-only. Those were visible only to `make check-nothreads-docker`.
+
+The suite now takes the refusal's own library form (it already reads it) and expands it with `eval` twice. The first run uses the form as it is and must `load` on this threaded Chez. The second replaces each call `(threaded?)` with `#f` and must raise a syntax violation from `chez-libuv` whose message starts with the marker. A third row requires the refusal to call `(threaded?)` at all.
+
+The replacement works on list ELEMENTS only. The first probe rewrote every sub-list equal to `(threaded?)`, which also rewrote the tail of `(only (chezscheme) threaded?)` and made the import `(only (chezscheme) . #f)`, so the probe got `invalid library reference` instead of the refusal (R5 below).
+
+With these three rows the suite has 16 passes. Every row below ran in a scratch copy and failed by name, with one exception: R6 is a counterfactual and is expected to pass.
+
+| | mutation | fails, by name |
+|---|---|---|
+| R1 | the refusal's message changed | `where (threaded?) is #f, the refusal raises its message at expansion` |
+| R2 | `(if #t …)`: never asks | that row, and `the refusal asks (threaded?)` |
+| R3 | `(if (not (threaded?)) …)`: asks backwards | that row, and `on this threaded Chez, the refusal lets its library load` |
+| R4 | the refusal only prints its message | `where (threaded?) is #f, …` |
+| R5 | the transform also rewrites tails (the probe's first bug) | `where (threaded?) is #f, …`, which gets `invalid library reference` |
+| R6 | counterfactual: `expand-under` ignores the message, run against R1 | **passes**, which shows the message clause is what catches R1 |
+| S3 | `require-threaded.sls` deleted | now also fails all three refusal rows by name. It does not crash, because `expand-under` guards everything |
+
+Every earlier row (S1–S4, C1–C7, C6b) still fails as before, and the control passes 16.
+
+What is still left to `make check-nothreads-docker`: that Chez's own `(threaded?)` answers `#f` on a `--nothreads` build, and that the refusal beats the real `missing import`.
+
+### 4. The Docker check read the mount as uid 1000
+
+On a Linux host whose checkout belongs to another uid inside a 0700 home, uid 1000 cannot read the mount, and every import reads as "not found".
+
+`make check-nothreads-docker` now does what `test-memory-docker` does. It starts the container as root to copy the read-only mount, chowns the copy to `dev`, and runs the check as `dev` via `su`. `su` keeps `NOTHREADS_MARKER` (measured). The script takes the source directory as its argument.
+
+The simulation stands in for a Linux host checkout. It is a copy owned by uid 1001 inside a 0700 directory; a bind mount on Linux keeps the host's owner and modes as they are.
+
+- **RED.** The committed script, run as uid 1000 on that tree, reported `library (libuv) not found`. The glob could not expand either, which gave a literal `(libuv *)`.
+- **GREEN.** The new model on the same tree reports 11 refused by name and `NOTHREADS REFUSED BY NAME`.
+- In the Docker sweep these are rows D13 (new model, passes) and D14 (old model, counterfactual, fails).
+
+### 6. A missing Chez read as a threaded one
+
+The precondition's else branch caught any failure of `scheme -q`. It now tells exit 3 ("threaded") apart from anything else.
+
+- **RED.** With `scheme` off `PATH`, the committed script printed `scheme: not found` and then `NOT A NON-THREADED CHEZ`.
+- **GREEN.** It now prints `COULD NOT RUN CHEZ: 'scheme -q' exited 127`. This is row D12.
+- **D6**, a threaded Chez, now reads `(threaded?) is #t here`.
+
+### The Docker sweep, again
+
+All 15 rows (D0–D14) were re-run with the new invocation, and every row gave its predicted result:
+
+- **Passes:** D0 (the control), D9 and D11 (counterfactuals), and D13 (the uid-1001 0700 checkout under the new model).
+- **Fails:** D1–D8, D10, D12, and the old-model counterfactual D14.
+
+### Gates, again
+
+All re-run on the fixed tree:
+
+- On macOS:
+  - `make test`: 18 suites, `ALL SUITES PASSED`, with this suite at 16 passes;
+  - `make check-purity` (3 suites) and `make check-help`;
+  - `make test-memory` (the ASan arm, 18 suites).
+- `make check-nothreads-docker`: 11 refused by name.
+- `make test-memory-docker`, from a fresh `--no-hardlinks` clone carrying this tree, exited 0 in 2:53:
+  - `MEMORY GATE CAN FAIL`;
+  - all 18 suites ran under Valgrind with 0 errors in each suite's own process, including this suite's in-process expansions (16 passes, 0 bytes definitely lost);
+  - no suite was checked through `timeout`;
+  - the only other summaries are the two forked-child artifacts (131 and 117 bytes).
+- shellcheck and hadolint are clean.

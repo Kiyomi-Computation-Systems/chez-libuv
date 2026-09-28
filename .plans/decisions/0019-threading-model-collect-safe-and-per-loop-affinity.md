@@ -92,7 +92,9 @@ the affinity check is a tautology there and `uv-async-send!` still works.
 > in order, and a thread primitive imported first fails with the old
 > message. Two checks hold this:
 >
-> - `tests/test-require-threaded.sps` holds the order on every `make test`;
+> - `tests/test-require-threaded.sps` holds the order on every `make test`.
+>   It also expands the refusal's source with `(threaded?)` answering `#f`
+>   and requires its message.
 > - `make check-nothreads-docker` proves the refusal on a real `--nothreads`
 >   Chez.
 >
