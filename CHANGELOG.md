@@ -3,6 +3,43 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.2 — 2026-09-28
+
+No library changes: nothing under `src/` changed, and the shim needs no
+rebuild. This release tightens `make check-memory-gate`, the check that
+proves the memory gate can fail. chez-cmark-gfm copied that check and found
+three gaps, and all three applied here too (#39).
+
+### Fixed
+
+- `make check-memory-gate MEMORY_SABOTAGE_MODES=` planted nothing, yet
+  passed with `MEMORY GATE CAN FAIL`. It now fails with "nothing was
+  planted".
+
+### Changed
+
+- On Linux, `make check-memory-gate` also plants a block that only a
+  pointer into its middle reaches, which Valgrind counts as "possibly lost".
+  The gate may pass on that block, or fail and print its loss record. It
+  must never fail on it without the record. This holds the gate's
+  `--errors-for-leak-kinds=definite`, the flag that keeps Valgrind from
+  failing a run on a leak kind the log does not show.
+- The macOS `make test-memory` no longer sets `MallocNanoZone=0`. With ASan
+  live, it made no measurable difference: the reports, exit statuses and
+  output were the same with or without it, because every block comes from
+  ASan's own allocator. The reason given for it, a trap on a double free
+  before ASan could report one, came from a run where ASan was never
+  loaded.
+
+### Notes
+
+- The Makefile used to justify `--errors-for-leak-kinds=definite` by saying
+  Chez's runtime routinely produces possibly-lost blocks. Measured, no
+  suite's own process has one. Only forked `uv_spawn` children do, and those
+  never gate. The flag stays, for the reason above.
+- The evidence is in `.plans/memory-gate-mutation-log.md` ("Port-back from
+  chez-cmark-gfm") and ADR-0003's 2026-09-28 amendment.
+
 ## 0.7.1 — 2026-09-28
 
 Writes and reads no longer hold the event loop for a time proportional to
