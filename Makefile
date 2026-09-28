@@ -631,6 +631,13 @@ endif
 #   3. its log carries the tool's own report of THAT defect (the markers
 #      below, measured). A gate that fails for another reason -- no valgrind,
 #      a build error, a crash -- is not evidence the tool is looking.
+#
+# The Linux libc-overrun marker names only the planted block, not where in
+# it the bad store landed. How wide memset's stores are, and so whether
+# Memcheck reports "0 bytes after" or "N bytes inside" the block, belongs to
+# whichever memset runs (Valgrind's replacement, or the platform's own), not
+# to the defect. The Scheme store's width is Chez's (one byte), so that
+# marker stays exact.
 MEMORY_SABOTAGE := tests/memory-gate-sabotage.sps
 ifeq ($(UNAME_S),Linux)
   MEMORY_SABOTAGE_MODES := store-overrun libc-overrun leak
@@ -638,12 +645,22 @@ else
   MEMORY_SABOTAGE_MODES := libc-overrun
 endif
 
+# The recipe re-enters make through this alias, never through a literal
+# $(MAKE). make runs any recipe line that names $(MAKE) even under -n, -t or
+# -q (so that a recursive make can print its own recipes), and this recipe
+# is a single line. So `make -n check-memory-gate` really ran the planted
+# program, and ran a test-memory that only printed its commands and exited 0,
+# then reported the gate VACUOUS. Through the alias the line is an ordinary
+# one: a dry run prints it and runs nothing. Measured on make 3.81 and 4.3
+# (.plans/memory-gate-mutation-log.md).
+MEMORY_GATE_MAKE = $(MAKE)
+
 check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the gate can go red)
 	@mkdir -p $(BUILD_DIR); fail=0; \
 	for m in $(MEMORY_SABOTAGE_MODES); do \
 	  case "$(UNAME_S):$$m" in \
 	    Linux:store-overrun) marker="0 bytes after a block of size 23 alloc'd" ;; \
-	    Linux:libc-overrun)  marker="0 bytes after a block of size 29 alloc'd" ;; \
+	    Linux:libc-overrun)  marker="a block of size 29 alloc'd" ;; \
 	    Linux:leak)          marker="777 bytes in 1 blocks are definitely lost" ;; \
 	    *:libc-overrun)      marker="0 bytes after 29-byte region" ;; \
 	    *) echo "check-memory-gate: no expected report for $$m on $(UNAME_S)" >&2; exit 1 ;; \
@@ -656,7 +673,7 @@ check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the ga
 	    echo "printed its planted line, so a red gate would prove nothing. Its output:" >&2; \
 	    printf '%s\n' "$$plain" >&2; fail=1; continue; \
 	  fi; \
-	  if CHEZ_LIBUV_SABOTAGE=$$m $(MAKE) --no-print-directory test-memory \
+	  if CHEZ_LIBUV_SABOTAGE=$$m $(MEMORY_GATE_MAKE) --no-print-directory test-memory \
 	       MEMORY_TESTS=$(MEMORY_SABOTAGE) > $$log 2>&1; then \
 	    echo "MEMORY GATE VACUOUS: make test-memory exited 0 with the $$m defect planted;" >&2; \
 	    echo "the memory tool is not checking the Chez process. Tail of $$log:" >&2; \

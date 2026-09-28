@@ -155,7 +155,7 @@ proves the memory gate can still fail. It plants real defects
 (`tests/memory-gate-sabotage.sps`), runs `make test-memory` on each, and
 passes only if the gate fails *and* the log carries the tool's own report
 of that defect. On Linux the defects are a one-byte overrun by a Scheme
-store, the same by `memset`, and a 777-byte leak. On macOS only the
+store, the same by `memset`, and a definite leak. On macOS only the
 `memset` overrun applies, because ASan cannot see the others. CI and
 `make test-memory-docker` run it before the memory gate. Run it yourself
 after touching either `test-memory` recipe. Both arms once passed while
@@ -201,19 +201,20 @@ spawn-options block whose cleanup only runs on the failure path is
 reported as a 131-byte definite leak — an environment artifact that looks
 exactly like a defect in the binding.
 
-**Expect more leak summaries than suites, and expect a couple to be
-non-zero.** `test-process.sps` deliberately exercises spawn failures, so
-two forked children never reach `exec` and exit under Valgrind. Each one
-reports that row's spawn-options block as lost: the parent holds the block
-while `uv_spawn` forks and frees it as soon as `uv_spawn` returns, but the
-child exits inside `uv_spawn`. Seventeen suites produce nineteen
-summaries. On arm64 those two report 131 and 117 bytes; in v0.5, CI's
-x86_64 runner showed them at zero. Neither is a leak in this binding. Plant
-a block that the parent holds for the whole suite, and each of those
-children reports it as well, while the parent stays at zero. Neither gates,
-either. libuv discards the exit status of a child whose `exec` failed, and
-the suite's own process is the one whose status the loop checks. **Read
-the exit status, not the scrollback**; the evidence is in
+**Expect more leak summaries than suites, and expect some of them to be
+non-zero.** Each suite's own process prints one. So does every forked
+child that exits under Valgrind without reaching `exec`, and
+`test-process.sps` arranges that on purpose in the rows that exercise
+spawn failures. Each such child reports that row's spawn-options block as
+lost: the parent holds the block while `uv_spawn` forks and frees it as
+soon as `uv_spawn` returns, but the child exits inside `uv_spawn`. On
+arm64 the block shows up as definitely lost; in v0.5, CI's x86_64 runner
+showed it at zero. None of these is a leak in this binding. Plant a block
+that the parent holds for the whole suite, and every such child reports it
+as well, while the parent stays at zero. None of them gates, either.
+libuv discards the exit status of a child whose `exec` failed, and the
+suite's own process is the one whose status the loop checks. **Read the
+exit status, not the scrollback**; the evidence is in
 `.plans/memory-gate-mutation-log.md`.
 
 Both `make test` and `make test-memory` cap each suite individually. A

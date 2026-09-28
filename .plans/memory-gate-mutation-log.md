@@ -124,10 +124,10 @@ returned `#f` on both.
 
 x86_64 was checked once, under emulation, in a `--platform linux/amd64`
 Debian bookworm container with Valgrind 3.19.0 and Debian's Chez 9.5.8. All
-three reports read exactly as above. CI's Ubuntu Valgrind is a newer version
-and has not been measured. If its wording ever drifts, the check fails
-loudly with "failed, but not on the planted defect". It cannot pass
-silently.
+three reports read exactly as above. CI's own Valgrind versions were
+measured the next day, after review; see "Review follow-ups" below. If the
+wording ever drifts, the check fails loudly with "failed, but not on the
+planted defect". It cannot pass silently.
 
 ### Red, then green
 
@@ -304,3 +304,101 @@ was loaded.
 - **The macOS arm still has no per-suite cap,** which is pre-existing. Any
   cap added there must not sit between `DYLD_INSERT_LIBRARIES` and `chez`
   (A2 above).
+
+---
+
+## Review follow-ups (2026-09-28)
+
+A `/code-review high` pass on PR #37 raised seven findings. Four were fixed
+(1, 2, 4 and 6) and three were left as they are (3, 5 and 7).
+
+### 1. The Linux libc-overrun marker depended on how `memset` stores
+
+The review's concern: the marker `0 bytes after a block of size 29 alloc'd`
+assumed that the tail of the overrun is written a byte at a time, and it had
+been measured only on Valgrind 3.19.
+
+**CI's own Valgrind versions were then measured,** under emulation
+(`--platform linux/amd64`, the distribution's `valgrind` and `chezscheme`):
+
+| image | Valgrind | store-overrun | libc-overrun | leak |
+|---|---|---|---|---|
+| ubuntu:24.04 (today's `ubuntu-latest`) | 3.22.0 | `0 bytes after a block of size 23 alloc'd` | `0 bytes after a block of size 29 alloc'd` | `777 bytes in 1 blocks are definitely lost` |
+| ubuntu:26.04 (`ubuntu-latest` from 2026-10-19) | 3.26.0 | the same | the same | the same |
+
+So the reviewed marker would have held on every version measured, and the
+failure scenario did not occur in practice. The dependency was real all the
+same, and one mutation shows it. W1 changes the planted `memset` to 32
+bytes, which makes Valgrind's replacement end in an 8-byte store. Valgrind
+3.19 then reports `Invalid write of size 8 … 24 bytes inside a block of size
+29 alloc'd`, and the reviewed marker raised a false alarm on that run. The
+marker is now `a block of size 29 alloc'd`: it names the planted block and
+not where in it the store landed. The Scheme-store marker stays exact,
+because Chez's `unsigned-8` store is one byte wide on every platform.
+
+In `/tmp/mut` in the container, libc-overrun mode only:
+
+| # | mutation | check-memory-gate |
+|---|---|---|
+| — | control, new marker | `gate caught libc-overrun: a block of size 29 alloc'd` |
+| C2 | an unrelated failure: Valgrind rejects `--bogus-flag` | `failed, but not on the planted libc-overrun` |
+| S1 | the wrong block: sentinel 31 (`memset` 32) | `failed, but not on the planted libc-overrun`; the report names `a block of size 31` |
+| W1 | wider stores: `memset` 32 into the 29-byte block, new marker | `gate caught` |
+| W1′ | W1 with the reviewed (old) marker | `failed, but not on the planted libc-overrun`: the false alarm |
+
+### 2. `make -n check-memory-gate` reported the gate VACUOUS
+
+make runs any recipe line that names `$(MAKE)` even under `-n`, `-t` and
+`-q`, and check-memory-gate's recipe is a single line. Before the fix, a dry
+run really ran the planted program and a sub-make that only printed
+test-memory's commands. It then reported the gate vacuous.
+
+- **make 3.81 (macOS):** `make -n check-memory-gate` exited 2 with
+  `MEMORY GATE VACUOUS … libc-overrun`, and wrote
+  `build/check-memory-gate-libc-overrun.log`.
+- **make 4.3 (container, from the old Makefile):** it exited 2 with
+  `MEMORY GATE VACUOUS` for all three defects, and wrote all three logs.
+
+The recipe now re-enters make through `MEMORY_GATE_MAKE = $(MAKE)`. On
+both make versions, make did not treat a line that reaches `$(MAKE)` only
+through the alias as recursive. After the fix, on both 3.81 and 4.3:
+
+- `make -n` exits 0, prints the recipe, and runs nothing. No check output
+  is printed and no log is written.
+- `make -t` exits 0 and `make -q` exits 1, and neither writes a log.
+- A real `make check-memory-gate` is unchanged: green on both platforms.
+
+### 4. The C library's name was guessed from `(machine-type)`
+
+The planted program now tries `libc.so.6`, `libc.dylib`, `libc.so.7`,
+`libc.so` and `msvcrt.dll` in turn until `memset` resolves. If none does, it
+exits 4 with `no C library providing memset loaded; tried (…)`.
+
+- **macOS:** `libc.so.6` fails to load and `libc.dylib` succeeds. All three
+  plain runs are clean, and the check is green.
+- **Debian:** `libc.so.6`. The check is green (above).
+- **A mutation with no loadable candidate** fails by name: `SABOTAGE NOT
+  CLEAN: the libc-overrun program exited 4`, and its output carries the
+  "tried" line.
+- **musl (Alpine 3.24, Chez 10.3.0):** all three plain runs are clean. A
+  correction to the finding itself: **the old code also worked on musl**.
+  musl's loader hands back its own libc for any `libc.*` name, and there
+  every candidate "loaded", `libc.dylib` included. The fix matters for
+  platforms that name libc otherwise, such as FreeBSD (`libc.so.7`) and
+  Windows (`msvcrt.dll`), and for the diagnosis. Neither of those platforms
+  was measured.
+
+### 6. The docs hard-coded suite and summary counts
+
+`docs/building.md` now states the rule instead: one summary per suite, plus
+one per forked child that exits before `exec`. It no longer cites "seventeen
+… nineteen" or the byte counts; the text it replaced ("sixteen …
+eighteen") had gone stale unnoticed. The leak sentinel's size is dropped
+from that page too. This log and ADR-0003 keep their counts, because they
+are dated records.
+
+### Not changed
+
+- **3.** Run the canary inside every `test-memory`.
+- **5.** Run the prerequisites once per check instead of once per defect.
+- **7.** Keep the sentinel sizes in one place.

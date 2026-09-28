@@ -40,16 +40,29 @@
   (newline)
   (flush-output-port (current-output-port)))
 
-;; memset is not a foreign entry on either platform until libc is loaded
-;; (measured: foreign-entry? is #f under both macOS and Debian).
+;; memset is not a foreign entry until a C library is loaded (measured on
+;; macOS and Debian), and each platform names that library differently. So
+;; rather than guess the name from (machine-type), try each candidate until
+;; memset resolves. If none does, say so and exit 4: a plain run that fails
+;; for this reason has to read as "no C library found", not as a sabotage
+;; that went wrong.
+(define libc-candidates
+  '("libc.so.6" "libc.dylib" "libc.so.7" "libc.so" "msvcrt.dll"))
+
 (define (libc-memset)
-  (let* ((mt (symbol->string (machine-type)))
-         (n (string-length mt)))
-    (load-shared-object
-     (if (and (>= n 3) (string=? "osx" (substring mt (- n 3) n)))
-         "libc.dylib"
-         "libc.so.6")))
-  (foreign-procedure "memset" (uptr int size_t) uptr))
+  (let try ((names libc-candidates))
+    (cond
+      ((foreign-entry? "memset")
+       (foreign-procedure "memset" (uptr int size_t) uptr))
+      ((null? names)
+       (let ((err (current-error-port)))
+         (display "memory-gate-sabotage: no C library providing memset loaded; tried " err)
+         (write libc-candidates err)
+         (newline err))
+       (exit 4))
+      (else
+       (guard (e (#t #f)) (load-shared-object (car names)))
+       (try (cdr names))))))
 
 (say "planting")
 (cond
