@@ -23,10 +23,13 @@
         ;; foreign-alloc / foreign-set! / foreign-ref / foreign-free build
         ;; and mutate real C buffers for the string- and memory-helper tests
         ;; below; current-directory anchors the synthetic absolute paths used
-        ;; by the resolve-shim-path matrix. None collides with an (rnrs)
-        ;; export (unlike file-exists? and exit, which do).
+        ;; by the resolve-shim-path matrix; the time procedures time the
+        ;; bulk-copy rows against a byte-at-a-time loop (issue #35). None
+        ;; collides with an (rnrs) export (unlike file-exists? and exit,
+        ;; which do).
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
-              foreign-sizeof current-directory getenv))
+              foreign-sizeof current-directory getenv
+              current-time time-difference time-second time-nanosecond))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -974,6 +977,168 @@
             (#t 'wrong-condition))
     (copy-out 4096 'four)
     'no-raise))
+
+;; --- bulk, not byte-at-a-time (issue #35) --------------------------------
+;; copy-in!, copy-out and zero-out! each move their span in ONE call into the
+;; shim. They used to loop in Scheme, one foreign-set! or foreign-ref per byte,
+;; at ~29 ns a byte: a 4 MiB uv-write! held its loop ~250 ms, half zeroing the
+;; block (alloc-zeroed) and half copying the payload in.
+;;
+;; Each row times its helper against that very loop, over the same span, in
+;; this process, and wants a factor of ten. Both are timed on one machine a
+;; moment apart, so machine speed cancels and no absolute budget appears: a
+;; bulk helper measures ~1000x faster, one reverted to a loop ~1x (a
+;; --program's loop compiles like the library's; measured 0.99-1.00). The
+;; least of five runs discards a collection or a preemption landing in one.
+;; 64 KiB is libuv's suggested read size, and its loop takes ~2 ms here, far
+;; above the monotonic clock's 1 us resolution on macOS.
+(define bulk-size (* 64 1024))
+
+;; least-ns : thunk -> exact nonnegative integer
+(define (least-ns thunk)
+  (let loop ((i 0) (best #f))
+    (if (= i 5)
+        best
+        (let* ((t0 (current-time 'time-monotonic))
+               (ignored (thunk))
+               (d (time-difference (current-time 'time-monotonic) t0))
+               (ns (+ (* (time-second d) 1000000000) (time-nanosecond d))))
+          (loop (+ i 1) (if (or (not best) (< ns best)) ns best))))))
+
+;; The replaced implementations, as the reference each row must beat.
+(define (byte-at-a-time-copy-in! dst bv start len)
+  (let loop ((i 0))
+    (when (< i len)
+      (foreign-set! 'unsigned-8 dst i (bytevector-u8-ref bv (+ start i)))
+      (loop (+ i 1)))))
+
+(define (byte-at-a-time-copy-out src len)
+  (let ((bv (make-bytevector len)))
+    (let loop ((i 0))
+      (if (= i len)
+          bv
+          (begin
+            (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 src i))
+            (loop (+ i 1)))))))
+
+(define (byte-at-a-time-zero-out! addr len)
+  (let loop ((i 0))
+    (when (< i len)
+      (foreign-set! 'unsigned-8 addr i 0)
+      (loop (+ i 1)))))
+
+;; bulk-verdict : symbol thunk thunk -> 'bulk | list
+;; 'bulk is the only success value and no failure path yields it: a raise
+;; becomes #f under SRFI-64, and a slow helper answers both timings. let*,
+;; not argument position, fixes the order (AGENTS.md: compiled code evaluates
+;; arguments right to left): the loop runs first, so the pages are touched
+;; before the helper is timed on them. Every timing is also kept for the
+;; informational line below, since SRFI-64's FAIL line shows no values.
+(define bulk-timings '())
+
+(define (bulk-verdict name helper loop)
+  (let* ((loop-ns (least-ns loop))
+         (helper-ns (least-ns helper)))
+    (set! bulk-timings (cons (list name helper-ns loop-ns) bulk-timings))
+    (if (< (* 10 helper-ns) loop-ns)
+        'bulk
+        (list 'helper-ns helper-ns 'byte-loop-ns loop-ns))))
+
+(let ((dst (alloc-zeroed bulk-size))
+      (src (make-bytevector bulk-size 7)))
+  (test-equal "copy-in! moves a span in bulk: over ten times faster than a byte-at-a-time loop"
+    'bulk
+    (bulk-verdict 'copy-in!
+                  (lambda () (copy-in! dst src 0 bulk-size))
+                  (lambda () (byte-at-a-time-copy-in! dst src 0 bulk-size))))
+  (test-equal "copy-out moves a span in bulk: over ten times faster than a byte-at-a-time loop"
+    'bulk
+    (bulk-verdict 'copy-out
+                  (lambda () (copy-out dst bulk-size))
+                  (lambda () (byte-at-a-time-copy-out dst bulk-size))))
+  (test-equal "zero-out! clears a span in bulk: over ten times faster than a byte-at-a-time loop"
+    'bulk
+    (bulk-verdict 'zero-out!
+                  (lambda () (zero-out! dst bulk-size))
+                  (lambda () (byte-at-a-time-zero-out! dst bulk-size))))
+  (free! dst))
+
+(display "  [informational] 64 KiB, helper vs byte-at-a-time loop, least of 5 (ns):")
+(for-each (lambda (t)
+            (display " ") (display (car t)) (display " ")
+            (display (cadr t)) (display " vs ") (display (caddr t)))
+          (reverse bulk-timings))
+(newline)
+
+;; The rows above only time. These check a bulk move's CONTENT at a size where
+;; a truncated or mis-based move shows (the rows further up use a 3-byte span),
+;; each against bytes read or written one at a time by this suite, never by
+;; the other helper. The pattern runs 1..251 with period 251, a prime, so no
+;; byte is 0 (a move that did nothing mismatches everywhere) and a shift of
+;; under 251 bytes mismatches too.
+(define big-size (* 1024 1024))
+
+(define (patterned-bytes n)
+  (let ((bv (make-bytevector n)))
+    (let loop ((i 0))
+      (when (< i n)
+        (bytevector-u8-set! bv i (+ 1 (mod (* i 7) 251)))
+        (loop (+ i 1))))
+    bv))
+
+;; foreign-mismatch : uptr bytevector start len -> index or #f
+;; The first i at which foreign byte i differs from bv[start + i].
+(define (foreign-mismatch addr bv start len)
+  (let loop ((i 0))
+    (cond ((= i len) #f)
+          ((= (foreign-ref 'unsigned-8 addr i) (bytevector-u8-ref bv (+ start i)))
+           (loop (+ i 1)))
+          (else i))))
+
+(let ((dst (alloc-zeroed big-size))
+      (src (patterned-bytes (+ big-size 8))))
+  (copy-in! dst src 3 big-size)
+  (test-equal "copy-in! writes every byte of a 1 MiB span taken from a non-zero start"
+    'all-match
+    (let ((at (foreign-mismatch dst src 3 big-size)))
+      (if at (list 'first-mismatch-at at) 'all-match)))
+  (free! dst))
+
+(let ((src (foreign-alloc big-size))
+      (want (patterned-bytes big-size)))
+  (let fill ((i 0))
+    (when (< i big-size)
+      (foreign-set! 'unsigned-8 src i (bytevector-u8-ref want i))
+      (fill (+ i 1))))
+  (test-equal "copy-out reads every byte of a 1 MiB span"
+    'all-match
+    (let ((got (copy-out src big-size)))
+      (cond ((not (= (bytevector-length got) big-size))
+             (list 'length (bytevector-length got)))
+            ((foreign-mismatch src got 0 big-size)
+             => (lambda (at) (list 'first-mismatch-at at)))
+            (else 'all-match))))
+  (foreign-free src))
+
+(let ((addr (foreign-alloc big-size)))
+  (let fill ((i 0))
+    (when (< i big-size) (foreign-set! 'unsigned-8 addr i #xff) (fill (+ i 1))))
+  (test-equal "the 1 MiB zero-out! probe really was seeded non-zero first"
+    #t (all-bytes-equal? addr big-size #xff))
+  (zero-out! addr big-size)
+  (test-equal "zero-out! clears every byte of a 1 MiB span"
+    #t (all-bytes-equal? addr big-size 0))
+  (foreign-free addr))
+
+;; An empty span at the very END of its bytevector is the edge a bulk move
+;; reaches with a one-past-the-end source address; it must write nothing.
+(let ((dst (foreign-alloc 4)))
+  (let fill ((i 0))
+    (when (< i 4) (foreign-set! 'unsigned-8 dst i #xff) (fill (+ i 1))))
+  (copy-in! dst (u8-list->bytevector (list 1 2 3)) 3 0)
+  (test-equal "copy-in! of an empty span at the end of its bytevector writes nothing"
+    #t (all-bytes-equal? dst 4 #xff))
+  (foreign-free dst))
 
 ;; --- uv_buf_t ftype vs the shim's real layout (design spec S4 rule 4) ---
 ;; uv-buf-ftype-layout MEASURES the declared ftype -- offsets via

@@ -54,7 +54,7 @@ unchanged, but its *rationale* was corrected by the Q2 finding — see §8.
 | ADR | Decision |
 |---|---|
 | [0001](decisions/0001-hybrid-native-dependency-acquisition.md) | Acquire libuv via `pkg-config`, with a pinned vendored submodule fallback; both paths shared-only |
-| [0002](decisions/0002-direct-ffi-with-constants-only-shim.md) | Bind `uv_*` directly via FFI; the C shim exports constants and counters only |
+| [0002](decisions/0002-direct-ffi-with-constants-only-shim.md) | Bind `uv_*` directly via FFI; the C shim exports constants and counters only (amended for #35: plus bulk byte moves, never a libuv call) |
 | [0003](decisions/0003-linux-valgrind-is-the-sole-memory-gate.md) | Linux Valgrind is the sole memory-leak gate; macOS ASan is supplementary |
 | [0004](decisions/0004-windows-deferred-design-clean.md) | Windows CI deferred; the design stays portable so it is additive later |
 | [0005](decisions/0005-constants-are-never-transcribed.md) | Constants are never transcribed — looked up by name from the shim at init |
@@ -74,7 +74,7 @@ Makefile  Akku.manifest  Akku.lock  .gitmodules  .github/workflows/ci.yml
 spike/FINDINGS.md  spike/0{0,1,2,3}-*.ss
 vendor/libuv (submodule @ v1.52.1)   vendor/chez-srfi (submodule)
 src/
-  libuv-shim.c / libuv-shim.h   # constant getters + debug counters ONLY
+  libuv-shim.c / libuv-shim.h   # constant getters + debug counters ONLY (+ bulk byte moves, #35)
   libuv.sls                     # (libuv) facade: re-exports + uv-version(-compatible?)
   libuv/
     loop.sls                    # (libuv loop)

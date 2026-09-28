@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -126,6 +126,29 @@ for that API when it is added.
 - An extra copy on every read and every write, accepted as v0.1's cost;
   nothing has yet demonstrated this matters for the workloads this binding
   targets.
+
+  > **Amended 2026-09-27 (issue #35).** Something has, but the cost came from
+  > how the copies were written, not from copying. Both directions ran as
+  > byte-at-a-time Scheme loops at ~29 ns a byte, and so did the zeroing
+  > `alloc-zeroed` gives every write block before the payload overwrites it.
+  >
+  > chez-http-server's M5 exit saw a 4 MiB `uv-write!` hold its loop 254 ms.
+  > Measured here, the call took 247–251 ms: 121 ms zeroing plus 125 ms
+  > copying. A 16 KiB read cost ~0.47 ms.
+  >
+  > Each helper is now one `memcpy` or `memset` through the shim
+  > ([ADR-0002](0002-direct-ffi-with-constants-only-shim.md), amended the same
+  > day). The same 4 MiB write now takes 0.41–0.54 ms.
+  >
+  > Copying at the boundary is unchanged, and the moves add no `lock-object`.
+  > The bytevector crosses as a `u8*` argument to a plain call, not a
+  > `__collect_safe` one. A plain call keeps its thread active, and the
+  > stop-the-world collector waits for every active thread
+  > ([ADR-0019](0019-threading-model-collect-safe-and-per-loop-affinity.md)
+  > fact 1), so the storage cannot move before the call returns.
+  >
+  > `tests/test-native.sps` times each helper against a byte-at-a-time loop
+  > in the same process.
 - The span-shaped `(bv start end)` read API and the reserved `uv-write*!`
   name exist so that adding zero-copy later is additive to the public API,
   not a breaking redesign of it.

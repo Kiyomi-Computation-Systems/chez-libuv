@@ -202,6 +202,21 @@ int chez_uv_errno_value(int i) {
   return chez_uv_errno_table[i].value;
 }
 
+/* Chez passes an empty bytevector's storage as a non-null pointer, so a zero
+ * len reaches memcpy/memset with valid pointers and moves nothing. */
+void chez_uv_copy_in(void *dst, const unsigned char *src, size_t start,
+                     size_t len) {
+  memcpy(dst, src + start, len);
+}
+
+void chez_uv_copy_out(unsigned char *dst, const void *src, size_t len) {
+  memcpy(dst, src, len);
+}
+
+void chez_uv_zero(void *dst, size_t len) {
+  memset(dst, 0, len);
+}
+
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
 static long live_loop            = 0;

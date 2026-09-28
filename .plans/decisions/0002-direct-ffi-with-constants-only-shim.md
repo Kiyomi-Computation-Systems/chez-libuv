@@ -1,6 +1,6 @@
 # ADR-0002: Bind libuv directly via FFI; keep the C shim to constants only
 
-- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2
+- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0001](0001-hybrid-native-dependency-acquisition.md)
@@ -42,6 +42,28 @@ Bind `uv_*` functions directly via `foreign-procedure`. The C shim
 getter, the name-keyed constant lookup function, the errno enumeration, and
 debug counters — never a function that itself calls into libuv on the
 binding's behalf.
+
+> **Amended 2026-09-27 (issue #35).** A fifth kind of export: three bulk byte
+> moves behind `copy-in!`, `copy-out` and `zero-out!`. They are
+> `chez_uv_copy_in` and `chez_uv_copy_out` (one `memcpy` each) and
+> `chez_uv_zero` (one `memset`).
+>
+> Scheme has no way to move bytes between a bytevector and foreign memory in
+> one operation. `foreign-set!` and `foreign-ref` move one scalar at a time, so
+> the copy-at-the-boundary helpers
+> ([ADR-0009](0009-copy-at-the-boundary.md)) looped a byte at a time, at
+> ~29 ns a byte. That held a 4 MiB `uv-write!`'s loop ~250 ms: 121 ms zeroing
+> the block and 125 ms copying the payload in. One `memcpy` moves 4 MiB in
+> ~0.1 ms.
+>
+> The line this ADR draws still holds: none of the three calls into libuv.
+> Every argument check stays in Scheme, before the call, because the shim
+> trusts what it is handed.
+>
+> Binding libc's `memcpy` directly was the alternative. It was rejected because
+> a `u8*` argument always passes the bytevector's first byte, which cannot
+> express `copy-in!`'s start offset. The shim's version takes the offset as an
+> argument.
 
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object

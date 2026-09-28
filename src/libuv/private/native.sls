@@ -158,6 +158,15 @@
   (define raw-errno-name  (foreign-procedure "chez_uv_errno_name" (int) uptr))
   (define raw-errno-value (foreign-procedure "chez_uv_errno_value" (int) int))
 
+  ;; Bulk byte moves (issue #35). Plain, not __collect_safe: a u8* argument
+  ;; is the bytevector's own storage, and a plain call keeps this thread
+  ;; active, so no collection can move that storage before the call returns.
+  (define raw-copy-in
+    (foreign-procedure "chez_uv_copy_in" (uptr u8* size_t size_t) void))
+  (define raw-copy-out
+    (foreign-procedure "chez_uv_copy_out" (u8* uptr size_t) void))
+  (define raw-zero (foreign-procedure "chez_uv_zero" (uptr size_t) void))
+
   ;; Counter symbols exist in every build; production implementations are no-ops.
   (define count-loop-new!  (foreign-procedure "chez_uv_count_loop_new" () void))
   (define count-loop-free! (foreign-procedure "chez_uv_count_loop_free" () void))
@@ -421,16 +430,19 @@
 
   (define (uv-version-string) (c-string->string (raw-version-string)))
 
+  ;; zero-out!, copy-in! and copy-out each move their span in one shim call.
+  ;; A byte-at-a-time Scheme loop costs ~29 ns a byte, which held the event
+  ;; loop ~250 ms per 4 MiB uv-write! (#35); test-native.sps times each of
+  ;; the three against such a loop. The checks stay here, before the call:
+  ;; the shim trusts its arguments.
+
   ;; zero-out! : uptr exact-nonnegative-integer -> unspecified
   (define (zero-out! addr len)
     (unless (and (integer? addr) (exact? addr) (positive? addr))
       (raise (make-uv-invalid-argument 'uv-zero-out! 'null-or-invalid-destination)))
     (unless (and (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-zero-out! 'length-out-of-range)))
-    (let loop ((i 0))
-      (when (< i len)
-        (foreign-set! 'unsigned-8 addr i 0)
-        (loop (+ i 1)))))
+    (raw-zero addr len))
 
   ;; alloc-zeroed : exact-positive-integer -> uptr
   (define (alloc-zeroed n)
@@ -458,10 +470,7 @@
                  (integer? len) (exact? len) (>= len 0)
                  (<= (+ start len) (bytevector-length bv)))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
-    (let loop ((i 0))
-      (when (< i len)
-        (foreign-set! 'unsigned-8 dst i (bytevector-u8-ref bv (+ start i)))
-        (loop (+ i 1)))))
+    (raw-copy-in dst bv start len))
 
   (define (c-int-size) (foreign-sizeof 'int))
 
@@ -516,12 +525,8 @@
     (unless (and (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-copy-out 'length-out-of-range)))
     (let ((bv (make-bytevector len)))
-      (let loop ((i 0))
-        (if (= i len)
-            bv
-            (begin
-              (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 src i))
-              (loop (+ i 1)))))))
+      (raw-copy-out bv src len)
+      bv))
 
   ;; fill-sockaddr! : uptr string exact-nonnegative-integer symbol -> unspecified
   ;; Try IPv4 then IPv6; neither parser retains the input string.
