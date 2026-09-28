@@ -142,8 +142,22 @@ None is obvious from reading the code.
   rather than reasoned about"); the broken shapes were hit in both this repo
   and chez-cmark-gfm on the same day.
 
-### valgrind
+### valgrind and ASan (the memory gate)
 
+* **Anything between the memory tool and Chez gets checked instead of
+  Chez.** Valgrind checks the command it is handed and does not follow an
+  exec. `valgrind … timeout 900 scheme …` therefore checked timeout's two
+  allocations while Chez ran natively and exited 0. #14 wrote that shape,
+  and the Linux gate stayed green from 2026-08-30 to 2026-09-27; v0.6.0 and
+  v0.7.0 shipped on it. On macOS, `DYLD_INSERT_LIBRARIES` is lost two ways.
+  SIP purges it when it launches a protected binary such as `/bin/sh`, and
+  the ASan arm's `sh -c` never loaded ASan from v0.1 on. ASan's Darwin
+  runtime also strips itself from the variable in whatever process it loads
+  into, so under `timeout` it is `timeout` that gets ASan. Put wrappers
+  *outside* the tool, and put the preload on the `chez` command itself.
+  `make check-memory-gate` holds this: it plants defects and requires the
+  real recipe to fail on each, with the tool's own report in the log. Watch
+  it go red whenever you touch either `test-memory` recipe.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.
