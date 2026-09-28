@@ -133,14 +133,34 @@ make test-memory
 
 runs the suites again under Valgrind on Linux, or an AddressSanitizer
 preload on macOS. **Only the Linux run can support a leak claim** —
-LeakSanitizer does not exist on macOS/ARM64, so the macOS leg reports
-use-after-free and double-free and says nothing at all about leaks
+LeakSanitizer does not exist on macOS/ARM64, so the macOS leg says nothing
+at all about leaks
 ([ADR-0003](../.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md)).
+It sees less than you might expect about everything else, too. Chez's
+generated code is not instrumented, so ASan checks only what passes
+through libc and the allocator: an overrun inside `memcpy` or `memset`, a
+double or invalid `free`. A Scheme `foreign-set!` one byte past a block,
+or a `foreign-ref` of freed memory, gets past it; Valgrind catches both.
 The Linux leg sets `UV_USE_IO_URING=0`: some CI kernels reject `io_uring`
 setup calls that Valgrind's syscall emulation does not model, which
 produces failures that have nothing to do with this binding. That is an
 escape hatch for the Valgrind leg only — `io_uring` stays on for
 `make test`.
+
+```sh
+make check-memory-gate
+```
+
+proves the memory gate can still fail. It plants real defects
+(`tests/memory-gate-sabotage.sps`), runs `make test-memory` on each, and
+passes only if the gate fails *and* the log carries the tool's own report
+of that defect. On Linux the defects are a one-byte overrun by a Scheme
+store, the same by `memset`, and a definite leak. On macOS only the
+`memset` overrun applies, because ASan cannot see the others. CI and
+`make test-memory-docker` run it before the memory gate. Run it yourself
+after touching either `test-memory` recipe. Both arms once passed while
+checking nothing: Valgrind was handed `timeout(1)` instead of Chez, and
+the ASan preload was lost on its way through `sh -c`.
 
 If you develop on macOS, that leaves a real hole: the leak gate you most
 need is the one leg you cannot run. v0.5 measured what it costs — four
@@ -181,16 +201,21 @@ spawn-options block whose cleanup only runs on the failure path is
 reported as a 131-byte definite leak — an environment artifact that looks
 exactly like a defect in the binding.
 
-**Expect more leak summaries than suites, and expect a couple to be
-non-zero.** `test-process.sps` deliberately exercises spawn failures, so
-some forked children never reach `exec` and exit under Valgrind, reporting
-whatever the parent had allocated at fork time as lost. Sixteen suites
-produce eighteen summaries. CI's x86_64 runner happens to show all
-eighteen at zero; on arm64 two of them report a hundred-odd bytes. Neither
-is a leak in this binding, and neither gates: `--error-exitcode` applies
-per process, and the suite's own process is the one whose status the loop
-checks. **Read the exit status, not the scrollback** — the same rule
-`make test-memory` has always needed.
+**Expect more leak summaries than suites, and expect some of them to be
+non-zero.** Each suite's own process prints one. So does every forked
+child that exits under Valgrind without reaching `exec`, and
+`test-process.sps` arranges that on purpose in the rows that exercise
+spawn failures. Each such child reports that row's spawn-options block as
+lost: the parent holds the block while `uv_spawn` forks and frees it as
+soon as `uv_spawn` returns, but the child exits inside `uv_spawn`. On
+arm64 the block shows up as definitely lost; in v0.5, CI's x86_64 runner
+showed it at zero. None of these is a leak in this binding. Plant a block
+that the parent holds for the whole suite, and every such child reports it
+as well, while the parent stays at zero. None of them gates, either.
+libuv discards the exit status of a child whose `exec` failed, and the
+suite's own process is the one whose status the loop checks. **Read the
+exit status, not the scrollback**; the evidence is in
+`.plans/memory-gate-mutation-log.md`.
 
 Both `make test` and `make test-memory` cap each suite individually. A
 suite that hangs — rather than failing an assertion — is reported as
@@ -199,9 +224,12 @@ suite that hangs — rather than failing an assertion — is reported as
 HUNG: tests/test-tcp.sps exceeded 300s and was killed (not a failing assertion)
 ```
 
-and **the run continues to the remaining suites**. Before this, a single
-hang took the whole run with it and produced no failing-row output at all,
-so a hang and a failure were indistinguishable in the log. Override with
+and, under `make test`, **the run continues to the remaining suites**.
+`make test-memory` stops at its first failing suite, hung or not. Before
+this, a single hang took the whole run with it and produced no failing-row
+output at all, so a hang and a failure were indistinguishable in the log.
+Under `make test-memory` the cap wraps Valgrind itself, so a hung suite is
+killed together with the Valgrind process running it. Override with
 `SUITE_TIMEOUT=` (default 300s) or `MEMORY_SUITE_TIMEOUT=` (default 900s,
 because Valgrind is far slower).
 

@@ -32,6 +32,9 @@ A PR must keep these green — they are exactly what CI runs:
 - `make check-purity` — the pure suites still import no native code.
 - `make test-memory` runs in CI; the Linux Valgrind leg is the only one
   that can support a leak claim.
+- `make check-memory-gate` — the memory gate still fails on planted
+  defects. CI runs it before `test-memory`; run it yourself after touching
+  either `test-memory` recipe.
 - **Tests accompany code changes.** A behavior change without a test that
   fails against the old behavior will be asked for one.
 - Every new test suite ends with its own `(exit …)` — SRFI-64 does not set

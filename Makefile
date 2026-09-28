@@ -143,7 +143,7 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
 
@@ -549,14 +549,25 @@ ifeq ($(UNAME_S),Linux)
 # (a plain allocator hands back dirty memory) is unobservable under Memcheck
 # by design, not by a bug in the seed; see the seed's own comment and the
 # stage-1 mutation log addendum for what that costs.
+#
+# The per-suite cap wraps VALGRIND, never the reverse. Valgrind checks the
+# command it is handed and does not follow an exec (--trace-children=no), so
+# `valgrind ... timeout N scheme ...` checks timeout's two allocations while
+# Chez runs natively, unchecked, and exits 0. #14 wrote exactly that, and the
+# gate stayed green over everything from 2026-08-30 to 2026-09-27
+# (ADR-0003's amendment). `make check-memory-gate` plants a defect and
+# requires this recipe to fail on it; that check, not this comment, is what
+# holds the order.
 	@for t in $(MEMORY_TESTS); do \
 	  UV_USE_IO_URING=0 \
 	  CHEZ_LIBUV_UNDER_VALGRIND=1 \
-	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) valgrind --error-exitcode=9 \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
+	    $(TIMEOUT_BIN) $(if $(TIMEOUT_BIN),$(MEMORY_SUITE_TIMEOUT),) \
+	    valgrind --error-exitcode=9 \
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \
 	    --undef-value-errors=no \
-	    $(TIMEOUT_BIN) $(if $(TIMEOUT_BIN),$(MEMORY_SUITE_TIMEOUT),) $(CHEZ) --program $$t; \
+	    $(CHEZ) --program $$t; \
 	  rc=$$?; \
 	  if [ $$rc -eq 124 ] && [ -n "$(TIMEOUT_BIN)" ]; then \
 	    echo "HUNG: $$t exceeded $(MEMORY_SUITE_TIMEOUT)s under valgrind and was killed" >&2; \
@@ -577,18 +588,107 @@ else
 # DYLD_INSERT_LIBRARIES would run every suite with no sanitizer at all and
 # still exit 0 -- this target staying green while checking nothing. `test -n`
 # turns that into a loud failure naming the pattern that missed.
+#
+# DYLD_INSERT_LIBRARIES goes on the Chez command ITSELF, with nothing between.
+# Two mechanisms each drop it silently, both measured 2026-09-27:
+#   - macOS purges every DYLD_* variable when it launches a SIP-protected
+#     binary. /bin/sh is one, and until 2026-09-27 this arm ran its loop
+#     under `sh -c`, so no suite since v0.1 ever loaded ASan.
+#   - ASan's Darwin runtime removes itself from DYLD_INSERT_LIBRARIES in
+#     whatever process it loads into (its strip_env default), so a wrapper
+#     such as timeout(1) gets ASan and the Chez it starts does not.
+# `make check-memory-gate` plants a memset overrun and requires this arm to
+# fail on it.
 	@asan="$$(command ls $(ASAN_DYLIB_PATTERN) 2>/dev/null | head -1)"; \
 	test -n "$$asan" || { \
 	  echo "test-memory: no ASan runtime matched $(ASAN_DYLIB_PATTERN); refusing to run un-sanitized" >&2; \
 	  exit 1; \
 	}; \
 	echo "test-memory: ASan runtime $$asan"; \
-	CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
+	for t in $(MEMORY_TESTS); do \
+	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
 	  DYLD_INSERT_LIBRARIES="$$asan" \
 	  ASAN_OPTIONS=detect_leaks=0 \
 	  MallocNanoZone=0 \
-	  sh -c 'for t in $(MEMORY_TESTS); do $(CHEZ) --program $$t || exit 1; done'
+	    $(CHEZ) --program $$t || exit 1; \
+	done
 endif
+
+# --- the memory gate must be able to FAIL ------------------------------------
+# A memory gate nobody has watched fail is a comment, and this one proved it:
+# from #14 until 2026-09-27 the Linux arm handed Valgrind timeout(1) instead
+# of Chez, the macOS arm's ASan preload never reached Chez at all, and both
+# stayed green through v0.6.0 and v0.7.0 (ADR-0003's 2026-09-27 amendment).
+# This target plants each defect the platform's tool must catch
+# (tests/memory-gate-sabotage.sps says which, and why) and runs the REAL
+# test-memory recipe on it through make, so what it judges is the recipe CI
+# and test-memory-docker run, not a copy of its command line.
+#
+# For each defect, three things must hold:
+#   1. the planted program exits 0 and prints its "planted" line with NO
+#      memory tool, or a red gate would prove nothing about the tool;
+#   2. `make test-memory` on it exits non-zero;
+#   3. its log carries the tool's own report of THAT defect (the markers
+#      below, measured). A gate that fails for another reason -- no valgrind,
+#      a build error, a crash -- is not evidence the tool is looking.
+#
+# The Linux libc-overrun marker names only the planted block, not where in
+# it the bad store landed. How wide memset's stores are, and so whether
+# Memcheck reports "0 bytes after" or "N bytes inside" the block, belongs to
+# whichever memset runs (Valgrind's replacement, or the platform's own), not
+# to the defect. The Scheme store's width is Chez's (one byte), so that
+# marker stays exact.
+MEMORY_SABOTAGE := tests/memory-gate-sabotage.sps
+ifeq ($(UNAME_S),Linux)
+  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun leak
+else
+  MEMORY_SABOTAGE_MODES := libc-overrun
+endif
+
+# The recipe re-enters make through this alias, never through a literal
+# $(MAKE). make runs any recipe line that names $(MAKE) even under -n, -t or
+# -q (so that a recursive make can print its own recipes), and this recipe
+# is a single line. So `make -n check-memory-gate` really ran the planted
+# program, and ran a test-memory that only printed its commands and exited 0,
+# then reported the gate VACUOUS. Through the alias the line is an ordinary
+# one: a dry run prints it and runs nothing. Measured on make 3.81 and 4.3
+# (.plans/memory-gate-mutation-log.md).
+MEMORY_GATE_MAKE = $(MAKE)
+
+check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the gate can go red)
+	@mkdir -p $(BUILD_DIR); fail=0; \
+	for m in $(MEMORY_SABOTAGE_MODES); do \
+	  case "$(UNAME_S):$$m" in \
+	    Linux:store-overrun) marker="0 bytes after a block of size 23 alloc'd" ;; \
+	    Linux:libc-overrun)  marker="a block of size 29 alloc'd" ;; \
+	    Linux:leak)          marker="777 bytes in 1 blocks are definitely lost" ;; \
+	    *:libc-overrun)      marker="0 bytes after 29-byte region" ;; \
+	    *) echo "check-memory-gate: no expected report for $$m on $(UNAME_S)" >&2; exit 1 ;; \
+	  esac; \
+	  log=$(BUILD_DIR)/check-memory-gate-$$m.log; \
+	  echo "=== check-memory-gate: $$m ==="; \
+	  plain=$$(CHEZ_LIBUV_SABOTAGE=$$m $(CHEZ) --program $(MEMORY_SABOTAGE) 2>&1); rc=$$?; \
+	  if [ $$rc -ne 0 ] || ! printf '%s\n' "$$plain" | grep -qx "memory-gate-sabotage: planted $$m"; then \
+	    echo "SABOTAGE NOT CLEAN: the $$m program exited $$rc with no memory tool, or never" >&2; \
+	    echo "printed its planted line, so a red gate would prove nothing. Its output:" >&2; \
+	    printf '%s\n' "$$plain" >&2; fail=1; continue; \
+	  fi; \
+	  if CHEZ_LIBUV_SABOTAGE=$$m $(MEMORY_GATE_MAKE) --no-print-directory test-memory \
+	       MEMORY_TESTS=$(MEMORY_SABOTAGE) > $$log 2>&1; then \
+	    echo "MEMORY GATE VACUOUS: make test-memory exited 0 with the $$m defect planted;" >&2; \
+	    echo "the memory tool is not checking the Chez process. Tail of $$log:" >&2; \
+	    tail -n 30 $$log >&2; fail=1; \
+	  elif ! grep -qF "$$marker" $$log; then \
+	    echo "check-memory-gate: make test-memory failed, but not on the planted $$m" >&2; \
+	    echo "defect: no \"$$marker\" in $$log. Tail:" >&2; \
+	    tail -n 30 $$log >&2; fail=1; \
+	  else \
+	    echo "gate caught $$m: $$marker"; \
+	  fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "MEMORY GATE CAN FAIL"; \
+	else echo "MEMORY GATE CHECK FAILED"; fi; \
+	exit $$fail
 
 # prod = the SAME graph as `build`, run at FLAVOR=prod after a clean, and
 # then judged by a program instead of by inspection. Each step is an explicit
@@ -668,6 +768,10 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	@# ordering, rows CI passes every run. A gate that silently tests a
 	@# different libuv than CI invents failures CI cannot reproduce and misses
 	@# ones it would catch. Mirror the leg or do not claim to mirror it.
+	@#
+	@# check-memory-gate runs FIRST, as in ci.yml: test-memory's green is
+	@# evidence only once this run has seen the same recipe go red on planted
+	@# defects. It costs a few seconds per defect.
 	$(DOCKER) run --rm \
 	  -v "$(CURDIR)":/src:ro \
 	  $(VALGRIND_IMAGE):$(CHEZ_FLOOR_VERSION) \
@@ -677,6 +781,7 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	      && make CHEZ=scheme deps \
 	      && make CHEZ=scheme HAVE_PKG=no vendor \
 	      && make CHEZ=scheme HAVE_PKG=no build \
+	      && make CHEZ=scheme HAVE_PKG=no check-memory-gate \
 	      && make CHEZ=scheme HAVE_PKG=no test-memory"'
 
 
