@@ -402,3 +402,221 @@ are dated records.
 - **3.** Run the canary inside every `test-memory`.
 - **5.** Run the prerequisites once per check instead of once per defect.
 - **7.** Keep the sentinel sizes in one place.
+
+---
+
+## Port-back from chez-cmark-gfm (2026-09-28)
+
+chez-cmark-gfm copied this check in its PR #23 (branch
+`fix/asan-preload-reaches-chez`) and found three things that apply here
+too. Each was measured here before anything changed, on branch
+`fix/memory-gate-port-findings`. The environment is as above, plus macOS
+26.6.2 (25G83), and GNU Make 4.3 in the Linux image.
+
+**This session's environment already had `MallocNanoZone=0`.** The Claude
+desktop app exports it to every process it starts. `Claude`, its
+`disclaimer` helper, `claude` and the shell all carry it, and it appears
+in no shell profile, no `launchctl` setting and no settings file. So every
+"without" leg below ran under `env -u MallocNanoZone`. Run from the app
+without `env -u`, the same leg compares `0` with `0`. chez-cmark-gfm's log
+does not say how its "unset" legs were unset.
+
+### 1. An empty mode list passed
+
+On the unmodified recipe (fe3cc3e), `make check-memory-gate
+MEMORY_SABOTAGE_MODES=` exited 0 and printed only `MEMORY GATE CAN FAIL`.
+It wrote no log, because nothing was planted. The check now counts the
+modes it runs and fails when there were none.
+
+| # | run | macOS | Linux |
+|---|---|---|---|
+| — | before the guard | exit 0, `MEMORY GATE CAN FAIL`, no log | not run: the same shell code as E′ |
+| E | an empty list | exit 2, `MEMORY_SABOTAGE_MODES is empty; nothing was planted.` (3 of 3, and for `MEMORY_SABOTAGE_MODES=' '`) | exit 2, the same line |
+| E′ | E, with the guard's test replaced by `false` | exit 0, `MEMORY GATE CAN FAIL` (3 of 3) | exit 0, `MEMORY GATE CAN FAIL` |
+
+A subset such as `MEMORY_SABOTAGE_MODES=leak` still runs and can pass. It
+checks less, which is what the override is for.
+
+### 2. `MallocNanoZone=0` had no measured effect, and is gone
+
+v0.1 (35f290b) added it, saying chez-cmark-gfm "observed this on this
+exact recipe". Nothing in this repository ever measured it. The DNS stage
+4 and 5 logs and `spike/dns/FINDINGS.md` Q2 list it only as part of the
+preload. chez-cmark-gfm has since traced its source run to one where ASan
+was never loaded.
+
+These are direct launches, 3 of 3 in every cell. Every ASan run printed
+the `verbosity=1` witness, `AddressSanitizer: libc interceptors
+initialized`.
+
+| probe | no tool, unset | no tool, `=0` | ASan, unset | ASan, `=0` |
+|---|---|---|---|---|
+| double free of a 16, 23 or 1024-byte block | 133 (SIGTRAP), no report | 133, no report | 134, `attempting double-free` | 134, `attempting double-free` |
+| `memset` 30 into 29 (the libc-overrun plant) | 0 | 0 | 134, `0 bytes after 29-byte region` | 134, the same |
+| a clean program | 0 | 0 | 0 | 0 |
+
+- **No run printed a "nano zone" or `malloc:` line.**
+- **Once pids, addresses and thread ids are normalized,** each ASan leg's
+  stderr is byte-identical with and without the variable, banner included.
+- **The mechanism.** Under ASan, every `foreign-alloc` block comes from
+  ASan's own allocator. Blocks of 16, 64, 200, 1024 and 100000 bytes land
+  at the same addresses with and without the variable (16 bytes at
+  `0x602000000130`). The system allocator that the variable tunes never
+  sees them. Without a tool, unset, `0` and `1` gave the same block layout
+  too.
+- **A plain double free depends on block size, not on the variable.** It
+  exits 133 (SIGTRAP) from 1 to 4096 bytes, and 134 (SIGABRT) from 32768
+  bytes up, with the variable set or unset. This corrects "Documentation
+  claims" above: "exit 134 with no tool" holds only for large blocks.
+
+**Through the recipe,** `make test-memory MEMORY_TESTS=df.sps` ran under
+`env -u` on a 16-byte and a 100000-byte double free, 3 of 3 each. The old
+recipe (with the variable) and the new one (without) both exit 2. Every
+log holds `ERROR: AddressSanitizer: attempting double-free` and ends in
+ASan's own `Abort trap: 6`. Normalized, the old and new logs are
+identical. The bare `Trace/BPT trap` that the old comment warned about
+never appeared. That trap is what plain malloc does when ASan is not
+loaded.
+
+- **N1:** without the variable, `check-memory-gate` printed `gate caught
+  libc-overrun` 3 of 3. It is also green with the app's inherited `=0`,
+  and with the variable put back into the recipe (sweep row N1 below).
+- **The full run:** `env -u MallocNanoZone make test-memory` exits 0 in
+  9 s: 17 suites, 0 ASan reports. A scratch copy of the recipe with
+  `verbosity=1` printed 17 witness lines (one per suite), 17 pass
+  summaries, 0 reports and 0 nano or `malloc:` lines.
+
+### 3. `possible-leak` holds `--errors-for-leak-kinds=definite`
+
+AGENTS.md's rule, that the gate must not fail on a leak kind it does not
+print, was a comment. A probe in the Linux image took 555 bytes from
+`foreign-alloc` (3 of 3 in each cell):
+
+| what reaches the block | gate flags | `--errors-for-leak-kinds` removed |
+|---|---|---|
+| `p+8`, as raw bytes in a live bytevector | exit 0, `possibly lost: 555 bytes in 1 blocks`, 0 errors, no loss record | **exit 9**, the same total, `ERROR SUMMARY: 1 errors`, **no loss record** |
+| `p` itself | exit 0, nothing possibly lost (still reachable) | exit 0 |
+| nothing | exit 9, `555 bytes in 1 blocks are definitely lost` | exit 9, the same |
+
+Showing and failing on both kinds prints the record: `555 bytes in 1
+blocks are possibly lost in loss record 2 of 2`, and exits 9.
+
+**Do the suites have such blocks?** Not their own processes. On fe3cc3e's
+recipe, all 17 suite processes report `possibly lost: 0 bytes in 0
+blocks`. The only possibly-lost blocks in the run, 1,576 bytes in 4 blocks
+each, are in the two forked children that also carry the 131- and 117-byte
+fork artifacts (matched by pid), and those never gate. So the Makefile's
+old reason for the flag ("a GC runtime's interior pointers … routinely
+classify as possibly lost") is not what a run shows. The comment now
+states what was measured, and names the check.
+
+The new mode plants the `p+8` block, written with `bytevector-uint-set!`
+into a bytevector that `keep-live` holds until exit. The check requires:
+
+- the summary total `possibly lost: 555 bytes in 1 blocks`. Without it
+  the mode proved nothing, and the check reports "never counted";
+- if the gate failed, the loss record `555 bytes in 1 blocks are possibly
+  lost` too. Without it the check reports `GATE RED WITHOUT A REPORT`.
+
+### The sweeps, on the final recipe
+
+Every row ran on a scratch clone whose HEAD held this branch's changes.
+The clone was reset to that commit before each row. Each mutation replaced
+whole lines, and aborted unless every target line matched exactly once.
+
+**Linux** (`chez-libuv-valgrind:10.4.1`, make 4.3; `store` and `libc` are
+the two overruns):
+
+| # | mutation | store | libc | leak | possible-leak | exit |
+|---|---|---|---|---|---|---|
+| — | control, at both ends | caught | caught | caught | consistent, exit 0 | 0 |
+| M1 | `timeout 900` between `valgrind` and `$(CHEZ)` (#14's shape) | VACUOUS | VACUOUS | VACUOUS | never counted | 2 |
+| M2 | `--error-exitcode=9` dropped | VACUOUS | VACUOUS | VACUOUS | consistent, exit 0 | 2 |
+| M3 | `--leak-check=full` dropped | caught | caught | VACUOUS | consistent, exit 0 | 2 |
+| M4 | `--errors-for-leak-kinds=possible` | caught | caught | VACUOUS | **red without a report** | 2 |
+| M5 | `--errors-for-leak-kinds` deleted | caught | caught | caught | **red without a report** | 2 |
+| M5′ | M5, with the loss-record test replaced by `false` | caught | caught | caught | **consistent, exit 2** | **0** |
+| P7 | not a defect: show and fail on `definite,possible` | caught | caught | caught | consistent, exit 2 | 0 |
+| PL1 | the plant keeps `p`, not `p+8` | caught | caught | caught | never counted | 2 |
+| PL1′ | PL1, with the counted test replaced by `false` | caught | caught | caught | **consistent, exit 0** | **0** |
+| C1 | the sabotage program ends `(exit 3)` | not clean | not clean | not clean | not clean | 2 |
+| C2 | Valgrind rejects `--bogus-flag` | not on planted | not on planted | not on planted | never counted | 2 |
+| C2′ | C2, with the marker test replaced by `false` | **caught** | **caught** | **caught** | never counted | 2 |
+| C1′ | the clean-run guard off, plus M2, plus C1 | **caught** | **caught** | **caught** | red without a report | 2 |
+| E | `MEMORY_SABOTAGE_MODES=` | — | — | — | — | 2, `nothing was planted.` |
+| E′ | E, with the empty-list test replaced by `false` | — | — | — | — | **0, `MEMORY GATE CAN FAIL`** |
+
+- **M5 is the new check's red.** Its log counts the block and shows
+  `ERROR SUMMARY: 1 errors` and make's `Error 1`, and holds no loss
+  record at all.
+- **M5′ and PL1′ are the counterfactuals, and show that both new tests are
+  load-bearing.** M5′ credits a gate that fails on a block it never
+  prints. PL1′ credits a block that was never possibly lost: its log
+  counts it as still reachable (`still reachable: 619 bytes in 2 blocks`,
+  which is 555 + 64).
+- **M1's logs name the client:** `Command: /usr/bin/timeout 900 scheme …`.
+  Every other row that ran Valgrind shows `Command: scheme --program
+  tests/memory-gate-sabotage.sps`.
+- **C2′ and C1′ still exit 2,** but only because `possible-leak` has tests
+  of its own. Both credit the three defect modes wrongly, which is what
+  those rows test.
+- **`make -n check-memory-gate` on make 4.3** exits 0, prints no check
+  output and writes no log. That rechecks #37's review finding 2 against
+  the new recipe.
+
+**macOS** (scratch clone; every row under `env -u MallocNanoZone`):
+
+| # | mutation | check-memory-gate |
+|---|---|---|
+| — | control, at both ends | exit 0, `gate caught libc-overrun` |
+| A1 | `sh -c` between the preload and `$(CHEZ)` (the v0.1 shape) | exit 2, `MEMORY GATE VACUOUS`. The log has no ASan report, and it does have the `planted` line |
+| A2 | `timeout 600` between the preload and `$(CHEZ)` | exit 2, `MEMORY GATE VACUOUS` |
+| A3 | the `DYLD_INSERT_LIBRARIES` line deleted | exit 2, `MEMORY GATE VACUOUS` |
+| H | `ASAN_OPTIONS=detect_leaks=0:halt_on_error=0` | exit 2, `MEMORY GATE VACUOUS`, though the log holds ASan's `heap-buffer-overflow` report |
+| N1 | `MallocNanoZone=0` put back | exit 0, `gate caught libc-overrun` |
+| C1 | the sabotage program ends `(exit 3)` | exit 2, `SABOTAGE NOT CLEAN … exited 3` |
+| C2 | `ASAN_DYLIB_PATTERN=/nonexistent/x.dylib`, so the recipe refuses | exit 2, `failed, but not on the planted libc-overrun` |
+| C2′ | C2, with the marker test replaced by `false` | **exit 0, `gate caught`**, while its log says `refusing to run un-sanitized` |
+| C1′ | the clean-run guard off, plus H, plus C1 | **exit 0, `gate caught`** |
+| E | `MEMORY_SABOTAGE_MODES=` | exit 2, `nothing was planted.` |
+| E′ | E, with the empty-list test replaced by `false` | **exit 0, `MEMORY GATE CAN FAIL`** |
+
+H is new to this repository. It shows the exit-status test is needed on
+macOS as well, because a marker-only check would credit it. On make 3.81,
+`make -n`, `-t` and `-q` still run nothing and write no log.
+
+**amd64, CI's Valgrind versions.** The `p+8` probe ran under emulation
+(`--platform linux/amd64`, with the distribution's `valgrind` and
+`chezscheme`), 3 of 3 on each image. Each column is one set of flags:
+
+| image | Valgrind | gate flags | `--errors-for-leak-kinds` removed | show and fail on `possible` |
+|---|---|---|---|---|
+| ubuntu:24.04 (today's `ubuntu-latest`) | 3.22.0 | exit 0, `possibly lost: 555 bytes in 1 blocks`, no record | exit 9, no record | exit 9, `555 bytes in 1 blocks are possibly lost` |
+| ubuntu:26.04 (`ubuntu-latest` from 2026-10-19) | 3.26.0 | the same | the same | the same |
+
+On 26.04, whose Chez is 10.0.0, the real sabotage program also counts
+`possibly lost: 555 bytes in 1 blocks`. It cannot run on 24.04's Chez
+9.5.8, where `keep-live` is unbound. The project's floor is 10.4.1, and CI
+builds that version.
+
+The sweep clones were cut before one comment paragraph moved. Their
+Makefiles match the commit below in every line that is not a comment, and
+their sabotage program is byte-identical.
+
+### Full runs, on the commit (272b07c)
+
+- **Linux:** the unmodified `make test-memory-docker`, from a clean clone
+  of 272b07c, exits 0 in 165 s.
+  - `check-memory-gate` prints `gate caught` for store-overrun,
+    libc-overrun and leak, then `gate consistent on possible-leak: exit
+    0`, then `MEMORY GATE CAN FAIL`.
+  - `test-memory` then runs all 17 suites, each as `Command: scheme
+    --program tests/test-*.sps`, with 778 to 2,990 allocations apiece.
+  - Every suite's own process reports 0 errors, 0 bytes definitely lost
+    and 0 bytes possibly lost.
+  - The only other summaries are the two fork-artifact children (131 and
+    117 bytes).
+- **macOS:** `make test` passes (17 suites, `ALL SUITES PASSED`), and so
+  do `check-help`, `check-purity` and `check-pins`. Under `env -u
+  MallocNanoZone`, `check-memory-gate` catches libc-overrun, and
+  `test-memory` passes all 17 suites with 0 ASan reports.

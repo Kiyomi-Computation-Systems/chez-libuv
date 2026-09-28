@@ -25,12 +25,22 @@
 ;;;                  interceptor, which makes it the macOS arm's witness.
 ;;;   leak           777 bytes allocated and never freed. Valgrind only; the
 ;;;                  macOS arm makes no leak claim (no LeakSanitizer on arm64).
+;;;   possible-leak  555 bytes whose only reference is an interior pointer,
+;;;                  kept as raw bytes in a live bytevector. Memcheck scans
+;;;                  the Scheme heap, finds the pointer, and counts the block
+;;;                  "possibly lost". Not a defect the gate must catch: it
+;;;                  checks that the gate never fails on a leak kind it does
+;;;                  not print. Linux only.
 ;;;
 ;;; The sizes are sentinels. The tool's report names them, and nothing else in
 ;;; a run allocates blocks of exactly these sizes to overrun or lose.
 (import (chezscheme))
 
 (define mode (getenv "CHEZ_LIBUV_SABOTAGE"))
+
+;; possible-leak's pointer lives here. The final keep-live holds the
+;; bytevector, and so the pointer's bytes, until the program exits.
+(define interior-pointer-holder (make-bytevector 16 0))
 
 (define (say what)
   (display "memory-gate-sabotage: ")
@@ -77,9 +87,14 @@
      (foreign-free p)))
   ((equal? mode "leak")
    (foreign-alloc 777))
+  ((equal? mode "possible-leak")
+   (let ((p (foreign-alloc 555)))
+     (bytevector-uint-set! interior-pointer-holder 8 (+ p 8)
+                           (native-endianness) (foreign-sizeof 'uptr))))
   (else
-   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun or leak\n"
+   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, leak or possible-leak\n"
             (current-error-port))
    (exit 2)))
 (say "planted")
+(keep-live interior-pointer-holder)
 (exit 0)

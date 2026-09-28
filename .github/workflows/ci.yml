@@ -243,8 +243,10 @@ jobs:
       # amendment). check-memory-gate plants a one-byte heap overrun (by a
       # Scheme store, then by libc's memset) and a definite leak, runs the real
       # test-memory recipe on each, and requires it to FAIL with Valgrind's own
-      # report of that defect. It runs first because it is the precondition
-      # for reading the next step's green as evidence.
+      # report of that defect. It also plants a possibly-lost block, and
+      # requires the gate never to fail on it without printing its loss
+      # record. It runs first because it is the precondition for reading the
+      # next step's green as evidence.
       - name: Verify the memory gate fails on planted defects
         run: make HAVE_PKG=no check-memory-gate
 

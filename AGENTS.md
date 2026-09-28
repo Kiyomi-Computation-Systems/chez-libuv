@@ -161,7 +161,10 @@ None is obvious from reading the code.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.
-  Pass `--errors-for-leak-kinds=definite` explicitly. Separately, Chez's
+  Pass `--errors-for-leak-kinds=definite` explicitly. `make check-memory-gate`
+  holds this with its `possible-leak` mode: it plants a block only an
+  interior pointer reaches, and prints `GATE RED WITHOUT A REPORT` if the
+  gate fails on it without printing its loss record. Separately, Chez's
   JIT-generated code produces uninitialised-value false positives by the
   hundreds from unstable call paths; the gate is scoped with
   `--undef-value-errors=no` (leaks and addressability stay fully enabled —
