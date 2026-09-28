@@ -520,12 +520,15 @@ ifeq ($(UNAME_S),Linux)
 # behaviour. io_uring stays ON for the normal `make test` run; only this
 # Valgrind leg forces libuv's epoll fallback.
 #
-# --errors-for-leak-kinds=definite (alongside --show-leak-kinds=definite):
-# Valgrind's own default for THIS flag is definite,possible, and a GC
-# runtime's interior pointers -- Chez's own, not this binding's -- routinely
-# classify as "possibly lost". Left at the default, the gate would exit 9 on
-# Chez's own runtime while not even displaying why, since --show-leak-kinds
-# alone controls what gets PRINTED, not what --error-exitcode reacts to.
+# --errors-for-leak-kinds=definite, the same list as --show-leak-kinds:
+# Valgrind fails a run on the leak kinds --errors-for-leak-kinds names (its
+# default adds "possible") and prints loss records only for the kinds
+# --show-leak-kinds names. Left at the default, a possibly-lost block fails
+# the gate with nothing in the log but a summary total. No suite's own
+# process has one today (measured 2026-09-28; only forked children that
+# never gate do), but a pointer into the middle of a block, held in the
+# Scheme heap, is enough to make one. check-memory-gate's possible-leak mode
+# holds the two lists consistent.
 #
 # --undef-value-errors=no: NOT a weakening of the leak gate -- ADR-0003
 # scopes this gate to leaks, and undefined-value tracking is a DIFFERENT
@@ -577,12 +580,6 @@ ifeq ($(UNAME_S),Linux)
 else
 	@echo "macOS: ASan preload only; LeakSanitizer is unsupported on arm64."
 	@echo "Leak claims must come from Linux CI (ADR-0003)."
-# MallocNanoZone=0: macOS's Nano allocator validates a freed block's own
-# metadata and can SIGTRAP on a double-free before ASan's interposed free()
-# gets a chance to run its check -- an unattributed crash (bare "Trace/BPT
-# trap") instead of the diagnostic this target exists to provide. Carried
-# over from chez-cmark-gfm, which observed this on this exact recipe.
-#
 # The dylib is resolved FIRST and required non-empty: if the clang resource
 # dir glob ever misses (a new Xcode layout, a renamed runtime), an empty
 # DYLD_INSERT_LIBRARIES would run every suite with no sanitizer at all and
@@ -609,7 +606,6 @@ else
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
 	  DYLD_INSERT_LIBRARIES="$$asan" \
 	  ASAN_OPTIONS=detect_leaks=0 \
-	  MallocNanoZone=0 \
 	    $(CHEZ) --program $$t || exit 1; \
 	done
 endif
@@ -632,6 +628,19 @@ endif
 #      below, measured). A gate that fails for another reason -- no valgrind,
 #      a build error, a crash -- is not evidence the tool is looking.
 #
+# possible-leak (Linux) is the exception to those three: not a defect the
+# gate must catch, but a block Valgrind counts "possibly lost". Valgrind
+# fails a run on the leak kinds --errors-for-leak-kinds names, and prints
+# loss records only for the kinds --show-leak-kinds names. A kind in the
+# first list and not the second fails the gate with nothing in the log but
+# a summary total. So the gate may pass on this block, or fail and print its
+# loss record; it must not fail without one. The summary must count the
+# block, too, or the mode proved nothing.
+#
+# And something must have been planted: until 2026-09-28,
+# `make check-memory-gate MEMORY_SABOTAGE_MODES=` looped over nothing and
+# printed MEMORY GATE CAN FAIL.
+#
 # The Linux libc-overrun marker names only the planted block, not where in
 # it the bad store landed. How wide memset's stores are, and so whether
 # Memcheck reports "0 bytes after" or "N bytes inside" the block, belongs to
@@ -640,7 +649,7 @@ endif
 # marker stays exact.
 MEMORY_SABOTAGE := tests/memory-gate-sabotage.sps
 ifeq ($(UNAME_S),Linux)
-  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun leak
+  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun leak possible-leak
 else
   MEMORY_SABOTAGE_MODES := libc-overrun
 endif
@@ -656,12 +665,15 @@ endif
 MEMORY_GATE_MAKE = $(MAKE)
 
 check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the gate can go red)
-	@mkdir -p $(BUILD_DIR); fail=0; \
+	@mkdir -p $(BUILD_DIR); fail=0; ran=0; \
 	for m in $(MEMORY_SABOTAGE_MODES); do \
+	  ran=$$((ran + 1)); \
 	  case "$(UNAME_S):$$m" in \
 	    Linux:store-overrun) marker="0 bytes after a block of size 23 alloc'd" ;; \
 	    Linux:libc-overrun)  marker="a block of size 29 alloc'd" ;; \
 	    Linux:leak)          marker="777 bytes in 1 blocks are definitely lost" ;; \
+	    Linux:possible-leak) marker="possibly lost: 555 bytes in 1 blocks"; \
+	                         record="555 bytes in 1 blocks are possibly lost" ;; \
 	    *:libc-overrun)      marker="0 bytes after 29-byte region" ;; \
 	    *) echo "check-memory-gate: no expected report for $$m on $(UNAME_S)" >&2; exit 1 ;; \
 	  esac; \
@@ -673,8 +685,22 @@ check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the ga
 	    echo "printed its planted line, so a red gate would prove nothing. Its output:" >&2; \
 	    printf '%s\n' "$$plain" >&2; fail=1; continue; \
 	  fi; \
-	  if CHEZ_LIBUV_SABOTAGE=$$m $(MEMORY_GATE_MAKE) --no-print-directory test-memory \
-	       MEMORY_TESTS=$(MEMORY_SABOTAGE) > $$log 2>&1; then \
+	  CHEZ_LIBUV_SABOTAGE=$$m $(MEMORY_GATE_MAKE) --no-print-directory test-memory \
+	    MEMORY_TESTS=$(MEMORY_SABOTAGE) > $$log 2>&1; rc=$$?; \
+	  if [ $$m = possible-leak ]; then \
+	    if ! grep -qF "$$marker" $$log; then \
+	      echo "check-memory-gate: Valgrind never counted the planted block as possibly lost" >&2; \
+	      echo "(no \"$$marker\" in $$log), so this mode proves nothing. Tail:" >&2; \
+	      tail -n 30 $$log >&2; fail=1; \
+	    elif [ $$rc -ne 0 ] && ! grep -qF "$$record" $$log; then \
+	      echo "GATE RED WITHOUT A REPORT: make test-memory failed on a possibly-lost block" >&2; \
+	      echo "and printed no loss record for it: --errors-for-leak-kinds names a kind" >&2; \
+	      echo "that --show-leak-kinds hides. Tail of $$log:" >&2; \
+	      tail -n 30 $$log >&2; fail=1; \
+	    else \
+	      echo "gate consistent on $$m: exit $$rc, $$marker"; \
+	    fi; \
+	  elif [ $$rc -eq 0 ]; then \
 	    echo "MEMORY GATE VACUOUS: make test-memory exited 0 with the $$m defect planted;" >&2; \
 	    echo "the memory tool is not checking the Chez process. Tail of $$log:" >&2; \
 	    tail -n 30 $$log >&2; fail=1; \
@@ -686,6 +712,10 @@ check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the ga
 	    echo "gate caught $$m: $$marker"; \
 	  fi; \
 	done; \
+	if [ $$ran -eq 0 ]; then \
+	  echo "check-memory-gate: MEMORY_SABOTAGE_MODES is empty; nothing was planted." >&2; \
+	  fail=1; \
+	fi; \
 	if [ $$fail -eq 0 ]; then echo "MEMORY GATE CAN FAIL"; \
 	else echo "MEMORY GATE CHECK FAILED"; fi; \
 	exit $$fail

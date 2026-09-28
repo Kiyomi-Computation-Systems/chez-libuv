@@ -148,3 +148,38 @@ should it appear.
 > checks of other programs, the shells and `cat`s the suites spawn. It
 > checks no more of this binding, whose code runs only in the parent and,
 > before `exec`, in forked children that Valgrind already follows.
+
+> **Amended 2026-09-28: three findings from chez-cmark-gfm's port of the
+> check.** chez-cmark-gfm copied `check-memory-gate` in its PR #23 and
+> found three things that hold here too. Each was measured here before
+> anything changed; the evidence is in `.plans/memory-gate-mutation-log.md`,
+> under "Port-back from chez-cmark-gfm".
+>
+> - **An empty mode list passed.** `make check-memory-gate
+>   MEMORY_SABOTAGE_MODES=` planted nothing, yet exited 0 and printed
+>   `MEMORY GATE CAN FAIL`. The check now counts the modes it runs and
+>   fails when there were none. With that test disabled, the empty list
+>   passes again.
+> - **`MallocNanoZone=0` is gone from the macOS arm.** v0.1 added it on
+>   chez-cmark-gfm's word that the Nano allocator traps a double free
+>   before ASan sees it. That trap was plain malloc, observed while ASan
+>   was not loaded. With ASan live, a double free and a `memset` overrun
+>   give the same report, exit status and output with the variable and
+>   without it. Every block comes from ASan's own allocator, at the same
+>   addresses either way. `check-memory-gate` and all 17 suites pass
+>   without it. Plain malloc also traps a double free the same way whether
+>   the variable is set or not: SIGTRAP up to 4 KiB, and SIGABRT from
+>   32 KiB up. When measuring this again, remember that the Claude desktop
+>   app exports `MallocNanoZone=0` to everything it runs, so "without" has
+>   to mean `env -u MallocNanoZone`.
+> - **A check now holds the Linux leak flags consistent.**
+>   `--errors-for-leak-kinds=definite` keeps the gate failing only on
+>   leak kinds it prints. Valgrind's default for that flag adds "possible",
+>   and a possibly-lost block then fails the run with no loss record in
+>   the log. A new `possible-leak` mode plants 555 bytes that only an
+>   interior pointer reaches. The gate may pass on that block, or fail and
+>   print its record, but it must not fail without the record (`GATE RED
+>   WITHOUT A REPORT`). Removing the flag turns the check red. The flag's
+>   old justification, that Chez's runtime "routinely" makes such blocks,
+>   was never measured, and a run shows otherwise. No suite's own process
+>   has one. Only forked children do, and they never gate.

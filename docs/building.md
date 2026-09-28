@@ -158,7 +158,10 @@ proves the memory gate can still fail. It plants real defects
 passes only if the gate fails *and* the log carries the tool's own report
 of that defect. On Linux the defects are a one-byte overrun by a Scheme
 store, the same by `memset`, and a definite leak. On macOS only the
-`memset` overrun applies, because ASan cannot see the others. CI and
+`memset` overrun applies, because ASan cannot see the others. On Linux it
+also plants a block that only a pointer into its middle reaches, which
+Valgrind counts as "possibly lost". The gate may pass on that block, but
+it must never fail on it without printing the block's loss record. CI and
 `make test-memory-docker` run it before the memory gate. Run it yourself
 after touching either `test-memory` recipe. Both arms once passed while
 checking nothing: Valgrind was handed `timeout(1)` instead of Chez, and
