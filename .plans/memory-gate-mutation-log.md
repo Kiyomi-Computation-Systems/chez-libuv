@@ -598,3 +598,25 @@ On 26.04, whose Chez is 10.0.0, the real sabotage program also counts
 `possibly lost: 555 bytes in 1 blocks`. It cannot run on 24.04's Chez
 9.5.8, where `keep-live` is unbound. The project's floor is 10.4.1, and CI
 builds that version.
+
+The sweep clones were cut before one comment paragraph moved. Their
+Makefiles match the commit below in every line that is not a comment, and
+their sabotage program is byte-identical.
+
+### Full runs, on the commit (272b07c)
+
+- **Linux:** the unmodified `make test-memory-docker`, from a clean clone
+  of 272b07c, exits 0 in 165 s.
+  - `check-memory-gate` prints `gate caught` for store-overrun,
+    libc-overrun and leak, then `gate consistent on possible-leak: exit
+    0`, then `MEMORY GATE CAN FAIL`.
+  - `test-memory` then runs all 17 suites, each as `Command: scheme
+    --program tests/test-*.sps`, with 778 to 2,990 allocations apiece.
+  - Every suite's own process reports 0 errors, 0 bytes definitely lost
+    and 0 bytes possibly lost.
+  - The only other summaries are the two fork-artifact children (131 and
+    117 bytes).
+- **macOS:** `make test` passes (17 suites, `ALL SUITES PASSED`), and so
+  do `check-help`, `check-purity` and `check-pins`. Under `env -u
+  MallocNanoZone`, `check-memory-gate` catches libc-overrun, and
+  `test-memory` passes all 17 suites with 0 ASan reports.
