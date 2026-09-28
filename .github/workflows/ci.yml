@@ -237,6 +237,17 @@ jobs:
       - name: Root lane (setuid/setgid, sudo)
         run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
 
+      # The gate below proves nothing unless it can fail, and for a month it
+      # could not: from #14 (2026-08-30) Valgrind's client was timeout(1), Chez
+      # ran unchecked, and this job stayed green (ADR-0003's 2026-09-27
+      # amendment). check-memory-gate plants a one-byte heap overrun (by a
+      # Scheme store, then by libc's memset) and a definite leak, runs the real
+      # test-memory recipe on each, and requires it to FAIL with Valgrind's own
+      # report of that defect. It runs first because it is the precondition
+      # for reading the next step's green as evidence.
+      - name: Verify the memory gate fails on planted defects
+        run: make HAVE_PKG=no check-memory-gate
+
       # The reason this job exists. Valgrind needs no instrumentation of Chez
       # or libuv and is the only tool in this project that can substantiate a
       # leak claim. Failure here blocks merge.

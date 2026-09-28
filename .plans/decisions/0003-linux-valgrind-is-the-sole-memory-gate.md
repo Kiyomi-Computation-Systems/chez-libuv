@@ -75,3 +75,76 @@ should it appear.
 > rejected because Chez's internal call paths are not a stable target to
 > pin a suppression to -- it risks whack-a-mole as those paths shift across
 > Chez versions, where a single flag scoped to the check *class* does not.
+
+> **Amended 2026-09-27: both arms were vacuous, and now there is a check.**
+> Neither arm of `make test-memory` was checking the Chez process that runs
+> the suites, and nothing noticed, because no run of either had ever been
+> watched failing.
+>
+> - **Linux, 2026-08-30 to 2026-09-27.** #14 (17b62b0) capped each suite by
+>   putting `timeout 900` between `valgrind` and `scheme`. Valgrind checks
+>   the command it is handed and does not follow an exec, so its client was
+>   `timeout` (2 allocations, 44 bytes, every suite) and Chez ran natively.
+>   **v0.6.0 and v0.7.0 shipped on that gate.** v0.5.0 predates #14 and was
+>   really gated. Found while working on #35. A planted one-byte heap
+>   overrun exited 0 through the recipe and 9 under `valgrind scheme`
+>   directly.
+> - **macOS, since v0.1 (35f290b).** The ASan arm set
+>   `DYLD_INSERT_LIBRARIES` on `sh -c '…'`. `/bin/sh` is SIP-protected, and
+>   macOS purges every `DYLD_*` variable when it launches a protected
+>   binary, so no suite ever loaded ASan. The runs recorded in
+>   `spike/dns/FINDINGS.md` Q2 were live, because they invoked `chez`
+>   directly; the make target never was. A second trap sits beside the
+>   first: ASan's Darwin runtime strips itself from
+>   `DYLD_INSERT_LIBRARIES` in whatever process it loads into (its
+>   `strip_env` default), so a wrapper such as `timeout(1)` gets ASan and
+>   the Chez it starts does not.
+>
+> **Fix.** The cap now wraps Valgrind (`timeout N valgrind … scheme`), and
+> the ASan arm sets `DYLD_INSERT_LIBRARIES` on the `chez` command itself.
+> With both live, all 17 suites pass. Under Valgrind every suite's own
+> process reports 0 errors and 0 bytes definitely lost (aarch64 container,
+> 163 s in total). Under ASan there are 0 reports.
+>
+> **Check.** `make check-memory-gate` plants defects
+> (`tests/memory-gate-sabotage.sps`) and runs the real `test-memory` recipe
+> on each. It requires a non-zero exit *and* the tool's own report of that
+> defect, after a plain run has shown the planted program is clean without
+> a tool. Linux plants a one-byte overrun by a Scheme store, the same by
+> libc `memset`, and a 777-byte definite leak. macOS plants only the
+> `memset` overrun. CI and `make test-memory-docker` run the check before
+> `test-memory`. Mutations and evidence are in
+> `.plans/memory-gate-mutation-log.md`.
+>
+> **What the macOS arm sees, now that it is live.** Only what passes
+> through libc or the allocator: overruns inside `memcpy` and `memset`,
+> double and invalid frees. Chez's generated code is not instrumented. A
+> `foreign-set!` past a block and a `foreign-ref` of freed memory both got
+> past live ASan and were caught by Valgrind. That covers the binding's own
+> copy loops, so the Decision above holds for more than leaks: Linux
+> Valgrind is the gate for any memory claim about Scheme-side access.
+>
+> **Forked children do not gate, deliberately.** `test-process.sps` has two
+> rows whose child fails before `exec` (ENOENT, and a stdio setup EINVAL).
+> Under Valgrind each child reports one definite leak: 131 and 117 bytes on
+> arm64. Each is that row's spawn-options block. The parent holds it while
+> `uv_spawn` forks and frees it as soon as `uv_spawn` returns, but the child
+> `_exit`s inside `uv_spawn`, and Memcheck cannot see Chez's tagged
+> references. So these are fork artifacts. Planting a block that the parent
+> held for the whole suite made the same children report 131+333 and
+> 117+333 bytes, while the parent stayed at 0. libuv discards such a
+> child's exit status (it reads errno from its pipe), and a child that
+> `exec`s leaves Valgrind at the `exec`. No child's report reaches the
+> gate, and none should.
+>
+> Two alternatives were considered. `--child-silent-after-fork=yes` changes
+> no gate outcome, and it would delete the only diagnostic for a fault in
+> the pre-exec window, where libuv's child reads the marshalled
+> file/args/env/cwd. That output stays visible, and non-gating.
+> `--trace-children=yes` was measured and rejected. On `test-process.sps`
+> it traced 24 processes, every `exec`'d `/bin/sh` and `/bin/cat`
+> included, and took 13 s against 10 s. None of those children's reports
+> reached the make log. What it adds are
+> checks of other programs, the shells and `cat`s the suites spawn. It
+> checks no more of this binding, whose code runs only in the parent and,
+> before `exec`, in forked children that Valgrind already follows.
