@@ -97,6 +97,22 @@ None is obvious from reading the code.
   Plumbing that can fail (kills, reads of another process's output) belongs
   inside a named row that fails *carrying the evidence*: gate every wait on
   `(or acked (pair? done))`, guard kills on the child being alive.
+* **`with-mutex` alone does not fence a check-then-call.** It is a
+  `dynamic-wind`: an engine that runs out of fuel inside the body releases
+  the mutex, and on resuming carries on from a check made before whatever ran
+  meanwhile. `uv-async-send!` shipped from v0.6.0 to v0.7.2 checking that a
+  handle was open and then sending on it, and a close could free the handle in
+  between (#33). The fence first proposed for it, a plain `with-mutex`, kept
+  that hole. `with-send-fence` in `(libuv private handles)` shows the three
+  parts a fence needs:
+  - its body runs under `with-interrupts-disabled`;
+  - the mutex is taken before interrupts are disabled, because a thread
+    blocked on it with them disabled stays active and stalls every other
+    thread's collection;
+  - nothing raises inside, because a `with-exception-handler` handler would
+    run with the lock held.
+
+  `tests/test-async-fence.sps` holds all three.
 
 ### C and the FFI
 

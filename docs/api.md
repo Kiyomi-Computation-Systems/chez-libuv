@@ -468,16 +468,20 @@ Three behaviours worth knowing before the
   `uv-run 'default` from returning (short of `uv-stop!`), and there is no
   `uv_unref` binding to exempt it (the design's §12 defers one), so close the
   async to let the loop finish.
-- **The handle must outlive every send** — libuv's contract, and the
-  caller's to keep. `uv-async-send!` raises `&uv-handle-closed` for a handle
-  already closing or closed, but that check cannot stop the loop thread from
-  closing — and freeing — the handle between the check and the send, so make
-  sure no thread can still send before calling `uv-close!`. One way: send
-  only while holding a mutex and seeing an open flag, and have the loop
-  thread clear the flag under the same mutex before it closes.
+- **A send that races the close is refused.** Each async handle has a lock
+  that `uv-async-send!` and `uv-close!` both take, so a send from any thread
+  either completes before a close begins or raises `&uv-handle-closed`
+  without touching the handle. That holds when the close frees the handle a
+  moment later, and for a send running inside an engine. Sends to one handle
+  from several threads take turns on its lock.
 - **A close drops wakes still pending.** `on-wake` never runs once
   `uv-close!` has started, even for a send made before it, so after closing,
-  drain the queue once more yourself.
+  drain the queue once more yourself. A refusal tells a sender only that its
+  wake was not sent. To know which items will be handled, queue and send
+  only while holding a mutex of your own and seeing an open flag, and have
+  the loop thread clear the flag under that mutex before it closes. Then the
+  final drain handles every item queued, and a sender that sees the flag
+  clear knows its item was not queued.
 
 ## Versions — `(libuv)`
 

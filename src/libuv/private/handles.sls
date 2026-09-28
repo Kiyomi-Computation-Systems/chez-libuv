@@ -30,6 +30,7 @@
           signal-mode set-signal-mode!
           %make-uv-async-record uv-async-record?
           async-on-wake set-async-on-wake!
+          async-fence with-send-fence
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -64,6 +65,10 @@
           ;; loop-queue query
           handle-in-loop-queue? walk-dispatch)
   (import (rnrs)
+          ;; Ahead of (chezscheme): make-mutex and with-mutex exist only in a
+          ;; threaded Chez (#41; tests/test-require-threaded.sps).
+          (libuv private require-threaded)
+          (only (chezscheme) make-mutex with-mutex with-interrupts-disabled)
           (libuv private conditions)
           (only (libuv private native)
                 uv-cancel
@@ -204,12 +209,15 @@
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
   ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
+  ;; fence is the handle's send fence (#33); see with-send-fence.
   (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
     (parent uv-handle-record)
-    (fields (mutable on-wake async-on-wake set-async-on-wake!))
+    (fields (mutable on-wake async-on-wake set-async-on-wake!)
+            (immutable fence async-fence))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop on-wake) ((pargs->new ptr 'async loop) on-wake)))))
+       (lambda (ptr loop on-wake)
+         ((pargs->new ptr 'async loop) on-wake (make-mutex))))))
 
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
@@ -233,8 +241,8 @@
   ;; per-verb sprinkling (design §6.3). The thread check comes first — a verb
   ;; from the wrong thread is refused before its handle's open state is even
   ;; consulted. uv-async-send! is the one verb that does NOT come through here
-  ;; (it is libuv's sole thread-safe call); it validates kind and open state on
-  ;; its own path in (libuv async).
+  ;; (it is libuv's sole thread-safe call); it validates kind on its own path in
+  ;; (libuv async), and checks open state inside the send fence.
   (define (require-open-handle handle who)
     (require-handle handle who)
     (require-loop-thread (handle-loop handle) who)
@@ -242,7 +250,9 @@
       (raise (make-uv-handle-closed (handle-kind handle))))
     handle)
 
-  ;; The checked accessor is the only route from a handle record to native code.
+  ;; The checked accessor is the only route from a handle record to native code,
+  ;; except inside the send fence: no raise is allowed there, and uv-async-send!
+  ;; reads the pointer only after seeing the handle open.
   (define (handle-pointer handle who)
     (let ((ptr (handle-ptr handle)))
       (unless (valid-pointer? ptr)
@@ -510,16 +520,49 @@
     (uv-walk-native (loop-ptr loop) 0)
     (and (memv (handle-ptr handle) walk-query-cell) #t))
 
+  ;; (with-send-fence async body ...) runs BODY holding ASYNC's send fence
+  ;; (#33), the lock that orders uv-async-send! against uv-close!. The send's
+  ;; open check and native call run inside it, and so does the close's
+  ;; open -> closing step (begin-close!). So no close begins while a send is
+  ;; between its check and its call, and no send gets past the check once a
+  ;; close has begun.
+  ;; - The fence is taken with interrupts enabled. A thread blocked taking it
+  ;;   is then deactivated, so another thread's collection is not refused.
+  ;; - BODY runs with interrupts disabled, so no engine suspends it there.
+  ;;   with-mutex is a dynamic-wind: a suspension would release the fence and
+  ;;   resume BODY after a close, on a stale check.
+  ;; - BODY must not raise. A with-exception-handler handler runs in the
+  ;;   raise's dynamic extent, so it would run holding the fence. Return a
+  ;;   status and raise after the release.
+  (define-syntax with-send-fence
+    (syntax-rules ()
+      ((_ async body1 body2 ...)
+       (with-mutex (async-fence async)
+         (with-interrupts-disabled body1 body2 ...)))))
+
   ;; Starting close is idempotent and asynchronous. A repeated call cannot
   ;; replace the original on-close callback.
   (define (real-close-handle! handle on-close)
     (require-handle handle 'uv-close!)
     (unless (or (not on-close) (procedure? on-close))
       (raise (make-uv-invalid-argument 'uv-close! 'on-close-not-a-procedure)))
-    (when (eq? (handle-state handle) 'open)
-      (set-handle-on-close! handle on-close)
-      (set-handle-state! handle 'closing)
+    (when (begin-close! handle on-close)
       (uv-close-native (handle-pointer handle 'uv-close!))))
+
+  ;; begin-close! : uv-handle (or procedure #f) -> boolean
+  ;; Moves an open handle to closing and answers #t, or answers #f if the
+  ;; handle was not open. An async makes the move inside its send fence, so
+  ;; the close waits for a send already past its open check, and every later
+  ;; send sees the handle closing.
+  (define (begin-close! handle on-close)
+    (define (open->closing!)
+      (and (eq? (handle-state handle) 'open)
+           (begin (set-handle-on-close! handle on-close)
+                  (set-handle-state! handle 'closing)
+                  #t)))
+    (if (uv-async-record? handle)
+        (with-send-fence handle (open->closing!))
+        (open->closing!)))
 
   (define close-handle-proc
     (lambda (handle on-close)

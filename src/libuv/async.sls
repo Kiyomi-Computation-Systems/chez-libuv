@@ -33,17 +33,22 @@
   ;; uv-async-send! : uv-async -> unspecified
   ;; The ONE verb exempt from the loop-thread affinity check (design §6.3):
   ;; uv_async_send is thread-safe, so a worker thread wakes the loop with it. It
-  ;; does not touch the registry. Kind and open state are validated as a
-  ;; courtesy for the already-closed case; the caller must ensure the async
-  ;; outlives its senders (libuv's own lifetime contract — close happens on the
-  ;; loop thread and is the consumer's responsibility to sequence).
+  ;; does not touch the registry. The open check and the native send run inside
+  ;; the handle's send fence, which uv-close! takes too (#33), so a send either
+  ;; completes before a close begins or is refused with &uv-handle-closed, never
+  ;; made on a freed handle. Inside the fence an open handle's pointer is live
+  ;; (close-dispatch zeroes it only after the close began), and nothing may
+  ;; raise there, so the raw pointer is read and the refusal raised after.
   (define (uv-async-send! async)
     (unless (uv-async-record? async)
       (raise (make-uv-invalid-argument 'uv-async-send! 'not-a-uv-async)))
-    (unless (eq? (handle-state async) 'open)
-      (raise (make-uv-handle-closed 'async)))
-    (uv-check (uv-async-send (handle-pointer async 'uv-async-send!))
-              'uv-async-send!))
+    (let ((status (with-send-fence async
+                    (if (eq? (handle-state async) 'open)
+                        (uv-async-send (handle-ptr async))
+                        'closed))))
+      (if (eq? status 'closed)
+          (raise (make-uv-handle-closed 'async))
+          (uv-check status 'uv-async-send!))))
 
   ;; Never deliver a wake to a handle already closing; the callback runs on the
   ;; loop thread, so it may safely touch the loop and its handles.

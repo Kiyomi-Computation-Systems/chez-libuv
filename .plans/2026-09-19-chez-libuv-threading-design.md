@@ -220,6 +220,10 @@ loop-thread-only. So:
 - **`uv-async-send! : uv-async -> unspecified`** — callable from *any* thread.
   The **only** verb exempt from the affinity check (§6.3). It touches no
   registry state; it calls `uv_async_send`, which libuv makes thread-safe.
+  *Amended 2026-09-28 (#33): libuv's thread-safety covers the call, not the
+  handle's lifetime. A close could free the handle between the send's open
+  check and its call, so sends and closes now share a per-handle fence; see
+  ADR-0019's decision-3 amendment.*
 - The async callback is the **14th locked trampoline** (D4), signature
   `uv_async_cb (uv_async_t*) -> void` — same arity as `timer`/`close` but a
   distinct callback *type*, so it gets its own slot (ADR-0008's rule, as the

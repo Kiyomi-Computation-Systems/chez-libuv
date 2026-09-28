@@ -63,6 +63,38 @@ state and calls `uv_async_send`. `uv_async` is the 14th locked trampoline
 (ADR-0008). Sends coalesce (N sends may yield one wake), so the wake callback
 drains a caller-side queue rather than assuming one item per send.
 
+> **Amended 2026-09-28 (issue #33): the exempt verb is fenced.** As
+> decided, `uv-async-send!` checked the handle's state, read its pointer, then
+> called `uv_async_send`. A close on the loop thread could free the block in
+> between: libuv's own guard, `uv__async_spin`, waits only for a sender
+> already inside `uv_async_send`. Until now only a caller convention
+> prevented that (docs/api.md, #30 and #32).
+>
+> Each async handle now carries a send fence, a mutex that `uv-async-send!`
+> and `uv-close!` both take (`with-send-fence` in `(libuv private handles)`).
+> The send's open check and native call run inside it, and so does the
+> close's open → closing step. So a send either completes before a close
+> begins, or is refused with `&uv-handle-closed` without touching the handle.
+> That holds from any thread and inside engines. Three details decide whether
+> the mutex fences anything:
+>
+> - The body runs with interrupts disabled. `with-mutex` is a `dynamic-wind`,
+>   so an engine suspended inside it releases the mutex, and resumes after
+>   whatever ran meanwhile, on a stale check.
+> - The mutex is taken with interrupts enabled. A thread blocked taking it
+>   is then deactivated, so other threads can still collect.
+> - Nothing raises inside it. A `with-exception-handler` handler runs in the
+>   raise's dynamic extent, so a refusal raised inside would reach the
+>   caller's handler with the fence held.
+>
+> `tests/test-async-fence.sps` holds each detail, with an engine-fuel sweep
+> and three rows that fork a second thread. The mutations and the
+> widened-window runs are in `.plans/async-send-fence-mutation-log.md`.
+> Decision 4 stands: this lock guards one handle's lifetime across the one
+> call libuv makes thread-safe, not the registry. The cost, on libuv's
+> no-syscall fast path: about 42 ns a send on macOS arm64, up from 8, and
+> senders sharing one handle now take turns.
+
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
 — it would guard the hashtable while the libuv call it wraps is still unsafe
