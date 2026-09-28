@@ -9,9 +9,10 @@ need a design decision first.
 
 ## Setup
 
-You need Chez Scheme 10.4.1+ (binary `chez`) and either a system libuv
-`pkg-config` can see or nothing (the build vendors a pinned libuv
-automatically):
+You need a threaded Chez Scheme 10.4.1+ (binary `chez`; threaded is Chez's
+default, so anything not configured with `--nothreads`) and either a
+system libuv `pkg-config` can see or nothing (the build vendors a pinned
+libuv automatically):
 
 ```sh
 git clone --recursive https://github.com/Kiyomi-Computation-Systems/chez-libuv.git

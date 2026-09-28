@@ -169,7 +169,9 @@ not `require-open-loop` (which `uv-run` calls before the owner transfers).
 - [x] 14th trampoline installed via the late-install seam; frozen name literals
       widened, watched-to-fail (RED captured in the Stage 2 mutation log).
 - [x] Non-threaded Chez: check is a tautology, `uv-async-send!` still works
-      (`current-thread-id` is a constant there).
+      (`current-thread-id` is a constant there). *Corrected 2026-09-28 (#41):
+      ticked by reasoning and never run. The library never loaded on a
+      non-threaded Chez; a threaded one is now required (ADR-0019, decision 5).*
 - [x] Default suite flake-free (races confined to the stress tier); Linux
       Valgrind gate clean (`make test-memory-docker`).
 - [x] ADR-0008 amended; threading ADR (ADR-0019) + ADR-0010 companion written.

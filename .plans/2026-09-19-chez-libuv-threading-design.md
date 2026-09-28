@@ -66,6 +66,9 @@ the minimum that makes a second Scheme thread *usable* alongside a libuv loop.
 5. **D5 — the threaded model is opt-in and gated on a threaded Chez.** On a
    non-threaded Chez the affinity check degenerates to a single owner and costs
    nothing; `uv-async-send!` still works (it is thread-safe regardless).
+   *Corrected 2026-09-28 (#41): never true. The binding has imported Chez's
+   thread primitives since v0.1, so it never loaded on a non-threaded Chez. A
+   threaded Chez is now required; see ADR-0019's decision-5 amendment.*
 6. **D6 — a new ADR records the threading model**; ADR-0008 is amended (14th
    trampoline + the `__collect_safe` attribute); ADR-0010 gets a threading-test
    companion (§9).

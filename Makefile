@@ -128,11 +128,13 @@ TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test
 MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
-# stay free of native imports. Two suites qualify: test-conditions.sps
-# (v0.1 Task 5) and test-addrinfo.sps (v0.2 Stage 4). Each imports (rnrs),
+# stay free of native imports. Three suites qualify: test-conditions.sps
+# (v0.1 Task 5) and test-addrinfo.sps (v0.2 Stage 4) import (rnrs),
 # (srfi :64), and pure private libraries only -- (libuv private conditions)
 # imports (rnrs) alone, (libuv private addrinfo) imports (rnrs) plus
 # conditions -- so neither chain ever reaches (libuv private native).
+# test-require-threaded.sps (#41) imports no library of this repo at all: it
+# reads src/'s import forms as data.
 # test-native.sps and test-shim-loading.sps are deliberately NOT here --
 # both import native code by design, and test-shim-loading.sps sets
 # CHEZ_LIBUV_SHIM itself in its children.
@@ -141,9 +143,10 @@ MEMORY_TESTS := $(TESTS)
 # default for a new suite must be "not claimed pure", so adding a genuinely
 # pure suite is a deliberate edit here. $(wildcard) is kept only so a
 # DELETED file drops out silently instead of failing the target.
-PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps)
+PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
+                           tests/test-require-threaded.sps)
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
+.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
 .DEFAULT_GOAL := help
 
@@ -813,6 +816,56 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	      && make CHEZ=scheme HAVE_PKG=no build \
 	      && make CHEZ=scheme HAVE_PKG=no check-memory-gate \
 	      && make CHEZ=scheme HAVE_PKG=no test-memory"'
+
+# --- a non-threaded Chez is refused by name (#41) ----------------------
+# The binding needs a threaded Chez: Chez builds make-mutex and the rest of
+# its thread system only into threaded builds, and native.sls has imported
+# them since v0.1. On a --nothreads Chez that import used to fail with a bare
+# "missing import for make-mutex". (libuv private require-threaded) replaces
+# it with a message naming the requirement, but only where it is imported
+# ahead of every (chezscheme) import, an order tests/test-require-threaded.sps
+# holds on every `make test`. That suite also expands the refusal's source
+# with (threaded?) answering #f, so a refusal that stopped refusing fails the
+# default gate. What only a real --nothreads Chez can show is that Chez's own
+# answer is #f there, and that the refusal beats the real missing import. So
+# this target imports each public library on one: each must exit non-zero, and
+# the first exception it prints must carry NOTHREADS_MARKER
+# (docker/check-nothreads.sh).
+#
+# Off the default gate, like test-memory-docker: the image builds Chez from
+# source (a few minutes, cached by version after the first run). Only src/ is
+# mounted, so no build, no submodules, and it runs from a linked worktree.
+NOTHREADS_IMAGE  ?= chez-libuv-nothreads
+NOTHREADS_MARKER := chez-libuv needs a threaded Chez Scheme
+
+check-nothreads-docker: ## Verify a non-threaded Chez is refused by name at import (builds a --nothreads Chez in Docker)
+	@command -v $(DOCKER) >/dev/null 2>&1 || { \
+	  echo "check-nothreads-docker: '$(DOCKER)' not found on PATH." >&2; \
+	  echo "Install Docker, or set DOCKER= to a compatible CLI (podman works)." >&2; \
+	  exit 1; \
+	}
+	@test -n "$(CHEZ_FLOOR_VERSION)" || { \
+	  echo "check-nothreads-docker: could not read CHEZ_FLOOR_VERSION from" >&2; \
+	  echo "  .github/workflows/ci.yml -- has that key been renamed or reformatted?" >&2; \
+	  exit 1; \
+	}
+	@echo "=== building $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) (cached after the first run) ==="
+	$(DOCKER) build \
+	  --build-arg CHEZ_VERSION=$(CHEZ_FLOOR_VERSION) \
+	  -t $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) \
+	  -f docker/nothreads.Dockerfile docker/
+	@echo "=== importing each public library on a --nothreads Chez ==="
+	@# As test-memory-docker does: root copies the read-only mount, and the
+	@# unprivileged dev user runs the check on that copy. Reading the mount as
+	@# dev directly fails on a Linux host whose checkout is owned by another
+	@# uid inside a 0700 home -- every import then reads as "not found".
+	$(DOCKER) run --rm --user root \
+	  -v "$(CURDIR)/src":/src:ro \
+	  -v "$(CURDIR)/docker/check-nothreads.sh":/check-nothreads.sh:ro \
+	  -e NOTHREADS_MARKER="$(NOTHREADS_MARKER)" \
+	  $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) \
+	  sh -ec 'cp -a /src /work-src && chown -R dev:dev /work-src \
+	    && su dev -c "sh /check-nothreads.sh /work-src"'
 
 
 prod: ## Rebuild the shim with optimizations and verify the release artifact
