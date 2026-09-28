@@ -8,9 +8,9 @@
 ;;; &uv-handle-closed without touching the handle.
 ;;;
 ;;; On the default gate and the memory gate. The engine sweep is
-;;; single-threaded and deterministic. The rows after it fork one or two
-;;; threads each, because Chez mutexes are recursive: only a thread that does
-;;; not hold the fence can see it held, or wait on it. Their verdicts on a
+;;; single-threaded and deterministic. The rows after it each fork a thread,
+;;; because Chez mutexes are recursive: only a thread that does not hold the
+;;; fence can see it held, or wait on it. Their verdicts on a
 ;;; correct build do not depend on timing. A row waits for events; where it
 ;;; also has a time bound, the bound caps how long it gives a broken build to
 ;;; show itself, or how long a retry may take.
@@ -69,9 +69,8 @@
 ;;                       wake landed before the close.
 ;; A send that returns normally although no wake landed before the close
 ;; made its native call after the close, on the freed block. On Linux that
-;; is otherwise silent: the block's bytes survive the free and the stale call
-;; returns 0. macOS reuses the block, and the stale call raises "invalid
-;; memory reference". Under Valgrind it is an invalid read.
+;; is otherwise silent: the stale call returns normally. On macOS it raises
+;; "invalid memory reference"; under Valgrind it is an invalid read.
 ;;
 ;; Rows whose fuel outlasts the verb finish before any close: 'finished,
 ;; which also requires their wake to land, the check the oracle above relies
