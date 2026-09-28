@@ -1,6 +1,6 @@
 # ADR-0010: Loopback integration tests replace a differential oracle
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-09-28 (issue #35): same-process speed ratios against libc gate the bulk moves — see the section at the end.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0003](0003-linux-valgrind-is-the-sole-memory-gate.md)
@@ -78,3 +78,36 @@ in two so the default gate stays deterministic:
   because they are timing-dependent, not because threads and Valgrind conflict;
   the leak surface (one async handle's alloc/init/close) is covered by the
   deterministic suite under the memory gate instead.
+
+## Amended 2026-09-28 (issue #35): same-process speed ratios on the default gate
+
+The rule "no wall-clock anywhere" now has one bounded exception, recorded
+here because the review of PR #36 found it undocumented.
+`tests/test-native.sps` and `tests/test-stream.sps` time this binding's bulk
+moves against libc and gate on the ratio. Those are `copy-in!`, `copy-out`
+and `zero-out!`, and the verbs `uv-write!` and `uv-write*!`. Each move must
+run within 3x of libc's own `memcpy`/`memset` over the same bytes
+(`tests/uv-bulk.sls`). These rows guard #35's defect, a per-byte copy that
+held the loop ~250 ms per 4 MiB write, and are worth nothing unless they run
+where regressions land, so they stay on the default and memory gates.
+
+Why the ratio does not reintroduce the flakiness the rule exists to prevent:
+
+- **It is a ratio of two timings taken in the same process, not a duration
+  against a budget.** The move and the reference are timed in seven
+  alternating pairs, each after a fresh collection, and the least of each
+  side counts. A slow machine or a burst of load slows both sides, so no
+  absolute bound appears.
+- **The reference is libc, not Scheme.** A byte-at-a-time Scheme loop's
+  speed depends on how Chez compiled it: at `--optimize-level 3` it ran only
+  4.8x slower than memcpy in the Linux image, and a bar calibrated against
+  it failed correct code. libc runs the same code at every optimize level,
+  and Memcheck replaces it for both sides alike.
+- **The margin is wide on both sides.** Correct code measured 0.95–1.10x
+  over five full runs on macOS, and 0.97–1.05x in the Linux image at
+  optimize levels 0 and 3, and under Memcheck. A reverted Scheme loop
+  measured 140x or more at the default level, and a C byte loop in a -O0
+  build 13–385x. Full numbers are in `.plans/bulk-copy-mutation-log.md`.
+
+The threaded proof that the copies stay plain lives off the gates, in
+`tests/test-threading-stress.sps`, per the Companion above.

@@ -43,27 +43,45 @@ getter, the name-keyed constant lookup function, the errno enumeration, and
 debug counters — never a function that itself calls into libuv on the
 binding's behalf.
 
-> **Amended 2026-09-27 (issue #35).** A fifth kind of export: three bulk byte
-> moves behind `copy-in!`, `copy-out` and `zero-out!`. They are
-> `chez_uv_copy_in` and `chez_uv_copy_out` (one `memcpy` each) and
-> `chez_uv_zero` (one `memset`).
+> **Amended 2026-09-27 (issue #35; the rejection reasons corrected
+> 2026-09-28 after review).** A fifth kind of export: three bulk byte moves
+> behind `copy-in!`, `copy-out` and `zero-out!`. They are `chez_uv_copy_in`
+> and `chez_uv_copy_out` (one `memcpy` each) and `chez_uv_zero` (one
+> `memset`).
 >
-> Scheme has no way to move bytes between a bytevector and foreign memory in
-> one operation. `foreign-set!` and `foreign-ref` move one scalar at a time, so
-> the copy-at-the-boundary helpers
-> ([ADR-0009](0009-copy-at-the-boundary.md)) looped a byte at a time, at
-> ~29 ns a byte. That held a 4 MiB `uv-write!`'s loop ~250 ms: 121 ms zeroing
-> the block and 125 ms copying the payload in. One `memcpy` moves 4 MiB in
-> ~0.1 ms.
+> Scheme's own primitives move one scalar at a time between a bytevector and
+> foreign memory (`foreign-set!`, `foreign-ref`), so the copy-at-the-boundary
+> helpers ([ADR-0009](0009-copy-at-the-boundary.md)) looped a byte at a time,
+> at ~29 ns a byte. That held a 4 MiB `uv-write!`'s loop ~250 ms: 122 ms
+> zeroing the block and 125 ms copying the payload in. A `memcpy` moves
+> 4 MiB in ~0.1 ms.
 >
 > The line this ADR draws still holds: none of the three calls into libuv.
 > Every argument check stays in Scheme, before the call, because the shim
 > trusts what it is handed.
 >
-> Binding libc's `memcpy` directly was the alternative. It was rejected because
-> a `u8*` argument always passes the bytevector's first byte, which cannot
-> express `copy-in!`'s start offset. The shim's version takes the offset as an
-> argument.
+> Binding libc's `memcpy` and `memset` directly would also have worked, and
+> was rejected. The first version of this note gave the wrong reason: that a
+> `u8*` argument cannot carry `copy-in!`'s start offset. Chez 10.4.1's
+> `ftype-scheme-object-pointer` argument type passes an object's address
+> plus an offset, and the reason never applied to `copy-out`, which copies to
+> offset 0, or to `zero-out!`, which takes no bytevector. The reasons that
+> hold are these:
+>
+> - **The symbols belong to the binding.** libc's `memcpy` resolves through
+>   `foreign-procedure` only because libuv, loaded first, links libc:
+>   `(foreign-entry? "memcpy")` is `#f` in a bare Chez. The shim's entries are
+>   this binding's own, and a shim missing one fails the import with
+>   `&uv-shim-unavailable` (`native.sls`'s `shim-procedure`).
+> - **One argument covers every move.** Each passes a bytevector as `u8*` to
+>   a plain call, so a single argument makes all three safe: a plain call
+>   keeps its thread active, and no collection can move the bytevector before
+>   the call returns (`test-threading-stress.sps` pins it). There is no offset
+>   arithmetic on a live Scheme object to reason about.
+> - **Windows** ([ADR-0004](0004-windows-deferred-design-clean.md)) would
+>   likely need the C runtime's DLL named to bind libc, where the shim is
+>   already loaded by path. This is plausible but unverified, since Windows
+>   is deferred.
 
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object
@@ -84,6 +102,8 @@ layers above this binding depend on.
   `uv_*` functions the binding eventually calls — which keeps the
   never-transcribe-constants policy
   ([ADR-0005](0005-constants-are-never-transcribed.md)) cheap to maintain.
+  (Amended 2026-09-27 for #35: five kinds of export now. The fifth is three
+  one-line functions, and "four" always counted kinds, not symbols.)
 - The Linux load-order requirement becomes a hard invariant, enforced in
   `native.sls` and covered by `test-shim-loading`; getting it wrong fails at
   import time, not at first call.

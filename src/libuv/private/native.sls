@@ -92,8 +92,10 @@
           count-async-new!       count-async-free!)
   (import (rnrs)
           (only (chezscheme)
-                load-shared-object foreign-procedure foreign-ref foreign-set!
+                load-shared-object foreign-procedure foreign-entry?
+                foreign-ref foreign-set!
                 foreign-alloc foreign-free foreign-sizeof
+                with-interrupts-disabled
                 foreign-callable foreign-callable-entry-point lock-object
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
@@ -147,101 +149,116 @@
 
   (define shim-loaded (load-shim resolved-shim-path))
 
+  ;; shim-procedure : like foreign-procedure, for an entry the shim exports.
+  ;; A shim built from older sources loads cleanly but lacks newer entries,
+  ;; and foreign-procedure would then fail the whole import with a bare
+  ;; "no entry" assertion. Checking the entry first raises &uv-shim-unavailable
+  ;; naming the shim, the condition every other unusable shim raises
+  ;; (test-shim-loading.sps).
+  (define-syntax shim-procedure
+    (syntax-rules ()
+      ((_ entry (arg ...) result)
+       (if (foreign-entry? entry)
+           (foreign-procedure entry (arg ...) result)
+           (raise (make-uv-shim-unavailable resolved-shim-path))))))
+
   (define shim-compiled-version
-    (foreign-procedure "chez_uv_shim_compiled_version" () int))
+    (shim-procedure "chez_uv_shim_compiled_version" () int))
 
   ;; chez_uv_constant writes a C long through an out-parameter.
   (define raw-constant
-    (foreign-procedure "chez_uv_constant" (string uptr) int))
+    (shim-procedure "chez_uv_constant" (string uptr) int))
 
-  (define raw-errno-count (foreign-procedure "chez_uv_errno_count" () int))
-  (define raw-errno-name  (foreign-procedure "chez_uv_errno_name" (int) uptr))
-  (define raw-errno-value (foreign-procedure "chez_uv_errno_value" (int) int))
+  (define raw-errno-count (shim-procedure "chez_uv_errno_count" () int))
+  (define raw-errno-name  (shim-procedure "chez_uv_errno_name" (int) uptr))
+  (define raw-errno-value (shim-procedure "chez_uv_errno_value" (int) int))
 
   ;; Bulk byte moves (issue #35). Plain, not __collect_safe: a u8* argument
   ;; is the bytevector's own storage, and a plain call keeps this thread
-  ;; active, so no collection can move that storage before the call returns.
+  ;; active, so no collection can move that storage before the call returns
+  ;; (test-threading-stress.sps pins this). The price is that other threads'
+  ;; collections wait for the whole move (ADR-0009's #35 note).
   (define raw-copy-in
-    (foreign-procedure "chez_uv_copy_in" (uptr u8* size_t size_t) void))
+    (shim-procedure "chez_uv_copy_in" (uptr u8* size_t size_t) void))
   (define raw-copy-out
-    (foreign-procedure "chez_uv_copy_out" (u8* uptr size_t) void))
-  (define raw-zero (foreign-procedure "chez_uv_zero" (uptr size_t) void))
+    (shim-procedure "chez_uv_copy_out" (u8* uptr size_t) void))
+  (define raw-zero (shim-procedure "chez_uv_zero" (uptr size_t) void))
 
   ;; Counter symbols exist in every build; production implementations are no-ops.
-  (define count-loop-new!  (foreign-procedure "chez_uv_count_loop_new" () void))
-  (define count-loop-free! (foreign-procedure "chez_uv_count_loop_free" () void))
-  (define live-loop        (foreign-procedure "chez_uv_live_loop" () long))
+  (define count-loop-new!  (shim-procedure "chez_uv_count_loop_new" () void))
+  (define count-loop-free! (shim-procedure "chez_uv_count_loop_free" () void))
+  (define live-loop        (shim-procedure "chez_uv_live_loop" () long))
 
-  (define count-tcp-new!  (foreign-procedure "chez_uv_count_tcp_new" () void))
-  (define count-tcp-free! (foreign-procedure "chez_uv_count_tcp_free" () void))
-  (define live-tcp        (foreign-procedure "chez_uv_live_tcp" () long))
+  (define count-tcp-new!  (shim-procedure "chez_uv_count_tcp_new" () void))
+  (define count-tcp-free! (shim-procedure "chez_uv_count_tcp_free" () void))
+  (define live-tcp        (shim-procedure "chez_uv_live_tcp" () long))
 
-  (define count-timer-new!  (foreign-procedure "chez_uv_count_timer_new" () void))
-  (define count-timer-free! (foreign-procedure "chez_uv_count_timer_free" () void))
-  (define live-timer        (foreign-procedure "chez_uv_live_timer" () long))
+  (define count-timer-new!  (shim-procedure "chez_uv_count_timer_new" () void))
+  (define count-timer-free! (shim-procedure "chez_uv_count_timer_free" () void))
+  (define live-timer        (shim-procedure "chez_uv_live_timer" () long))
 
   (define count-write-req-new!
-    (foreign-procedure "chez_uv_count_write_req_new" () void))
+    (shim-procedure "chez_uv_count_write_req_new" () void))
   (define count-write-req-free!
-    (foreign-procedure "chez_uv_count_write_req_free" () void))
-  (define live-write-req (foreign-procedure "chez_uv_live_write_req" () long))
+    (shim-procedure "chez_uv_count_write_req_free" () void))
+  (define live-write-req (shim-procedure "chez_uv_live_write_req" () long))
 
   (define count-connect-req-new!
-    (foreign-procedure "chez_uv_count_connect_req_new" () void))
+    (shim-procedure "chez_uv_count_connect_req_new" () void))
   (define count-connect-req-free!
-    (foreign-procedure "chez_uv_count_connect_req_free" () void))
+    (shim-procedure "chez_uv_count_connect_req_free" () void))
   (define live-connect-req
-    (foreign-procedure "chez_uv_live_connect_req" () long))
+    (shim-procedure "chez_uv_live_connect_req" () long))
 
   (define count-getaddrinfo-req-new!
-    (foreign-procedure "chez_uv_count_getaddrinfo_req_new" () void))
+    (shim-procedure "chez_uv_count_getaddrinfo_req_new" () void))
   (define count-getaddrinfo-req-free!
-    (foreign-procedure "chez_uv_count_getaddrinfo_req_free" () void))
+    (shim-procedure "chez_uv_count_getaddrinfo_req_free" () void))
   (define live-getaddrinfo-req
-    (foreign-procedure "chez_uv_live_getaddrinfo_req" () long))
+    (shim-procedure "chez_uv_live_getaddrinfo_req" () long))
 
   (define count-getnameinfo-req-new!
-    (foreign-procedure "chez_uv_count_getnameinfo_req_new" () void))
+    (shim-procedure "chez_uv_count_getnameinfo_req_new" () void))
   (define count-getnameinfo-req-free!
-    (foreign-procedure "chez_uv_count_getnameinfo_req_free" () void))
+    (shim-procedure "chez_uv_count_getnameinfo_req_free" () void))
   (define live-getnameinfo-req
-    (foreign-procedure "chez_uv_live_getnameinfo_req" () long))
+    (shim-procedure "chez_uv_live_getnameinfo_req" () long))
 
   (define count-read-buffer-new!
-    (foreign-procedure "chez_uv_count_read_buffer_new" () void))
+    (shim-procedure "chez_uv_count_read_buffer_new" () void))
   (define count-read-buffer-free!
-    (foreign-procedure "chez_uv_count_read_buffer_free" () void))
+    (shim-procedure "chez_uv_count_read_buffer_free" () void))
   (define live-read-buffer
-    (foreign-procedure "chez_uv_live_read_buffer" () long))
+    (shim-procedure "chez_uv_live_read_buffer" () long))
 
-  (define count-pipe-new!  (foreign-procedure "chez_uv_count_pipe_new" () void))
-  (define count-pipe-free! (foreign-procedure "chez_uv_count_pipe_free" () void))
-  (define live-pipe        (foreign-procedure "chez_uv_live_pipe" () long))
+  (define count-pipe-new!  (shim-procedure "chez_uv_count_pipe_new" () void))
+  (define count-pipe-free! (shim-procedure "chez_uv_count_pipe_free" () void))
+  (define live-pipe        (shim-procedure "chez_uv_live_pipe" () long))
 
   (define count-process-new!
-    (foreign-procedure "chez_uv_count_process_new" () void))
+    (shim-procedure "chez_uv_count_process_new" () void))
   (define count-process-free!
-    (foreign-procedure "chez_uv_count_process_free" () void))
-  (define live-process (foreign-procedure "chez_uv_live_process" () long))
+    (shim-procedure "chez_uv_count_process_free" () void))
+  (define live-process (shim-procedure "chez_uv_live_process" () long))
 
   (define count-spawn-options-new!
-    (foreign-procedure "chez_uv_count_spawn_options_new" () void))
+    (shim-procedure "chez_uv_count_spawn_options_new" () void))
   (define count-spawn-options-free!
-    (foreign-procedure "chez_uv_count_spawn_options_free" () void))
+    (shim-procedure "chez_uv_count_spawn_options_free" () void))
   (define live-spawn-options
-    (foreign-procedure "chez_uv_live_spawn_options" () long))
+    (shim-procedure "chez_uv_live_spawn_options" () long))
 
   (define count-signal-new!
-    (foreign-procedure "chez_uv_count_signal_new" () void))
+    (shim-procedure "chez_uv_count_signal_new" () void))
   (define count-signal-free!
-    (foreign-procedure "chez_uv_count_signal_free" () void))
-  (define live-signal (foreign-procedure "chez_uv_live_signal" () long))
+    (shim-procedure "chez_uv_count_signal_free" () void))
+  (define live-signal (shim-procedure "chez_uv_live_signal" () long))
 
   (define count-async-new!
-    (foreign-procedure "chez_uv_count_async_new" () void))
+    (shim-procedure "chez_uv_count_async_new" () void))
   (define count-async-free!
-    (foreign-procedure "chez_uv_count_async_free" () void))
-  (define live-async (foreign-procedure "chez_uv_live_async" () long))
+    (shim-procedure "chez_uv_count_async_free" () void))
+  (define live-async (shim-procedure "chez_uv_live_async" () long))
 
   (define uv-version (foreign-procedure "uv_version" () int))
 
@@ -430,11 +447,11 @@
 
   (define (uv-version-string) (c-string->string (raw-version-string)))
 
-  ;; zero-out!, copy-in! and copy-out each move their span in one shim call.
-  ;; A byte-at-a-time Scheme loop costs ~29 ns a byte, which held the event
-  ;; loop ~250 ms per 4 MiB uv-write! (#35); test-native.sps times each of
-  ;; the three against such a loop. The checks stay here, before the call:
-  ;; the shim trusts its arguments.
+  ;; zero-out!, copy-in! and copy-out each move their span in one shim call,
+  ;; never a Scheme loop (#35; test-native.sps holds each within a small
+  ;; factor of libc). The checks stay here, before the call: the shim trusts
+  ;; its arguments. A foreign extent cannot be checked, so every caller passes
+  ;; a live block of at least len bytes.
 
   ;; zero-out! : uptr exact-nonnegative-integer -> unspecified
   (define (zero-out! addr len)
@@ -461,16 +478,24 @@
 
   ;; copy-in! : uptr bytevector exact-nonnegative-integer
   ;;            exact-nonnegative-integer -> unspecified
+  ;; The span is checked against the bytevector's length in the same
+  ;; interrupt-free step as the copy. Otherwise an interrupt handler run
+  ;; between the two (an engine's timer, say) could truncate the bytevector
+  ;; and memcpy would read the heap past its new end (test-native.sps's
+  ;; truncation scan). Another thread truncating it mid-copy is that
+  ;; program's own race; nothing here can order it.
   (define (copy-in! dst bv start len)
     (unless (and (integer? dst) (exact? dst) (positive? dst))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
     (unless (bytevector? bv)
       (raise (make-uv-invalid-argument 'uv-copy-in! 'source-not-a-bytevector)))
     (unless (and (integer? start) (exact? start) (>= start 0)
-                 (integer? len) (exact? len) (>= len 0)
-                 (<= (+ start len) (bytevector-length bv)))
+                 (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
-    (raw-copy-in dst bv start len))
+    (unless (with-interrupts-disabled
+              (and (<= (+ start len) (bytevector-length bv))
+                   (begin (raw-copy-in dst bv start len) #t)))
+      (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range))))
 
   (define (c-int-size) (foreign-sizeof 'int))
 

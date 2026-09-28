@@ -202,8 +202,10 @@ int chez_uv_errno_value(int i) {
   return chez_uv_errno_table[i].value;
 }
 
-/* Chez passes an empty bytevector's storage as a non-null pointer, so a zero
- * len reaches memcpy/memset with valid pointers and moves nothing. */
+/* A zero len moves nothing between valid pointers. Chez passes even an empty
+ * bytevector's storage as a non-null address (test-native.sps pins it), and
+ * the foreign side is a live block at every call site, empty writes
+ * included. */
 void chez_uv_copy_in(void *dst, const unsigned char *src, size_t start,
                      size_t len) {
   memcpy(dst, src + start, len);

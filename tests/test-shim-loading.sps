@@ -132,6 +132,13 @@
                 (string-append (current-directory) "/Makefile"))
 (check-rejected "an empty override" "")
 
+;; A real shared library that loads cleanly but lacks the shim's exports --
+;; libuv's own, here -- stands in for a shim built from older sources. Such a
+;; shim used to fail the whole import with a bare "no entry for ..."
+;; assertion (review of #36); every shim binding now checks its entry first.
+(check-rejected "a loadable library without the shim's exports"
+                (car uv-library-paths))
+
 ;; --- the libuv leg, distinguished from the shim leg ----------------------
 ;; A synthetic (libuv private config), resolved AHEAD of the generated one
 ;; via CHEZSCHEMELIBDIRS, is the only seam to uv-library-paths -- there is

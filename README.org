@@ -66,7 +66,9 @@ make build
 ~make build~ compiles the small C shim and generates
 ~src/libuv/private/config.sls~, which records absolute paths for /this/
 machine. That file is deliberately not in the repository, so every clone
-runs ~make build~ once before ~(import (libuv))~ resolves. ~make help~
+runs ~make build~ once before ~(import (libuv))~ resolves. Run it again after
+every upgrade: the shim's exports change between releases, and a shim built
+from older sources fails the import with ~&uv-shim-unavailable~. ~make help~
 lists all targets; [[file:docs/building.md][docs/building.md]] has the full
 story, release builds included.
 

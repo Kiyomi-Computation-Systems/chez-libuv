@@ -23,8 +23,10 @@
         (libuv async)
         (only (libuv private conditions) uv-wrong-thread?)
         (only (libuv private handles) loop-owner-thread)
+        (only (libuv private native) copy-in! copy-out)
         (only (chezscheme)
-              collect threaded? fork-thread
+              collect collect-trip-bytes foreign-alloc foreign-free
+              threaded? fork-thread
               make-mutex make-condition condition-wait condition-signal with-mutex
               get-thread-id sleep make-time real-time
               open-output-string get-output-string display-condition
@@ -101,6 +103,85 @@
        N ok-collects)
      (test-equal "the worker hit no collector error"
        #f first-error))))
+
+;; --- bulk copies stay plain, not __collect_safe (issue #35) -------------
+;; The mirror of the rows above. copy-in! and copy-out hand a bytevector to
+;; the shim as a u8*, which is only safe while the collector cannot move it:
+;; the binding is PLAIN, so the calling thread stays active and no collection
+;; can run until the copy returns. Chez accepts __collect_safe on those
+;; bindings without complaint, and then a concurrent collection moves the
+;; bytevector mid-copy and corrupts it (review of #36: 31-49 of 50 slowed
+;; copies). No single-threaded suite can see the difference, so it is pinned
+;; here: a helper thread keeps calling (collect) while the main thread copies
+;; 64 MiB, and none of its attempts made wholly inside a copy may succeed.
+;;
+;; A collection that did run inside the call would be the defect, so the
+;; buffers are 64 MiB, a size Chez's collector does not move, and a broken
+;; binding fails the row instead of crashing the suite. collect-trip-bytes is
+;; raised for the duration so no allocation-triggered request can stall the
+;; helper inside an interval; each copy-out interval allocates 64 MiB, so
+;; there are only 3 of them.
+(when (threaded?)
+  (let ()
+    (define n (* 64 1024 1024))
+    (define bv (make-bytevector n 1))
+    (define buf (foreign-alloc n))
+    (define epoch 0)                   ; odd while the main thread is inside a copy
+    (define stop #f)
+    (define attempts-inside 0)
+    (define collections-inside 0)
+    (define m (make-mutex))
+    (define helper-done-cond (make-condition))
+    (define helper-done #f)
+    (define saved-trip (collect-trip-bytes))
+
+    ;; Each refused (collect) allocates a little, and nothing collects it
+    ;; while the trip is raised, so the helper pauses 50 us between attempts;
+    ;; a 64 MiB copy still sees dozens.
+    (define (helper)
+      (let loop ()
+        (unless stop
+          (let* ((e0 epoch)
+                 (collected (guard (e (#t #f)) (collect) #t))
+                 (e1 epoch))
+            (when (and (odd? e0) (= e0 e1))
+              (set! attempts-inside (+ attempts-inside 1))
+              (when collected (set! collections-inside (+ collections-inside 1)))))
+          (sleep (make-time 'time-duration 50000 0))
+          (loop)))
+      (with-mutex m (set! helper-done #t) (condition-signal helper-done-cond)))
+
+    ;; inside-verdict : exact-positive-integer thunk -> (list symbol count)
+    ;; '(tried 0) is the only success value: attempts landed inside the
+    ;; copies, and not one of them collected.
+    (define (inside-verdict intervals thunk)
+      (set! attempts-inside 0)
+      (set! collections-inside 0)
+      (let loop ((i 0))
+        (when (< i intervals)
+          (set! epoch (+ epoch 1))
+          (thunk)
+          (set! epoch (+ epoch 1))
+          (loop (+ i 1))))
+      (list (if (> attempts-inside 0) 'tried 'never-tried) collections-inside))
+
+    (copy-in! buf bv 0 n)
+    (collect-trip-bytes (expt 2 40))
+    (fork-thread helper)
+    (let* ((copy-in-verdict
+            (guard (e (#t (list 'raised (describe e))))
+              (inside-verdict 10 (lambda () (copy-in! buf bv 0 n)))))
+           (copy-out-verdict
+            (guard (e (#t (list 'raised (describe e))))
+              (inside-verdict 3 (lambda () (copy-out buf n))))))
+      (set! stop #t)
+      (with-mutex m (let w () (unless helper-done (condition-wait helper-done-cond m) (w))))
+      (collect-trip-bytes saved-trip)
+      (foreign-free buf)
+      (test-equal "no collection completes while copy-in! is inside its foreign call"
+        '(tried 0) copy-in-verdict)
+      (test-equal "no collection completes while copy-out is inside its foreign call"
+        '(tried 0) copy-out-verdict))))
 
 ;; --- real cross-thread affinity refusal (design §6.3) -------------------
 ;; The deterministic suite (test-async.sps) simulates a foreign owner by
