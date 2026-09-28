@@ -247,14 +247,21 @@ review's verifier had seen 11/20, and 4/10 with garbage.
     so they predate this change.
 - **The Linux image without Valgrind:** test-native 281 and test-stream 18, at
   optimize levels 0 and 3.
-- **The memory gate itself cannot fail.** `make test-memory` runs `valgrind …
-  timeout 900 scheme`, so Memcheck checks `timeout`, never Chez: every suite
-  reports "total heap usage: 2 allocs, 2 frees, 44 bytes", and a planted
-  overrun exits 0. The shape dates from 17b62b0 (#14). PR #37
-  (fix/memory-gate-traces-chez) makes the gate check Chez and proves it can
-  fail. Until #37 lands, the real-Memcheck runs above are the memory evidence
-  for this change. Once it lands, rerun `make test-memory-docker` and macOS
-  `make test-memory` on this branch.
+- **The memory gate, before and after #37.** Until #37, `make test-memory`
+  ran `valgrind … timeout 900 scheme`, so Memcheck checked `timeout`, never
+  Chez: every suite reported "total heap usage: 2 allocs, 2 frees, 44 bytes",
+  and a planted overrun exited 0. The shape dates from 17b62b0 (#14).
+
+  After #37 (fe303c5) was merged into this branch, both arms are live and
+  pass with this change:
+  - `make test-memory-docker` exits 0. Its `check-memory-gate` caught the
+    planted store overrun, libc overrun and leak ("MEMORY GATE CAN FAIL").
+    All 17 suites then passed under Memcheck on `scheme` itself: test-native
+    281 with bulk ratios 1.00, test-stream's verbs at 1.01–1.02. The two
+    forked-child leaks are non-gating per #37.
+  - macOS `make test-memory` (ASan) exits 0: test-native 281,
+    test-shim-loading 27, test-stream 18, no AddressSanitizer reports.
+    `make check-memory-gate` there caught the planted libc overrun.
 - **Release build guard, as CI runs it.** `make prod` built the -O2 shim
   under `-Werror` and `check-prod` passed. After `make build`, `check-prod`
   refused the dev shim. `make check-pins` passes.
