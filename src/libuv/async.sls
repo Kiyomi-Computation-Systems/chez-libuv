@@ -65,9 +65,7 @@
       (if (uv-async-record? async)
           (when (eq? (handle-state async) 'open)
             (let ((on-wake (async-on-wake async)))
-              (when on-wake
-                (dispatch-guarded (handle-loop async)
-                                  (lambda () (on-wake async))))))
+              (when on-wake (on-wake async))))
           (record-orphan-callback! 'async handle-ptr))))
 
   (define async-dispatch-installed

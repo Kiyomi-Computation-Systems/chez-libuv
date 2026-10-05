@@ -348,9 +348,7 @@
          (let ((sig (term-signal->value term-signal))
                (on-exit (process-on-exit proc)))
            (set-process-exited! proc #t)
-           (when on-exit
-             (dispatch-guarded (handle-loop proc)
-                               (lambda () (on-exit exit-status sig)))))))))
+           (when on-exit (on-exit exit-status sig)))))))
 
   (define exit-dispatch-installed
     (install-dispatch-procedure! 'exit exit-dispatch))

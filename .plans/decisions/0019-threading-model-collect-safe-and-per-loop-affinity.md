@@ -56,6 +56,34 @@ passes — no per-verb sprinkling — and it runs before the open-state check an
 before any registry mutation. `make-uv-async` calls it directly, because a
 constructor mutates the registry before a handle exists to check.
 
+> **Amended 2026-10-05 (issue #45): the running mark lasts as long as
+> uv_run's frame.** The transfer still happens at `uv-run` entry, but the
+> `dynamic-wind` that set and cleared `loop-running` is gone.
+>
+> - It cleared the mark whenever control left `uv-run`. An engine that runs
+>   out of fuel inside a callback leaves `uv-run` while uv_run's frame stays
+>   live in the middle of an iteration, to be resumed. During that
+>   suspension every verb accepted the loop. On v0.7.3 a `uv-loop-teardown!`
+>   then freed it, and resuming the engine died with "invalid memory
+>   reference".
+> - Now the mark is set before the call and cleared when uv_run returns, so
+>   the verbs that run, close or tear down the loop refuse it while an
+>   engine is suspended in one of its callbacks. No raise unwinds through
+>   the frame, because the seams contain them all.
+> - A continuation that escapes a callback abandons the frame for good, and
+>   the loop stays marked running. Re-running it was never sound: escaping a
+>   close callback strands the rest of libuv's batch of closes, and teardown
+>   then fails with `'EBUSY`.
+> - `call-with-uv-loop` still tears its own loop down on the way out. It
+>   clears the mark first, but only one this thread left. That is safe
+>   there because its entry check refuses every return into the body once
+>   the loop is gone. A loop another thread is running keeps its mark, and
+>   the teardown refuses it.
+>
+> Dropping the `dynamic-wind` also saves 112 of the 128 B an idle `uv-run`
+> allocated. `tests/test-loop.sps` holds the mark, the refusals and both
+> `call-with-uv-loop` exits.
+
 **3. `uv-async-send!` is the one exempt verb.** `uv_async_send` is libuv's sole
 thread-safe call, so it is the one way a worker thread hands work back to the
 loop thread. It touches no registry state; it validates handle kind and open

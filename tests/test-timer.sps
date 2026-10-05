@@ -737,6 +737,12 @@
 (test-equal "the teardown that raised still freed its timer"
   0 (live-count 'timer))
 
+;; The close dispatcher calls on-close last, so a raise there skips none of
+;; its own steps (#45): the seam contains the raise only after the dispatcher
+;; has returned control to it, with nothing left to run.
+(test-equal "...and marked it closed before its on-close raised"
+  'closed (uv-handle-state teardown-timer))
+
 ;; --- the dispatcher's state check, reached directly ----------------------
 ;; libuv stops a timer as part of uv_close, so a timeout for a 'closing
 ;; handle cannot be produced through libuv -- which would leave the state
@@ -813,18 +819,17 @@
 ;; again, and it is once more the one pre-guard raise reachable through
 ;; shipped code: v0.1's replacement route (a req record whose handle field
 ;; is not a handle, making complete-request!'s record-accessor read raise
-;; before any dispatch-guarded) no longer raises at all, because ADR-0011's
+;; before it reached user code) no longer raises at all, because ADR-0011's
 ;; complete-request! resolves the owning loop from the REGISTRY ENTRY and
 ;; never touches the handle field -- that record now completes normally,
 ;; the entry being the authority on ownership. This suite keeps no row on
 ;; that shape; the handle-less completion itself is pinned in
 ;; tests/test-loop.sps's ADR-0011 section.
 ;;
-;; THE SEAM CLOSURE IS ITSELF GUARDED, and these rows are what says so.
-;; `dispatch-guarded` protects the USER's callback but runs INSIDE a
-;; dispatcher, so anything raised before a dispatcher gets that far -- a
-;; stub, or a bug in a dispatcher's own registry lookup -- is covered by
-;; the guard around the installed closure and by nothing else. Unguarded,
+;; THE SEAM CLOSURE IS GUARDED, and these rows are what says so. Since #45
+;; its guard is the only containment a callback crosses: it covers the
+;; user's callback, and anything raised before a dispatcher gets that far
+;; -- a stub, or a bug in a dispatcher's own registry lookup. Unguarded,
 ;; spike FINDINGS Q2 applies: exit 255, no teardown, no foreign-free.
 (define seam-loop (make-uv-loop))
 (define seam-block (alloc-zeroed 64))
@@ -832,7 +837,7 @@
 
 (registry-register! seam-block 'getaddrinfo-req seam-loop 'stub-target)
 
-(test-equal "a stub raising before any dispatch-guarded does not escape into its caller"
+(test-equal "a stub raising in its slot does not escape into its caller"
   'contained
   (guard (e (#t (list 'escaped-into-the-caller e)))
     ((dispatcher-ref 'getaddrinfo) seam-block 0 0)

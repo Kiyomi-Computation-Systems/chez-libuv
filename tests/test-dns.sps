@@ -572,9 +572,10 @@
   'callback-never-fired i-fired)
 
 ;; --- row j: a raising on-complete surfaces as &uv-callback-error ---------
-;; The raise is caught by dispatch-guarded, recorded against the loop the
-;; dispatcher found through registry-loop-of (no handle-loop route exists
-;; for a handle-less request -- ADR-0011), and re-raised by uv-run.
+;; The raise is caught by the seam's guard and recorded against the loop the
+;; seam found through registry-loop-of before the dispatcher deregistered
+;; the request (no handle-loop route exists for a handle-less request --
+;; ADR-0011), then re-raised by uv-run.
 (uv-getaddrinfo! l "127.0.0.1" "80"
                  (suite-hints #t '(family . inet) '(socktype . stream))
                  (lambda (err results)

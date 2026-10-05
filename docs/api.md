@@ -40,6 +40,18 @@ exemption is `uv-async-send!`, which is how another thread reaches the loop
 ([Async](#async--libuv-async)). While the loop thread waits in `uv-run`, other
 Scheme threads allocate and collect freely.
 
+**A callback ends only by returning.** To end a run early, call `uv-stop!` or
+raise. A continuation that escapes a callback leaves libuv in the middle of
+an iteration that nothing can finish, so the loop stays marked running:
+`uv-run`, `uv-loop-close!` and `uv-loop-teardown!` refuse it from then on.
+The one exception is `call-with-uv-loop`, which still tears down its own loop
+on the way out. An engine whose fuel runs out inside a callback is different,
+because it can be resumed. The loop stays marked running while the engine is
+suspended, so nothing can run, close or free the loop under it, and resuming
+the engine finishes the run. Inside `call-with-uv-loop` the suspension is an
+exit like any other: the loop is torn down, and resuming the engine raises
+`&uv-handle-closed`.
+
 ## Handles — `(libuv handle)`
 
 | Export | |

@@ -75,9 +75,7 @@
           (when (eq? (handle-state sig) 'open)
             (let ((on-signal (signal-on-signal sig)))
               (when on-signal
-                (dispatch-guarded
-                 (handle-loop sig)
-                 (lambda () (on-signal (term-signal->value signum)))))))
+                (on-signal (term-signal->value signum)))))
           (record-orphan-callback! 'signal handle-ptr))))
 
   (define signal-dispatch-installed

@@ -789,6 +789,10 @@
        (let drain ((i 0))
          (uv-run loop 'once)
          (if (< i 2048) (drain (+ i 1)) 'never-raised))))
+   ;; The exit dispatcher calls on-exit last, so a raise there skips none
+   ;; of its own steps (#45).
+   (test-equal "the record was marked exited before on-exit raised"
+     'exited (if (process-exited? proc) 'exited 'not-exited))
    (uv-close! proc)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
 

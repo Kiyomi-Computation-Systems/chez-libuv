@@ -1,6 +1,10 @@
 #!r6rs
 ;;; Stream operations shared by TCP and pipe handles. Validate arguments before
 ;;; allocation; native start failures must leave no registered request behind.
+;;; When libuv refuses a start, the verb takes its request back itself, by
+;;; checking the status rather than guarding the native call: the guard
+;;; allocated ~300 B on every write (#45). So the stream's pointer, whose
+;;; check can raise, is resolved before the request exists.
 (library (libuv stream)
   (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -39,6 +43,7 @@
                     (<= end (bytevector-length bv)))
          (raise (make-uv-invalid-argument 'uv-write! 'span-out-of-range)))
        (let* ((len (- end start))
+              (stream-ptr (handle-pointer stream 'uv-write!))
               (buf-offset (align-16 (uv-req-size (uv-write-req-type))))
               (payload-offset (+ buf-offset (sizeof-uv-buf-t)))
               ;; Empty writes still need an address inside the owned block.
@@ -49,13 +54,11 @@
          (let ((req (%make-uv-req-record block 'write stream on-complete)))
            (registry-register! block 'write-req (handle-loop stream) req)
            (count-write-req-new!)
-           (guard (e (#t (abandon-request! req) (count-write-req-free!)
-                         (raise e)))
-             (uv-check (uv-write-native block
-                                        (handle-pointer stream 'uv-write!)
-                                        (+ block buf-offset)
-                                        1)
-                       'uv-write!))
+           (let ((status (uv-write-native block stream-ptr (+ block buf-offset) 1)))
+             (unless (zero? status)
+               (abandon-request! req)
+               (count-write-req-free!)
+               (raise (uv-errno-condition status 'uv-write!))))
            req)))))
 
   ;; parse-write-segment : segment -> (list bytevector start len)
@@ -95,6 +98,7 @@
     ;; Normalize and range-check every segment before anything is allocated, so
     ;; a malformed list leaves no block and no registration behind.
     (let* ((specs (map parse-write-segment segments))
+           (stream-ptr (handle-pointer stream 'uv-write*!))
            (n (length specs))
            (total (fold-left (lambda (acc s) (+ acc (caddr s))) 0 specs))
            (bufs-offset (align-16 (uv-req-size (uv-write-req-type))))
@@ -118,25 +122,25 @@
       (let ((req (%make-uv-req-record block 'write stream on-complete)))
         (registry-register! block 'write-req (handle-loop stream) req)
         (count-write-req-new!)
-        (guard (e (#t (abandon-request! req) (count-write-req-free!)
-                      (raise e)))
-          (uv-check (uv-write-native block
-                                     (handle-pointer stream 'uv-write*!)
-                                     (+ block bufs-offset)
-                                     n)
-                    'uv-write*!))
+        (let ((status (uv-write-native block stream-ptr (+ block bufs-offset) n)))
+          (unless (zero? status)
+            (abandon-request! req)
+            (count-write-req-free!)
+            (raise (uv-errno-condition status 'uv-write*!))))
         req)))
 
   ;; uv-shutdown! : uv-stream procedure -> uv-request
   (define (uv-shutdown! stream on-shutdown)
     (require-open-stream stream 'uv-shutdown!)
     (require-callback on-shutdown 'uv-shutdown! 'on-shutdown-not-a-procedure)
-    (let* ((block (alloc-zeroed (uv-req-size (uv-shutdown-req-type))))
+    (let* ((stream-ptr (handle-pointer stream 'uv-shutdown!))
+           (block (alloc-zeroed (uv-req-size (uv-shutdown-req-type))))
            (req (%make-uv-req-record block 'shutdown stream on-shutdown)))
       (registry-register! block 'shutdown-req (handle-loop stream) req)
-      (guard (e (#t (abandon-request! req) (raise e)))
-        (uv-check (uv-shutdown-native block (handle-pointer stream 'uv-shutdown!))
-                  'uv-shutdown!))
+      (let ((status (uv-shutdown-native block stream-ptr)))
+        (unless (zero? status)
+          (abandon-request! req)
+          (raise (uv-errno-condition status 'uv-shutdown!))))
       req))
 
   (define default-read-buffer-size 65536)
