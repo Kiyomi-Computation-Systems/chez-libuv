@@ -950,8 +950,9 @@
   (free! addr))
 
 (test-equal "copy-in! rejects a span that runs past the end of the bytevector"
-  'uv-copy-in!
-  (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
+  '(uv-copy-in! span-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
     (let ((addr (alloc-zeroed 8)))
       (guard (inner (#t (free! addr) (raise inner)))
@@ -969,13 +970,44 @@
     (free! addr)
     (list answer written)))
 
+;; refused-span-under-seed : byte -> (list answer bytevector)
+;; A span past the end, copied onto a destination seeded with SEED. As for
+;; the empty span further down, two seeds: a refusal that wrote zeros, or
+;; ones, matches one of them.
+(define (refused-span-under-seed seed)
+  (let ((dst (foreign-alloc 4)))
+    (libc-memset! dst seed 4)
+    (let* ((answer (guard (e (#t 'raised))
+                     (try-copy-in! dst (u8-list->bytevector (list 1 2 3)) 1 3)))
+           (written (foreign->bytevector dst 4)))
+      (foreign-free dst)
+      (list answer written))))
+
 (test-equal "try-copy-in! answers span-out-of-range for a span past the end, and writes nothing"
-  (list 'span-out-of-range (make-bytevector 4 0))
-  (let* ((addr (alloc-zeroed 4))
-         (answer (try-copy-in! addr (u8-list->bytevector (list 1 2 3)) 1 3))
-         (written (copy-out addr 4)))
-    (free! addr)
-    (list answer written)))
+  (list (list 'span-out-of-range (make-bytevector 4 #x00))
+        (list 'span-out-of-range (make-bytevector 4 #xff)))
+  (let* ((under-zeros (refused-span-under-seed #x00))
+         (under-ones (refused-span-under-seed #xff)))
+    (list under-zeros under-ones)))
+
+;; Only that is answered. The caller's own mistakes raise, under copy-in!'s
+;; name, so a verb can never take one for a payload that shrank.
+(test-equal "try-copy-in! raises for the caller's own mistakes rather than answering"
+  '((uv-copy-in! null-or-invalid-destination)
+    (uv-copy-in! source-not-a-bytevector)
+    (uv-copy-in! span-out-of-range))
+  (let ((dst (alloc-zeroed 4)))
+    (define (raised thunk)
+      (guard (e ((uv-invalid-argument? e)
+                 (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                (#t 'wrong-condition))
+        (list 'answered (thunk))))
+    (let* ((null-dst (raised (lambda () (try-copy-in! 0 (make-bytevector 1 1) 0 1))))
+           (not-bv (raised (lambda () (try-copy-in! dst "abc" 0 1))))
+           (bad-start (raised (lambda ()
+                                (try-copy-in! dst (make-bytevector 1 1) 'one 1)))))
+      (free! dst)
+      (list null-dst not-bv bad-start))))
 
 (test-equal "copy-out rejects a null source"
   'uv-copy-out

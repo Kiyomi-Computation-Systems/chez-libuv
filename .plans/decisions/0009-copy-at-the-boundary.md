@@ -192,9 +192,20 @@ for that API when it is added.
   > handler, or another thread, truncated in that window leaked it; the shape
   > dates from v0.1.0. The step now answers the refusal as a status
   > (`try-copy-in!`), and each verb frees its block before raising its own
-  > `span-out-of-range`. A `guard` around the copy would also free it, at
-  > ~300 B a write (#45). `tests/test-stream.sps`'s shrinking-payload sweep
-  > holds the refusal and the bytes sent, and Valgrind holds the free.
+  > refusal: `uv-write!`'s `span-out-of-range`, or `uv-write*!`'s
+  > `segment-span-out-of-range`. A `guard` around the copy would also free
+  > it, at ~300 B a write (#45).
+  >
+  > What holds it:
+  >
+  > - `tests/test-stream.sps`'s shrinking-payload sweep holds the refusal and
+  >   the bytes sent. It overwrites the payload before truncating it, so a
+  >   copy that read past the new end would show.
+  > - Valgrind holds the free.
+  > - The late refusal looks the same as each verb's own up-front span check,
+  >   so `tests/test-tcp.sps` holds that check with an end only it can refuse
+  >   cleanly.
+  >
   > `.plans/write-copy-leak-mutation-log.md` has the evidence.
   >
   > **What pins all this:**

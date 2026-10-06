@@ -135,18 +135,23 @@
 ;; verb can free it.
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. At the first expiry it
-;; truncates the payload to 16 bytes, then resumes the verb. Fuel 1 expires
-;; before the verb's own check, and the sweep stops at the first run that
-;; finishes before any expiry, so between them every point in the verb is
-;; visited. Each run has one right answer:
+;; overwrites the payload with #xff, a byte no run's FILL takes, truncates it
+;; to 16 bytes, and resumes the verb. Truncation only shortens the length, so
+;; without the overwrite a copy that read past the new end would still send
+;; FILL. Fuel 1 stops the engine at its first chance, before the verb's own
+;; check, and the sweep stops at the first run no expiry reached, whatever
+;; its verdict, so between them every point in the verb is visited. Each run
+;; has one right answer:
 ;;   'refused   the verb refused the span under its own name, with no
 ;;              request left registered or counted;
 ;;   'written   the copy came first, and the peer received exactly the bytes
 ;;              the call was given;
 ;;   'untouched the last run, which no expiry reached.
-;; A block a refusal fails to free is invisible here, because the live
-;; counters count a request from its registration on. Valgrind reports it
-;; definitely lost when `make test-memory` runs this suite on Linux.
+;; Which refusals came after the block was allocated is invisible here: the
+;; two refusals look the same by design, and the live counters count a
+;; request from its registration on. So is a block a refusal fails to free;
+;; Valgrind reports that one definitely lost when `make test-memory` runs
+;; this suite on Linux.
 
 (define s-loop (make-uv-loop))
 (define s-server (make-uv-tcp s-loop))
@@ -170,6 +175,9 @@
 
 (define sweep-len 3001)
 (define sweep-max-fuel 400)
+;; A delivered write drains in one or two steps. The cap bounds what a broken
+;; build spends on each of the few runs it can still reach.
+(define drain-steps 256)
 (define s-issued 0)
 (define s-completed 0)
 (define (on-swept err) (set! s-completed (+ s-completed 1)))
@@ -208,10 +216,13 @@
   (let fill ((i start))
     (when (< i end) (bytevector-u8-set! bv i byte) (fill (+ i 1)))))
 
-;; shrink-verdict : sweep-variant exact-positive-integer -> verdict
-;; A verdict is one of the symbols above, or else the evidence, a list.
-;; FILL is unique to the run among its neighbours and never 0, so a run that
-;; sent a zeroed or a stale block cannot match the bytes it was given.
+;; shrink-verdict : sweep-variant exact-positive-integer
+;;                  -> (values verdict boolean)
+;; A verdict is one of the symbols above, or else the evidence, a list; the
+;; second value says whether an expiry reached the run. FILL is unique to
+;; the run among its neighbours and never 0 or #xff, so a run that sent a
+;; zeroed or a stale block, or read past the truncated end, cannot match the
+;; bytes it was given.
 (define (shrink-verdict variant fuel)
   (let* ((fill (+ 1 (mod fuel 254)))
          (bv (make-bytevector sweep-len fill))
@@ -234,47 +245,54 @@
                  (lambda (next)
                    (unless expired
                      (set! expired #t)
+                     (bytevector-fill! bv #xff)
                      (bytevector-truncate! bv 16))
                    (run next 100000)))))
          (registry-after (registry-count))
          (requests-after (live-count 'write-req)))
-    (case (car outcome)
-      ((refused)
-       (if (and (equal? (cdr outcome) (sweep-variant-refusal variant))
-                (= registry-after registry-before)
-                (= requests-after requests-before))
-           'refused
-           (list 'refused-as (cdr outcome)
-                 'registered (- registry-after registry-before)
-                 'counted (- requests-after requests-before))))
-      ((written)
-       (set! s-issued (+ s-issued 1))
-       (set! s-received (make-byte-collector))
-       (let* ((expected ((sweep-variant-expected variant) fill))
-              (drained (run-until/ticking
-                        s-loop
-                        (lambda ()
-                          (and (= s-completed s-issued)
-                               (>= (collector-count s-received)
-                                   (bytevector-length expected))))
-                        1000))
-              (sent (compare-bytes expected (collector-bytes s-received))))
-         (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
-                (list 'written-but-sent sent drained))
-               (expired 'written)
-               (else 'untouched))))
-      (else outcome))))
+    (values
+     (case (car outcome)
+       ((refused)
+        (if (and (equal? (cdr outcome) (sweep-variant-refusal variant))
+                 (= registry-after registry-before)
+                 (= requests-after requests-before))
+            'refused
+            (list 'refused-as (cdr outcome)
+                  'registered (- registry-after registry-before)
+                  'counted (- requests-after requests-before))))
+       ((written)
+        (set! s-issued (+ s-issued 1))
+        (set! s-received (make-byte-collector))
+        (let* ((expected ((sweep-variant-expected variant) fill))
+               (drained (run-until/ticking
+                         s-loop
+                         (lambda ()
+                           (and (= s-completed s-issued)
+                                (>= (collector-count s-received)
+                                    (bytevector-length expected))))
+                         drain-steps))
+               (sent (compare-bytes expected (collector-bytes s-received))))
+          (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
+                 (list 'written-but-sent sent drained))
+                (expired 'written)
+                (else 'untouched))))
+       (else outcome))
+     expired)))
 
 ;; shrink-sweep : sweep-variant -> (list-of (list fuel verdict))
-;; A raise between runs would abort the suite, so the whole sweep is caught
-;; and its evidence handed to the rows.
+;; It stops at the first run no expiry reached, whatever that run's verdict:
+;; a build that cannot deliver would otherwise exhaust a drain at every fuel
+;; up to the cap, and outlast the suite's timeout before any row could say
+;; why. A raise between runs would abort the suite, so the whole sweep is
+;; caught and its evidence handed to the rows.
 (define (shrink-sweep variant)
   (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
     (let run ((fuel 1) (acc '()))
-      (let ((row (list fuel (shrink-verdict variant fuel))))
-        (if (or (eq? (cadr row) 'untouched) (= fuel sweep-max-fuel))
-            (reverse (cons row acc))
-            (run (+ fuel 1) (cons row acc)))))))
+      (let-values (((verdict expired) (shrink-verdict variant fuel)))
+        (let ((acc (cons (list fuel verdict) acc)))
+          (if (or (not expired) (= fuel sweep-max-fuel))
+              (reverse acc)
+              (run (+ fuel 1) acc)))))))
 
 (define shrink-sweeps
   (map (lambda (v) (cons (sweep-variant-name v) (shrink-sweep v)))
@@ -291,14 +309,15 @@
 (define (verdict-is? kind) (lambda (v) (and (pair? v) (eq? (car v) kind))))
 
 ;; The rows below look for bad verdicts and must find none, which says
-;; nothing unless each sweep saw the span refused and ran its verb to the end.
-(test-equal "each sweep began before the verb's own check and ended in a run no expiry reached"
-  (map (lambda (v) (list (sweep-variant-name v) 'refused 'untouched))
+;; nothing unless each sweep began at the engine's first stop, saw the span
+;; refused there, and ran its verb to the end.
+(test-equal "each sweep began at fuel 1 with a refusal and ended in a run no expiry reached"
+  (map (lambda (v) (list (sweep-variant-name v) '(1 refused) 'untouched))
        sweep-variants)
   (map (lambda (sweep)
          (let ((rows (cdr sweep)))
            (list (car sweep)
-                 (cadr (car rows))
+                 (car rows)
                  (cadr (list-ref rows (- (length rows) 1))))))
        shrink-sweeps))
 

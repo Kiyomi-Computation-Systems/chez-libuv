@@ -525,6 +525,20 @@
 (test-equal "an out-of-range span is refused before anything is allocated"
   '((uv-write! span-out-of-range) (0 0) 0) span-probe)
 
+;; The copy refuses a span that no longer fits with uv-write!'s own refusal
+;; and frees its block, so the row above passes even without the verb's end
+;; bound: the copy refuses 99 after allocating. Only that bound refuses an
+;; end past fixnum range cleanly. Without it, foreign-alloc refuses the
+;; block's size with its own condition, and a large fixnum end allocates and
+;; zeroes that many bytes before the copy refuses.
+(test-equal "an end past fixnum range is refused by uv-write!'s own check"
+  '(uv-write! span-out-of-range)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (uv-write! client (string->utf8 "hello") 0 (expt 2 70) (lambda (err) #f))
+    'no-raise))
+
 (test-equal "a negative start is refused, naming who and why"
   '(uv-write! span-out-of-range)
   (guard (e ((uv-invalid-argument? e)
@@ -2061,6 +2075,24 @@
   (wv-refusal
    (lambda ()
      (uv-write*! wv-client (list (list (string->utf8 "hello") 3 99))
+                 (lambda (err) #f)))))
+
+;; As for uv-write! above, the copy's own refusal would also satisfy the
+;; row above, so these two hold the parse-time bound. Without it, an end
+;; past fixnum range reaches foreign-alloc, and an empty span past the end
+;; is sent, since an empty span is never copied.
+(test-equal "a segment end past fixnum range is refused before allocation"
+  '((uv-write*! segment-span-out-of-range) (0 0) 0)
+  (wv-refusal
+   (lambda ()
+     (uv-write*! wv-client (list (list (string->utf8 "hello") 0 (expt 2 70)))
+                 (lambda (err) #f)))))
+
+(test-equal "an empty segment past the end is refused before allocation"
+  '((uv-write*! segment-span-out-of-range) (0 0) 0)
+  (wv-refusal
+   (lambda ()
+     (uv-write*! wv-client (list (list (string->utf8 "hello") 6 6))
                  (lambda (err) #f)))))
 
 (test-equal "a non-procedure on-complete is refused, naming who and why"
