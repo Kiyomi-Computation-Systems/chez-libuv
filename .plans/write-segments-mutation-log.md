@@ -189,7 +189,10 @@ the commit after 139ebe4 unless the list says otherwise.
   A million-segment write ran 11 or 12 collections to main's 2, and took
   15-26% longer. A spec is now `(bv . len)` for a span from 0, else
   `(bv start . len)`. That brings one segment from 208 to 176 B, and 64
-  segments from 5,248 to 3,200 B.
+  segments from 5,248 to 3,200 B. A million one-byte segments written to an
+  unconnected pipe (parsed, copied, then refused by libuv) now take as long
+  as on main: 60–72 ms against 61–90 ms over five calls, with 7 collections
+  against main's 2 (macOS arm64, 3335c38).
 - **Not fixed here: #66 has them.** Three older walks have
   the faults this PR removed from uv-write*!, and none of the three is in
   its diff:
