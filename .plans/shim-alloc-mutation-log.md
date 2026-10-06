@@ -106,7 +106,8 @@ the two frozen literals, the meter's arity table, and test-tcp's direct
 **Time is not resolved.** Draining 16 MiB through a 4 KiB read buffer
 (4,098 reads) took a median 32.1 ms on #46's head and 30.5 ms on this
 branch, over 15 alternating runs each, with spreads of 26–36 ms and
-26–46 ms. No per-read saving in time is claimed.
+26–46 ms. No per-read saving in time is claimed. (A burst of short reads
+later resolved it: about 24% less a read. See "Review", "Time".)
 
 **Reads while another thread collects.** A probe drained 16 MiB through a
 4 KiB buffer while a second thread allocated hard. Each of the 4,098 alloc
@@ -436,11 +437,29 @@ libuv reads per `uv-run`) took 1,298–1,353 ns a read on #46 and 990–1,046 ns
 on b2b4c1f: about 300 ns, 23%, less. The burst runs were at load averages
 of 8 to 11.
 
-The final layout was not measured on its own. Its read path differs from
+The final layout, measured after #48 merged (2026-10-06), is about as
+fast as b2b4c1f: about 24% less a read than #46.
+
+- **Method.** The same burst on macOS arm64, interleaved, four runs per
+  tree. Each run gives five measurements, each the mean over 5,000 rounds
+  of 32 reads, so each tree has 20.
+- **Trees.** #46 (0e6a8e1), and 66d7b5f, the final layout before the
+  rebase onto #49. #49 changed only the write verbs, and neither tree has
+  it.
+- **Load.** The load average was 6.
+
+| tree | ns a read | median |
+|---|---|---|
+| #46 | 1,319–1,531 | 1,362 |
+| the final layout | 1,003–1,143 | 1,029 |
+
+The ranges do not overlap. The final layout's read path differs from
 b2b4c1f's only by the payload offset the review timed at 5–9 ns a read
-(K15), now gone. Two interleaved burst runs of #46 against the final
-tree, at load averages of 40 to 150 from work outside this branch, spread
-both over 2.5–68 µs a read and resolved nothing.
+(K15), now gone.
+
+Two earlier runs of the same pair resolved nothing. They ran at load
+averages of 40 to 150, from work outside this branch, and spread both
+trees over 2.5–68 µs a read.
 
 ## Measurements
 
