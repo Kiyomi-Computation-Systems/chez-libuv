@@ -30,7 +30,9 @@
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
-              make-engine bytevector-truncate! collect))
+              make-engine bytevector-truncate! collect)
+        ;; Reaches (libuv private native) only, never handles.sls.
+        (only (uv-evidence) live-count))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -1534,8 +1536,6 @@
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.
 ;; Seeded: the counter is driven to a non-zero value and asserted there
 ;; first, so a counter permanently stuck at 0 cannot pass the balance check.
-(define (live-count kind)
-  (cdr (assq kind (live-counts))))
 
 ;; Task 2 (v0.4) added the signal row; #20 added async as the thirteenth.
 (test-equal "live-counts reports all thirteen allocation classes"

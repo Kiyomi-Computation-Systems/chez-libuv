@@ -57,13 +57,12 @@
         (only (libuv private constants)
               uv-write-req-type sizeof-uv-buf-t uv-eof errno-symbol->value)
         (uv-testing)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 ;; Captured before this suite allocates anything.
 (define registry-count-at-start (registry-count))

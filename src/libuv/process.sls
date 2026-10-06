@@ -334,23 +334,20 @@
     (uv-os-getpid-native))
   ;; Exit does not free or close the handle. Set lifecycle state before invoking
   ;; user code so a callback failure cannot leave the record inconsistent.
-  (define (exit-dispatch handle-ptr exit-status term-signal)
-    (let ((proc (registry-ref handle-ptr)))
-      (cond
-        ((not proc) (record-orphan-callback! 'exit handle-ptr))
-        ((not (uv-process-record? proc))
-         (raise (condition
-                 (make-uv-error)
-                 (make-who-condition 'uv-exit-dispatch)
-                 (make-message-condition
-                  "exit completion for a handle of another kind"))))
-        (else
-         (let ((sig (term-signal->value term-signal))
-               (on-exit (process-on-exit proc)))
-           (set-process-exited! proc #t)
-           (when on-exit
-             (dispatch-guarded (handle-loop proc)
-                               (lambda () (on-exit exit-status sig)))))))))
+  (define (exit-dispatch proc handle-ptr exit-status term-signal)
+    (cond
+      ((not proc) (record-orphan-callback! 'exit handle-ptr))
+      ((not (uv-process-record? proc))
+       (raise (condition
+               (make-uv-error)
+               (make-who-condition 'uv-exit-dispatch)
+               (make-message-condition
+                "exit completion for a handle of another kind"))))
+      (else
+       (let ((sig (term-signal->value term-signal))
+             (on-exit (process-on-exit proc)))
+         (set-process-exited! proc #t)
+         (when on-exit (on-exit exit-status sig))))))
 
   (define exit-dispatch-installed
     (install-dispatch-procedure! 'exit exit-dispatch))

@@ -26,6 +26,7 @@
         (only (libuv private native) live-counts)
         (uv-testing)
         (uv-bulk)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect foreign-alloc foreign-free))
 
 (define runner (test-runner-simple))
@@ -78,6 +79,37 @@
 (test-assert "[informational] unconnected-pipe errno recorded"
   (begin (display "  [informational] unconnected pipe write: ")
          (display unconnected-errno) (newline) #t))
+
+;; --- a start libuv refuses leaves nothing behind (#45) -------------------
+;; Each verb registers its request before libuv sees it, so a refusal has
+;; to take the request back: deregistered, freed and uncounted, then
+;; libuv's errno raised under the verb's own name. `let*` orders the reads
+;; around the call (AGENTS.md's right-to-left trap).
+(define (refusal-and-residue thunk)
+  (let* ((write-reqs-before (live-count 'write-req))
+         (registry-before (registry-count))
+         (outcome (guard (e ((uv-errno-error? e) (list (condition-who e) 'errno))
+                            (#t 'wrong-condition))
+                    (thunk)
+                    'accepted))
+         (write-reqs-after (live-count 'write-req))
+         (registry-after (registry-count)))
+    (list outcome
+          (- write-reqs-after write-reqs-before)
+          (- registry-after registry-before))))
+
+(test-equal "a uv-write! libuv refuses raises its errno as uv-write! and leaves no request"
+  '((uv-write! errno) 0 0)
+  (refusal-and-residue (lambda () (uv-write! pipe (make-bytevector 1 7) nop))))
+
+(test-equal "a uv-write*! libuv refuses raises its errno as uv-write*! and leaves no request"
+  '((uv-write*! errno) 0 0)
+  (refusal-and-residue
+   (lambda () (uv-write*! pipe (list (make-bytevector 1 7)) nop))))
+
+(test-equal "a uv-shutdown! libuv refuses raises its errno as uv-shutdown! and leaves no request"
+  '((uv-shutdown! errno) 0 0)
+  (refusal-and-residue (lambda () (uv-shutdown! pipe nop))))
 
 ;; --- the write verbs move their payload in bulk (issue #35) -------------
 ;; A write to the unconnected pipe runs the verb's whole synchronous prefix --

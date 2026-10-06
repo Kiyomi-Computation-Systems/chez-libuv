@@ -159,6 +159,47 @@ lookup itself.
 > ADR's wording was wrong; the design spec (§4) carried the same error and is
 > corrected alongside this.
 
+> **Amendment (2026-10-05, issue #45): one containment per callback.**
+> Through v0.7.3 every callback was contained twice. The seam's `guard`
+> wrapped its dispatcher, and most dispatchers wrapped the user's procedure
+> in a second one, `dispatch-guarded`. Both recorded a raise on the loop.
+> The inner one existed because a completing request, like a closing handle,
+> is deregistered before its user code runs, and after that the seam could
+> no longer find the loop through the registry.
+>
+> Now the seam looks the pointer up in the registry once, before it calls
+> the dispatcher, while the pointer is still registered. It contains a raise
+> with that entry's loop, and its guard is the only containment.
+>
+> - The dispatcher receives the registered object, or `#f`, ahead of
+>   libuv's arguments, so no dispatcher looks the pointer up again.
+> - A dispatcher calls user code directly, and last, so a raise skips none
+>   of the dispatcher's own steps.
+> - The seam is a fixed-arity `case-lambda`, one clause per trampoline arity
+>   (1 to 4), so no callback's arguments are gathered into a rest list.
+> - Each seam is built with its callback type's name as a literal. A name
+>   held in a variable is one more variable for the guard's closures to
+>   capture: 16 B a callback.
+> - The guard has an `else` clause, which takes Chez 10.4.1's cheaper
+>   `$guard` path: 16 B a callback less than a `#t` clause.
+>
+> A one-shot continuation, with the continuation itself as the exception
+> handler, would allocate less for an empty callback: 336 B against 400 B
+> for a uv-run that fires a timer. It was rejected for what it costs any
+> callback that captures a full continuation itself, as its own `guard`
+> does. Chez then promotes the seam's one-shot continuation and copies the
+> stack 64 KiB at a time, ~4.1 KB a callback on the mean.
+>
+> `tests/test-callback-alloc.sps` holds the costs. macOS arm64 and Linux
+> aarch64 and x86_64 agree to the byte, against v0.7.3's figures:
+>
+> - a timer's delivery through its slot: 320 B (672 B);
+> - a uv-run that fires a timer: 400 B (864 B);
+> - one whose callback uses a guard of its own: 787 B on the mean (1,446 B).
+>
+> The invariant this ADR records, that every trampoline body is guarded,
+> stands: there is one guard, and it is the seam's.
+
 The store-and-reraise error policy this trampoline design carries was
 originally justified by the assumption that a Scheme `raise` cannot cross
 libuv's C stack frames safely. **Stage 0 spike Q2 measured it, and that

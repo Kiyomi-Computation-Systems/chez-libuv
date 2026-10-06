@@ -228,54 +228,52 @@
 
   ;; Convert first, then free the chain unconditionally before user delivery.
   ;; A conversion failure frees the request without fabricating callback data.
-  (define (getaddrinfo-dispatch block-ptr status res)
-    (let ((req (registry-ref block-ptr)))
-      (cond
-        ((not req)
+  (define (getaddrinfo-dispatch req block-ptr status res)
+    (cond
+      ((not req)
+       (uv-freeaddrinfo res)
+       (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+                          count-getaddrinfo-req-free! req block-ptr status))
+      ((not (and (uv-req? req) (eq? (req-kind req) 'getaddrinfo)))
+       (raise (condition
+               (make-uv-error)
+               (make-who-condition 'uv-getaddrinfo-dispatch)
+               (make-message-condition
+                "getaddrinfo completion for a request of another kind"))))
+      (else
+       (let-values (((tag payload)
+                     (guard (e (#t (values 'conversion-raised e)))
+                       (values 'converted (addrinfo-chain->list res)))))
          (uv-freeaddrinfo res)
-         (complete-request! 'getaddrinfo 'uv-getaddrinfo!
-                            count-getaddrinfo-req-free! block-ptr status))
-        ((not (and (uv-req? req) (eq? (req-kind req) 'getaddrinfo)))
-         (raise (condition
-                 (make-uv-error)
-                 (make-who-condition 'uv-getaddrinfo-dispatch)
-                 (make-message-condition
-                  "getaddrinfo completion for a request of another kind"))))
-        (else
-         (let ((loop (registry-loop-of block-ptr)))
-           (let-values (((tag payload)
-                         (guard (e (#t (values 'conversion-raised e)))
-                           (values 'converted (addrinfo-chain->list res)))))
-             (uv-freeaddrinfo res)
-             (if (eq? tag 'converted)
-                 (complete-request! 'getaddrinfo 'uv-getaddrinfo!
-                                    count-getaddrinfo-req-free!
-                                    block-ptr status payload)
-                 (begin
-                   (abandon-request! req)
-                   (count-getaddrinfo-req-free!)
-                   (loop-record-error! loop payload)))))))))
+         (if (eq? tag 'converted)
+             (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+                                count-getaddrinfo-req-free!
+                                req block-ptr status payload)
+             ;; The loop is read while the request is still registered.
+             (let ((loop (registry-loop-of block-ptr)))
+               (abandon-request! req)
+               (count-getaddrinfo-req-free!)
+               (loop-record-error! loop payload)))))))
 
   ;; hostname and service point inside the request block; copy both before
   ;; complete-request! frees that block.
-  (define (getnameinfo-dispatch block-ptr status hostname-ptr service-ptr)
-    (let ((req (registry-ref block-ptr)))
-      (cond
-        ((not req)
+  (define (getnameinfo-dispatch req block-ptr status hostname-ptr service-ptr)
+    (cond
+      ((not req)
+       (complete-request! 'getnameinfo 'uv-getnameinfo!
+                          count-getnameinfo-req-free! req block-ptr status))
+      ((not (and (uv-req? req) (eq? (req-kind req) 'getnameinfo)))
+       (raise (condition
+               (make-uv-error)
+               (make-who-condition 'uv-getnameinfo-dispatch)
+               (make-message-condition
+                "getnameinfo completion for a request of another kind"))))
+      (else
+       (let ((hostname (c-string->string hostname-ptr))
+             (service  (c-string->string service-ptr)))
          (complete-request! 'getnameinfo 'uv-getnameinfo!
-                            count-getnameinfo-req-free! block-ptr status))
-        ((not (and (uv-req? req) (eq? (req-kind req) 'getnameinfo)))
-         (raise (condition
-                 (make-uv-error)
-                 (make-who-condition 'uv-getnameinfo-dispatch)
-                 (make-message-condition
-                  "getnameinfo completion for a request of another kind"))))
-        (else
-         (let ((hostname (c-string->string hostname-ptr))
-               (service  (c-string->string service-ptr)))
-           (complete-request! 'getnameinfo 'uv-getnameinfo!
-                              count-getnameinfo-req-free!
-                              block-ptr status hostname service))))))
+                            count-getnameinfo-req-free!
+                            req block-ptr status hostname service)))))
 
   (define getaddrinfo-dispatch-installed
     (install-dispatch-procedure! 'getaddrinfo getaddrinfo-dispatch))

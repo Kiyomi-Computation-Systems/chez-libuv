@@ -49,9 +49,13 @@
         ;; The uv-update-time! rows step their loops with the shared capped
         ;; stepper rather than a hand-rolled one.
         (only (uv-testing) run-until)
+        (only (uv-evidence) live-count describe)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
-        (only (chezscheme) collect sleep make-time))
+        ;; make-engine suspends a run inside a callback (#45); getenv and
+        ;; open-process-ports run tests/stranded-exit-child.sps.
+        (only (chezscheme) collect sleep make-time make-engine
+              getenv open-process-ports))
 
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
@@ -62,7 +66,6 @@
 (define native-initialized-at-start (native-initialized?))
 (define registry-count-at-start (registry-count))
 
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 (test-begin "loop")
 
@@ -1049,7 +1052,7 @@
   (guard (e (#t (list 'raised e)))
     (complete-request! 'getaddrinfo 'uv-getaddrinfo!
                        (lambda () (set! synth-freed (+ synth-freed 1)))
-                       synth-block 0 'record-a 'record-b)
+                       synth-req synth-block 0 'record-a 'record-b)
     'completed))
 
 (test-equal "the handle-less completion delivered err then the extras, via apply"
@@ -1062,24 +1065,25 @@
         (req-ptr synth-req)))
 
 ;; The loop read must happen BEFORE the deregister pops the entry, and its
-;; answer is where a raising on-complete lands. A completion whose callback
-;; raises is the one observable consumer of that loop this stage: the raise
-;; must be contained by dispatch-guarded and recorded on the loop the
-;; REGISTRY ENTRY named -- a loop no (handle-loop (req-handle req)) read
-;; could have found, since the handle field is #f.
+;; answer is where a raising on-complete lands. Since #45 the seam reads it,
+;; before the dispatcher runs, and the seam is the only place a raise is
+;; contained, so this completion goes through an installed slot. The
+;; shutdown slot completes its request through complete-request!, as the DNS
+;; slots do, and handles.sls installs it in every process. The raise must be
+;; recorded on the loop the REGISTRY ENTRY named -- a loop no
+;; (handle-loop (req-handle req)) read could have found, since the handle
+;; field is #f.
 (define synth-raise-block (alloc-zeroed 64))
 (define synth-raise-req
-  (%make-uv-req-record synth-raise-block 'getnameinfo #f
-                       (lambda (err . extras)
-                         (raise 'synthetic-on-complete-raise))))
-(registry-register! synth-raise-block 'getnameinfo-req sweep-loop
+  (%make-uv-req-record synth-raise-block 'shutdown #f
+                       (lambda (err) (raise 'synthetic-on-complete-raise))))
+(registry-register! synth-raise-block 'shutdown-req sweep-loop
                     synth-raise-req)
 
-(test-equal "a raising handle-less on-complete is contained, not escaped"
+(test-equal "a raising handle-less on-complete is contained at the seam, not escaped"
   'contained
   (guard (e (#t (list 'escaped e)))
-    (complete-request! 'getnameinfo 'uv-getnameinfo! (lambda () #f)
-                       synth-raise-block 0)
+    ((dispatcher-ref 'shutdown) synth-raise-block 0)
     'contained))
 
 (test-equal "the raise was recorded on the loop the registry entry named"
@@ -1087,6 +1091,13 @@
   (if (loop-has-pending-error? sweep-loop)
       (loop-pending-error sweep-loop)
       'no-pending-error))
+
+;; complete-request! calls on-complete last, so a raise there skips none of
+;; its own steps (#45).
+(test-equal "...and the request was deregistered and zeroed before on-complete raised"
+  '(deregistered 0)
+  (list (if (registry-ref synth-raise-block) 'still-registered 'deregistered)
+        (req-ptr synth-raise-req)))
 
 (clear-loop-pending-error! sweep-loop)
 
@@ -1221,6 +1232,268 @@
 
 (test-equal "the refused re-entry left no live loop behind"
   cwl-live-before (live-count 'loop))
+
+;; --- a run left from inside a callback (#45) ----------------------------
+;; uv-run marks its loop running for as long as uv_run's frame is on the
+;; stack, and a callback that never returns leaves that frame there: an
+;; engine that runs out of fuel in a callback suspends it, and a continuation
+;; that escapes a callback abandons it. Either way libuv is in the middle of
+;; an iteration that only a return into the frame can finish, so the loop
+;; stays marked running and every verb that would run, close or tear it down
+;; refuses it. Before #45 a dynamic-wind cleared the mark on the way out, so
+;; a teardown during an engine's suspension was accepted, and resuming the
+;; engine then died with "invalid memory reference".
+
+;; raise-evidence : object -> object
+;; A refusal as the rows below expect it, or else the raise's description.
+(define (raise-evidence e)
+  (cond ((uv-invalid-argument? e)
+         (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+        ((uv-handle-closed? e) (list 'handle-closed (uv-handle-closed-kind e)))
+        (else (describe e))))
+
+(define (spin n) (let lp ((i 0)) (when (< i n) (lp (+ i 1)))))
+
+;; tear-down-row-loop : uv-loop -> (or 'torn-down list)
+;; Ends a row's loop inside a row of its own, so a build that left the loop
+;; marked running, or owned by another thread, fails that row by name instead
+;; of aborting the suite before the rows after it. The suite has finished
+;; with the run by then, so it clears the mark and takes the loop back.
+(define (tear-down-row-loop loop)
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (set-loop-running! loop #f)
+    (set-loop-owner-thread! loop (current-thread-id))
+    (uv-loop-teardown! loop)
+    'torn-down))
+
+;; Fuel for an engine's first slice: far less than one spin of a callback.
+(define slice-fuel 5000)
+
+(define (run-slice engine fuel)
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (engine fuel
+            (lambda (ticks value) (list 'finished value))
+            (lambda (resume) (list 'suspended resume)))))
+
+(define suspended-loop (make-uv-loop))
+(define suspended-timer (make-uv-timer suspended-loop))
+(define in-callback #f)
+(define suspended-fires 0)
+(uv-timer-start! suspended-timer
+                 (lambda (t)
+                   (set! in-callback #t)
+                   (set! suspended-fires (+ suspended-fires 1))
+                   (spin 200000)
+                   (set! in-callback #f))
+                 0 0)
+
+(define first-slice
+  (run-slice (make-engine (lambda () (uv-run suspended-loop 'default)))
+             slice-fuel))
+
+(test-equal "seed: the engine ran out of fuel inside the callback"
+  '(suspended #t) (list (car first-slice) in-callback))
+
+(test-equal "a loop whose run is suspended inside a callback is still marked running"
+  'running (if (loop-running? suspended-loop) 'running 'not-running))
+
+;; Each verb is tried only while the loop is marked running. On a build that
+;; cleared the mark it would run or free the loop under the suspended
+;; iteration, so the row names that instead of trying it.
+(define (refusal-of-marked loop thunk)
+  (if (loop-running? loop)
+      (guard (e (#t (raise-evidence e)))
+        (thunk)
+        'accepted)
+      'not-marked-running))
+
+(test-equal "...so uv-run refuses it"
+  '(uv-run loop-running)
+  (refusal-of-marked suspended-loop (lambda () (uv-run suspended-loop 'nowait))))
+
+(test-equal "...and uv-loop-close! refuses it"
+  '(uv-loop-close! loop-running)
+  (refusal-of-marked suspended-loop (lambda () (uv-loop-close! suspended-loop))))
+
+(test-equal "...and uv-loop-teardown! refuses it"
+  '(uv-loop-teardown! loop-running)
+  (refusal-of-marked suspended-loop (lambda () (uv-loop-teardown! suspended-loop))))
+
+(define resumed
+  (if (eq? (car first-slice) 'suspended)
+      (run-slice (cadr first-slice) 100000000)
+      'never-suspended))
+
+(test-equal "resuming the engine finishes the callback and the run"
+  '((finished #f) 1 #f) (list resumed suspended-fires in-callback))
+
+(test-equal "...after which the loop is no longer marked running"
+  'not-running (if (loop-running? suspended-loop) 'running 'not-running))
+
+(test-equal "the suspended run's loop tears down once the run is over"
+  'torn-down (tear-down-row-loop suspended-loop))
+
+;; A continuation that escapes a callback abandons the iteration for good.
+;; The loop stays marked running, and every verb keeps refusing it: libuv may
+;; have been anywhere in that iteration (escaping one close callback strands
+;; the rest of libuv's batch of closes, which then never finish).
+(define escaped-loop (make-uv-loop))
+(define escaped-timer (make-uv-timer escaped-loop))
+(define escaped-outcome
+  (call/cc
+   (lambda (k)
+     (uv-timer-start! escaped-timer (lambda (t) (k 'escaped)) 0 0)
+     (uv-run escaped-loop 'default)
+     'returned)))
+
+(test-equal "seed: the continuation escaped the callback"
+  'escaped escaped-outcome)
+
+(test-equal "a run escaped from inside a callback leaves its loop marked running"
+  'running (if (loop-running? escaped-loop) 'running 'not-running))
+
+(test-equal "...and uv-run refuses it from then on"
+  '(uv-run loop-running)
+  (refusal-of-marked escaped-loop (lambda () (uv-run escaped-loop 'nowait))))
+
+;; The escape left a timer callback, after which libuv's state is whole, so
+;; the suite may clear the mark by hand to free the loop.
+(test-equal "the escaped run's loop tears down once the suite clears its mark"
+  'torn-down (tear-down-row-loop escaped-loop))
+
+;; --- call-with-uv-loop after a run left from inside a callback (#45) ----
+;; call-with-uv-loop's loop does not outlive it. Its exit tears the loop down
+;; even when the body left from inside one of the loop's callbacks, leaving
+;; it marked running, as long as this thread is the one that left it so.
+;; That is safe here, and only here, because the entry check refuses every
+;; return into the body once the loop is gone, so nothing resumes the frame
+;; the teardown took the loop from.
+(define escaping-body-loop #f)
+(define escaping-body-outcome
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (call/cc
+     (lambda (k)
+       (call-with-uv-loop
+        (lambda (l)
+          (set! escaping-body-loop l)
+          (uv-timer-start! (make-uv-timer l) (lambda (t) (k 'escaped)) 0 0)
+          (uv-run l 'default)
+          'returned))))))
+
+(test-equal "a continuation that escapes a callback leaves call-with-uv-loop with its value"
+  'escaped escaping-body-outcome)
+
+(test-equal "...and call-with-uv-loop tore its loop down on the way out"
+  'closed (if (uv-loop-open? escaping-body-loop) 'open 'closed))
+
+(define suspending-body-loop #f)
+(define in-body-callback #f)
+(define suspending-slice
+  (run-slice
+   (make-engine
+    (lambda ()
+      (call-with-uv-loop
+       (lambda (l)
+         (set! suspending-body-loop l)
+         (uv-timer-start! (make-uv-timer l)
+                          (lambda (t)
+                            (set! in-body-callback #t)
+                            (spin 200000)
+                            (set! in-body-callback #f))
+                          0 0)
+         (uv-run l 'default)
+         'body-finished))))
+   slice-fuel))
+
+(test-equal "seed: the engine ran out of fuel inside a callback of call-with-uv-loop's loop"
+  '(suspended #t) (list (car suspending-slice) in-body-callback))
+
+(test-equal "an engine suspended in a callback does not keep call-with-uv-loop's loop"
+  'closed (if (uv-loop-open? suspending-body-loop) 'open 'closed))
+
+(test-equal "...and resuming it is refused like any other return into the body"
+  '(handle-closed loop)
+  (if (eq? (car suspending-slice) 'suspended)
+      (let ((outcome (run-slice (cadr suspending-slice) 100000000)))
+        (if (eq? (car outcome) 'raised) (cadr outcome) outcome))
+      'never-suspended))
+
+;; A loop another thread is running is live under that thread's uv_run, and
+;; the exit leaves it alone: its teardown refuses it, as before #45. The row
+;; forges that state, the mark and another thread's id, on a loop no thread
+;; is running, so a build that tore the loop down anyway fails here by name
+;; instead of racing a real thread.
+(define foreign-run-loop #f)
+(define foreign-run-outcome
+  (guard (e (#t (raise-evidence e)))
+    (call-with-uv-loop
+     (lambda (l)
+       (set! foreign-run-loop l)
+       (set-loop-owner-thread! l (+ (current-thread-id) 1))
+       (set-loop-running! l #t)
+       'body-returned))))
+
+(test-equal "call-with-uv-loop's exit refuses a loop another thread is running"
+  '(uv-loop-teardown! loop-running) foreign-run-outcome)
+
+(test-equal "...and leaves that thread's mark in place"
+  'running (if (loop-running? foreign-run-loop) 'running 'not-running))
+
+(test-equal "the forged run's loop tears down once the suite takes it back"
+  'torn-down (tear-down-row-loop foreign-run-loop))
+
+;; --- an exit whose teardown libuv cannot finish (#46's review) ----------
+;; Left from inside one close callback while another close waits in libuv's
+;; batch, the exit's teardown cannot close the loop: libuv walks that batch
+;; from a list it has already detached, so the other close never finishes.
+;; The exit contains that failure instead of raising it in the middle of the
+;; escape or the engine's suspension, leaves the loop marked running, as any
+;; abandoned run is, and refuses every return into the body. The loop stays
+;; allocated for good, so tests/stranded-exit-child.sps runs the scenario in
+;; a process of its own, which the memory gate does not follow, and this
+;; suite checks the datum it prints.
+(define chez-for-children (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+
+(define stranded-report
+  (if (not chez-for-children)
+      'no-chez
+      (guard (e (#t (list 'spawn-failed (describe e))))
+        (let-values (((to-child from-child errors pid)
+                      (open-process-ports
+                       (string-append chez-for-children
+                                      " --program tests/stranded-exit-child.sps")
+                       (buffer-mode block) (native-transcoder))))
+          (close-port to-child)
+          (let* ((out (get-string-all from-child))
+                 (err (get-string-all errors)))
+            (close-port from-child)
+            (close-port errors)
+            (let ((datum (guard (e (#t #f)) (read (open-string-input-port out)))))
+              (if (list? datum) datum (list 'unreadable out err))))))))
+
+;; stranded : symbol -> object, one entry of the child's report.
+(define (stranded key)
+  (let ((entry (and (list? stranded-report) (assq key stranded-report))))
+    (if entry (cdr entry) (list 'no-entry key stranded-report))))
+
+(if (eq? stranded-report 'no-chez)
+    (test-equal "stranded-exit rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (begin
+      (test-equal "seed: the child's engine ran out of fuel inside the close callback"
+        #t (stranded 'engine-in-close))
+      (test-equal "an escape out of a close callback, with another close pending, keeps its value"
+        'escaped (stranded 'escape))
+      (test-equal "...leaves the loop marked running, since libuv cannot finish closing it"
+        'running (stranded 'escape-marked))
+      (test-equal "...and refuses a return into the body"
+        '(refused loop) (stranded 'reentry))
+      (test-equal "an engine suspended there expires instead of failing mid-suspension"
+        'expired (stranded 'engine))
+      (test-equal "...leaves its loop marked running"
+        'running (stranded 'engine-marked))
+      (test-equal "...and its resume is refused like any other return into the body"
+        '(refused loop) (stranded 'engine-resume))))
 
 ;; --- balance ------------------------------------------------------------
 ;; l0, other-loop, policy-loop and false-loop are still open at this point;

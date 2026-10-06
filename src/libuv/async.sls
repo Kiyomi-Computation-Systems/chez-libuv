@@ -60,15 +60,12 @@
 
   ;; Never deliver a wake to a handle already closing; the callback runs on the
   ;; loop thread, so it may safely touch the loop and its handles.
-  (define (async-dispatch handle-ptr)
-    (let ((async (registry-ref handle-ptr)))
-      (if (uv-async-record? async)
-          (when (eq? (handle-state async) 'open)
-            (let ((on-wake (async-on-wake async)))
-              (when on-wake
-                (dispatch-guarded (handle-loop async)
-                                  (lambda () (on-wake async))))))
-          (record-orphan-callback! 'async handle-ptr))))
+  (define (async-dispatch async handle-ptr)
+    (if (uv-async-record? async)
+        (when (eq? (handle-state async) 'open)
+          (let ((on-wake (async-on-wake async)))
+            (when on-wake (on-wake async))))
+        (record-orphan-callback! 'async handle-ptr)))
 
   (define async-dispatch-installed
     (install-dispatch-procedure! 'async async-dispatch)))

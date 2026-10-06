@@ -47,6 +47,15 @@
   ;; uv-run : uv-loop [symbol] -> boolean
   ;; The boolean says whether work remains; libuv's raw integer would invert
   ;; ordinary Scheme truth tests because zero is true.
+  ;;
+  ;; The loop is marked running for as long as uv_run's frame is on the
+  ;; stack, and that can outlast the call: an engine that runs out of fuel in
+  ;; a callback suspends the frame, and a continuation that escapes a
+  ;; callback abandons it, both in the middle of an iteration only a return
+  ;; into the frame can finish. So the mark is cleared when uv_run returns
+  ;; and not on the way out of the call (#45), and every verb that would run,
+  ;; close or tear the loop down meanwhile refuses it. No raise needs
+  ;; unwinding here: the seams contain every raise, and uv_run returns.
   (define uv-run
     (case-lambda
       ((loop) (uv-run loop 'default))
@@ -62,12 +71,10 @@
          ;; whichever thread runs it. Concurrent uv-run is already refused above,
          ;; so at most one thread runs the loop at a time and the transfer is
          ;; unambiguous (design §6.2).
-         (let ((rc (dynamic-wind
-                    (lambda ()
-                      (set-loop-owner-thread! loop (current-thread-id))
-                      (set-loop-running! loop #t))
-                    (lambda () (uv-loop-run ptr mode-int))
-                    (lambda () (set-loop-running! loop #f)))))
+         (set-loop-owner-thread! loop (current-thread-id))
+         (set-loop-running! loop #t)
+         (let ((rc (uv-loop-run ptr mode-int)))
+           (set-loop-running! loop #f)
            (deliver-pending-callback-error! loop)
            (not (zero? rc)))))))
 
@@ -166,14 +173,34 @@
                           "loop still had work after the drain bound")))))))))
 
   ;; call-with-uv-loop : (uv-loop -> object) -> object
-  ;; The before thunk rejects continuation re-entry after teardown.
+  ;; The body runs once: the before thunk refuses every return into it after
+  ;; it has been left, whatever became of the loop. The after thunk tears the
+  ;; loop down however the body left.
+  ;; - A body left from inside one of the loop's callbacks, by a continuation
+  ;;   or an engine's suspension, leaves the loop marked running by this
+  ;;   thread (#45). The after thunk clears that mark first, which is safe
+  ;;   because nothing can resume the run the teardown ends.
+  ;; - That teardown can fail: escaping one close callback strands the rest
+  ;;   of libuv's batch of closes, and the loop cannot be closed. The failure
+  ;;   is contained rather than raised in the middle of the escape or the
+  ;;   suspension, and the loop stays marked running, as any abandoned run
+  ;;   is, so no verb touches it.
+  ;; - A loop marked running by another thread is live under that thread's
+  ;;   uv_run: its mark stays, and the teardown refuses it, as from any exit.
   (define (call-with-uv-loop proc)
-    (let ((loop (make-uv-loop)))
+    (let ((loop (make-uv-loop)) (left #f))
       (dynamic-wind
        (lambda ()
-         (unless (loop-open? loop)
+         (when left
            (raise (make-uv-handle-closed 'loop))))
        (lambda () (proc loop))
        (lambda ()
+         (set! left #t)
          (when (loop-open? loop)
-           (uv-loop-teardown! loop)))))))
+           (if (and (loop-running? loop)
+                    (eqv? (loop-owner-thread loop) (current-thread-id)))
+               (begin
+                 (set-loop-running! loop #f)
+                 (guard (e (#t (set-loop-running! loop #t)))
+                   (uv-loop-teardown! loop)))
+               (uv-loop-teardown! loop))))))))

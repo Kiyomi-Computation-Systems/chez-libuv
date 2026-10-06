@@ -97,7 +97,10 @@ That program depends on three rules, stated in full in the design spec
   is stored, the loop is stopped, and it is re-raised from `uv-run` wrapped
   in `&uv-callback-error` and composed with the original condition, so a
   `guard` written against the original type still matches. Later raises in
-  the same run are readable through `uv-loop-deferred-errors`.
+  the same run are readable through `uv-loop-deferred-errors`. Raising, or
+  calling `uv-stop!`, is how a callback ends a run early: a continuation
+  that escapes a callback leaves its loop marked running for good
+  ([the loop](api.md#the-loop--libuv-loop)).
 
 ## Where next
 

@@ -59,6 +59,7 @@
               offsetof-addrinfo-ai-protocol offsetof-addrinfo-ai-addr
               offsetof-addrinfo-ai-canonname offsetof-addrinfo-ai-next)
         (uv-testing)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect putenv))
 
 ;; PIN THE THREADPOOL TO ONE WORKER, before any native/threadpool touch.
@@ -73,8 +74,6 @@
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 ;; #f is the worst possible expected value (AGENTS.md), so every err
 ;; observation maps to a symbol: 'no-error for success, the errno symbol
@@ -572,9 +571,10 @@
   'callback-never-fired i-fired)
 
 ;; --- row j: a raising on-complete surfaces as &uv-callback-error ---------
-;; The raise is caught by dispatch-guarded, recorded against the loop the
-;; dispatcher found through registry-loop-of (no handle-loop route exists
-;; for a handle-less request -- ADR-0011), and re-raised by uv-run.
+;; The raise is caught by the seam's guard and recorded against the loop the
+;; seam found through registry-loop-of before the dispatcher deregistered
+;; the request (no handle-loop route exists for a handle-less request --
+;; ADR-0011), then re-raised by uv-run.
 (uv-getaddrinfo! l "127.0.0.1" "80"
                  (suite-hints #t '(family . inet) '(socktype . stream))
                  (lambda (err results)
