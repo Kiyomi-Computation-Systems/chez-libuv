@@ -29,22 +29,13 @@
               fork-thread
               make-mutex make-condition condition-wait condition-signal with-mutex
               get-thread-id sleep make-time real-time
-              open-output-string get-output-string display-condition
-              make-list iota))
+              make-list iota)
+        ;; describe is total: a raise escaping a worker's handler would skip
+        ;; its signal, and a worker that never signals hangs its join.
+        (only (uv-evidence) describe))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-;; describe : object -> string
-;; A raised object's message, for a row to carry as evidence. Total: if
-;; printing it raises too (a record writer that raises, say), the answer is a
-;; fixed string, because a raise escaping the handler that called this would
-;; skip whatever follows -- a worker that never signals hangs its join.
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (let ((p (open-output-string)))
-      (if (condition? e) (display-condition e p) (write e p))
-      (get-output-string p))))
 
 (test-begin "threading-stress")
 

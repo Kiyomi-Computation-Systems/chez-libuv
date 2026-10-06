@@ -69,14 +69,13 @@
               'uv-signal-stop!))
 
   ;; Never deliver a queued signal to a handle already closing.
-  (define (signal-dispatch handle-ptr signum)
-    (let ((sig (registry-ref handle-ptr)))
-      (if (uv-signal-record? sig)
-          (when (eq? (handle-state sig) 'open)
-            (let ((on-signal (signal-on-signal sig)))
-              (when on-signal
-                (on-signal (term-signal->value signum)))))
-          (record-orphan-callback! 'signal handle-ptr))))
+  (define (signal-dispatch sig handle-ptr signum)
+    (if (uv-signal-record? sig)
+        (when (eq? (handle-state sig) 'open)
+          (let ((on-signal (signal-on-signal sig)))
+            (when on-signal
+              (on-signal (term-signal->value signum)))))
+        (record-orphan-callback! 'signal handle-ptr)))
 
   (define signal-dispatch-installed
     (install-dispatch-procedure! 'signal signal-dispatch)))

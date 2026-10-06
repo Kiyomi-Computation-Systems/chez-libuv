@@ -26,8 +26,8 @@
         (only (chezscheme) make-engine
               fork-thread make-mutex make-condition with-mutex
               mutex-acquire mutex-release condition-wait condition-broadcast
-              collect-trip-bytes make-time current-time add-duration
-              open-output-string get-output-string display-condition))
+              collect-trip-bytes make-time current-time add-duration)
+        (only (uv-evidence) describe))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -42,15 +42,6 @@
         (display "  actual: ")
         (write (test-result-ref r 'actual-value))
         (newline)))))
-
-;; describe : object -> string
-;; A raised object's message, for a row to carry as evidence. Total, so a
-;; handler that calls it cannot raise in turn.
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (let ((p (open-output-string)))
-      (if (condition? e) (display-condition e p) (write e p))
-      (get-output-string p))))
 
 (test-begin "async-fence")
 

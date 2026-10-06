@@ -356,42 +356,41 @@
   ;; Handle callbacks require open state; request callbacks remain deliverable
   ;; while their handle is closing.
   ;;
-  ;; A dispatcher calls user code directly and last: the seam around it
-  ;; contains whatever user code raises (#45), and a raise skips none of the
-  ;; dispatcher's own steps.
-  (define (timer-dispatch handle-ptr)
-    (let ((handle (registry-ref handle-ptr)))
-      (if (uv-timer? handle)
-          (when (eq? (handle-state handle) 'open)
-            (let ((on-timeout (timer-on-timeout handle)))
-              (when on-timeout (on-timeout handle))))
-          (record-orphan-callback! 'timer handle-ptr))))
+  ;; A dispatcher receives the object registered under the callback's pointer,
+  ;; or #f, ahead of libuv's arguments: the seam has already looked it up
+  ;; (#45). It calls user code directly and last: the seam contains whatever
+  ;; user code raises, and a raise skips none of the dispatcher's own steps.
+  (define (timer-dispatch handle handle-ptr)
+    (if (uv-timer? handle)
+        (when (eq? (handle-state handle) 'open)
+          (let ((on-timeout (timer-on-timeout handle)))
+            (when on-timeout (on-timeout handle))))
+        (record-orphan-callback! 'timer handle-ptr)))
 
   ;; Callback statuses become condition values; they are never raised here.
   (define (status->err status who)
     (if (zero? status) #f (uv-errno-condition status who)))
 
-  (define (connection-dispatch server-ptr status)
-    (let ((server (registry-ref server-ptr)))
-      (if (uv-tcp-record? server)
-          (let ((on-connection (tcp-on-connection server)))
-            (when on-connection
-              (on-connection (status->err status 'uv-listen!))))
-          (record-orphan-callback! 'connection server-ptr))))
+  (define (connection-dispatch server server-ptr status)
+    (if (uv-tcp-record? server)
+        (let ((on-connection (tcp-on-connection server)))
+          (when on-connection
+            (on-connection (status->err status 'uv-listen!))))
+        (record-orphan-callback! 'connection server-ptr)))
 
   ;; Deregister and free the complete request block before invoking user code.
-  ;; Extra payloads must already be Scheme-owned values.
-  (define (complete-request! name who count-free! block-ptr status . extras)
-    (let ((req (registry-ref block-ptr)))
-      (if (uv-req? req)
-          (let ((on-complete (req-on-complete req)))
-            (registry-deregister! block-ptr)
-            (free! block-ptr)
-            (count-free!)
-            (set-req-ptr! req 0)
-            (when on-complete
-              (apply on-complete (status->err status who) extras)))
-          (record-orphan-callback! name block-ptr))))
+  ;; REQ is what the seam found registered under BLOCK-PTR. Extra payloads
+  ;; must already be Scheme-owned values.
+  (define (complete-request! name who count-free! req block-ptr status . extras)
+    (if (uv-req? req)
+        (let ((on-complete (req-on-complete req)))
+          (registry-deregister! block-ptr)
+          (free! block-ptr)
+          (count-free!)
+          (set-req-ptr! req 0)
+          (when on-complete
+            (apply on-complete (status->err status who) extras)))
+        (record-orphan-callback! name block-ptr)))
 
   ;; Synchronous-start failure uses the same release order without a callback.
   (define (abandon-request! req)
@@ -400,39 +399,37 @@
       (free! ptr)
       (set-req-ptr! req 0)))
 
-  (define (write-done-dispatch req-ptr status)
+  (define (write-done-dispatch req req-ptr status)
     (complete-request! 'write-done 'uv-write! count-write-req-free!
-                       req-ptr status))
+                       req req-ptr status))
 
-  (define (connect-dispatch req-ptr status)
+  (define (connect-dispatch req req-ptr status)
     (complete-request! 'connect 'uv-tcp-connect! count-connect-req-free!
-                       req-ptr status))
+                       req req-ptr status))
 
   (define (no-request-counter) #f)
 
-  (define (shutdown-dispatch req-ptr status)
+  (define (shutdown-dispatch req req-ptr status)
     (complete-request! 'shutdown 'uv-shutdown! no-request-counter
-                       req-ptr status))
+                       req req-ptr status))
 
   ;; This dispatcher must remain infallible: it can only return the existing
   ;; handle buffer or a zero-length buffer. libuv provides no alloc error path.
-  (define (alloc-dispatch handle-ptr suggested buf-ptr)
-    (let ((handle (registry-ref handle-ptr)))
-      (if (and (uv-stream-record? handle)
-               (valid-pointer? (stream-read-buf handle)))
-          (uv-buf-set! buf-ptr (stream-read-buf handle) (stream-read-buf-len handle))
-          (uv-buf-set! buf-ptr 0 0))))
+  (define (alloc-dispatch handle handle-ptr suggested buf-ptr)
+    (if (and (uv-stream-record? handle)
+             (valid-pointer? (stream-read-buf handle)))
+        (uv-buf-set! buf-ptr (stream-read-buf handle) (stream-read-buf-len handle))
+        (uv-buf-set! buf-ptr 0 0)))
 
   ;; nread is signed so UV_EOF cannot masquerade as a huge positive read. The
   ;; buffer argument is ignored; the registered handle owns the trusted base.
-  (define (read-dispatch stream-ptr nread buf-ptr)
-    (let ((handle (registry-ref stream-ptr)))
-      (if (uv-stream-record? handle)
-          (cond ((positive? nread) (deliver-read-data! handle nread))
-                ((zero? nread) #f)
-                ((= nread (uv-eof)) (deliver-read-eof! handle))
-                (else (deliver-read-error! handle nread)))
-          (record-orphan-callback! 'read stream-ptr))))
+  (define (read-dispatch handle stream-ptr nread buf-ptr)
+    (if (uv-stream-record? handle)
+        (cond ((positive? nread) (deliver-read-data! handle nread))
+              ((zero? nread) #f)
+              ((= nread (uv-eof)) (deliver-read-eof! handle))
+              (else (deliver-read-error! handle nread)))
+        (record-orphan-callback! 'read stream-ptr)))
 
   (define (deliver-read-data! handle nread)
     (let ((on-data (stream-on-data handle)))
@@ -450,19 +447,18 @@
 
   ;; The close callback is the sole handle-freeing site. Deregister, free the
   ;; read buffer and handle, zero the pointer, mark closed, then call user code.
-  (define (close-dispatch handle-ptr)
-    (let ((handle (registry-ref handle-ptr)))
-      (if (uv-handle? handle)
-          (begin
-            (registry-deregister! handle-ptr)
-            (free-read-buffer! handle)
-            (free! handle-ptr)
-            (count-handle-free! (handle-kind handle))
-            (set-handle-ptr! handle 0)
-            (set-handle-state! handle 'closed)
-            (let ((on-close (handle-on-close handle)))
-              (when on-close (on-close))))
-          (record-orphan-callback! 'close handle-ptr))))
+  (define (close-dispatch handle handle-ptr)
+    (if (uv-handle? handle)
+        (begin
+          (registry-deregister! handle-ptr)
+          (free-read-buffer! handle)
+          (free! handle-ptr)
+          (count-handle-free! (handle-kind handle))
+          (set-handle-ptr! handle 0)
+          (set-handle-state! handle 'closed)
+          (let ((on-close (handle-on-close handle)))
+            (when on-close (on-close))))
+        (record-orphan-callback! 'close handle-ptr)))
 
   ;; A zero buffer means reading never started; free! deliberately rejects zero.
   (define (free-read-buffer! handle)
@@ -498,7 +494,7 @@
   ;; uv_walk is synchronous, so one resettable cell can collect its pointers.
   (define walk-query-cell '())
 
-  (define (walk-dispatch walked-ptr arg)
+  (define (walk-dispatch walked walked-ptr arg)
     (set! walk-query-cell (cons walked-ptr walk-query-cell)))
 
   (define (handle-in-loop-queue? loop handle)
@@ -633,37 +629,44 @@
   (define installed-dispatch-names '(timer close))
 
   ;; This is the outermost Scheme error boundary reachable from libuv, and
-  ;; the only one a callback crosses (#45). LOOP is the one the seam resolved
-  ;; before dispatch, while the pointer was still registered: a dispatcher
-  ;; deregisters a completing request or a closing handle before it calls
-  ;; user code, and the address may belong to another object by the time a
-  ;; raise arrives.
-  (define (contain-dispatcher-raise! name ptr loop obj)
-    (if loop
-        (loop-record-error! loop obj)
+  ;; the only one a callback crosses (#45). ENTRY is what the seam found
+  ;; registered under PTR before dispatch: a dispatcher deregisters a
+  ;; completing request or a closing handle before it calls user code, and
+  ;; the address may belong to another object by the time a raise arrives.
+  (define (contain-dispatcher-raise! name ptr entry obj)
+    (if entry
+        (loop-record-error! (registry-entry-loop entry) obj)
         (record-orphan-callback! name ptr)))
 
   ;; (seam-lambda name (ptr arg ...) ...) is a case-lambda with one clause
   ;; per argument list, so a callback's arguments are never gathered into a
-  ;; rest list. Each clause contains every raise with one guard; an else
-  ;; clause takes Chez's cheaper guard path. A one-shot continuation would
-  ;; allocate less for an empty callback, but a callback that captures a full
-  ;; continuation, as its own guard does, promotes it and copies the stack:
-  ;; about 4 KB a callback on the mean (tests/test-callback-alloc.sps holds
-  ;; both).
+  ;; rest list. Each clause looks PTR up in the registry once, hands the
+  ;; dispatcher the registered object, and contains every raise with one
+  ;; guard; an else clause takes Chez's cheaper guard path. A one-shot
+  ;; continuation would allocate less for an empty callback, but a callback
+  ;; that captures a full continuation, as its own guard does, promotes it and
+  ;; copies the stack: about 4 KB a callback on the mean
+  ;; (tests/test-callback-alloc.sps holds both).
   (define-syntax seam-lambda
     (syntax-rules ()
       ((_ name (ptr arg ...) ...)
        (case-lambda
          ((ptr arg ...)
-          (let ((loop (registry-loop-of ptr)))
-            (guard (e (else (contain-dispatcher-raise! name ptr loop e)))
-              ((dispatch-procedure name) ptr arg ...))))
+          (let ((entry (hashtable-ref registry ptr #f)))
+            (guard (e (else (contain-dispatcher-raise! name ptr entry e)))
+              ((dispatch-procedure name)
+               (and entry (registry-entry-object entry)) ptr arg ...))))
          ...))))
 
-  ;; The trampolines pass one to four arguments (native.sls).
-  (define (seam-closure name)
-    (seam-lambda name (a) (a b) (a b c) (a b c d)))
+  ;; (seams name ...) builds each seam with its name as a literal, so no
+  ;; closure inside it captures the name: one variable fewer is 16 B less on
+  ;; every callback. The trampolines pass one to four arguments (native.sls).
+  ;; install-callback-dispatchers! refuses a set that does not name every
+  ;; slot in dispatcher-names exactly once.
+  (define-syntax seams
+    (syntax-rules ()
+      ((_ name ...)
+       (list (cons 'name (seam-lambda 'name (a) (a b) (a b c) (a b c d))) ...))))
 
   ;; Use definitions for library-body effects; R6RS requires definitions before
   ;; expressions, and wiring must complete before a callback can fire.
@@ -684,7 +687,7 @@
                       (cons 'alloc      alloc-dispatch)
                       (cons 'read       read-dispatch)))
       (install-callback-dispatchers!
-       (map (lambda (name) (cons name (seam-closure name)))
-            dispatcher-names))
+       (seams alloc read connection write-done close timer shutdown connect
+              getaddrinfo getnameinfo exit walk signal async))
       (install-close-handle! real-close-handle!)
       'wired)))

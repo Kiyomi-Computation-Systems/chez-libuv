@@ -21,14 +21,12 @@
         (libuv pipe)
         (libuv stream)
         (libuv private conditions)
-        (only (libuv private native) live-counts)
         (uv-testing)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 (test-begin "signal")
 

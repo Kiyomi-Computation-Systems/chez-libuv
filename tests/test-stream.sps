@@ -26,6 +26,7 @@
         (only (libuv private native) live-counts)
         (uv-testing)
         (uv-bulk)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect foreign-alloc foreign-free))
 
 (define runner (test-runner-simple))
@@ -84,8 +85,6 @@
 ;; to take the request back: deregistered, freed and uncounted, then
 ;; libuv's errno raised under the verb's own name. `let*` orders the reads
 ;; around the call (AGENTS.md's right-to-left trap).
-(define (live-count kind) (cdr (assq kind (live-counts))))
-
 (define (refusal-and-residue thunk)
   (let* ((write-reqs-before (live-count 'write-req))
          (registry-before (registry-count))

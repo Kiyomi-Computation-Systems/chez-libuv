@@ -59,6 +59,7 @@
               offsetof-addrinfo-ai-protocol offsetof-addrinfo-ai-addr
               offsetof-addrinfo-ai-canonname offsetof-addrinfo-ai-next)
         (uv-testing)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect putenv))
 
 ;; PIN THE THREADPOOL TO ONE WORKER, before any native/threadpool touch.
@@ -73,8 +74,6 @@
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 ;; #f is the worst possible expected value (AGENTS.md), so every err
 ;; observation maps to a symbol: 'no-error for success, the errno symbol

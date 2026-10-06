@@ -22,11 +22,19 @@
 ;;; mean instead, for the one cost that lands only on such calls. The first
 ;;; rows check the meter itself.
 ;;;
-;;; THE BOUNDS are what each path allocates plus 128 B (plus 48 B for an idle
-;;; run). That is above every platform measured, which agree to the byte, and
-;;; below what v0.7.3 allocated and what any one undone change adds back: a
-;;; second guard around the user's call, or a guard around a write's native
-;;; start, adds 304 to 320 B, and the dynamic-wind 112 B. The figures are in
+;;; THE BOUNDS follow the Chez that runs the suite. Each path declares what it
+;;; allocated on Chez 10.4.1 and how many guards it holds, and the suite
+;;; measures a guard and a dynamic-wind of its own, so a path's bound moves
+;;; with what a guard costs on this Chez:
+;;;
+;;;   bound = bytes on 10.4.1 + guards x (a guard now - a guard on 10.4.1)
+;;;           + half a guard now
+;;;
+;;; Half a guard is far more than the platforms measured differ by (macOS
+;;; arm64, Linux aarch64 and x86_64 agree to the byte), and less than any
+;;; undone change adds back: a second guard around the user's call, or one
+;;; around a write's native start. The idle run's margin is half a
+;;; dynamic-wind instead, for the one uv-run held. The figures are in
 ;;; .plans/callback-alloc-mutation-log.md.
 ;;;
 ;;; NOT pure: (libuv) reaches (libuv private native). Never add this to the
@@ -45,6 +53,7 @@
         (only (libuv private constants) uv-eof errno-symbol->value sig-usr1)
         (only (uv-testing) run-until run-until/ticking
               bind-loopback! connect-loopback!)
+        (only (uv-evidence) describe)
         (only (chezscheme) bytes-allocated bytes-deallocated
               collect-request-handler collect void procedure-arity-mask))
 
@@ -132,31 +141,86 @@
                            (run (+ i 1) bytes counted)))))))))
      (lambda () (collect-request-handler saved)))))
 
-;; Every bound, in one place (see the header and the mutation log).
-(define at-most
-  '((read-data . 496) (read-eof . 464) (read-error . 1072)
-    (connection . 464) (timer . 448) (signal . 464) (async . 448)
-    (exit . 464) (write-done . 464) (shutdown . 464) (connect . 464)
-    (getaddrinfo . 784) (getnameinfo . 512)
-    (idle-run . 64) (timer-through-libuv . 528) (close-through-libuv . 528)
-    (guarded-callback-through-libuv . 2048)
-    (uv-write! . 368) (uv-write*! . 432) (uv-shutdown! . 256)))
+;; --- what a guard and a dynamic-wind cost on this Chez ---------------------
+;; Each is shaped like the code the paths hold or once held: a guard with an
+;; else clause around a call through a variable, like a seam's, and a
+;; dynamic-wind whose thunks set a field around a call, like uv-run's.
+(define ref-cell (make-vector 1 #f))
+(define (ref-record! e) (vector-set! ref-cell 0 e))
+(define ref-callee (lambda (a) #f))
+(define (ref-guarded a) (guard (e (else (ref-record! e))) (ref-callee a)))
+(define (ref-wound a b)
+  (dynamic-wind (lambda () (vector-set! ref-cell 0 a))
+                (lambda () (ref-callee b))
+                (lambda () (vector-set! ref-cell 0 #f))))
 
-(define (bound name) (cdr (assq name at-most)))
+(define a-guard (fewest-bytes void (lambda () (ref-guarded 1)) always))
+(define a-wind (fewest-bytes void (lambda () (ref-wound 1 2)) always))
 
-;; row : symbol string (or exact-integer symbol) -> unspecified
-;; Records the measurement in the output, then holds it to its bound: the
-;; row's value is 'within, or the measurement beside the bound.
-(define (row name title bytes)
-  (display "  [informational] ") (display name) (display ": ")
-  (display bytes) (display " B (at most ") (display (bound name))
-  (display ")") (newline)
-  (test-equal (string-append title ", at most "
-                             (number->string (bound name)) " bytes")
-    'within
-    (if (and (integer? bytes) (<= bytes (bound name)))
-        'within
-        (list 'allocated bytes 'at-most (bound name)))))
+;; What the same two shapes allocate on Chez 10.4.1.
+(define a-guard-on-10.4.1 256)
+(define a-wind-on-10.4.1 80)
+
+(display "  [informational] a guard: ") (display a-guard)
+(display " B, a dynamic-wind: ") (display a-wind) (display " B (on 10.4.1: ")
+(display a-guard-on-10.4.1) (display " B, ") (display a-wind-on-10.4.1)
+(display " B)") (newline)
+
+;; A bound built from a measurement that answered nothing would be no bound.
+(test-equal "seed: a guard and a dynamic-wind of the suite's own allocate"
+  '(allocates allocates)
+  (map (lambda (bytes) (if (and (integer? bytes) (positive? bytes)) 'allocates bytes))
+       (list a-guard a-wind)))
+
+;; Every path, in one place: what it allocated on Chez 10.4.1, and how many
+;; guards it holds (see the header and the mutation log).
+(define paths
+  '((read-data 368 1) (read-eof 336 1) (read-error 944 1)
+    (connection 336 1) (timer 320 1) (signal 336 1) (async 320 1)
+    (exit 336 1) (write-done 336 1) (shutdown 336 1) (connect 336 1)
+    ;; the dispatcher guards its conversion of the answer too
+    (getaddrinfo 656 2)
+    (getnameinfo 384 1)
+    (idle-run 16 0) (timer-through-libuv 400 1) (close-through-libuv 400 1)
+    ;; the seam's guard and the callback's own
+    (guarded-callback-through-libuv 787 2)
+    (uv-write! 240 0) (uv-write*! 304 0) (uv-shutdown! 128 0)))
+
+;; bound : symbol -> exact-integer, per the header.
+(define (bound name)
+  (let* ((path (cdr (assq name paths)))
+         (on-10.4.1 (car path))
+         (guards (cadr path))
+         (margin (case name
+                   ((idle-run) (div a-wind 2))
+                   ;; a mean, which a stray stack segment can move
+                   ((guarded-callback-through-libuv) (* 2 a-guard))
+                   (else (div a-guard 2)))))
+    (+ on-10.4.1 (* guards (- a-guard a-guard-on-10.4.1)) margin)))
+
+;; (row name title measurement) records the measurement in the output and
+;; holds it to its bound: the row's value is 'within, or the measurement
+;; beside the bound. A measurement that raises becomes the row's evidence,
+;; so it cannot abort the rows after it.
+(define-syntax row
+  (syntax-rules ()
+    ((_ name title measurement)
+     (row-of name title
+             (lambda ()
+               (guard (e (#t (list 'raised (describe e))))
+                 measurement))))))
+
+(define (row-of name title measure)
+  (let ((bytes (measure)) (limit (bound name)))
+    (display "  [informational] ") (display name) (display ": ")
+    (display bytes) (display " B (at most ") (display limit)
+    (display ")") (newline)
+    (test-equal (string-append title ", at most "
+                               (number->string limit) " bytes")
+      'within
+      (if (and (integer? bytes) (<= bytes limit))
+          'within
+          (list 'allocated bytes 'at-most limit)))))
 
 (define keep (make-vector 1 #f))
 

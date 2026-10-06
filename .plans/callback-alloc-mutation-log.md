@@ -7,9 +7,9 @@ the shim is unchanged:
 
 1. **One containment per callback.** The seam's `guard` was the outer of
    two: most dispatchers wrapped the user's procedure in `dispatch-guarded`,
-   a second `guard`. The seam now resolves the loop before it calls the
-   dispatcher and is the only containment; dispatchers call user code
-   directly, and last.
+   a second `guard`. The seam now looks the pointer up once, before it calls
+   the dispatcher, hands the dispatcher the registered object, and is the
+   only containment; dispatchers call user code directly, and last.
 2. **Fixed-arity seams.** A `case-lambda` per seam, not a rest-argument
    lambda and `apply`.
 3. **`uv-run` without `dynamic-wind`.** The running mark is set before the
@@ -140,8 +140,10 @@ call was 592 B, under the branch's 656 B, while its mean was 4,084 B.
 `tests/test-callback-alloc.sps`, final. Every fewest row read the same value
 on macOS arm64, Linux aarch64 and Linux x86_64 (3 runs each on Linux, 20 on
 macOS). The guarded row reads 787 B on the arm64 platforms and 793 B on
-x86_64. Each bound is the branch's figure plus 128 B (plus 48 B for an idle
-run):
+x86_64. The bounds are relative ("Review fixes", below); on Chez 10.4.1 they
+come to the branch's figure plus half a guard (128 B), plus half a
+dynamic-wind (40 B) for an idle run, and plus two guards (512 B) for the
+guarded mean:
 
 | row | branch | v0.7.3 | bound |
 |---|---|---|---|
@@ -156,9 +158,9 @@ run):
 | delivering a write's / shutdown's / connect's completion | 336 | 704 | 464 |
 | delivering a getaddrinfo's completion | 656 | 1040 | 784 |
 | delivering a getnameinfo's completion | 384 | 768 | 512 |
-| a uv-run with nothing to do | 16 | 128 | 64 |
+| a uv-run with nothing to do | 16 | 128 | 56 |
 | a uv-run that delivers a timer's firing | 400 | 864 | 528 |
-| ...a timer callback using a guard of its own, on the mean | 787 | 1446 | 2048 |
+| ...a timer callback using a guard of its own, on the mean | 787 | 1446 | 1299 |
 | a uv-run that delivers a handle's close | 400 | 848 | 528 |
 | a uv-write! of 16 bytes, the call alone | 240 | 544 | 368 |
 | a uv-write*! of one 16-byte segment, the call alone | 304 | 624 | 432 |
@@ -175,18 +177,20 @@ v0.7.3 figures at the same 1.5–1.6 `uv-run`s a round:
 
 On v0.7.3's `src/`, with this branch's tests:
 
-- **`tests/test-loop.sps`, 6 rows fail by name.** These are the four
-  engine-suspension rows ("a loop whose run is suspended inside a callback is
-  still marked running", and the `uv-run`, `uv-loop-close!` and
-  `uv-loop-teardown!` refusals) and the two escape rows.
+- **`tests/test-loop.sps`, 9 rows fail by name.** Six are the behaviour:
+  the four engine-suspension rows ("a loop whose run is suspended inside a
+  callback is still marked running", and the `uv-run`, `uv-loop-close!` and
+  `uv-loop-teardown!` refusals) and the two escape rows. The other three
+  drive `complete-request!` directly, which now takes the request the seam
+  found, so they call v0.7.3's with the wrong arguments.
   - Each refusal is tried only while the loop is marked running. On v0.7.3 it
     reads `not-marked-running` instead of running the loop under the
     suspended engine.
   - The `call-with-uv-loop` rows pass on v0.7.3. They pin behaviour the
     branch keeps.
-- **`tests/test-callback-alloc.sps`, 20 rows fail by name**: the arity row
-  (every slot's mask is -1) and every allocation row except the guarded
-  mean, which is meant for a different failure.
+- **`tests/test-callback-alloc.sps`, 21 rows fail by name**: the arity row
+  (every slot's mask is -1) and every allocation row, the guarded mean
+  included (1,446 B against 1,299 B).
 - **`tests/test-stream.sps`'s three refusal rows pass on v0.7.3**, by
   design: they pin what the status checks must keep, and M21–M23 show they
   can fail.
@@ -196,8 +200,9 @@ On v0.7.3's `src/`, with this branch's tests:
 Each mutation was applied to a fresh copy of `src/` by exact text
 replacement. The harness aborts unless the target occurs once, re-checks the
 edit, then runs the owning suites against the copy. A mutation counts as
-caught only if every expected row fails by name. The final sweep caught 36
-of 37 by name; the 37th is M14, recorded as uncovered below.
+caught only if every expected row fails by name. The final sweep, on the
+tree after the review fixes, caught 36 of 39 by name; M14, M27 and M28 are
+recorded as uncovered below.
 
 | id | mutation | caught by |
 |---|---|---|
@@ -211,7 +216,7 @@ of 37 by name; the 37th is M14, recorded as uncovered below.
 | M08 | the same in `signal-dispatch` | delivering a signal |
 | M09 | the same in `async-dispatch` | delivering an async wake |
 | M10 | the same in `exit-dispatch` | delivering a process's exit |
-| M11 | the seam resolves the loop after the raise, not before dispatch | test-timer: a raise from an on-close callback escapes `uv-loop-teardown!`; test-loop: the raise was recorded on the loop the registry entry named; test-dns: a raising on-complete re-raises from `uv-run` |
+| M11 | the seam looks the pointer up after the raise, not before dispatch | test-timer: a raise from an on-close callback escapes `uv-loop-teardown!`; test-loop: the raise was recorded on the loop the registry entry named; test-dns: a raising on-complete re-raises from `uv-run` |
 | M12 | the seam takes a rest list and `apply`s | every installed slot takes its trampoline's arguments with no rest list |
 | M13 | the seam contains with `call/1cc`, the continuation as handler | ...a timer callback using a guard of its own, on the mean (4,084 B) |
 | M15 | the seam contains nothing | test-timer: the re-raised condition satisfies `uv-callback-error?`; the callback-error's cause is the original condition object |
@@ -239,6 +244,10 @@ Notes on individual mutations:
   were fixed and re-run, and each is caught by its row.
 - **M15** fails its two named rows and then kills the suite at the next
   uncontained raise, which is spike Q2's process death.
+- After the review fixes changed the dispatchers' text, the targets became
+  short substrings of the code (a call, not the call and its closing
+  parentheses), so a mutation keeps its parentheses balanced by
+  construction.
 
 ## Uncovered
 
@@ -246,11 +255,82 @@ Notes on individual mutations:
   costs 16 B a callback, inside every bound's 128 B margin. A bound tight
   enough to see it would hold only for one Chez version's code paths. Not
   pinned.
+- **M27: a dispatcher looks its pointer up again** instead of taking the
+  seam's object. The lookup allocates nothing and changes no outcome, only
+  CPU time. Not pinned.
+- **M28: a seam captures its name** instead of holding it as a literal.
+  16 B a callback, inside the margin, as M14. Not pinned.
 - **The stream pointer resolved before the request exists** (`stream.sls`).
   It moves `handle-pointer`, whose check can raise, ahead of the allocation.
   But an open stream's pointer is always valid, and nothing exported can
   forge an invalid one (`set-handle-ptr!` is private to `handles.sls`), so
   no test can produce the raise. Not pinned.
+
+## Review fixes
+
+PR #46's /code-review (high) reported eight findings. Five were fixed here.
+The other three were left as they are:
+
+- the write block that leaks when `copy-in!` refuses a span (a follow-up
+  task);
+- `call-with-uv-loop`'s exit re-entering `uv_run` under a suspended frame,
+  as v0.7.3 did;
+- an abandoned escape leaving its loop marked running, which is the
+  documented contract.
+
+**One registry lookup per callback.** The seam looked the pointer up
+(`registry-loop-of`), and then each dispatcher looked it up again
+(`registry-ref`). Now the seam looks it up once and passes the registered
+object to the dispatcher, ahead of libuv's arguments. It contains a raise
+with the loop of that same entry. `complete-request!` takes the request
+too.
+- Passing the object made the guard's body closure capture one more
+  variable, 16 B on every callback: a timer's delivery went from 320 to
+  336 B.
+- Building each seam with its name as a literal (`seams` in `handles.sls`)
+  takes the name out of both closures, and every row read its earlier
+  figure again. `install-callback-dispatchers!` refuses a set that does not
+  name every slot exactly once, so the list cannot drift from
+  `dispatcher-names` unnoticed.
+
+**Bounds that follow the Chez running them.** Absolute bounds would fail
+row by row on a Chez whose `guard` costs more. Each path now declares its
+bytes on 10.4.1 and how many guards it holds. The suite measures a guard
+and a `dynamic-wind` of its own in the same run (256 B and 80 B on all
+three platforms), and a bound is:
+
+    bytes on 10.4.1 + guards x (a guard now - 256) + margin
+
+- The margin is half a guard, or half a `dynamic-wind` for the idle run,
+  or two guards for the guarded mean.
+- A seed row requires both references to allocate, so a bound can never be
+  built from a measurement that answered nothing.
+
+**A measurement that raises cannot abort the suite.** `row` is now a macro
+that evaluates its measurement inside a guard, so a raise becomes the row's
+evidence. The exit row's fake process entry is therefore always
+deregistered before teardown. Injected-failure probe, a raise in the exit
+row's measurement:
+
+- the suite as of 2e55a3c aborted (exit 255) before deregistering;
+- this one fails that row by name and finishes (29 rows pass).
+
+**test-loop's cleanups are rows.** `tear-down-row-loop` clears a stale
+mark, takes the loop back for this thread, and tears it down inside a named
+row. Injected-failure probe, the suspended engine never resumed:
+
+- as of 2e55a3c the suite aborted at the unguarded teardown (exit 255);
+- now it fails the two resume rows by name and finishes (171 rows pass).
+
+**Shared evidence helpers.** `tests/uv-evidence.sls` exports `live-count`
+and a total `describe`.
+- Ten suites had the same `live-count`, and three had the same `describe`.
+- `tests/test-echo.sps` keeps its `live-count`, over a counter query renamed
+  at the facade's boundary.
+- `tests/test-require-threaded.sps` keeps its `describe`, because it is a
+  pure suite.
+- The library reaches `(libuv private native)` and never `handles.sls`, so
+  `tests/test-native.sps` can use it.
 
 ## Not changed
 

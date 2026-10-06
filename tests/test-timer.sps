@@ -44,7 +44,8 @@
         ;; (an async closes by its own path, inside its send fence) and an
         ;; engine to interleave the two closes.
         (only (libuv async) make-uv-async)
-        (only (chezscheme) collect make-engine display-condition))
+        (uv-evidence)
+        (only (chezscheme) collect make-engine))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -61,16 +62,6 @@
         (display "  actual: ")
         (write (test-result-ref r 'actual-value))
         (newline)))))
-
-;; describe : object -> string
-;; A raised object's message, for a row to carry as evidence. Total, so a
-;; guard that calls it cannot raise in turn and abort the suite.
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (call-with-string-output-port
-     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
-
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 ;; Captured before this suite allocates anything, so every "back to baseline"
 ;; assertion below is measured against a real observation.

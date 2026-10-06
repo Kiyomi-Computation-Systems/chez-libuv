@@ -49,6 +49,7 @@
         ;; The uv-update-time! rows step their loops with the shared capped
         ;; stepper rather than a hand-rolled one.
         (only (uv-testing) run-until)
+        (only (uv-evidence) live-count describe)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
         ;; make-engine suspends a run inside a callback (#45).
@@ -63,7 +64,6 @@
 (define native-initialized-at-start (native-initialized?))
 (define registry-count-at-start (registry-count))
 
-(define (live-count kind) (cdr (assq kind (live-counts))))
 
 (test-begin "loop")
 
@@ -1050,7 +1050,7 @@
   (guard (e (#t (list 'raised e)))
     (complete-request! 'getaddrinfo 'uv-getaddrinfo!
                        (lambda () (set! synth-freed (+ synth-freed 1)))
-                       synth-block 0 'record-a 'record-b)
+                       synth-req synth-block 0 'record-a 'record-b)
     'completed))
 
 (test-equal "the handle-less completion delivered err then the extras, via apply"
@@ -1242,21 +1242,33 @@
 ;; a teardown during an engine's suspension was accepted, and resuming the
 ;; engine then died with "invalid memory reference".
 
-;; describe-raise : object -> object, the evidence a row keeps of a raise.
-(define (describe-raise e)
+;; raise-evidence : object -> object
+;; A refusal as the rows below expect it, or else the raise's description.
+(define (raise-evidence e)
   (cond ((uv-invalid-argument? e)
          (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
         ((uv-handle-closed? e) (list 'handle-closed (uv-handle-closed-kind e)))
-        ((message-condition? e) (condition-message e))
-        (else e)))
+        (else (describe e))))
 
 (define (spin n) (let lp ((i 0)) (when (< i n) (lp (+ i 1)))))
+
+;; tear-down-row-loop : uv-loop -> (or 'torn-down list)
+;; Ends a row's loop inside a row of its own, so a build that left the loop
+;; marked running, or owned by another thread, fails that row by name instead
+;; of aborting the suite before the rows after it. The suite has finished
+;; with the run by then, so it clears the mark and takes the loop back.
+(define (tear-down-row-loop loop)
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (set-loop-running! loop #f)
+    (set-loop-owner-thread! loop (current-thread-id))
+    (uv-loop-teardown! loop)
+    'torn-down))
 
 ;; Fuel for an engine's first slice: far less than one spin of a callback.
 (define slice-fuel 5000)
 
 (define (run-slice engine fuel)
-  (guard (e (#t (list 'raised (describe-raise e))))
+  (guard (e (#t (list 'raised (raise-evidence e))))
     (engine fuel
             (lambda (ticks value) (list 'finished value))
             (lambda (resume) (list 'suspended resume)))))
@@ -1288,7 +1300,7 @@
 ;; iteration, so the row names that instead of trying it.
 (define (refusal-of-marked loop thunk)
   (if (loop-running? loop)
-      (guard (e (#t (describe-raise e)))
+      (guard (e (#t (raise-evidence e)))
         (thunk)
         'accepted)
       'not-marked-running))
@@ -1316,7 +1328,8 @@
 (test-equal "...after which the loop is no longer marked running"
   'not-running (if (loop-running? suspended-loop) 'running 'not-running))
 
-(uv-loop-teardown! suspended-loop)
+(test-equal "the suspended run's loop tears down once the run is over"
+  'torn-down (tear-down-row-loop suspended-loop))
 
 ;; A continuation that escapes a callback abandons the iteration for good.
 ;; The loop stays marked running, and every verb keeps refusing it: libuv may
@@ -1342,9 +1355,9 @@
   (refusal-of-marked escaped-loop (lambda () (uv-run escaped-loop 'nowait))))
 
 ;; The escape left a timer callback, after which libuv's state is whole, so
-;; the suite clears the mark by hand to free the loop.
-(set-loop-running! escaped-loop #f)
-(uv-loop-teardown! escaped-loop)
+;; the suite may clear the mark by hand to free the loop.
+(test-equal "the escaped run's loop tears down once the suite clears its mark"
+  'torn-down (tear-down-row-loop escaped-loop))
 
 ;; --- call-with-uv-loop after a run left from inside a callback (#45) ----
 ;; call-with-uv-loop's loop does not outlive it. Its exit tears the loop down
@@ -1355,7 +1368,7 @@
 ;; the teardown took the loop from.
 (define escaping-body-loop #f)
 (define escaping-body-outcome
-  (guard (e (#t (list 'raised (describe-raise e))))
+  (guard (e (#t (list 'raised (raise-evidence e))))
     (call/cc
      (lambda (k)
        (call-with-uv-loop
@@ -1410,7 +1423,7 @@
 ;; instead of racing a real thread.
 (define foreign-run-loop #f)
 (define foreign-run-outcome
-  (guard (e (#t (describe-raise e)))
+  (guard (e (#t (raise-evidence e)))
     (call-with-uv-loop
      (lambda (l)
        (set! foreign-run-loop l)
@@ -1424,9 +1437,8 @@
 (test-equal "...and leaves that thread's mark in place"
   'running (if (loop-running? foreign-run-loop) 'running 'not-running))
 
-(set-loop-running! foreign-run-loop #f)
-(set-loop-owner-thread! foreign-run-loop (current-thread-id))
-(uv-loop-teardown! foreign-run-loop)
+(test-equal "the forged run's loop tears down once the suite takes it back"
+  'torn-down (tear-down-row-loop foreign-run-loop))
 
 ;; --- balance ------------------------------------------------------------
 ;; l0, other-loop, policy-loop and false-loop are still open at this point;

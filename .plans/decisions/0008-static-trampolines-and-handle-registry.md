@@ -167,13 +167,19 @@ lookup itself.
 > is deregistered before its user code runs, and after that the seam could
 > no longer find the loop through the registry.
 >
-> Now the seam resolves the loop before it calls the dispatcher, while the
-> pointer is still registered, and its guard is the only containment.
+> Now the seam looks the pointer up in the registry once, before it calls
+> the dispatcher, while the pointer is still registered. It contains a raise
+> with that entry's loop, and its guard is the only containment.
 >
+> - The dispatcher receives the registered object, or `#f`, ahead of
+>   libuv's arguments, so no dispatcher looks the pointer up again.
 > - A dispatcher calls user code directly, and last, so a raise skips none
 >   of the dispatcher's own steps.
 > - The seam is a fixed-arity `case-lambda`, one clause per trampoline arity
 >   (1 to 4), so no callback's arguments are gathered into a rest list.
+> - Each seam is built with its callback type's name as a literal. A name
+>   held in a variable is one more variable for the guard's closures to
+>   capture: 16 B a callback.
 > - The guard has an `else` clause, which takes Chez 10.4.1's cheaper
 >   `$guard` path: 16 B a callback less than a `#t` clause.
 >

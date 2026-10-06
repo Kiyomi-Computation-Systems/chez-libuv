@@ -26,6 +26,7 @@
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
+        (only (uv-evidence) live-count)
         (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor))
 
@@ -34,7 +35,6 @@
 
 (test-begin "process")
 
-(define (live-count kind) (cdr (assq kind (live-counts))))
 (define registry-count-at-start (registry-count))
 
 ;; Every scenario runs on a fresh loop torn down at its end, so counter
