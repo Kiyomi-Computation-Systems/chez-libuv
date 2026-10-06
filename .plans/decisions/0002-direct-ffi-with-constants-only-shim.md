@@ -96,40 +96,67 @@ binding's behalf.
 > every read: 416 B a read through libuv (864 B against 448 B,
 > `tests/test-callback-alloc.sps`).
 >
-> Now the answer is in place before the first read. A handle that has
-> started reading has a `data` field pointing at a `uv_buf_t` descriptor at
-> the head of its read buffer, with the payload after it, and the callback
-> copies the descriptor into libuv's `uv_buf_t`. A handle whose `data` is
-> NULL gets the empty buffer, which libuv reports as `UV_ENOBUFS`, as the
-> Scheme dispatcher answered for a handle with no buffer.
+> Now the answer is in place before every read. Each stream's handle block
+> holds a `uv_buf_t` descriptor after libuv's handle, at the first 16-byte
+> boundary, and the handle's `data` field points at it from the moment the
+> stream is made. The callback copies the descriptor into libuv's
+> `uv_buf_t`. Until the first read start installs the read buffer, the
+> descriptor is the empty buffer, which libuv reports as `UV_ENOBUFS`, as
+> the Scheme dispatcher answered for a stream with no buffer. A handle
+> whose `data` is NULL gets the empty buffer too.
 >
 > The line this ADR draws holds: the callback calls nothing, in libuv or in
 > Scheme. It reads one field of the handle libuv passes it and copies one
 > struct. What it relies on:
 >
-> - **`data` belongs to the read path.** libuv never reads or writes a
->   handle's `data` (in `vendor/libuv/src`, only `uv_handle_get_data` and
->   `uv_handle_set_data` touch it), and nothing else in the binding sets it.
->   A feature that wants `data` for anything else has to move the
->   descriptor first.
-> - **The descriptor lives exactly as long as the buffer, because it is
->   part of the buffer's block.** It is written once, when the block is
->   allocated, and freed with it by the close dispatcher, after libuv's last
->   alloc callback for the handle. `tests/test-tcp.sps` holds that `data`
->   points at the head of the read buffer, and the Linux Valgrind gate sees
->   the callback's reads: a descriptor freed early reads as an invalid read
->   in `chez_uv_alloc_cb` (`.plans/shim-alloc-mutation-log.md`).
-> - **It has libuv's `uv_alloc_cb` type**, checked when the shim compiles.
+> - **`data` belongs to the read path, and has one writer.** libuv never
+>   reads or writes a handle's `data` (in `vendor/libuv/src`, only
+>   `uv_handle_get_data` and `uv_handle_set_data` touch it). The binding
+>   sets it once, when it makes the stream, and
+>   `tests/test-source-rules.sps` holds that `uv-handle-set-data` is called
+>   from one place in `src/`. A feature that wants `data` for anything else
+>   has to move the descriptor first.
+> - **The descriptor lives exactly as long as the handle, because it is
+>   part of the handle's block.** libuv calls no alloc callback for a
+>   handle after its close callback, and the close dispatcher frees the
+>   block then. The first read start installs the read buffer in one
+>   interrupt-free step with the stream's record, and only while the stream
+>   is open. The close dispatcher empties the descriptor before it frees
+>   the buffer. So the descriptor never names memory that is gone.
+>   `tests/test-tcp.sps` holds where `data` points and what the callback
+>   answers. It also suspends a read start at every point where an engine
+>   can, before a second start or a close, and holds that the descriptor
+>   agrees with the record and nothing leaks. The Linux Valgrind gate sees
+>   the callback's reads (`.plans/shim-alloc-mutation-log.md`).
+> - **It has libuv's `uv_alloc_cb` type, checked when the shim compiles.**
 >   Scheme passes only its address, so no call site would notice a drift.
+>   The shim declares the function through a function typedef, and declares
+>   one object twice: as a `uv_alloc_cb`, and as a pointer to that typedef.
+>   Two declarations of one object must have compatible types (C99 6.2.7),
+>   so a drift is a constraint violation. clang 21, gcc 12 and gcc 13 reject
+>   it without `-Werror`, and under `-w`.
 > - **A shim built from older sources is still refused by name.**
->   `native.sls` fetches the address through `shim-entry`, which checks the
->   entry as `shim-procedure` does, and `tests/test-shim-loading.sps` loads
->   a shim built without the callback.
+>   `native.sls` fetches the address through `shim-entry`, which
+>   `shim-procedure` goes through too, and `tests/test-shim-loading.sps`
+>   loads a shim built without the callback. `tests/test-source-rules.sps`
+>   holds that every shim entry `native.sls` resolves goes through one of
+>   the two.
 >
-> Rejected: a block of its own for the descriptor, which would be a second
-> allocation with a second lifetime to keep in step with the buffer's; and
-> a table in C keyed by handle, which would be a lookup on every read for
-> what one field already holds.
+> Rejected:
+>
+> - **The descriptor at the head of the read buffer**, which this amendment
+>   first chose; #48's review (2026-10-06) moved it. The 16-byte header
+>   pushed a power-of-two buffer into the next macOS malloc size class:
+>   the default 64 KiB buffer took 81,920 B, 25% more, and a 32 KiB one
+>   49,152 B, 50% more. In the handle block the descriptor costs nothing on
+>   macOS arm64: a `uv_tcp_t` (264 B) and a `uv_pipe_t` (280 B) take 320 B
+>   with it or without it. glibc 2.36 rounds to 16 bytes, and there it
+>   costs 32 B in every stream's handle block (a `uv_tcp_t`'s 248 B grow
+>   to 280 usable) against 16 B in each reading stream's buffer.
+> - **A block of its own for the descriptor**, which would be a second
+>   allocation with a second lifetime to keep in step with the handle's.
+> - **A table in C keyed by handle**, which would be a lookup on every read
+>   for what one field already holds.
 
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object

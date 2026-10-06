@@ -225,8 +225,9 @@ lookup itself.
 >   cannot raise, and allocates nothing.
 > - The two frozen literals (tests/test-loop.sps, tests/test-native.sps)
 >   narrow to the thirteen-name literal, watched to fail first.
->   tests/test-tcp.sps's alloc rows call the shim's function as libuv
->   does. tests/test-callback-alloc.sps meters a read through libuv, 448 B
+>   tests/test-tcp.sps reads the alloc callback libuv holds for a reading
+>   stream, requires the shim's, and calls it as libuv does.
+>   tests/test-callback-alloc.sps meters a read through libuv, 448 B
 >   against 864 B with the trampoline, and a relative row there holds that
 >   a read crosses into Scheme once, as a timer does.
 >
