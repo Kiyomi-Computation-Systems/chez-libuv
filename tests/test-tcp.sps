@@ -96,6 +96,16 @@
 ;; (2026-10-06).
 (define handshake-cap 4000)
 
+;; The cap for a ticking wait on a delivery to a connected peer: data, an
+;; EOF, a reset, or a write's completion. It is a time budget like
+;; handshake-cap, and the same size. During an 8-pair loopback flood these
+;; waits took up to 1529 ticks (the 1 MiB transfer) and failed by name at
+;; their old caps, 64 and the transfer's 1024; 4000 is 2.6 times the longest
+;; (.plans/tcp-delivery-cap-mutation-log.md). Only a wait that fails spends
+;; it, and tests/test-seed-gates.sps keeps every ticking wait's cap at or
+;; above that longest delivery.
+(define delivery-cap 4000)
+
 (test-begin "tcp")
 
 ;; --- seeds ---------------------------------------------------------------
@@ -1484,7 +1494,7 @@
 
 (define s-eof-outcome
   (if (eq? s-outcome 'satisfied)
-      (run-until/ticking sl (lambda () (positive? s-eof-fires)) cap)
+      (run-until/ticking sl (lambda () (positive? s-eof-fires)) delivery-cap)
       'no-first-delivery))
 
 (test-equal "the peer's on-eof fired when the client shut its write side down"
@@ -2014,7 +2024,8 @@
     (write-chunk (+ i 1))))
 
 (define m-outcome
-  (run-until/ticking ml (lambda () (>= (collector-count m-in) m-total)) 1024))
+  (run-until/ticking ml (lambda () (>= (collector-count m-in) m-total))
+                     delivery-cap))
 
 ;; UNCONDITIONAL, not failure-gated: SRFI-64's simple runner prints only row
 ;; NAMES, never expected-vs-actual, so a red row here says "the megabyte did
@@ -2026,9 +2037,10 @@
 ;; The three rows fail TOGETHER whenever the transfer falls short, so the
 ;; discriminating question is which of the two causes did it: the drain ran
 ;; out of iterations, or a callback reported an error. Measured locally, the
-;; drain uses TWO iterations against a cap of 1024 -- so exhaustion here
-;; would itself be the finding, not the explanation. Printing both leaves the
-;; next failure self-diagnosing instead of requiring a bisect.
+;; drain takes at most 30 iterations with no added load and up to 1529 during
+;; a loopback flood, against delivery-cap -- so exhaustion here would itself
+;; be the finding, not the explanation. Printing both leaves the next failure
+;; self-diagnosing instead of requiring a bisect.
 (display "  [informational] 1 MiB transfer: outcome=")
 (display m-outcome)
 (display " got=")
@@ -2066,7 +2078,7 @@
 (uv-shutdown! mclient (lambda (err) (collect) (set! m-shutdown-err err)))
 
 (define m-eof-outcome
-  (run-until/ticking ml (lambda () (positive? m-eof-fires)) cap))
+  (run-until/ticking ml (lambda () (positive? m-eof-fires)) delivery-cap))
 
 (test-equal "the transfer ended with on-eof exactly once, and no on-error"
   '(satisfied 1 on-error-never-fired)
@@ -2150,7 +2162,7 @@
 (b-write! 0 b-chunk)
 
 (define b-first-outcome
-  (run-until/ticking bl (lambda () (positive? b-data-fires)) cap))
+  (run-until/ticking bl (lambda () (positive? b-data-fires)) delivery-cap))
 
 (test-equal "the first chunk arrived, and on-data stopped the read from inside itself"
   '(satisfied 1 not-reading)
@@ -2194,7 +2206,7 @@
 (define b-resume-outcome
   (run-until/ticking bl
              (lambda () (>= (collector-count b-in) (* b-chunk b-chunks)))
-             cap))
+             delivery-cap))
 
 (test-equal "restarting the read delivers exactly the bytes that were held back"
   '(satisfied identical)
@@ -2301,10 +2313,17 @@
 ;; the write aborting the suite (AGENTS.md).
 (when (uv-tcp? x-peer)
   (uv-write! x-peer (make-bytevector 4096 88)
-             (lambda (err) (collect) (set! x-write-err err)))
-  (run-until/ticking xl
-                     (lambda () (not (eq? x-write-err 'write-cb-never-fired)))
-                     cap))
+             (lambda (err) (collect) (set! x-write-err err))))
+
+;; The wait is a row, so a write that never completes fails here by name
+;; instead of only through the reset rows it takes down.
+(test-equal "seed: the reset section's write to the client completed without error"
+  '(satisfied no-error)
+  (let ((outcome (run-until/ticking
+                  xl
+                  (lambda () (not (eq? x-write-err 'write-cb-never-fired)))
+                  delivery-cap)))
+    (list outcome (err->symbol x-write-err))))
 
 ;; A COMPLETED WRITE IS NOT A QUEUED READ. The write callback means libuv
 ;; handed the bytes to the server's socket; the kernel delivers them to the
@@ -2318,7 +2337,7 @@
 (define x-queue-wait
   (run-until/ticking xl
                      (lambda () (eqv? 4096 (queued-bytes xclient 4096)))
-                     cap))
+                     delivery-cap))
 
 ;; Read again right before the close, with no loop step between: this is the
 ;; queue the close finds, and a second look shows the wait's did not drain it.
@@ -2330,7 +2349,7 @@
   (run-until/ticking xl
              (lambda () (or (not (eq? x-error 'on-error-never-fired))
                             (positive? x-eof-fires)))
-             cap))
+             delivery-cap))
 
 (display "  [informational] abrupt peer close delivered as: ")
 (display x-error)

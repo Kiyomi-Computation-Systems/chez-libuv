@@ -171,6 +171,17 @@ None is obvious from reading the code.
   after activity can return before the timer comes due. This flaked exactly
   once in five CI runs. Always step with a capped `'once` loop
   (`run-until`-style), never a single call and never wall-clock.
+* **A ticking wait's cap is a time budget, and CPU load does not test it.**
+  `run-until/ticking` spends an iteration on every 1 ms tick, so a cap of 64
+  gives up after about 64 ms. Under CPU load the ticks slow down along with
+  the deliveries: 128 copies of test-tcp at once (load 411) never took a
+  wait past 14 ticks, so running many copies proves nothing about a cap. A
+  loopback flood on a box with CPU to spare does. There test-tcp's
+  deliveries took up to 1529 ticks, and its waits at their old caps (64,
+  and 1024 for the 1 MiB drain) failed by name in 12 of 125 runs.
+  `tests/test-seed-gates.sps` now holds test-tcp's ticking waits to that.
+  Other suites' ticking waits need measuring under a flood the same way
+  (`.plans/tcp-delivery-cap-mutation-log.md`).
 * **A completed write is not a byte in the peer's receive queue.** The write
   callback means the bytes reached the sending socket. The kernel delivers
   them to the peer after that, and under load the gap outlasts any fixed

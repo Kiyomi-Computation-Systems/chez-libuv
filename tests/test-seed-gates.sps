@@ -1,6 +1,6 @@
 #!r6rs
 ;;; SRFI-64 suite for where tests/test-tcp.sps lets a failed loopback seed
-;;; reach.
+;;; reach, and for the caps its ticking waits give up at.
 ;;;
 ;;; Each loopback section of test-tcp.sps starts its peer as a placeholder,
 ;;; (define p 'never-accepted), which the server's accept callback replaces
@@ -25,10 +25,21 @@
 ;;;    arrives hangs the suite until the Makefile's timeout. A wait on a peer
 ;;;    must tick (run-until/ticking), so that it gives up at its cap.
 ;;;
-;;; Neither rule sees a callback that raises inside a later wait, which a late
-;;; handshake can cause. That was checked by forcing each seed to fail, in a
-;;; scratch clone (.plans/tcp-seed-gates-mutation-log.md); make test does not
-;;; repeat it.
+;;; 3. A ticking wait should not give up early in the first place.
+;;;    run-until/ticking spends an iteration on every 1 ms tick, so its cap is
+;;;    a time budget, and `cap` (64) makes it one of about 64 ms. During an
+;;;    8-pair loopback flood, deliveries to a connected peer outlasted that,
+;;;    and the waits capped at 64 failed by name
+;;;    (.plans/tcp-delivery-cap-mutation-log.md). So no ticking wait may give
+;;;    up sooner than the longest delivery measured there,
+;;;    flooded-delivery-ticks: its cap, a literal or a name test-tcp.sps
+;;;    defines as one, must allow at least that many ticks. `cap` stays the
+;;;    budget of a plain run-until, whose iterations count events.
+;;;
+;;; Neither of the first two rules sees a callback that raises inside a later
+;;; wait, which a late handshake can cause. That was checked by forcing each
+;;; seed to fail, in a scratch clone (.plans/tcp-seed-gates-mutation-log.md);
+;;; make test does not repeat it.
 ;;;
 ;;; PURE: it reads a source file and imports no native code (PURE_TESTS).
 (import (rnrs)
@@ -124,6 +135,63 @@
     (if (pair? xs) (append (walk (car xs)) (walk-each (cdr xs))) '()))
   (walk form))
 
+;; ticking-waits : datum -> (list-of datum)
+;; Each (run-until/ticking loop pred cap) anywhere in FORM, in order. Quoted
+;; data is not a wait.
+(define (ticking-waits form)
+  (define (walk x)
+    (cond ((not (pair? x)) '())
+          ((eq? (car x) 'quote) '())
+          ((and (eq? (car x) 'run-until/ticking) (list? x) (= (length x) 4))
+           (cons x (walk-each (cdr x))))
+          (else (walk-each x))))
+  (define (walk-each xs)
+    (if (pair? xs) (append (walk (car xs)) (walk-each (cdr xs))) '()))
+  (walk form))
+
+;; The longest a delivery took during an 8-pair loopback flood, in ticks: the
+;; 1 MiB transfer's drain (.plans/tcp-delivery-cap-mutation-log.md). Rule 3's
+;; floor.
+(define flooded-delivery-ticks 1529)
+
+;; integer-definitions : (list-of datum) -> (list-of (symbol . integer))
+;; Each top-level (define name n) among FORMS whose n is an exact integer.
+(define (integer-definitions forms)
+  (filter pair?
+          (map (lambda (form)
+                 (and (pair? form) (eq? (car form) 'define)
+                      (pair? (cdr form)) (symbol? (cadr form))
+                      (pair? (cddr form)) (null? (cdddr form))
+                      (integer? (caddr form)) (exact? (caddr form))
+                      (cons (cadr form) (caddr form))))
+               forms)))
+
+;; budget : (list-of (symbol . integer)) datum -> integer or #f
+;; How many ticks a wait's cap allows: a literal, or a name DEFS defines.
+(define (budget defs cap-form)
+  (cond ((and (integer? cap-form) (exact? cap-form)) cap-form)
+        ((and (symbol? cap-form) (assq cap-form defs)) => cdr)
+        (else #f)))
+
+;; short-waits : (list-of (symbol . integer)) datum -> (list-of datum)
+;; Each ticking wait in FORM whose cap allows fewer ticks than the floor, or
+;; a number this scan cannot tell (rule 3), as (cap predicate), so that a
+;; failure says which wait.
+(define (short-waits defs form)
+  (map (lambda (wait) (list (cadddr wait) (caddr wait)))
+       (filter (lambda (wait)
+                 (let ((ticks (budget defs (cadddr wait))))
+                   (not (and ticks (>= ticks flooded-delivery-ticks)))))
+               (ticking-waits form))))
+
+;; first-uses : list -> list
+;; XS without repeats, each kept where it first occurs.
+(define (first-uses xs)
+  (let loop ((xs xs) (seen '()))
+    (cond ((null? xs) (reverse seen))
+          ((member (car xs) seen) (loop (cdr xs) seen))
+          (else (loop (cdr xs) (cons (car xs) seen))))))
+
 ;; findings : (symbol-list datum -> symbol-list) (list-of datum)
 ;;            -> (list-of (list symbol symbol datum))
 ;; Each peer SCAN reports, with the head and first argument of the top-level
@@ -183,6 +251,28 @@
          (run-until l (lambda () (positive? n)) 64)
          (run-until l (lambda () (eq? x 'p)) 64))))
 
+(test-equal "a cap's ticks come from the file's own integer definitions"
+  '((cap . 64) (delivery-cap . 4000))
+  (integer-definitions '((define cap 64) (define (f) 64) (define x 'sym)
+                         (define y 2.0) (define z (+ 1 2))
+                         (define delivery-cap 4000))))
+
+(test-equal "rule 3 flags a ticking wait that gives up sooner than a flooded delivery, and only that"
+  '(((cap p)) ((64 p)) ((short p)) ((unknown p)) ((cap p)) ((cap p))
+    () () () ())
+  (let ((defs '((cap . 64) (short . 1528) (long . 1529))))
+    (map (lambda (form) (short-waits defs form))
+         '((run-until/ticking l p cap)
+           (run-until/ticking l p 64)
+           (run-until/ticking l p short)
+           (run-until/ticking l p unknown)
+           (define o (run-until/ticking l p cap))
+           (test-equal "row" 'satisfied (if ok (run-until/ticking l p cap) 'skipped))
+           (run-until/ticking l p long)
+           (run-until/ticking l p 4000)
+           (run-until l p cap)
+           (define x '(run-until/ticking l p cap))))))
+
 (test-equal "the findings name each flagged peer with the head and first argument of its form"
   '((p uv-read-stop! p) (p define x))
   (findings raising '(p)
@@ -192,16 +282,30 @@
 
 (define raise-findings (findings raising peers forms))
 (define block-findings (findings blocking peers forms))
+(define cap-definitions (integer-definitions forms))
+(define short-findings
+  (apply append (map (lambda (form) (short-waits cap-definitions form)) forms)))
 
 ;; The runner prints only a failing row's name, so the findings are printed.
 (report "raises" raise-findings)
 (report "blocks" block-findings)
+(report "short" short-findings)
 
 (test-equal "no top-level form of test-tcp.sps names a placeholder peer where a failed seed would raise from it"
   '() raise-findings)
 
 (test-equal "no plain run-until in test-tcp.sps waits on a placeholder peer"
   '() block-findings)
+
+;; Live, and the whole vocabulary: a scan that found no ticking wait would
+;; pass the row after it against any file. A ticking wait given a new cap,
+;; or a literal, changes this list, so that choice gets made here on purpose.
+(test-equal "the cap scan sees every cap test-tcp.sps's ticking waits give up at"
+  '(handshake-cap 8000 delivery-cap 4000)
+  (first-uses (map cadddr (apply append (map ticking-waits forms)))))
+
+(test-equal "no ticking wait in test-tcp.sps gives up sooner than a delivery took during a loopback flood"
+  '() short-findings)
 
 (test-end "seed-gates")
 
