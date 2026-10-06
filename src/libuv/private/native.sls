@@ -51,7 +51,7 @@
 
           ;; shared validators and boundary helpers
           fill-sockaddr! align-16
-          validate-address require-port fold-flags
+          validate-address require-port fold-flags proper-length
           require-callback
           signal-symbol->int term-signal->value
 
@@ -706,17 +706,25 @@
   ;; it ends at the list's end, at a pair whose cdr is not a pair or '(), or
   ;; where the hare meets the tortoise in a cycle, so it raises nothing and
   ;; allocates nothing, where length raises and a guard around it allocates.
+  ;; The list can change during the walk, from an engine's handler or
+  ;; another thread, so every cdr is taken of a value just found to be a
+  ;; pair, and each is read once. The tortoise walks pairs the hare has
+  ;; passed, which a change can have cut behind the hare: a tortoise that
+  ;; then finds no pair answers #f. It took the cdr of whatever it found,
+  ;; and raised for a list of twelve cut during the walk (#64).
   (define (proper-length x)
     (let walk ((hare x) (tortoise x) (n 0))
       (cond ((null? hare) n)
             ((not (pair? hare)) #f)
-            ((null? (cdr hare)) (+ n 1))
-            ((not (pair? (cdr hare))) #f)
             (else
-             (let ((hare (cddr hare)) (tortoise (cdr tortoise)))
-               (if (eq? hare tortoise)
-                   #f
-                   (walk hare tortoise (+ n 2))))))))
+             (let ((next (cdr hare)))
+               (cond ((null? next) (+ n 1))
+                     ((not (pair? next)) #f)
+                     (else
+                      (let ((hare (cdr next)) (tortoise (cdr tortoise)))
+                        (cond ((eq? hare tortoise) #f)
+                              ((not (pair? tortoise)) #f)
+                              (else (walk hare tortoise (+ n 2))))))))))))
 
   (define (require-callback proc who reason)
     (unless (procedure? proc)

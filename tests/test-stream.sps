@@ -13,6 +13,8 @@
 ;;; NOT pure: (libuv stream) reaches (libuv private native). Never add this
 ;;; to the Makefile's PURE_TESTS.
 (import (rnrs)
+        ;; set-cdr! changes a segment list in the segment-list sweeps.
+        (rnrs mutable-pairs)
         (srfi :64)
         (libuv loop)
         (libuv handle)
@@ -229,16 +231,23 @@
   (let fill ((i start))
     (when (< i end) (bytevector-u8-set! bv i byte) (fill (+ i 1)))))
 
-;; shrink-verdict : sweep-variant exact-positive-integer
-;;                  -> (values verdict boolean)
+;; change-verdict : exact-positive-integer (fill -> argument)
+;;                  (argument fill -> object) (argument -> unspecified)
+;;                  (fill -> bytevector) list -> (values verdict boolean)
+;; One run of a sweep: WRITE the argument MAKE gives for the run's FILL, in
+;; an engine with FUEL, and CHANGE! that argument at the first expiry. The
+;; peer must then receive EXPECTED's bytes, or the verb refuse with REFUSAL.
 ;; A verdict is one of the symbols above, or else the evidence, a list; the
 ;; second value says whether an expiry reached the run. FILL is unique to
 ;; the run among its neighbours and never 0 or #xff, so a run that sent a
 ;; zeroed or a stale block, or read past the truncated end, cannot match the
-;; bytes it was given.
-(define (shrink-verdict variant fuel)
+;; bytes it was given. A call still running after resume-cap resumes is
+;; given up there, so a walk that never ends fails its run by name.
+(define resume-cap 20)
+
+(define (change-verdict fuel make write change! expected refusal)
   (let* ((fill (+ 1 (mod fuel 254)))
-         (bv (make-bytevector sweep-len fill))
+         (argument (make fill))
          (expired #f)
          (registry-before (registry-count))
          (requests-before (live-count 'write-req))
@@ -250,23 +259,25 @@
                                              (uv-invalid-argument-who e)
                                              (uv-invalid-argument-reason e)))
                                       (#t (list 'raised (describe e))))
-                              ((sweep-variant-write variant) bv fill)
+                              (write argument fill)
                               '(written)))))
-                    (ticks fuel))
+                    (ticks fuel)
+                    (resumes 0))
             (eng ticks
                  (lambda (left v) v)
                  (lambda (next)
                    (unless expired
                      (set! expired #t)
-                     (bytevector-fill! bv #xff)
-                     (bytevector-truncate! bv 16))
-                   (run next 100000)))))
+                     (change! argument))
+                   (if (= resumes resume-cap)
+                       (list 'stuck-after-resumes resumes)
+                       (run next 100000 (+ resumes 1)))))))
          (registry-after (registry-count))
          (requests-after (live-count 'write-req)))
     (values
      (case (car outcome)
        ((refused)
-        (if (and (equal? (cdr outcome) (sweep-variant-refusal variant))
+        (if (and (equal? (cdr outcome) refusal)
                  (= registry-after registry-before)
                  (= requests-after requests-before))
             'refused
@@ -276,7 +287,7 @@
        ((written)
         (set! s-issued (+ s-issued 1))
         (set! s-received (make-byte-collector))
-        (let* ((expected ((sweep-variant-expected variant) fill))
+        (let* ((expected (expected fill))
                (drained (run-until/ticking
                          s-loop
                          (lambda ()
@@ -292,34 +303,57 @@
        (else outcome))
      expired)))
 
-;; shrink-sweep : sweep-variant -> (list-of (list fuel verdict))
+(define (shrink! bv)
+  (bytevector-fill! bv #xff)
+  (bytevector-truncate! bv 16))
+
+;; shrink-verdict : sweep-variant exact-positive-integer
+;;                  -> (values verdict boolean)
+(define (shrink-verdict variant fuel)
+  (change-verdict fuel
+                  (lambda (fill) (make-bytevector sweep-len fill))
+                  (sweep-variant-write variant)
+                  shrink!
+                  (sweep-variant-expected variant)
+                  (sweep-variant-refusal variant)))
+
+;; sweep-runs : (exact-positive-integer -> (values verdict boolean))
+;;              -> (list-of (list fuel verdict))
 ;; It stops at the first run no expiry reached, whatever that run's verdict:
 ;; a build that cannot deliver would otherwise exhaust a drain at every fuel
 ;; up to the cap, and outlast the suite's timeout before any row could say
-;; why. A raise between runs would abort the suite, so the whole sweep is
-;; caught and its evidence handed to the rows.
-(define (shrink-sweep variant)
+;; why. It stops at a run given up after resume-cap resumes too, which would
+;; cost every later run the same. A raise between runs would abort the
+;; suite, so the whole sweep is caught and its evidence handed to the rows.
+(define (sweep-runs verdict-at)
   (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
     (let run ((fuel 1) (acc '()))
-      (let-values (((verdict expired) (shrink-verdict variant fuel)))
+      (let-values (((verdict expired) (verdict-at fuel)))
         (let ((acc (cons (list fuel verdict) acc)))
-          (if (or (not expired) (= fuel sweep-max-fuel))
+          (if (or (not expired)
+                  ((verdict-is? 'stuck-after-resumes) verdict)
+                  (= fuel sweep-max-fuel))
               (reverse acc)
               (run (+ fuel 1) acc)))))))
+
+(define (shrink-sweep variant)
+  (sweep-runs (lambda (fuel) (shrink-verdict variant fuel))))
+
+(define (verdict-is? kind) (lambda (v) (and (pair? v) (eq? (car v) kind))))
 
 (define shrink-sweeps
   (map (lambda (v) (cons (sweep-variant-name v) (shrink-sweep v)))
        sweep-variants))
 
-;; rows-where : (verdict -> boolean) -> (list-of (list name fuel verdict))
-(define (rows-where bad?)
+;; rows-in : sweeps (verdict -> boolean) -> (list-of (list name fuel verdict))
+(define (rows-in sweeps bad?)
   (apply append
          (map (lambda (sweep)
                 (map (lambda (row) (cons (car sweep) row))
                      (filter (lambda (row) (bad? (cadr row))) (cdr sweep))))
-              shrink-sweeps)))
+              sweeps)))
 
-(define (verdict-is? kind) (lambda (v) (and (pair? v) (eq? (car v) kind))))
+(define (rows-where bad?) (rows-in shrink-sweeps bad?))
 
 ;; The rows below look for bad verdicts and must find none, which says
 ;; nothing unless each sweep began at the engine's first stop, saw the span
@@ -343,6 +377,124 @@
 (test-equal "a write the sweep let through sent the peer exactly the bytes it was given"
   '()
   (rows-where (verdict-is? 'written-but-sent)))
+
+;; --- a segment list that changes during the call (#64) ---------------------
+;; uv-write*! reads the caller's segment list before its step. It used to
+;; read it with Chez's map, which measures a list and then walks it without
+;; checking its pairs. An engine's handler, or another thread, that put a
+;; non-pair in the list during the walk had the walk read through it, an
+;; `invalid memory reference` wherever the non-pair pointed. A list made
+;; circular there was walked without end, in a walk no engine's fuel stops:
+;; the process grew to about 6 GB before it was killed. The verb now counts
+;; the list with proper-length, walks at most that many pairs checking each
+;; one, and reads each (bytevector start end) span once the same way.
+;;
+;; Each sweep writes twelve 5-byte segments through uv-write*! in an engine
+;; at rising fuel, as the payload sweeps above do, and changes the list at
+;; the first expiry:
+;;   segments-cut            the third pair's cdr becomes a vector;
+;;   segments-made-circular  the third pair's cdr becomes the list's head;
+;;   span-cut                the third segment, a (bv 0 5) span, loses its end.
+;; Each run has one right answer: 'refused under the verb's own name with no
+;; request left, or 'written with the peer receiving exactly the twelve
+;; segments the call was given ('untouched for the last run, as above).
+;;
+;; The circular sweep runs only when every run of the cut sweep had one of
+;; those answers. A build whose walk reads through a non-pair would walk a
+;; circular list without end and take the machine's memory instead of
+;; failing, so there the sweep is skipped, and its rows fail by name.
+(define seg-count 12)
+(define seg-len 5)
+
+;; seg-byte : fill exact-nonnegative-integer -> byte
+;; Segment I's byte: never 0 or #xff, and different for each segment, so a
+;; walk that read a segment twice or out of order cannot send the bytes the
+;; call was given.
+(define (seg-byte fill i) (+ 1 (mod (+ fill (* 19 i)) 254)))
+
+(define (seg-list fill)
+  (let make ((i 0))
+    (if (= i seg-count)
+        '()
+        (cons (make-bytevector seg-len (seg-byte fill i)) (make (+ i 1))))))
+
+;; The same list, with the third segment a (bv 0 5) span of a longer
+;; bytevector.
+(define (seg-list-with-span fill)
+  (let ((segs (seg-list fill)))
+    (set-car! (cddr segs)
+              (list (make-bytevector (+ seg-len 4) (seg-byte fill 2)) 0 seg-len))
+    segs))
+
+(define (seg-bytes fill)
+  (let ((out (make-bytevector (* seg-count seg-len))))
+    (let fill-in ((i 0))
+      (when (< i seg-count)
+        (bytevector-fill-range! out (* i seg-len) (* (+ i 1) seg-len)
+                                (seg-byte fill i))
+        (fill-in (+ i 1))))
+    out))
+
+(define (cut-third! segs) (set-cdr! (cddr segs) (vector 'not 'a 'pair)))
+(define (circle-third! segs) (set-cdr! (cddr segs) segs))
+(define (cut-span! segs) (set-cdr! (cdr (caddr segs)) 'oops))
+
+(define-record-type list-variant (fields name make change! refusal))
+
+(define segments-cut
+  (make-list-variant 'segments-cut seg-list cut-third!
+                     '(uv-write*! segments-not-a-list)))
+(define segments-made-circular
+  (make-list-variant 'segments-made-circular seg-list circle-third!
+                     '(uv-write*! segments-not-a-list)))
+(define span-cut
+  (make-list-variant 'span-cut seg-list-with-span cut-span!
+                     '(uv-write*! segment-not-a-bytevector)))
+
+(define (list-sweep variant)
+  (sweep-runs
+   (lambda (fuel)
+     (change-verdict fuel
+                     (list-variant-make variant)
+                     (lambda (segs fill) (uv-write*! s-client segs on-swept))
+                     (list-variant-change! variant)
+                     seg-bytes
+                     (list-variant-refusal variant)))))
+
+(define (one-right-answer? verdict)
+  (and (memq verdict '(refused written untouched)) #t))
+
+(define cut-sweep (list-sweep segments-cut))
+
+(define list-sweeps
+  (list (cons 'segments-cut cut-sweep)
+        (cons 'segments-made-circular
+              (if (for-all (lambda (row) (one-right-answer? (cadr row))) cut-sweep)
+                  (list-sweep segments-made-circular)
+                  '((0 (skipped the-cut-sweep-had-another-answer)))))
+        (cons 'span-cut (list-sweep span-cut))))
+
+;; The two rows after this one look for bad verdicts and must find none.
+(test-equal "each segment-list sweep began at fuel 1 with a refusal and ended in a run no expiry reached"
+  '((segments-cut (1 refused) untouched)
+    (segments-made-circular (1 refused) untouched)
+    (span-cut (1 refused) untouched))
+  (map (lambda (sweep)
+         (let ((rows (cdr sweep)))
+           (list (car sweep)
+                 (car rows)
+                 (cadr (list-ref rows (- (length rows) 1))))))
+       list-sweeps))
+
+(test-equal "a uv-write*! whose segment list changed during the call is refused by the verb itself, leaving no request"
+  '()
+  (rows-in list-sweeps
+           (lambda (v) (not (or (one-right-answer? v)
+                                ((verdict-is? 'written-but-sent) v))))))
+
+(test-equal "a uv-write*! the segment-list sweeps let through sent the peer exactly the segments it was given"
+  '()
+  (rows-in list-sweeps (verdict-is? 'written-but-sent)))
 
 (uv-loop-teardown! s-loop)
 

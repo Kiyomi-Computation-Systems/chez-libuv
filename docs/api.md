@@ -113,6 +113,18 @@ pipe handle.
 | `uv-read-stop!` | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
 | `uv-stream-write-queue-size` | Queued write bytes libuv is holding for this stream. Allocation-free. See Flow control, below |
 
+**A segment list is read once.** `uv-write*!` counts its list without
+raising, then reads it, and each `(bv start end)` span in it, one pair at
+a time, checking each pair as it reads it and taking no more pairs than it
+counted. So a list that an engine's timer handler or another thread changes
+during the call is written as the call read it, or refused
+(`&uv-invalid-argument`, reason `'segments-not-a-list`, or
+`'segment-not-a-bytevector` for a span) when what it read is no longer one
+list of that length. It is never read through a non-pair, and a list made
+circular is never walked without end. The spans' bytes are copied later, in
+the verb's step, which checks each span against its bytevector again: one
+that shrank meanwhile is refused with `'segment-span-out-of-range`.
+
 **Inside an engine.** An engine's fuel can run out anywhere in a stream
 verb, and a scheduler may close the stream before resuming it, or never
 resume it at all. Each verb makes its checks, its allocation and its native

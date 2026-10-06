@@ -1735,6 +1735,70 @@
              (circular '(a b c d) 2)
              (circular '(a b c d e) 1))))
 
+;; --- proper-length: a list changed during the count (#64) ------------------
+;; proper-length counts with a hare and a tortoise, and the tortoise walks
+;; pairs the hare has passed, which a change made during the count (by an
+;; engine's handler or another thread) can have cut behind the hare. It took
+;; the cdr of whatever it found there: `cdr: ... is not a pair` for a list of
+;; twelve cut during the count, and at optimize-level 3 an unchecked read.
+;; Each sweep counts a fresh twelve-element list in an engine at rising
+;; fuel and changes it at the first expiry: the third pair's cdr becomes a
+;; vector, or the list's head. A run must answer #f or 12, the count the
+;; list began with, without raising; a count it answers can be stale, which
+;; is why uv-write*! walks to the end it counted. Each sweep stops at the
+;; first run no expiry reached, or a run whose resumes ran out.
+(define (length-sweep change!)
+  (let next ((fuel 1) (acc '()))
+    (let* ((l (iota* 12))
+           (expired #f)
+           (answer
+            (let run ((eng (make-engine
+                            (lambda ()
+                              (guard (e (#t (list 'raised (describe e))))
+                                (proper-length l)))))
+                      (ticks fuel)
+                      (resumes 0))
+              (eng ticks
+                   (lambda (left v) v)
+                   (lambda (more)
+                     (unless expired
+                       (set! expired #t)
+                       (change! l))
+                     (if (= resumes 100)
+                         'stuck
+                         (run more 100000 (+ resumes 1)))))))
+           (acc (cons (list fuel answer expired) acc)))
+      (if (and expired (not (eq? answer 'stuck)) (< fuel 400))
+          (next (+ fuel 1) acc)
+          (reverse acc)))))
+
+(define length-sweeps
+  (list (cons 'cut (length-sweep
+                    (lambda (l) (set-cdr! (cddr l) (vector 'not 'a 'pair)))))
+        (cons 'made-circular (length-sweep
+                              (lambda (l) (set-cdr! (cddr l) l))))))
+
+(test-equal "proper-length answers #f or the count it began with for a list changed during the count, never raising"
+  '()
+  (apply append
+         (map (lambda (s)
+                (map (lambda (run) (cons (car s) run))
+                     (filter (lambda (run) (not (memv (cadr run) '(#f 12))))
+                             (cdr s))))
+              length-sweeps)))
+
+;; The row above finds no bad answer, which says nothing unless each sweep
+;; changed the list before the count began and ran the last count whole.
+(test-equal "each proper-length sweep changed the list before the count began and ended with a count no expiry reached"
+  '((cut (1 #f #t) 12) (made-circular (1 #f #t) 12))
+  (map (lambda (s)
+         (let ((runs (cdr s)))
+           (list (car s)
+                 (car runs)
+                 (let ((last-run (list-ref runs (- (length runs) 1))))
+                   (if (caddr last-run) 'expired (cadr last-run))))))
+       length-sweeps))
+
 
 ;; The flags were measured with a guarded length, and a guard costs a few
 ;; hundred bytes a call even when nothing raises; the walk that replaced it

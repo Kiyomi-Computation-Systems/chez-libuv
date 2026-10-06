@@ -22,6 +22,8 @@
 ;;; NOT pure: (libuv tcp) reaches (libuv private native). Never add this to
 ;;; the Makefile's PURE_TESTS.
 (import (rnrs)
+        ;; set-cdr! makes the circular segment list a uv-write*! row refuses.
+        (rnrs mutable-pairs)
         (srfi :64)
         (libuv loop)
         (libuv handle)
@@ -2513,6 +2515,53 @@
    (lambda ()
      (uv-write*! wv-client (list (string->utf8 "ok") "not-a-segment")
                  (lambda (err) #f)))))
+
+;; The verb reads the list and each span one pair at a time, checking each
+;; pair as it reads it (#64), so these are the shapes that walk must refuse
+;; as the old list? and length checks did.
+;;
+;; capped : (-> object) -> object
+;; THUNK's value, run in an engine whose resumes are capped: a call that
+;; never ends answers 'stuck, so a count that loops on a circular list fails
+;; its row by name instead of hanging the suite. A raise inside is raised
+;; again outside, for the row's own guard.
+(define (capped thunk)
+  (let run ((eng (make-engine
+                  (lambda ()
+                    (guard (e (#t (cons 'raised e)))
+                      (thunk)))))
+            (resumes 0))
+    (eng 100000
+         (lambda (left v)
+           (if (and (pair? v) (eq? (car v) 'raised)) (raise (cdr v)) v))
+         (lambda (more)
+           (if (= resumes 100) 'stuck (run more (+ resumes 1)))))))
+
+(test-equal "an improper or circular segment list is refused before allocation"
+  '(((uv-write*! segments-not-a-list) (0 0) 0)
+    ((uv-write*! segments-not-a-list) (0 0) 0))
+  (list (wv-refusal
+         (lambda ()
+           (uv-write*! wv-client (cons (string->utf8 "ok") 'tail) (lambda (err) #f))))
+        (wv-refusal
+         (lambda ()
+           (let ((segs (list (string->utf8 "a") (string->utf8 "b"))))
+             (set-cdr! (cdr segs) segs)
+             (capped (lambda () (uv-write*! wv-client segs (lambda (err) #f)))))))))
+
+(test-equal "a span that is not exactly (bytevector start end) is refused before allocation"
+  '(((uv-write*! segment-not-a-bytevector) (0 0) 0)
+    ((uv-write*! segment-not-a-bytevector) (0 0) 0)
+    ((uv-write*! segment-not-a-bytevector) (0 0) 0)
+    ((uv-write*! segment-not-a-bytevector) (0 0) 0)
+    ((uv-write*! segment-not-a-bytevector) (0 0) 0))
+  (map (lambda (span)
+         (wv-refusal (lambda () (uv-write*! wv-client (list span) (lambda (err) #f)))))
+       (list (list (string->utf8 "hello") 0)
+             (list (string->utf8 "hello") 0 5 5)
+             (cons (string->utf8 "hello") (cons 0 5))
+             (cons (string->utf8 "hello") 'tail)
+             (list "hello" 0 5))))
 
 (test-equal "a segment span out of range is refused before allocation"
   '((uv-write*! segment-span-out-of-range) (0 0) 0)
