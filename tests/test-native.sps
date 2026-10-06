@@ -815,98 +815,50 @@
 ;; large enough to leave that zone and the size this binding will actually
 ;; allocate at, so the test exercises the real case.
 ;;
-;; The seed assertion below is what keeps this honest across platforms: it
-;; proves the churn really does leave dirty memory on the free list. On an
-;; allocator that always zeroes, that assertion fails BY NAME -- telling us
-;; the next one is non-discriminating -- instead of letting it pass vacuously
-;; against an alloc-zeroed that does nothing (AGENTS.md).
+;; The dirt is laid through the shim's own allocator, which alloc-zeroed
+;; uses (chez_uv_alloc). The shim does not draw on the blocks Chez's
+;; foreign-free releases: measured on macOS, a block foreign-free had just
+;; released came back from the shim 0 times in 200, and one the shim had
+;; just freed came back 200 times in 200. A churn through foreign-alloc, as
+;; this row once used, left the shim nothing dirty, and a shim that did not
+;; zero (malloc in place of calloc) passed it in three runs of five (the
+;; stream-step mutation log). So each allocation first dirties a block
+;; through the shim and frees it, and records whether alloc-zeroed was
+;; handed that very block and whether it came back zeroed.
 (define churn-size (sizeof-uv-loop-t))
 
-(define (any-nonzero? addr len)
-  (let loop ((i 0))
-    (cond ((= i len) #f)
-          ((zero? (foreign-ref 'unsigned-8 addr i)) (loop (+ i 1)))
-          (else #t))))
+;; dirty-then-alloc-zeroed : -> (list reused? zeroed?)
+(define (dirty-then-alloc-zeroed)
+  (let ((dirty (alloc-block churn-size)))
+    (libc-memset! dirty #xff churn-size)
+    (free-block! dirty)
+    (let* ((a (alloc-zeroed churn-size))
+           (seen (list (= a dirty) (all-bytes-equal? a churn-size 0))))
+      (free! a)
+      seen)))
 
-;; Allocate, fill with #xff, free -- leaving the allocator's free list dirty.
-(define (churn-dirty-blocks! reps)
+(define shim-dirt
   (let loop ((i 0) (acc '()))
-    (if (= i reps)
-        (for-each foreign-free acc)
-        (let ((a (foreign-alloc churn-size)))
-          (let fill ((j 0))
-            (when (< j churn-size)
-              (foreign-set! 'unsigned-8 a j #xff)
-              (fill (+ j 1))))
-          (loop (+ i 1) (cons a acc))))))
-
-;; Self-dirtying, not hoping. This used to churn 32 blocks, free all of
-;; them, then allocate ONE fresh block and hope the allocator handed back
-;; one of the 32 just-freed ones. It doesn't always: Valgrind's own
-;; allocator quarantines freed blocks (to catch use-after-free) rather than
-;; recycling them straight back, so the "fresh" block it hands the next
-;; caller can be a genuinely fresh, zeroed one -- which is exactly what this
-;; seed is here to catch, and exactly what it caught under Valgrind.
-;;
-;; Freeing and immediately re-requesting the SAME size targets the
-;; allocator's own free-list/fastbin path directly instead of depending on
-;; what an unrelated batch of frees happened to leave behind. But a SINGLE
-;; alloc/free/alloc cycle is not enough either -- measured directly
-;; (scratchpad probe, macOS): the first ~3 cycles at a size class come back
-;; clean every time (a first-touch page, zero-filled on fault), and only
-;; from the 4th cycle onward does the allocator actually recycle the same
-;; bytes it was just handed. So this warms the SAME slot up across several
-;; cycles and only asserts on the last one, with margin over the observed
-;; threshold.
-(define (alloc-fill-free-cycle! size)
-  (let ((a (foreign-alloc size)))
-    (let fill ((i 0))
-      (when (< i size)
-        (foreign-set! 'unsigned-8 a i #xff)
-        (fill (+ i 1))))
-    (foreign-free a)))
-
-;; Root-caused under real Valgrind (run 4): recycled-dirt is unobservable
-;; there BY DESIGN, not by an insufficient warm-up. Memcheck's own freelist
-;; (--freelist-vol, ~20MB by default) exists SPECIFICALLY to delay reusing a
-;; freed block, so it can still flag a use-after-free against it -- no
-;; warm-up depth can make an alloc-after-free observe the just-freed block's
-;; leftover bytes there, because Memcheck's whole point is to keep serving
-;; genuinely different memory instead. make test-memory's Linux leg sets
-;; CHEZ_LIBUV_UNDER_VALGRIND=1 for exactly this reason: under it, the seed
-;; drops to the weak form below (proves the fill/read-back machinery works,
-;; nothing about allocator dirt) rather than asserting a property Valgrind
-;; makes structurally unobservable. See the stage-1 mutation log addendum
-;; for what this costs and where that coverage actually lives instead.
-(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
-    (test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size (valgrind: recycled-dirt unobservable by design)"
-      #t
-      (let ((a (foreign-alloc churn-size)))
-        (let fill ((i 0))
-          (when (< i churn-size)
-            (foreign-set! 'unsigned-8 a i #xff)
-            (fill (+ i 1))))
-        (let ((filled (all-bytes-equal? a churn-size #xff)))
-          (foreign-free a)
-          filled)))
-    (test-equal "seed: a plain foreign-alloc really does hand back dirty memory at this size"
-      #t
-      (begin
-        (let loop ((i 0)) (when (< i 8) (alloc-fill-free-cycle! churn-size) (loop (+ i 1))))
-        (let* ((a (foreign-alloc churn-size))
-               (dirty (any-nonzero? a churn-size)))
-          (foreign-free a)
-          dirty))))
-
-(churn-dirty-blocks! 32)
-(test-equal "alloc-zeroed returns zeroed memory even when the allocator hands back a dirty block"
-  #t
-  (let loop ((i 0) (blocks '()) (ok #t))
     (if (= i 32)
-        (begin (for-each free! blocks) ok)
-        (let ((a (alloc-zeroed churn-size)))
-          (loop (+ i 1) (cons a blocks)
-                (and ok (all-bytes-equal? a churn-size 0)))))))
+        acc
+        (loop (+ i 1) (cons (dirty-then-alloc-zeroed) acc)))))
+
+;; The seed: the row below can fail only if alloc-zeroed was handed a block
+;; just dirtied. Neither memory tool hands back a block just freed. Memcheck's
+;; freelist (--freelist-vol, ~20MB by default) and ASan's quarantine both
+;; delay reuse so that they can still flag a use-after-free. make
+;; test-memory sets CHEZ_LIBUV_UNDER_VALGRIND=1 on its Linux leg and
+;; ASAN_OPTIONS on its macOS one, and under either the seed requires only
+;; that the allocations were made; the dirty-memory property is held by the
+;; plain run (the stage-1 mutation log addendum).
+(if (or (getenv "CHEZ_LIBUV_UNDER_VALGRIND") (getenv "ASAN_OPTIONS"))
+    (test-equal "seed: alloc-zeroed made every allocation (a memory tool: reuse unobservable by design)"
+      32 (length shim-dirt))
+    (test-equal "seed: the shim's allocator handed alloc-zeroed the very block just dirtied"
+      #t (exists car shim-dirt)))
+
+(test-equal "alloc-zeroed returns zeroed memory even when the allocator hands back a dirty block"
+  #t (for-all cadr shim-dirt))
 
 (test-equal "alloc-zeroed rejects a non-positive size"
   'uv-alloc-zeroed
@@ -914,6 +866,65 @@
             (#t 'wrong-condition))
     (alloc-zeroed 0)
     'no-raise))
+
+;; --- the step forms: alloc-block, free-block!, copy-in-unchecked! ---------
+;; A verb calls these inside an interrupt-free step, where a raise would
+;; leave interrupts disabled for good (stream.sls). So each is total: it
+;; answers or ignores an argument it cannot use, and no argument makes it
+;; raise. Each row's expected value is one a raise cannot produce, since
+;; SRFI-64 turns a raise in the actual expression into #f.
+(test-equal "alloc-block answers 0 for a size that is not a positive fixnum, and counts no block"
+  '((0 0 0 0 0) 0)
+  (let* ((before (live-count 'block))
+         (answers (map alloc-block (list 0 -16 (expt 2 70) 16.0 'sixteen))))
+    (list answers (- (live-count 'block) before))))
+
+(test-equal "alloc-block answers a zeroed block, counted until free-block! frees it"
+  '(zeroed 1 0)
+  (let* ((before (live-count 'block))
+         (addr (alloc-block 64))
+         (zeroed (if (and (positive? addr) (all-bytes-equal? addr 64 0))
+                     'zeroed
+                     (list 'not-zeroed addr)))
+         (held (- (live-count 'block) before)))
+    (free-block! addr)
+    (list zeroed held (- (live-count 'block) before))))
+
+;; Each input the FFI would refuse, rather than wrap: a uptr argument takes
+;; -2^63 and up and wraps a negative one, so -8 would reach free() as a huge
+;; address and abort the process instead of failing this row.
+(test-equal "free-block! ignores what cannot be an address, 0 included, and counts nothing"
+  '(ignored 0)
+  (let ((before (live-count 'block)))
+    (for-each free-block! (list 'addr (expt 2 64) (- (expt 2 64)) 0))
+    (list 'ignored (- (live-count 'block) before))))
+
+;; A size the allocator refuses. ASan aborts on a request this large
+;; rather than answering NULL, so the macOS memory gate (which sets
+;; ASAN_OPTIONS) leaves these two rows to the plain run and to Valgrind.
+(define refused-size (expt 2 59))
+(unless (getenv "ASAN_OPTIONS")
+  (test-equal "alloc-block answers 0 when the allocator refuses, and counts no block"
+    '(0 0)
+    (let* ((before (live-count 'block))
+           (addr (alloc-block refused-size)))
+      (list addr (- (live-count 'block) before))))
+
+  (test-equal "alloc-zeroed raises ENOMEM under its own name when the allocator refuses"
+    '(uv-alloc-zeroed ENOMEM)
+    (guard (e ((uv-errno-error? e) (list (condition-who e) (uv-errno-error-errno e)))
+              (#t 'wrong-condition))
+      (alloc-zeroed refused-size)
+      'no-raise)))
+
+(let ((addr (alloc-zeroed 8))
+      (src (u8-list->bytevector (list 10 20 30 40 50))))
+  (test-equal "copy-in-unchecked! copies the requested span, honouring start, and nothing past it"
+    (u8-list->bytevector (list 20 30 40 0))
+    (begin
+      (copy-in-unchecked! addr src 1 3)
+      (copy-out addr 4)))
+  (free! addr))
 
 ;; free! of a null pointer is always a bug: design spec S5/S6/S7 require the
 ;; freeing site to zero the stored uptr immediately, so a zeroed slot
@@ -924,6 +935,16 @@
   (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
             (#t 'wrong-condition))
     (free! 0)
+    'no-raise))
+
+;; free-block! ignores an address past the address space; free!, the checked
+;; form, refuses it, as foreign-free did before the shim's free replaced it.
+(test-equal "free! rejects an address past the address space"
+  '(uv-free! null-or-invalid-pointer)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t 'wrong-condition))
+    (free! (expt 2 64))
     'no-raise))
 
 ;; copy-in! / copy-out are the two halves of ADR-0009's copy-at-the-boundary
@@ -1604,11 +1625,12 @@
 ;; Seeded: the counter is driven to a non-zero value and asserted there
 ;; first, so a counter permanently stuck at 0 cannot pass the balance check.
 
-;; Task 2 (v0.4) added the signal row; #20 added async as the thirteenth.
-(test-equal "live-counts reports all thirteen allocation classes"
+;; Task 2 (v0.4) added the signal row; #20 added async as the thirteenth;
+;; block, every block the binding allocates, is the fourteenth.
+(test-equal "live-counts reports all fourteen allocation classes"
   '(loop tcp timer write-req connect-req
     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options
-    signal async)
+    signal async block)
   (map car (live-counts)))
 
 ;; Superseded by the twelve-class row above, kept for provenance:
@@ -1663,7 +1685,13 @@
         (list 'spawn-options
               count-spawn-options-new! count-spawn-options-free!)
         (list 'signal count-signal-new! count-signal-free!)
-        (list 'async  count-async-new!  count-async-free!)))
+        (list 'async  count-async-new!  count-async-free!)
+        ;; The block class has no count entries of its own: the shim's
+        ;; allocator and free count it, so it is driven through those.
+        (let ((held '()))
+          (list 'block
+                (lambda () (set! held (cons (alloc-zeroed 16) held)))
+                (lambda () (free! (car held)) (set! held (cdr held)))))))
 
 (for-each
  (lambda (entry)

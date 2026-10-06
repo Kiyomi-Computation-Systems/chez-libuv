@@ -27,10 +27,13 @@
         (uv-testing)
         (uv-bulk)
         (only (uv-evidence) live-count describe)
-        ;; make-engine and bytevector-truncate! drive the shrinking-payload
-        ;; sweep.
-        (only (chezscheme) collect foreign-alloc foreign-free
-              make-engine bytevector-truncate!))
+        ;; make-engine drives the engine sweeps, and bytevector-truncate!
+        ;; the shrinking-payload one; the interrupt pair checks that no
+        ;; refusal leaves interrupts disabled; foreign-procedure binds the
+        ;; libuv queries the split sweeps' witnesses read.
+        (only (chezscheme) collect foreign-alloc foreign-free foreign-procedure
+              make-engine bytevector-truncate!
+              disable-interrupts enable-interrupts))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -98,31 +101,35 @@
 ;; Each verb registers its request before libuv sees it, so a refusal has
 ;; to take the request back: deregistered, freed and uncounted, then
 ;; libuv's errno raised under the verb's own name. `let*` orders the reads
-;; around the call (AGENTS.md's right-to-left trap).
+;; around the call (AGENTS.md's right-to-left trap). The block counter
+;; sees the free itself.
 (define (refusal-and-residue thunk)
   (let* ((write-reqs-before (live-count 'write-req))
          (registry-before (registry-count))
+         (blocks-before (live-count 'block))
          (outcome (guard (e ((uv-errno-error? e) (list (condition-who e) 'errno))
                             (#t 'wrong-condition))
                     (thunk)
                     'accepted))
          (write-reqs-after (live-count 'write-req))
-         (registry-after (registry-count)))
+         (registry-after (registry-count))
+         (blocks-after (live-count 'block)))
     (list outcome
           (- write-reqs-after write-reqs-before)
-          (- registry-after registry-before))))
+          (- registry-after registry-before)
+          (- blocks-after blocks-before))))
 
 (test-equal "a uv-write! libuv refuses raises its errno as uv-write! and leaves no request"
-  '((uv-write! errno) 0 0)
+  '((uv-write! errno) 0 0 0)
   (refusal-and-residue (lambda () (uv-write! pipe (make-bytevector 1 7) nop))))
 
 (test-equal "a uv-write*! libuv refuses raises its errno as uv-write*! and leaves no request"
-  '((uv-write*! errno) 0 0)
+  '((uv-write*! errno) 0 0 0)
   (refusal-and-residue
    (lambda () (uv-write*! pipe (list (make-bytevector 1 7)) nop))))
 
 (test-equal "a uv-shutdown! libuv refuses raises its errno as uv-shutdown! and leaves no request"
-  '((uv-shutdown! errno) 0 0)
+  '((uv-shutdown! errno) 0 0 0)
   (refusal-and-residue (lambda () (uv-shutdown! pipe nop))))
 
 ;; --- a payload that shrinks during the call -------------------------------
@@ -175,9 +182,11 @@
 
 (define sweep-len 3001)
 (define sweep-max-fuel 400)
-;; A delivered write drains in one or two steps. The cap bounds what a broken
-;; build spends on each of the few runs it can still reach.
-(define drain-steps 256)
+;; A delivered write drains in one or two steps on a quiet machine. With the
+;; machine's load average at 43, a drain once outran 256 steps, and the
+;; write's bytes then landed in the next run's count. The cap bounds what a
+;; broken build spends on each of the few runs it can still reach.
+(define drain-steps 2000)
 (define s-issued 0)
 (define s-completed 0)
 (define (on-swept err) (set! s-completed (+ s-completed 1)))
@@ -422,11 +431,464 @@
                      (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
     (uv-write*! timer (list (make-bytevector 1 0)) nop) #f))
 
+;; --- a verb split by an engine ---------------------------------------------
+;; A green-thread scheduler on the loop thread runs each task in an engine,
+;; and a task's fuel can run out anywhere inside a stream verb. Two things
+;; can then go wrong, and both did on every verb here before each verb's
+;; check, allocation, registration and native call became one interrupt-free
+;; step (one-step in (libuv private handles)):
+;; - Another task closes the stream and runs the loop, which frees the
+;;   uv_tcp_t, and the verb resumes past its open check with the stale
+;;   pointer. Valgrind reports libuv reading the freed block. If a new
+;;   connection has been given the same address meanwhile, as it was on every
+;;   macOS run, the verb acts on that connection instead: a write delivers
+;;   its bytes to the new connection's peer and reports success.
+;; - The scheduler drops the task, as a timeout does, and never resumes it.
+;;   Whatever the verb had allocated and not yet handed to libuv is lost: a
+;;   block, or a request registered and counted that libuv never saw.
+;;
+;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
+;; the verb's own open check, and the sweep stops at the first run no expiry
+;; reaches, so between them every point in the verb is visited. At the
+;; expiry, the split sweep asks libuv whether the verb's native call has
+;; been made, closes the stream, steps the loop until the close has freed
+;; it, and resumes the verb. So each run has one right answer:
+;;   'refused           not yet made: resumed, the verb sees the stream
+;;                      closed and raises &uv-handle-closed;
+;;   'made-before-close made before the close (or the verb had returned),
+;;                      its effect landed, and resumed, the verb returns;
+;;   'untouched         no expiry: it ran whole, and its effect landed.
+;; A verb that returns after the close without having been made made its
+;; native call on the freed stream. The reuse sweeps open a new connection
+;; after the free, before resuming, and its peer must receive nothing. The
+;; drop sweep drops the engine instead, and requires the registry, every
+;; counter and the blocks alive back where the run began once the
+;; connection is closed.
+
+(define (interrupts-enabled?)
+  (disable-interrupts)
+  (zero? (enable-interrupts)))
+
+(define sw-loop (make-uv-loop))
+(define sw-server (make-uv-tcp sw-loop))
+(define sw-port (bind-loopback! sw-server))
+(define sw-accepted #f)
+(uv-listen! sw-server 16
+            (lambda (err) (set! sw-accepted (uv-accept! sw-server))))
+
+;; libuv's own view of a stream, for the witnesses below: whether it is
+;; active (reading, here) and whether it can still be written (a shutdown
+;; clears that at once, in uv_shutdown itself). Neither is bound by the
+;; library; the loop above has loaded libuv.
+(define uv-is-active (foreign-procedure "uv_is_active" (uptr) int))
+(define uv-is-writable (foreign-procedure "uv_is_writable" (uptr) int))
+
+;; A link is one connection: the client a verb runs on, the peer the server
+;; accepted for it, what each received, whether the peer saw EOF, and
+;; whether the verb's own callback has run.
+(define-record-type link
+  (fields client (mutable peer) (mutable connected)
+          peer-got client-got (mutable peer-eof) (mutable called-back)))
+
+;; connect-link! : -> (or link #f)
+(define (connect-link!)
+  (let ((lk (make-link (make-uv-tcp sw-loop) #f #f
+                       (make-byte-collector) (make-byte-collector) #f #f)))
+    (set! sw-accepted #f)
+    (connect-loopback! (link-client lk) sw-port
+                       (lambda (err) (link-connected-set! lk (if err 'failed #t))))
+    (run-until/ticking sw-loop
+                       (lambda () (or (eq? (link-connected lk) 'failed)
+                                      (and (link-connected lk) sw-accepted)))
+                       4000)
+    (and (eq? (link-connected lk) #t) sw-accepted
+         (begin
+           (link-peer-set! lk sw-accepted)
+           (uv-read-start! sw-accepted
+                           (lambda (bv start end)
+                             (collect-span! (link-peer-got lk) bv start end))
+                           (lambda () (link-peer-eof-set! lk #t))
+                           nop)
+           lk))))
+
+;; poll! : (-> boolean) -> boolean
+;; Steps the loop until (DONE?) holds, at most 16 times, and answers it.
+;; 'nowait, never 'once: with nothing due, 'once would block on the server.
+;; For what the loop delivers by itself (a callback libuv has queued, a
+;; close); bytes crossing the kernel's loopback want settle!.
+(define (poll! done?)
+  (let step ((i 0))
+    (cond ((done?) #t)
+          ((= i 16) #f)
+          (else (uv-run sw-loop 'nowait) (step (+ i 1))))))
+
+;; settle! : (-> boolean) exact-positive-integer -> boolean
+;; Steps the loop until (DONE?) holds, waking at least every millisecond, at
+;; most STEPS times, and answers it. Bytes cross the kernel's loopback after
+;; the call that sent them: macOS hands the packets to a kernel thread.
+;; - Waiting for something to land, a run waits LANDING-STEPS. On a quiet
+;;   machine it lands in one or two steps, but with the machine's load
+;;   average at 43, an untouched write once missed a cap of 20. Only a build
+;;   whose effect never lands pays the full wait.
+;; - Waiting to see that nothing lands, a run waits STRAY-STEPS. A late
+;;   arrival there can only let a broken build pass, never fail a sound one.
+(define landing-steps 2000)
+(define stray-steps 20)
+
+(define (settle! done? steps)
+  (eq? 'satisfied (run-until/ticking sw-loop done? steps)))
+
+(define (closed-or-absent? h) (or (not h) (eq? 'closed (uv-handle-state h))))
+
+;; close-link! : link -> unspecified
+;; Closes whatever of the link is still open, and steps the loop until the
+;; closes have freed it all. A 'nowait step runs the closes due, so poll!
+;; suffices, and a close that never finishes cannot block the suite.
+(define (close-link! lk)
+  (for-each (lambda (h) (when (and h (uv-handle-open? h)) (uv-close! h)))
+            (list (link-client lk) (link-peer lk)))
+  (poll! (lambda () (and (closed-or-absent? (link-client lk))
+                         (closed-or-absent? (link-peer lk))))))
+
+;; What the run must leave as it found it: the registry, and every debug
+;; counter, blocks included.
+(define (balance) (cons (registry-count) (live-counts)))
+
+(define (residue before)
+  (let ((after (balance)))
+    (append
+     (if (= (car before) (car after))
+         '()
+         (list (list 'registry (- (car after) (car before)))))
+     (filter (lambda (x) x)
+             (map (lambda (b a)
+                    (and (not (= (cdr b) (cdr a)))
+                         (list (car b) (- (cdr a) (cdr b)))))
+                  (cdr before) (cdr after))))))
+
+;; A variant names a verb, readies a link for it, and starts it on the
+;; link's client. MADE? says, with the stream still open, whether the verb's
+;; native call has been made, or 'unobservable for a call that leaves no
+;; trace. LANDED? checks the effect of a call that was made.
+(define-record-type variant (fields name prepare start made? landed?))
+
+(define payload-len 64)
+
+(define (no-prepare lk fill) #f)
+
+;; The verb's own callback records its answer: #t, or the error it got.
+(define (calls-back lk)
+  (lambda (err) (link-called-back-set! lk (if err (describe err) #t))))
+
+;; A write's callback is queued once uv_write has written, and the next
+;; loop step runs it.
+(define (called-back? lk fill) (poll! (lambda () (link-called-back lk))))
+
+;; link-evidence : link -> list
+;; What a run that never landed carries, for whoever reads its row: the
+;; callback's answer, what each side received, and whether libuv has each
+;; side reading and how much it still holds to write.
+(define (link-evidence lk)
+  (define (state h)
+    (if (uv-handle-open? h)
+        (list 'active (uv-is-active (handle-ptr h))
+              'queued (uv-stream-write-queue-size h))
+        (list (uv-handle-state h))))
+  (list 'called-back (link-called-back lk)
+        'peer-got (collector-count (link-peer-got lk))
+        'client-got (collector-count (link-client-got lk))
+        'peer-eof (link-peer-eof lk)
+        'client (state (link-client lk))
+        'peer (state (link-peer lk))))
+
+;; Whether the peer received exactly the payload: PAYLOAD-LEN bytes of FILL.
+(define (peer-got-payload? lk fill)
+  (settle! (lambda () (>= (collector-count (link-peer-got lk)) payload-len))
+           landing-steps)
+  (eq? 'identical (compare-bytes (make-bytevector payload-len fill)
+                                 (collector-bytes (link-peer-got lk)))))
+
+(define (client-reader lk)
+  (lambda (bv start end) (collect-span! (link-client-got lk) bv start end)))
+
+(define (client-got-a-byte? lk)
+  (positive? (collector-count (link-client-got lk))))
+
+;; The peer sends the client one byte; answers whether its write completed.
+(define (peer-sends-a-byte! lk fill)
+  (let ((done #f))
+    (uv-write! (link-peer lk) (make-bytevector 1 fill) (lambda (err) (set! done #t)))
+    (poll! (lambda () done))))
+
+(define (client-active? lk) (= 1 (uv-is-active (handle-ptr (link-client lk)))))
+
+(define variants
+  (list
+   (make-variant
+    'uv-write! no-prepare
+    (lambda (lk fill)
+      (uv-write! (link-client lk) (make-bytevector payload-len fill) 0 payload-len
+                 (calls-back lk)))
+    called-back? peer-got-payload?)
+   (make-variant
+    'uv-write*! no-prepare
+    (lambda (lk fill)
+      (let ((half (div payload-len 2)))
+        (uv-write*! (link-client lk)
+                    (list (make-bytevector half fill)
+                          (list (make-bytevector payload-len fill) 0 half))
+                    (calls-back lk))))
+    called-back? peer-got-payload?)
+   (make-variant
+    'uv-shutdown! no-prepare
+    (lambda (lk fill) (uv-shutdown! (link-client lk) nop))
+    (lambda (lk fill) (zero? (uv-is-writable (handle-ptr (link-client lk)))))
+    (lambda (lk fill) (settle! (lambda () (link-peer-eof lk)) landing-steps)))
+   ;; The peer's byte waits until reading starts.
+   (make-variant
+    'uv-read-start! peer-sends-a-byte!
+    (lambda (lk fill) (uv-read-start! (link-client lk) (client-reader lk) nop nop))
+    (lambda (lk fill) (client-active? lk))
+    (lambda (lk fill) (settle! (lambda () (client-got-a-byte? lk)) landing-steps)))
+   ;; The client reads before the call; once stopped, it is delivered nothing.
+   (make-variant
+    'uv-read-stop!
+    (lambda (lk fill) (uv-read-start! (link-client lk) (client-reader lk) nop nop))
+    (lambda (lk fill) (uv-read-stop! (link-client lk)))
+    (lambda (lk fill) (not (client-active? lk)))
+    (lambda (lk fill)
+      (and (peer-sends-a-byte! lk fill)
+           (not (settle! (lambda () (client-got-a-byte? lk)) stray-steps)))))
+   ;; A split run counts as made only if the verb had returned.
+   (make-variant
+    'uv-stream-write-queue-size no-prepare
+    (lambda (lk fill) (uv-stream-write-queue-size (link-client lk)))
+    (lambda (lk fill) 'unobservable)
+    (lambda (lk fill) #t))))
+
+;; split-run : variant exact-positive-integer symbol -> verdict
+;; MODE is 'free, or 'reuse to open a new connection after the free.
+(define (split-run v fuel mode)
+  (let* ((before (balance))
+         (lk (connect-link!)))
+    (if (not lk)
+        '(connect-failed)
+        (let* ((fill (+ 1 (mod fuel 250)))
+               (prepared ((variant-prepare v) lk fill))
+               (returned #f)
+               (eng (make-engine
+                     (lambda ()
+                       (guard (e ((uv-handle-closed? e) 'refused)
+                                 (#t (list 'raised (describe e))))
+                         ((variant-start v) lk fill)
+                         (set! returned #t)
+                         'returned))))
+               (verdict
+                (eng fuel
+                     (lambda (ticks outcome)
+                       (cond ((not (eq? outcome 'returned)) (list 'untouched outcome))
+                             ((not ((variant-made? v) lk fill)) '(untouched not-made))
+                             ((not ((variant-landed? v) lk fill))
+                              (list 'untouched 'never-landed (link-evidence lk)))
+                             (else 'untouched)))
+                     (lambda (resume)
+                       (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
+                                               returned))
+                              (landed (and made-before ((variant-landed? v) lk fill))))
+                         (uv-close! (link-client lk))
+                         (poll! (lambda () (closed-or-absent? (link-client lk))))
+                         (let* ((new (and (eq? mode 'reuse) (connect-link!)))
+                                (outcome (resume 1000000 (lambda (ticks o) o)
+                                                 (lambda (more) 'still-running)))
+                                (stray (and new
+                                            (settle! (lambda ()
+                                                       (positive? (collector-count
+                                                                   (link-peer-got new))))
+                                                     stray-steps))))
+                           (when new (close-link! new))
+                           (cond (stray (list 'the-new-connection-got-bytes outcome))
+                                 ((and (eq? outcome 'refused) (not made-before)) 'refused)
+                                 ((and (eq? outcome 'returned) landed) 'made-before-close)
+                                 (else (list outcome
+                                             (cond ((not made-before) 'not-made-before-close)
+                                                   ((not landed)
+                                                    (list 'made-but-never-landed
+                                                          (link-evidence lk)))
+                                                   (else 'made-before-close)))))))))))
+          (close-link! lk)
+          (let ((left (residue before)))
+            (cond ((not (interrupts-enabled?))
+                   (enable-interrupts)
+                   (list 'interrupts-left-disabled verdict))
+                  ((pair? left) (list verdict 'left left))
+                  (else verdict)))))))
+
+;; drop-run : variant exact-positive-integer -> verdict
+(define (drop-run v fuel)
+  (let* ((before (balance))
+         (lk (connect-link!)))
+    (if (not lk)
+        '(connect-failed)
+        (let* ((fill (+ 1 (mod fuel 250)))
+               (prepared ((variant-prepare v) lk fill))
+               (eng (make-engine
+                     (lambda ()
+                       (guard (e (#t (list 'raised (describe e))))
+                         ((variant-start v) lk fill)
+                         'returned))))
+               (outcome (eng fuel
+                             (lambda (ticks o) (if (eq? o 'returned) 'untouched (list 'untouched o)))
+                             (lambda (resume) 'dropped))))
+          (close-link! lk)
+          (let ((left (residue before)))
+            (cond ((not (interrupts-enabled?))
+                   (enable-interrupts)
+                   (list 'interrupts-left-disabled outcome))
+                  ((pair? left) (list outcome 'left left))
+                  (else outcome)))))))
+
+(define sweep-fuel-cap 400)
+
+(define (untouched? verdict)
+  (or (eq? verdict 'untouched) (and (pair? verdict) (eq? (car verdict) 'untouched))))
+
+;; sweep : (exact-positive-integer -> verdict) -> (list-of (cons fuel verdict))
+;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
+;; to the cap. A raise between runs would abort the suite, so the sweep is
+;; caught and its evidence handed to the rows.
+(define (sweep run)
+  (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
+    (let next ((fuel 1) (acc '()))
+      (let* ((verdict (run fuel))
+             (acc (cons (cons fuel verdict) acc)))
+        (if (or (untouched? verdict) (= fuel sweep-fuel-cap))
+            (reverse acc)
+            (next (+ fuel 1) acc))))))
+
+(define (named-sweeps run vs)
+  (map (lambda (v) (cons (variant-name v) (sweep (lambda (fuel) (run v fuel))))) vs))
+
+(define split-sweeps
+  (named-sweeps (lambda (v fuel) (split-run v fuel 'free)) variants))
+(define reuse-sweeps
+  (named-sweeps (lambda (v fuel) (split-run v fuel 'reuse))
+                (filter (lambda (v) (memq (variant-name v) '(uv-write! uv-write*!)))
+                        variants)))
+(define drop-sweeps (named-sweeps drop-run variants))
+
+;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
+(define (bad-runs good? sweeps)
+  (apply append
+         (map (lambda (s)
+                (map (lambda (run) (list (car s) (car run) (cdr run)))
+                     (filter (lambda (run) (not (good? (cdr run)))) (cdr s))))
+              sweeps)))
+
+;; reach : sweeps symbol -> (list-of (list name first last))
+;; The rows below look for bad runs and must find none, which says nothing
+;; unless each sweep caught its verb before the step (FIRST) and ran it to
+;; the end (the last run untouched).
+(define (reach sweeps)
+  (map (lambda (s)
+         (let ((runs (cdr s)))
+           (list (car s) (cdar runs) (cdr (list-ref runs (- (length runs) 1))))))
+       sweeps))
+
+(define (expected-reach sweeps first)
+  (map (lambda (s) (list (car s) first 'untouched)) sweeps))
+
+;; fuel-map : sweep -> list, e.g. ((refused 1 9) (untouched 10 10)): each
+;; run of equal verdicts with its first and last fuel, for the record.
+(define (fuel-map runs)
+  (let collect ((runs runs) (acc '()))
+    (cond ((null? runs) (reverse acc))
+          ((and (pair? acc) (equal? (caar acc) (cdar runs)))
+           (collect (cdr runs)
+                    (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
+          (else (collect (cdr runs)
+                         (cons (list (cdar runs) (caar runs) (caar runs)) acc))))))
+
+(for-each
+ (lambda (kind sweeps)
+   (for-each (lambda (s)
+               (display "  [informational] ") (display kind) (display " ")
+               (display (car s)) (display ": ")
+               (write (fuel-map (cdr s))) (newline))
+             sweeps))
+ '(split reuse drop)
+ (list split-sweeps reuse-sweeps drop-sweeps))
+
+(test-equal "a stream verb split by a close is refused, or had made its call before the close"
+  '()
+  (bad-runs (lambda (v) (memq v '(refused made-before-close untouched))) split-sweeps))
+
+(test-equal "each split sweep caught its verb before the close and ran it to the end"
+  (expected-reach split-sweeps 'refused)
+  (reach split-sweeps))
+
+(test-equal "a write split by a close never reaches a new connection given the stream's address"
+  '()
+  (bad-runs (lambda (v) (memq v '(refused made-before-close untouched))) reuse-sweeps))
+
+(test-equal "each reuse sweep caught its write before the close and ran it to the end"
+  (expected-reach reuse-sweeps 'refused)
+  (reach reuse-sweeps))
+
+(test-equal "a stream verb whose engine is dropped leaves no request, block or registry entry"
+  '()
+  (bad-runs (lambda (v) (memq v '(dropped untouched))) drop-sweeps))
+
+(test-equal "each drop sweep dropped its verb and ran it to the end"
+  (expected-reach drop-sweeps 'dropped)
+  (reach drop-sweeps))
+
+(uv-close! sw-server)
+(uv-loop-teardown! sw-loop)
+
 (uv-loop-teardown! loop)
 (collect)
 (test-assert "counters all zero after teardown"
   (for-all (lambda (kv) (zero? (cdr kv))) (live-counts)))
 (test-equal "registry back to baseline" registry-count-at-start (registry-count))
+
+;; --- a stream left open with no native block --------------------------------
+;; No path in the library leaves a stream open with its pointer zeroed, but
+;; a step must not fault if one ever does: the fault would be raised with
+;; interrupts disabled. Each step checks the pointer and answers a status,
+;; and the refusal is the one handle-pointer raises outside a step. The
+;; private setter forces the state. This row comes last, because a fault here
+;; would leave interrupts disabled for any row after it.
+(test-equal "a stream verb on a stream left open with no native block is refused, not made"
+  '((uv-write! null-handle-pointer) (uv-write*! null-handle-pointer)
+    (uv-shutdown! null-handle-pointer) (uv-read-start! null-handle-pointer)
+    (uv-read-stop! null-handle-pointer)
+    (uv-stream-write-queue-size null-handle-pointer)
+    interrupts-enabled)
+  (let* ((l (make-uv-loop))
+         (t (make-uv-tcp l)))
+    (uv-close! t)
+    (uv-run l 'nowait)            ; the close callback frees the block, zeroes the pointer
+    (set-handle-state! t 'open)
+    (let ((refusals
+           (map (lambda (call)
+                  (guard (e ((uv-invalid-argument? e)
+                             (list (uv-invalid-argument-who e)
+                                   (uv-invalid-argument-reason e)))
+                            (#t (list 'raised (describe e))))
+                    (call)
+                    'made))
+                (list (lambda () (uv-write! t (make-bytevector 1 7) nop))
+                      (lambda () (uv-write*! t (list (make-bytevector 1 7)) nop))
+                      (lambda () (uv-shutdown! t nop))
+                      (lambda () (uv-read-start! t nop nop nop))
+                      (lambda () (uv-read-stop! t))
+                      (lambda () (uv-stream-write-queue-size t))))))
+      (set-handle-state! t 'closed)
+      (uv-loop-teardown! l)
+      (append refusals
+              (list (if (interrupts-enabled?)
+                        'interrupts-enabled
+                        'interrupts-left-disabled))))))
 
 (test-end "stream")
 (exit (if (zero? (test-runner-fail-count runner)) 0 1))

@@ -119,6 +119,23 @@ None is obvious from reading the code.
   another thread at every point where an engine can suspend the send or the
   close: the lock is recursive, so the thread holding it cannot see it
   held.
+* **A verb's open check does not cover its native call, and a dropped
+  engine never finishes a verb.** No second thread is needed. An engine can
+  suspend a verb between its check and its call, and a scheduler on the
+  same thread can close the handle and run the loop meanwhile. Resumed, the
+  verb calls libuv on freed memory. A new connection given the freed
+  address gets the verb's effect: a `uv-write!` reported success and its
+  bytes reached the new peer. An engine that is dropped runs nothing after
+  its suspension, neither a `guard` nor a `dynamic-wind` exit. Whatever the
+  verb had allocated but not yet handed to libuv is lost, or stays
+  registered and counted for good.
+  - Every stream verb shipped this way until each became one `one-step`
+    (2026-10-06): check, pointer, allocation, registration and native
+    call. `tests/test-stream.sps`'s split, reuse and drop sweeps hold
+    them.
+  - The other verb families are still exposed (ADR-0019's decision 3
+    amendment lists them). A new verb, or a change to one, takes the same
+    shape and the same three sweeps.
 
 ### C and the FFI
 

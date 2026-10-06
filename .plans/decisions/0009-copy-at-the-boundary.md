@@ -208,6 +208,16 @@ for that API when it is added.
   >
   > `.plans/write-copy-leak-mutation-log.md` has the evidence.
   >
+  > **The write verbs now check the span before they allocate** (added
+  > 2026-10-06). Each write is one interrupt-free step: the stream's open
+  > check, the span checked again, the allocation, the copy
+  > (`copy-in-unchecked!`, since the step has checked the span itself),
+  > the registration and `uv_write` (ADR-0019's decision 3, amended
+  > 2026-10-06). A span the payload no longer covers is refused before any
+  > block exists, so there is nothing left to free; the shrinking-payload
+  > sweep holds the same refusals, and Valgrind finds nothing to hold.
+  > `try-copy-in!` stays as `copy-in!`'s base.
+  >
   > **What pins all this:**
   >
   > - `tests/test-native.sps` holds each helper within 3x of libc's own

@@ -42,6 +42,15 @@ void chez_uv_zero(void *dst, size_t len);
 void chez_uv_alloc_cb(struct uv_handle_s *handle, size_t suggested_size,
                       struct uv_buf_t *buf);
 
+/* The binding's own foreign blocks: handles, requests, read buffers and
+ * scratch. chez_uv_alloc answers n zeroed bytes, or NULL when the allocator
+ * refuses; it never aborts. Neither call can fail in Scheme for a size or an
+ * address in range, so a verb may make them inside an interrupt-free step,
+ * where nothing may raise (stream.sls). Every block from chez_uv_alloc goes
+ * back through chez_uv_free, so the debug build counts the blocks alive. */
+void *chez_uv_alloc(size_t n);
+void chez_uv_free(void *p);
+
 /* Counters are single-threaded diagnostics. Without CHEZ_LIBUV_DEBUG_COUNTERS,
  * updates are no-ops and live queries return zero. */
 void chez_uv_count_loop_new(void);
@@ -95,5 +104,9 @@ long chez_uv_live_signal(void);
 void chez_uv_count_async_new(void);
 void chez_uv_count_async_free(void);
 long chez_uv_live_async(void);
+
+/* Counted by chez_uv_alloc and chez_uv_free themselves, not by a pair of
+ * count entries. */
+long chez_uv_live_block(void);
 
 #endif /* CHEZ_LIBUV_SHIM_H */
