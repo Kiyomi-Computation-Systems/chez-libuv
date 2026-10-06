@@ -90,8 +90,9 @@
 (define cap 64)
 
 ;; The cap for a ticking wait that spans a loopback handshake. Every 1 ms
-;; tick spends an iteration, so a ticking cap is a time budget, and under
-;; heavy load a handshake has outlasted 64 of them (2026-10-06).
+;; tick spends an iteration, so a ticking cap is a time budget, and during
+;; other runs' loopback floods a handshake has outlasted 64 of them
+;; (2026-10-06).
 (define handshake-cap 4000)
 
 (test-begin "tcp")
@@ -2163,9 +2164,9 @@
 ;; Restarting with the same three callbacks: the buffer and the stored
 ;; callbacks are reused, and the bytes held back arrive now, in order. The
 ;; restart is a row, not plumbing: it raises EALREADY when the first chunk
-;; never arrived to stop the read (seen under load, 2026-10-06), and without
-;; a peer it raises for want of one. Either way the rows after it then fail
-;; by name instead of the suite aborting (AGENTS.md).
+;; never arrived to stop the read (seen during a loopback flood,
+;; 2026-10-06), and without a peer it raises for want of one. Either way the
+;; rows after it then fail by name instead of the suite aborting (AGENTS.md).
 (test-equal "the stopped reader restarts with the same three callbacks"
   'restarted
   (begin (uv-read-start! b-peer b-on-data b-on-eof b-on-error)

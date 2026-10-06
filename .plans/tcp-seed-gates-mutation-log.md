@@ -12,7 +12,12 @@ exactly once, and every plant was validated before any ran. The clone's file
 was restored after each run. Platform: macOS arm64 26.6.2, Chez 10.4.1
 (`tarm64osx`), libuv 1.52.1 from pkg-config, the dev build. The machine was
 shared with other sessions' test runs, at load averages from ~7 to ~158;
-the sections below say which runs were under heavy load.
+the sections below say which runs were under heavy load. The #50 session's
+notes put deliberate loopback floods at 05:19–05:51 and 05:54–06:30 local
+that day, to reproduce the reset section's flake, and record 0 failures in
+400 test-tcp runs under CPU load alone (load average up to 106). The RED
+sweep and the first green sweep ran inside the second window; the final
+green sweep ran after it.
 
 ---
 
@@ -143,9 +148,9 @@ Load ~100 to ~158. The control passed 210 rows.
 | ka-late | 0 | yes | |
 
 Ten of the twenty plants cost the summary: nine aborted with exit 255 and
-one hung. Two of the aborts were not the plant's: the backpressure and reset
-sections, which waited 64 ticks for their handshakes, missed them under load
-and died exactly as the reported run did.
+one hung. Two of the aborts were not the plant's. The backpressure and reset
+sections, which waited 64 ticks for their handshakes, missed them during the
+loopback floods and died exactly as the reported run did.
 
 `tests/test-seed-gates.sps` against main's file fails both scan rows by
 name. It prints 16 exposed uses in 14 forms for rule 1 (pa 1, s 13, b 1,
@@ -190,9 +195,10 @@ Load ~7 to ~38. Two control runs bracket the sweep: 217 passes each.
 | b-nodata | 1 | yes | 4: the first chunk, the idle reader, the restart, the resume |
 
 Every failure in this sweep belongs to the planted section. The earlier
-green sweep, at load ~30 to ~100, also passed every plant this way. Its
-spontaneous failures were the restart abort that shape 5 records, and named
-failures in other sections' cap-64 EOF and reset waits.
+green sweep, at load ~30 to ~100 and inside the flood window, also passed
+every plant this way. Its spontaneous failures were the restart abort that
+shape 5 records, and named failures in other sections' cap-64 EOF and reset
+waits.
 
 **Stress.** Four rounds ran 8 copies of main's suite and 8 of this branch's
 at once, at load ~32 to ~50. Neither side aborted or hung. The only failures
