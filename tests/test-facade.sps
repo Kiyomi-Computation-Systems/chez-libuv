@@ -341,19 +341,25 @@
 
 (define fclient (make-uv-tcp fl))
 
+;; The chain goes on only from a successful connect. A connect still pending
+;; when the drain below gives up completes at the suite's teardown, as
+;; 'ECANCELED, and going on then, on the closing client, raised
+;; &uv-handle-closed out of uv-loop-teardown! and aborted the suite (measured
+;; 2026-10-06, by forcing the drain to give up).
 (uv-tcp-connect! fclient "127.0.0.1" fport
                  (lambda (err)
                    (collect)
                    (set! f-connect-err err)
-                   (uv-tcp-nodelay! fclient #t)
-                   (uv-write! fclient (string->utf8 "facade")
-                              (lambda (werr)
-                                (collect)
-                                (set! f-write-err werr)
-                                (uv-shutdown! fclient
-                                              (lambda (serr)
-                                                (collect)
-                                                (set! f-shutdown-err serr)))))))
+                   (when (not err)
+                     (uv-tcp-nodelay! fclient #t)
+                     (uv-write! fclient (string->utf8 "facade")
+                                (lambda (werr)
+                                  (collect)
+                                  (set! f-write-err werr)
+                                  (uv-shutdown! fclient
+                                                (lambda (serr)
+                                                  (collect)
+                                                  (set! f-shutdown-err serr))))))))
 
 ;; Bounded by iteration count, never by a clock (design spec S11). The whole
 ;; chain above is driven by callbacks the loop itself delivers.
@@ -370,15 +376,29 @@
 ;; miswired dispatcher -- left this suite HANGING instead of failing: the
 ;; iteration bound was never reached because iterations stopped arriving.
 ;; A repeating facade-only timer guarantees every 'once returns, so a dead
-;; chain now burns through the 32 iterations and the rows below fail BY
+;; chain now burns through its iterations and the rows below fail BY
 ;; NAME. Built from facade exports alone -- (uv-testing)'s run-until/ticking
 ;; is exactly this, but that library imports (libuv tcp) directly and may
 ;; not stand between this suite and the facade.
+;;
+;; THE SAME TICKER MAKES THE CAP A TIME BUDGET. Each tick spends an
+;; iteration, so the cap counts milliseconds, not events. This drain, the dns
+;; and resolve->connect drains and the spawn drain wait on the kernel or the
+;; threadpool, and load can slow those while the ticker keeps its pace: under
+;; a loopback flood (2026-10-06), handshakes outlasted a cap of 32 in up to 18
+;; runs of 20. delivery-cap is four seconds or more. Under the heaviest flood
+;; measured, a working chain used under a quarter of it, and a dead chain
+;; spends all of it, then fails by name
+;; (.plans/facade-drain-caps-mutation-log.md). The timer drains above and
+;; the close drain at the end keep 32: 'once waits there for the suite's own
+;; timer or close, so those caps count events.
+(define delivery-cap 4000)
+
 (define f-ticker (make-uv-timer fl))
 (uv-timer-start! f-ticker (lambda (t) (collect)) 1 1)
 
 (let drain ((i 0))
-  (when (and (< i 32)
+  (when (and (< i delivery-cap)
              (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
                  (eq? f-accepted 'never-accepted)
                  (eq? f-read 'on-data-never-fired)))
@@ -503,7 +523,7 @@
 (uv-timer-start! d-ticker (lambda (t) (collect)) 1 1)
 
 (let drain ((i 0))
-  (when (and (< i 32) (eq? d-err 'callback-never-fired))
+  (when (and (< i delivery-cap) (eq? d-err 'callback-never-fired))
     (uv-run dl 'once)
     (drain (+ i 1))))
 
@@ -545,7 +565,7 @@
 (define n-cancel-answer (uv-cancel! n-req))
 
 (let drain ((i 0))
-  (when (and (< i 32) (eq? n-err 'callback-never-fired))
+  (when (and (< i delivery-cap) (eq? n-err 'callback-never-fired))
     (uv-run dl 'once)
     (drain (+ i 1))))
 
@@ -630,7 +650,7 @@
 (uv-timer-start! c-ticker (lambda (t) (collect)) 1 1)
 
 (let drain ((i 0))
-  (when (and (< i 32) (eq? c-resolve-err 'resolve-cb-never-fired))
+  (when (and (< i delivery-cap) (eq? c-resolve-err 'resolve-cb-never-fired))
     (uv-run cl 'once)
     (drain (+ i 1))))
 
@@ -658,7 +678,7 @@
 ;; Both ends waited for, as the tcp block above records: the accept and
 ;; the connect completion are separate poll events.
 (let drain ((i 0))
-  (when (and (< i 32)
+  (when (and (< i delivery-cap)
              (or (eq? c-connect-err 'connect-cb-never-fired)
                  (eq? c-accepted 'never-accepted)))
     (uv-run cl 'once)
@@ -750,13 +770,10 @@
                (collect)
                (set! p-exit (list status sig)))))
 
-;; 2048, not this file's usual 32: every other drain here waits on local,
-;; in-process callbacks, but this one waits on a real fork/exec/exit --
-;; with the 1ms ticker, 32 iterations was a ~32ms budget for the child,
-;; flake-shaped under load. 2048 matches test-process.sps's cap for the
-;; same exit-5 scenario.
+;; A real fork/exec/exit waits on the kernel, so this drain's cap is a time
+;; budget too, like the tcp and dns drains above: delivery-cap.
 (let drain ((i 0))
-  (when (and (< i 2048) (eq? p-exit 'never-exited))
+  (when (and (< i delivery-cap) (eq? p-exit 'never-exited))
     (uv-run pl 'once)
     (drain (+ i 1))))
 
