@@ -124,7 +124,9 @@ The other verbs do not promise this yet
 decision 3, amended 2026-10-06). Until they do, close a handle only from
 the task that is using it, and do not abandon an engine inside
 `uv-tcp-connect!`, a DNS request, `uv-spawn!`, or `call-with-uv-loop`'s
-teardown on the way out of its body.
+teardown on the way out of its body. `uv-spawn!` already keeps the first
+promise for the handles in its `stdio` and for its loop
+([Child processes](#child-processes--libuv-process)), not yet the second.
 
 ## Flow control
 
@@ -312,7 +314,7 @@ Deliberately minimal (design spec §1): no `bind`/`connect`/`listen`, no
 `file`/`args` are libuv's own execvp/argv contract — unresolved and
 unvalidated by the binding. The `options` alist covers `env` (a list of
 `"K=V"` strings, libuv's own format, not an alist encoding), `cwd`,
-`stdio`, `detached`, and `uid`/`gid`. Eight behaviours worth knowing before
+`stdio`, `detached`, and `uid`/`gid`. Nine behaviours worth knowing before
 the design spec (§4–§6):
 
 - **The spawn surface.** Each child fd (index = slot; 0/1/2 are
@@ -361,7 +363,7 @@ the design spec (§4–§6):
   opens the parent end before it can know whether the exec will succeed —
   so a raising `uv-spawn!` still leaves its pipes needing an explicit
   `uv-close!`; naming an already-consumed pipe again raises
-  `'pipe-already-used`.
+  `'pipe-already-used`, and so does naming one pipe twice in one spawn.
 - **The arguments are read once.** `uv-spawn!` reads `file`, `args` and
   `options`, with every string, list and stdio spec in them, once, early in
   the call and in one step no engine's timer can split. Everything after
@@ -373,6 +375,18 @@ the design spec (§4–§6):
   no lock here can order: the child may get part of each version, or the
   call may raise on a list that stopped being one, but the read never takes
   bytes a string did not hold.
+- **The handles are checked again where it spawns.** The handles named in
+  `stdio`, and the loop, stay yours while `uv-spawn!` runs, so an engine's
+  timer handler can close one, spawn on the same pipe, or tear the loop
+  down mid-call. `uv-spawn!` checks them again in the one step that calls
+  libuv, marks the pipes and registers the process (or cleans up after a
+  failure). So such a change either finds the spawn finished, or makes it
+  raise what the same state raises on entry: `&uv-handle-closed` for a
+  closed handle or loop, `'pipe-already-used` for a consumed pipe. A spawn
+  refused there leaves nothing allocated and no pipe marked. One caveat
+  remains: an engine whose fuel runs out after the spawn has allocated and
+  before that step, and that is never resumed, strands the process handle
+  and the options block.
 
 **Root lane.** Exercising `uid`/`gid` (which map to
 `UV_PROCESS_SETUID`/`SETGID`) needs to actually run as root, so that
@@ -567,7 +581,7 @@ discriminant is a symbol).
 | `&uv-libuv-unavailable` | `path` (inherited) | libuv's own shared object could not be found or loaded — a subtype of `&uv-shim-unavailable`, so guards on the parent keep matching; the sharper predicate is `uv-libuv-unavailable?` |
 | `&uv-version-incompatible` | `compiled` `runtime` | Either libuv version is outside the supported range |
 | `&uv-constant-unavailable` | `name` | The shim has no constant under that name |
-| `&uv-invalid-argument` | `who` `reason` | A caller error, refused before anything was allocated |
+| `&uv-invalid-argument` | `who` `reason` | A caller error, refused leaving nothing allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
 | `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the owner's thread id, `actual` the caller's ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 
