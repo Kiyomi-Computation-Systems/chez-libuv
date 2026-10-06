@@ -15,14 +15,10 @@
   (define (make-uv-signal loop)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-signal)
-    (let ((ptr (alloc-zeroed (uv-handle-size (uv-signal-type)))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-signal-init (loop-pointer loop 'make-uv-signal) ptr)
-                  'make-uv-signal))
-      (let ((sig (%make-uv-signal-record ptr loop)))
-        (registry-register! ptr 'signal loop sig)
-        (count-signal-new!)
-        sig)))
+    (construct-handle 'make-uv-signal loop (uv-handle-size (uv-signal-type))
+                      uv-signal-init
+                      (lambda (ptr) (%make-uv-signal-record ptr loop))
+                      count-signal-new! #f))
 
   ;; watch-symbol->int : (or symbol 0) symbol -> exact-integer
   (define (watch-symbol->int sig who)

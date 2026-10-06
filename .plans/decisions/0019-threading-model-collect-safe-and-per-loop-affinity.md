@@ -233,7 +233,7 @@ drains a caller-side queue rather than assuming one item per send.
 >   - The constructors: a block lost, or teardown failing with `EBUSY` for
 >     good once the handle is initialised and not yet registered. For
 >     `make-uv-async` the teardown hangs, and `make-uv-loop` also leaks its
->     backend fd.
+>     backend fd. (Each is one step since the next amendment.)
 >   - `uv-tcp-connect!`, `uv-getaddrinfo!` and `uv-getnameinfo!`: a block
 >     lost, or a request registered and never submitted.
 >   - `uv-spawn!`: one or two blocks lost, or `EBUSY`.
@@ -242,6 +242,82 @@ drains a caller-side queue rather than assuming one item per send.
 >   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,
 >     `uv-loop-alive?` and `uv-update-time!` after a teardown: one or two
 >     fuel values, between reading the pointer and the call.
+
+> **Amended 2026-10-06 (the series' second part): every constructor is
+> one step.** Measured on main (eb5b719), with the sweeps now in
+> `tests/test-constructors.sps`, over `make-uv-timer`, `-tcp`, `-pipe`,
+> `-signal` and `-async`, `uv-accept!`, which makes the client it accepts
+> into, `make-uv-loop` and `call-with-uv-loop`:
+>
+> - **A teardown between the check and the init.** A sweep suspended each
+>   constructor at every point, tore its loop down, and resumed it. Under
+>   Guard Malloc each handle constructor initialised its handle on the
+>   freed `uv_loop_t` at one fuel, two for `make-uv-async`. `make-uv-tcp`
+>   and `make-uv-pipe` also wrote the stream's descriptor into a handle
+>   block the teardown had freed, at another. Ten to fourteen fuels each
+>   were refused as `null-loop-pointer` rather than `&uv-handle-closed`.
+>   A teardown between the init and the registration could not close the
+>   handle: `uv_loop_close` failed with `EBUSY` for good at three to five
+>   fuels, and for `make-uv-async`, which keeps its loop alive, the
+>   teardown's drain would never have returned.
+> - **`uv-accept!` and its server.** Suspended, then resumed after its
+>   server was closed and freed, it called `uv_accept` on the freed server
+>   at fuel 42, and raised `null-handle-pointer` at 33 earlier fuels.
+>   Resumed while the close was pending, it raised libuv's `EAGAIN`.
+> - **Dropped.** Each handle constructor lost its block at six or seven
+>   fuels, left its handle initialised and unregistered at three to five
+>   (the same `EBUSY`, or the hang), and left a counter at −1 at one.
+>   `make-uv-loop` lost its block, or the loop with its two descriptors.
+>   `call-with-uv-loop` made its loop before entering its `dynamic-wind`,
+>   and at two fuels in between an engine dropped the whole loop.
+> - **The init lock.** Every constructor starts at `ensure-native-loaded!`,
+>   which took its lock with `with-mutex` on every call. Dropped in its
+>   exit thunk, after the winder is gone and before the release, it left
+>   the lock held for good: fuel 11–14, one in each constructor. The lock
+>   is recursive, so this thread carried on, and any other thread's next
+>   constructor would have waited on it forever.
+> - **The handoff.** `make-uv-async` is loop-thread-only, checked before
+>   any allocation. Suspended after the check while the loop was handed to
+>   another thread, it made the async anyway, for a loop this thread no
+>   longer owned.
+>
+> Each constructor now makes its handle in one interrupt-free step,
+> `try-construct-handle` in `(libuv private handles)`: the loop's open
+> check again (`open-loop-ptr`), the block, the record, its registration,
+> libuv's init, a stream's descriptor, and the count, and for
+> `make-uv-async` the loop's owner. The handle is registered before the
+> init (`register-then-init!`), so a refused registration frees a block
+> libuv never saw and a failed init unregisters it; a step refused leaves
+> nothing behind, and `step-refusal` raises what stood in the way, a
+> closed loop as `&uv-handle-closed`. `uv-accept!` checks its server and
+> calls `uv_accept` in the same step, the client's construction nested in
+> it. `make-uv-loop` makes the same step for a loop, `try-construct-loop`,
+> and `call-with-uv-loop` now makes its loop inside its body, handed the
+> loop inside the step, so wherever an engine expires from there on its
+> exit finds the loop to tear down. `ensure-native-loaded!` takes and
+> releases its lock with interrupts disabled, the send fence's discipline:
+> no engine expires and no collection stops a thread holding it, so a
+> thread that waits on it, waiting with interrupts disabled too, waits only
+> for a holder that is running. Unlike the fence's body, the init can
+> raise, and `with-interrupts-disabled`'s `dynamic-wind` unwinds it.
+>
+> - **Measured after:** every split run is refused before its step, every
+>   dropped run leaves the registry, the counters, the blocks, the
+>   descriptors and the init lock as it found them, and no run was
+>   suspended after its step. Allocation per call fell by 96–112 B, since
+>   no `guard` wraps the init any more: `make-uv-timer` 608 → 496 B,
+>   `make-uv-tcp` 656 → 560, `make-uv-async` 688 → 592, `make-uv-loop`
+>   592 → 480. Evidence and mutations:
+>   `.plans/constructor-step-mutation-log.md`.
+> - **Found, not done:**
+>   - An engine dropped inside `call-with-uv-loop`'s own teardown, on the
+>     way out of the body, leaves the loop open. If the drop lands in
+>     `uv-run` between setting the running mark and clearing it, it leaves
+>     the loop marked running, which no verb then touches. Both belong to
+>     the loop verbs, the series' last part.
+>   - The stream verbs' steps (#53) re-check the handle but not the loop's
+>     owner. This change re-checks the owner for `make-uv-async` only, the
+>     one constructor inside the enforced surface.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety

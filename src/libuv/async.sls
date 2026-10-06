@@ -15,25 +15,20 @@
   ;; make-uv-async : uv-loop procedure -> uv-async
   ;; Loop-thread-only: it initialises native state and mutates the registry.
   ;; require-loop-thread runs before any allocation, so a wrong-thread create is
-  ;; a named refusal, not a corrupted registry. The record, and with it the
-  ;; send fence (a native mutex), is made before uv_async_init links the handle
-  ;; into the loop, so nothing that can fail runs between that link and the
-  ;; registration that lets teardown close the handle.
+  ;; a named refusal, not a corrupted registry, and the constructor's step
+  ;; checks the owner again, since an engine can suspend the constructor
+  ;; while the loop is handed to another thread. The send fence, a native
+  ;; mutex, is made before the step, because making one can raise.
   (define (make-uv-async loop on-wake)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-async)
     (require-loop-thread loop 'make-uv-async)
     (require-callback on-wake 'make-uv-async 'on-wake-not-a-procedure)
-    (let* ((ptr (alloc-zeroed (uv-handle-size (uv-async-type))))
-           (async (guard (e (#t (free! ptr) (raise e)))
-                    (let ((async (%make-uv-async-record ptr loop on-wake)))
-                      (uv-check (uv-async-init-native
-                                 (loop-pointer loop 'make-uv-async) ptr)
-                                'make-uv-async)
-                      async))))
-      (registry-register! ptr 'async loop async)
-      (count-async-new!)
-      async))
+    (let ((fence (make-send-fence)))
+      (construct-handle 'make-uv-async loop (uv-handle-size (uv-async-type))
+                        uv-async-init-native
+                        (lambda (ptr) (%make-uv-async-record ptr loop on-wake fence))
+                        count-async-new! #t)))
 
   ;; uv-async-send! : uv-async -> unspecified
   ;; The ONE verb exempt from the loop-thread affinity check (design §6.3):

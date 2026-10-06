@@ -15,13 +15,8 @@
   ;; make-uv-loop : -> uv-loop
   (define (make-uv-loop)
     (ensure-native-loaded!)
-    (let ((ptr (alloc-zeroed (uv-loop-size))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-loop-init ptr) 'make-uv-loop))
-      (let ((loop (%make-uv-loop-record ptr)))
-        (registry-register! ptr 'loop loop loop)
-        (count-loop-new!)
-        loop)))
+    (let ((made (try-construct-loop uv-loop-init values)))
+      (if (uv-loop? made) made (raise (step-refusal made 'make-uv-loop #f)))))
 
   ;; uv-loop-open? : uv-loop -> boolean
   (define (uv-loop-open? loop)
@@ -176,6 +171,10 @@
   ;; The body runs once: the before thunk refuses every return into it after
   ;; it has been left, whatever became of the loop. The after thunk tears the
   ;; loop down however the body left.
+  ;; - The loop is made inside the body, and handed over inside its own
+  ;;   step, so wherever an engine expires from then on, the after thunk
+  ;;   finds the loop. Made before the dynamic-wind, a loop was lost to an
+  ;;   engine dropped in between (tests/test-constructors.sps).
   ;; - A body left from inside one of the loop's callbacks, by a continuation
   ;;   or an engine's suspension, leaves the loop marked running by this
   ;;   thread (#45). The after thunk clears that mark first, which is safe
@@ -188,12 +187,17 @@
   ;; - A loop marked running by another thread is live under that thread's
   ;;   uv_run: its mark stays, and the teardown refuses it, as from any exit.
   (define (call-with-uv-loop proc)
-    (let ((loop (make-uv-loop)) (left #f))
+    (ensure-native-loaded!)
+    (let ((loop #f) (left #f))
       (dynamic-wind
        (lambda ()
          (when left
            (raise (make-uv-handle-closed 'loop))))
-       (lambda () (proc loop))
+       (lambda ()
+         (let ((made (try-construct-loop uv-loop-init (lambda (made) (set! loop made)))))
+           (if (uv-loop? made)
+               (proc made)
+               (raise (step-refusal made 'make-uv-loop #f)))))
        (lambda ()
          (set! left #t)
          (when (loop-open? loop)

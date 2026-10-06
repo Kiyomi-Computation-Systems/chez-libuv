@@ -29,16 +29,13 @@
   (define (make-uv-tcp loop)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-tcp)
-    (let* ((handle-size (uv-handle-size (uv-tcp-type)))
-           (ptr (alloc-zeroed (stream-block-size handle-size))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-tcp-init (loop-pointer loop 'make-uv-tcp) ptr)
-                  'make-uv-tcp))
-      (let ((tcp (%make-uv-tcp-record ptr loop handle-size)))
-        (registry-register! ptr 'tcp loop tcp)
-        (count-tcp-new!)
-        (attach-stream-descriptor! tcp)
-        tcp)))
+    (let ((handle-size (uv-handle-size (uv-tcp-type))))
+      (construct-handle 'make-uv-tcp loop (stream-block-size handle-size)
+                        uv-tcp-init (tcp-record-maker loop handle-size)
+                        count-tcp-new! #f)))
+
+  (define (tcp-record-maker loop handle-size)
+    (lambda (ptr) (%make-uv-tcp-record ptr loop handle-size)))
 
   ;; bind-flags->bits : (listof symbol) symbol -> exact-integer
   ;; Fold a bind-flag list into the unsigned bitmask uv_tcp_bind's third
@@ -157,16 +154,35 @@
               'uv-listen!))
 
   ;; uv-accept! : uv-tcp -> uv-tcp
-  ;; An initialized client must close asynchronously if uv_accept fails; direct
-  ;; foreign-free would leave libuv's handle queue pointing at freed memory.
+  ;; One interrupt-free step makes the client and accepts into it: the
+  ;; server's open check and pointer, the client's construction
+  ;; (try-construct-handle, whose step nests), and uv_accept. So no engine
+  ;; can split the accept from the server's check, or drop it holding a
+  ;; client it has not registered. An initialized client must close
+  ;; asynchronously if uv_accept fails; freeing it directly would leave
+  ;; libuv's handle queue pointing at freed memory.
   (define (uv-accept! server)
     (require-open-tcp server 'uv-accept!)
-    (let ((client (make-uv-tcp (handle-loop server))))
-      (guard (e (#t (close-handle! client) (raise e)))
-        (uv-check (uv-accept (handle-pointer server 'uv-accept!)
-                             (handle-pointer client 'uv-accept!))
-                  'uv-accept!))
-      client))
+    (let* ((loop (handle-loop server))
+           (handle-size (uv-handle-size (uv-tcp-type)))
+           (size (stream-block-size handle-size))
+           (make-record (tcp-record-maker loop handle-size))
+           (accepted
+            (one-step
+             (let ((server-ptr (open-handle-ptr server)))
+               (if (symbol? server-ptr)
+                   server-ptr
+                   (let ((client (try-construct-handle loop size uv-tcp-init make-record
+                                                       count-tcp-new! #f)))
+                     (if (not (uv-handle? client))
+                         client
+                         (let ((rc (uv-accept server-ptr (handle-ptr client))))
+                           (if (zero? rc)
+                               client
+                               (begin (begin-close! client #f) rc))))))))))
+      (if (uv-handle? accepted)
+          accepted
+          (raise (step-refusal accepted 'uv-accept! server)))))
 
   ;; uv-tcp-connect! : uv-tcp string exact-nonnegative-integer procedure
   ;;                   -> uv-request

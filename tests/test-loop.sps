@@ -630,9 +630,9 @@
       (list first (if (registry-ref (car step-req)) 'present 'absent)))))
 
 ;; step-refusal turns what a step answered into what its verb raises. The
-;; closed handle and the missing pointer are what require-open-handle and
-;; handle-pointer raise outside a step, so a verb refuses the same way
-;; whichever check catches it.
+;; closed handle or loop and the missing pointer are what require-open-handle,
+;; require-open-loop and the checked accessors raise outside a step, so a verb
+;; or constructor refuses the same way whichever check catches it.
 (define (refusal-shape c)
   (cond ((uv-handle-closed? c) (list 'handle-closed (uv-handle-closed-kind c)))
         ((uv-invalid-argument? c)
@@ -643,6 +643,8 @@
 (test-equal "step-refusal raises each status as the checks outside a step do"
   '((handle-closed timer)
     (invalid uv-test-verb! null-handle-pointer)
+    (handle-closed loop)
+    (invalid uv-test-verb! null-loop-pointer)
     (errno uv-test-verb! ENOMEM)
     (invalid uv-registry-register! pointer-already-registered)
     (invalid uv-test-verb! span-out-of-range)
@@ -651,9 +653,9 @@
          (t (make-uv-timer l))
          (shapes (map (lambda (status)
                         (refusal-shape (step-refusal status 'uv-test-verb! t)))
-                      (list 'not-open 'no-pointer 'no-memory
-                            'pointer-already-registered 'span-out-of-range
-                            (errno-symbol->value 'EBADF)))))
+                      (list 'not-open 'no-pointer 'loop-not-open 'no-loop-pointer
+                            'no-memory 'pointer-already-registered
+                            'span-out-of-range (errno-symbol->value 'EBADF)))))
     (uv-loop-teardown! l)
     shapes))
 

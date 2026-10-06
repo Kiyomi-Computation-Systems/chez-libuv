@@ -125,6 +125,14 @@ None is obvious from reading the code.
   another thread at every point where an engine can suspend the send or the
   close: the lock is recursive, so the thread holding it cannot see it
   held.
+
+  `ensure-native-loaded!`, where every constructor starts, took its lock
+  with a bare `with-mutex` until 2026-10-06. A constructor dropped in its
+  exit thunk left the lock held for good. It now takes the lock inside
+  `with-interrupts-disabled`, the reverse of #43's second fence: the lock
+  is held only with interrupts disabled, and a raise from the init still
+  unwinds both. `tests/test-constructors.sps` probes the lock after every
+  dropped constructor.
 * **A verb's open check does not cover its native call, and a dropped
   engine never finishes a verb.** No second thread is needed. An engine can
   suspend a verb between its check and its call, and a scheduler on the
@@ -139,8 +147,14 @@ None is obvious from reading the code.
     (2026-10-06): check, pointer, allocation, registration and native
     call. `tests/test-stream.sps`'s split, reuse and drop sweeps hold
     them.
+  - So did every constructor, `uv-accept!` included: a teardown between
+    the loop check and the init linked the handle into the freed loop,
+    and a drop after the init left a handle no teardown could close
+    (`EBUSY` for good; for an async, a drain that never returns). Each is
+    now one step too (`try-construct-handle`, `try-construct-loop`), and
+    `tests/test-constructors.sps` sweeps them.
   - The other verb families are still exposed (ADR-0019's decision 3
-    amendment lists them). A new verb, or a change to one, takes the same
+    amendments list them). A new verb, or a change to one, takes the same
     shape and the same three sweeps.
 
 ### C and the FFI
