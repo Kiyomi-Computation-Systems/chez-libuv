@@ -499,14 +499,22 @@
              (set! tcp-peak-live (max tcp-peak-live (live-count 'tcp)))
              (set! connect-req-peak
                    (max connect-req-peak (live-count 'connect-req)))
-             (run-until loop (lambda () (and done (= accepts (+ i 1)))) 64)
-             (set! connects (+ connects 1))
-             (collect)
-             (uv-close! c)
-             (run-until loop
-                        (lambda () (eq? 'closed (uv-handle-state c)))
-                        64))
-           (iterate (+ i 1))))))))
+             ;; The wait ticks: a plain 'once blocks for good on an accept
+             ;; that never comes, since the listening server keeps the loop
+             ;; alive. It spans a handshake, so its cap is a time budget, and
+             ;; the iterations stop at the first that ran out of it: the rows
+             ;; below then fail by name, after one cap rather than a hundred.
+             ;; A connect counts only once its callback came, since the last
+             ;; iteration's has nothing after it to stop.
+             (let ((outcome (run-until/ticking
+                             loop (lambda () (and done (= accepts (+ i 1)))) 4000)))
+               (when done (set! connects (+ connects 1)))
+               (collect)
+               (uv-close! c)
+               (run-until loop
+                          (lambda () (eq? 'closed (uv-handle-state c)))
+                          64)
+               (when (eq? outcome 'satisfied) (iterate (+ i 1)))))))))))
 
 (test-equal "seed: every iteration held the server plus its own client"
   2 tcp-peak-live)

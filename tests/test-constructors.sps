@@ -394,16 +394,21 @@
   (or (memq verdict '(untouched reached-body))
       (and (pair? verdict) (memq (car verdict) '(untouched completed)))))
 
+;; A run whose fixture could not be made: the next would wait the same
+;; handshake out again, at every fuel up to the cap.
+(define (unprepared? verdict) (equal? verdict '(prepare-failed)))
+
 ;; sweep : (exact-positive-integer -> verdict) -> (list-of (cons fuel verdict))
 ;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
-;; to the cap. A raise between runs would abort the suite, so the sweep is
-;; caught and its evidence handed to the rows.
+;; to the first run whose fixture could not be made, or to the cap. A raise
+;; between runs would abort the suite, so the sweep is caught and its
+;; evidence handed to the rows.
 (define (sweep run)
   (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
     (let next ((fuel 1) (acc '()))
       (let* ((verdict (run fuel))
              (acc (cons (cons fuel verdict) acc)))
-        (if (or (last-run? verdict) (= fuel sweep-fuel-cap))
+        (if (or (last-run? verdict) (unprepared? verdict) (= fuel sweep-fuel-cap))
             (reverse acc)
             (next (+ fuel 1) acc))))))
 

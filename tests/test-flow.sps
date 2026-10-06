@@ -70,19 +70,30 @@
         (if (equal? (payload-for 1) (payload-for 3)) 'same 'distinct)
         (if (equal? (payload-for 2) (payload-for 3)) 'same 'distinct)))
 
+;; Reader 0, the one that closes itself, and its collector. Until the seed
+;; above accepts it, the reader is a placeholder and its collector stays
+;; empty, and each use of the reader outside a row is gated on it: a failed
+;; seed then fails the rows below by name instead of aborting the suite
+;; between them (AGENTS.md).
+(define closing-peer
+  (if (positive? (vector-length peers)) (vector-ref peers 0) 'not-accepted))
+(define closing-col
+  (if (positive? (vector-length cols)) (vector-ref cols 0) (make-byte-collector)))
+
 ;; Close reader 0 from inside its own read callback. The replacement callback
-;; STILL COLLECTS: without that, cols[0] is frozen at 0 on both sides of the
-;; comparison below and no src/ mutation could move it.
+;; STILL COLLECTS: without that, its collector is frozen at 0 on both sides of
+;; the comparison below and no src/ mutation could move it.
 (define closed-fired 'not-yet)
-(uv-read-stop! (vector-ref peers 0))
-(uv-read-start! (vector-ref peers 0)
-                (lambda (bv s e)
-                  (collect-span! (vector-ref cols 0) bv s e)
-                  (when (uv-handle-open? (vector-ref peers 0))
-                    (uv-close! (vector-ref peers 0)
-                               (lambda () (set! closed-fired 'fired)))))
-                (lambda () #f)
-                (lambda (c) #f))
+(when (uv-tcp? closing-peer)
+  (uv-read-stop! closing-peer)
+  (uv-read-start! closing-peer
+                  (lambda (bv s e)
+                    (collect-span! closing-col bv s e)
+                    (when (uv-handle-open? closing-peer)
+                      (uv-close! closing-peer
+                                 (lambda () (set! closed-fired 'fired)))))
+                  (lambda () #f)
+                  (lambda (c) #f)))
 (uv-write! (vector-ref cli 0) (seeded-bytes 32 1) (lambda (err) #f))
 
 ;; THE GATE. close-dispatch frees on a LATER loop iteration than the
@@ -91,11 +102,11 @@
 (test-equal "gate: the closed reader reached 'closed before survivors are written to"
   '(satisfied fired closed)
   (let ((r (run-until/ticking loop
-                              (lambda () (eq? 'closed (uv-handle-state (vector-ref peers 0))))
+                              (lambda () (eq? 'closed (uv-handle-state closing-peer)))
                               4000)))
-    (list r closed-fired (uv-handle-state (vector-ref peers 0)))))
+    (list r closed-fired (uv-handle-state closing-peer))))
 
-(define closed-deliveries-at-gate (collector-count (vector-ref cols 0)))
+(define closed-deliveries-at-gate (collector-count closing-col))
 
 (test-assert "seed: the closing reader received the trigger write before closing"
   (positive? closed-deliveries-at-gate))
@@ -144,7 +155,7 @@
                     '(1 2 3))))
 
 (test-equal "the closed reader received nothing further"
-  closed-deliveries-at-gate (collector-count (vector-ref cols 0)))
+  closed-deliveries-at-gate (collector-count closing-col))
 
 ;; --- OS socket buffer sizes ------------------------------------------------
 (define bloop (make-uv-loop))
@@ -293,9 +304,11 @@
                      4000))
 
 ;; Shrink BOTH: shrinking only the writer's does not bound loopback
-;; buffering, because the peer's receive buffer absorbs independently.
+;; buffering, because the peer's receive buffer absorbs independently. The
+;; peer's is gated on the seed, as its read start below is: without a peer,
+;; the rows fail by name instead of these lines aborting the suite.
 (uv-send-buffer-size! cclient 4096)
-(uv-recv-buffer-size! cpeer 4096)
+(when (uv-tcp? cpeer) (uv-recv-buffer-size! cpeer 4096))
 
 (define chunk (seeded-bytes 65536 4242))
 (define submissions 0)
@@ -326,7 +339,8 @@
 
 ;; Drain, requiring BOTH halves. Without the completions half, a gauge
 ;; stubbed to 0 passes this row trivially.
-(uv-read-start! cpeer (lambda (bv s e) (collect)) (lambda () #f) (lambda (c) #f))
+(when (uv-tcp? cpeer)
+  (uv-read-start! cpeer (lambda (bv s e) (collect)) (lambda () #f) (lambda (c) #f)))
 
 (test-equal "the queue falls to zero AND every write completed once the peer reads"
   '(satisfied all-completed)
