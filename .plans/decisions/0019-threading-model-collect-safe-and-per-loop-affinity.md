@@ -148,6 +148,101 @@ drains a caller-side queue rather than assuming one item per send.
 > send on macOS arm64, up from 8, with no allocation. Senders sharing one
 > handle take turns: about 90 ns a send with four.
 
+> **Amended 2026-10-06 (found reviewing #49): every stream verb is one
+> step.** The fence's discipline was never only about threads. An engine
+> on the loop thread splits a verb just as another thread does, and every
+> verb that checks a handle and then calls libuv on it was split by one:
+>
+> - **A close freed the stream between the check and the call.** A sweep
+>   suspended each verb at every point, closed the stream, stepped the
+>   loop until the close freed it, and resumed. Under Guard Malloc,
+>   `uv-write!` faulted at fuel 12–30, `uv-write*!` at 12–37,
+>   `uv-shutdown!` at 10–21 and `uv-read-start!` at 16–17. `uv-read-stop!`
+>   and `uv-stream-write-queue-size` faulted at fuel 10, between reading
+>   the pointer and the call. When a new connection was given the freed
+>   address before the resume, as it was on every macOS run, `uv-write!`
+>   reported success and its bytes reached the new connection's peer.
+>   `uv-read-start!` resumed after the close also put a read buffer into a
+>   record its close had already cleaned up, and nothing freed it. (#48,
+>   merged meanwhile, made the buffer's install a step that refuses a
+>   closed stream; its start still read the pointer outside any step.)
+> - **A dropped engine stranded what the verb held.** A scheduler that
+>   drops a task, as a timeout does, runs nothing after the suspension: no
+>   `guard`, and no `dynamic-wind` exit (that runs at the suspension
+>   itself, before anyone knows whether the engine will be resumed). A
+>   `uv-write!` dropped between its allocation and libuv lost the block,
+>   or left a request registered and counted that libuv never saw and
+>   teardown never swept, since `registry-snapshot-for-loop` collects
+>   handles only.
+>
+> Each stream verb (`uv-write!`, `uv-write*!`, `uv-shutdown!`,
+> `uv-read-start!`, `uv-read-stop!`, `uv-stream-write-queue-size`) now
+> validates its arguments, then makes one interrupt-free step: the open
+> check again (`open-handle-ptr`), the pointer, a second check of what it
+> reads of the caller's data (the spans, the read buffer's size), the
+> allocation, the registration, the count, and the native call. The step
+> answers a status, and the verb raises afterwards (`step-refusal`), with
+> the condition the checks outside a step raise: `&uv-handle-closed` for a
+> stream closed meanwhile. So an engine suspends or drops a verb only
+> before its step, when it holds nothing, or after it, when libuv holds
+> what it was given and its completion frees it. `one-step` in
+> `(libuv private handles)` is the step; `begin-close!` is now written with
+> it too, and so is #48's `install-read-buffer!`, which the read start's
+> step makes. The rules are the fence's:
+>
+> - **A bare `disable-interrupts`/`enable-interrupts` pair.**
+>   `with-interrupts-disabled` is a `dynamic-wind`: 96 B a step around a
+>   copy (#49's measurement), and its exit thunk runs where an engine can
+>   still suspend.
+> - **Nothing raises inside.** Every call a step makes is total for its
+>   arguments. `foreign-alloc` raises when malloc fails, so the binding's
+>   blocks now come from the shim: `chez_uv_alloc` (calloc) answers NULL,
+>   and `alloc-block`, `free-block!` and `copy-in-unchecked!` answer or
+>   ignore what they cannot use. `registry-add!`, the registry's one write
+>   site, answers its refusals, and `registry-register!` raises them.
+>   `tests/test-stream.sps` checks after each run that interrupts are
+>   enabled, so a raise inside a step fails a row by name.
+>
+> Because the span is checked again inside the step, before the block is
+> allocated, #49's leak cannot arise in the write verbs: a span the
+> payload no longer covers is refused with nothing allocated.
+> `try-copy-in!` remains as `copy-in!`'s base.
+>
+> The debug shim also counts every block it allocates (`'block` in
+> `live-counts`). So a block a verb loses fails a row in plain `make test`,
+> and not only under Valgrind, and every suite's closing all-zero check
+> now covers blocks too.
+>
+> - **Measured after:** every suspended run of every sweep is refused
+>   before its step, every dropped one leaves the registry, every counter
+>   and the blocks as it found them, and a new connection at the freed
+>   address receives nothing. Allocation per call fell from 240 B to
+>   144 B for `uv-write!` and from 304 B to 208 B for a one-segment
+>   `uv-write*!`; `uv-shutdown!` stays at 128 B. Evidence and mutations:
+>   `.plans/stream-step-mutation-log.md`.
+> - **Trade-offs:** a fault in a native call inside a step leaves
+>   interrupts disabled, as `begin-close!` always has. And the thread
+>   stays active for the whole step, so another thread's collection waits
+>   for all of it, where it waited for each foreign call in it before. On
+>   macOS loopback that wait is dominated by `uv_write`'s own copy into the
+>   socket, and the call takes as long as before (0.2–0.9 ms for 1 MiB,
+>   2.4–4.4 ms for 4 MiB). The shim gained exports, so an upgrade
+>   needs `make build`; an old shim is refused with `&uv-shim-unavailable`.
+> - **Not yet done:** measured on the same base, the same splits and drops
+>   reach the other verbs, each to be made one step in turn.
+>   - The constructors: a block lost, or teardown failing with `EBUSY` for
+>     good once the handle is initialised and not yet registered. For
+>     `make-uv-async` the teardown hangs, and `make-uv-loop` also leaks its
+>     backend fd.
+>   - `uv-tcp-connect!`, `uv-getaddrinfo!` and `uv-getnameinfo!`: a block
+>     lost, or a request registered and never submitted.
+>   - `uv-spawn!`: one or two blocks lost, or `EBUSY`.
+>   - The scratch verbs (bind, the address and port queries, the buffer
+>     sizes): one or two blocks lost.
+>   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,
+>     `uv-loop-alive?` and `uv-update-time!` after a teardown: one or two
+>     fuel values, between reading the pointer and the call.
+
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
 — it would guard the hashtable while the libuv call it wraps is still unsafe

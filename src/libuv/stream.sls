@@ -1,16 +1,15 @@
 #!r6rs
-;;; Stream operations shared by TCP and pipe handles. Validate arguments before
-;;; allocation; native start failures must leave no registered request behind.
-;;; When libuv refuses a start, the verb takes its request back itself, by
-;;; checking the status rather than guarding the native call: the guard
-;;; allocated ~300 B on every write (#45). So the stream's pointer, whose
-;;; check can raise, is resolved before the request exists.
-;;;
-;;; One check can still fail once a write's block exists: the payload can
-;;; shrink between the verb's span check and the copy (an engine's timer
-;;; handler can truncate it, or another thread). The copy answers that as a
-;;; status, and the verb frees the block before it raises its own refusal
-;;; (test-stream.sps's shrinking-payload sweep).
+;;; Stream operations shared by TCP and pipe handles. Each verb validates its
+;;; arguments, then makes its native call in one interrupt-free step
+;;; (one-step): the step checks again that the stream is open, reads its
+;;; pointer, checks again what it reads of the caller's data, allocates,
+;;; registers and counts the request, and calls libuv. An engine can then
+;;; suspend or drop a verb only before its step, when it holds nothing, or
+;;; after, when libuv holds what it was given (test-stream.sps's engine
+;;; sweeps). Nothing in a step raises: it answers a status, and the verb
+;;; raises after the step (step-refusal). When libuv refuses a start, the
+;;; step takes its request back itself; a guard around the native call
+;;; allocated ~300 B on every write (#45).
 (library (libuv stream)
   (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -27,10 +26,35 @@
     (require-open-handle stream who)
     stream)
 
+  ;; start-write! : uv-stream uptr uptr uptr exact-positive-integer procedure
+  ;;                -> (or uv-request symbol exact-integer)
+  ;; Inside a write's step, once its payload and uv_buf_t[] are in BLOCK:
+  ;; registers and counts the request and starts it on the stream at PTR.
+  ;; Answers the request, or a status with BLOCK freed and nothing left
+  ;; registered or counted.
+  (define (start-write! stream ptr block bufs nbufs on-complete)
+    (let* ((req (%make-uv-req-record block 'write stream on-complete))
+           (registered (registry-add! block 'write-req (handle-loop stream) req)))
+      (if (eq? registered 'registered)
+          (begin
+            (count-write-req-new!)
+            (let ((rc (uv-write-native block ptr bufs nbufs)))
+              (if (zero? rc)
+                  req
+                  (begin (registry-remove! block)
+                         (count-write-req-free!)
+                         (free-block! block)
+                         (set-req-ptr! req 0)
+                         rc))))
+          (begin (free-block! block) registered))))
+
   ;; uv-write! : uv-stream bytevector procedure -> uv-request
   ;; uv-write! : uv-stream bytevector exact-nonnegative-integer
   ;;             exact-nonnegative-integer procedure -> uv-request
   ;; The [start, end) payload is copied into request-owned foreign memory.
+  ;; The span is checked again in the step: the bytevector can be truncated
+  ;; while the verb is suspended, and the step allocates nothing for a span
+  ;; that no longer fits.
   (define uv-write!
     (case-lambda
       ((stream bv on-complete)
@@ -49,25 +73,28 @@
                     (<= end (bytevector-length bv)))
          (raise (make-uv-invalid-argument 'uv-write! 'span-out-of-range)))
        (let* ((len (- end start))
-              (stream-ptr (handle-pointer stream 'uv-write!))
               (buf-offset (align-16 (uv-req-size (uv-write-req-type))))
               (payload-offset (+ buf-offset (sizeof-uv-buf-t)))
               ;; Empty writes still need an address inside the owned block.
-              (block (alloc-zeroed (+ payload-offset (max len 1))))
-              (payload (+ block payload-offset)))
-         (unless (eq? (try-copy-in! payload bv start len) 'copied)
-           (free! block)
-           (raise (make-uv-invalid-argument 'uv-write! 'span-out-of-range)))
-         (uv-buf-set! (+ block buf-offset) payload len)
-         (let ((req (%make-uv-req-record block 'write stream on-complete)))
-           (registry-register! block 'write-req (handle-loop stream) req)
-           (count-write-req-new!)
-           (let ((status (uv-write-native block stream-ptr (+ block buf-offset) 1)))
-             (unless (zero? status)
-               (abandon-request! req)
-               (count-write-req-free!)
-               (raise (uv-errno-condition status 'uv-write!))))
-           req)))))
+              (size (+ payload-offset (max len 1)))
+              (started
+               (one-step
+                (let ((ptr (open-handle-ptr stream)))
+                  (cond ((symbol? ptr) ptr)
+                        ((> end (bytevector-length bv)) 'span-out-of-range)
+                        (else
+                         (let ((block (alloc-block size)))
+                           (if (zero? block)
+                               'no-memory
+                               (let ((buf (+ block buf-offset))
+                                     (payload (+ block payload-offset)))
+                                 (copy-in-unchecked! payload bv start len)
+                                 (uv-buf-set! buf payload len)
+                                 (start-write! stream ptr block buf 1
+                                               on-complete))))))))))
+         (if (uv-req? started)
+             started
+             (raise (step-refusal started 'uv-write! stream)))))))
 
   ;; parse-write-segment : segment -> (list bytevector start len)
   ;; A whole bytevector is the span [0, len); an explicit (bv start end) span
@@ -87,6 +114,31 @@
       (else
        (raise (make-uv-invalid-argument 'uv-write*! 'segment-not-a-bytevector)))))
 
+  ;; spans-fit? : (listof (list bytevector start len)) -> boolean
+  ;; Whether every span still lies inside its bytevector, which can have been
+  ;; truncated since parse-write-segment checked it.
+  (define (spans-fit? specs)
+    (or (null? specs)
+        (let ((spec (car specs)))
+          (and (<= (+ (cadr spec) (caddr spec)) (bytevector-length (car spec)))
+               (spans-fit? (cdr specs))))))
+
+  ;; place-spans! : (listof (list bytevector start len)) uptr uptr
+  ;;                -> unspecified
+  ;; Inside the write's step: copies each span in and fills its uv_buf_t in
+  ;; the array at BUFS. Packs non-empty spans consecutively from the payload region's start, and
+  ;; points every empty span's base at that same start (always valid, the
+  ;; region is >= 1 byte) so no base lands one-past-the-end of the block.
+  (define (place-spans! specs bufs payload-base)
+    (let place ((specs specs) (buf bufs) (running 0))
+      (when (pair? specs)
+        (let* ((spec (car specs))
+               (bv (car spec)) (start (cadr spec)) (len (caddr spec))
+               (base (if (zero? len) payload-base (+ payload-base running))))
+          (when (positive? len) (copy-in-unchecked! base bv start len))
+          (uv-buf-set! buf base len)
+          (place (cdr specs) (+ buf (sizeof-uv-buf-t)) (+ running len))))))
+
   ;; uv-write*! : uv-stream (listof segment) procedure -> uv-request
   ;;   segment = bytevector | (bytevector start end)
   ;; The scatter-gather write ADR-0009 reserved this name for. Each segment's
@@ -103,57 +155,64 @@
       (raise (make-uv-invalid-argument 'uv-write*! 'segments-not-a-list)))
     (when (null? segments)
       (raise (make-uv-invalid-argument 'uv-write*! 'empty-segment-list)))
-    ;; Normalize and range-check every segment before anything is allocated, so
-    ;; a malformed list leaves no block and no registration behind.
+    ;; Normalize and range-check every segment before the step, so a
+    ;; malformed list is refused before anything is allocated. The step
+    ;; checks every span again, against the bytevectors as they are then.
     (let* ((specs (map parse-write-segment segments))
-           (stream-ptr (handle-pointer stream 'uv-write*!))
            (n (length specs))
            (total (fold-left (lambda (acc s) (+ acc (caddr s))) 0 specs))
            (bufs-offset (align-16 (uv-req-size (uv-write-req-type))))
            (payload-offset (+ bufs-offset (* n (sizeof-uv-buf-t))))
            ;; (max total 1) keeps the payload region addressable even when every
            ;; span is empty, so no uv_buf_t base is ever a null or dangling one.
-           (block (alloc-zeroed (+ payload-offset (max total 1))))
-           (payload-base (+ block payload-offset)))
-      ;; Pack non-empty spans consecutively from the region start; point every
-      ;; empty span's base at that same start (always valid, region >= 1) so no
-      ;; base lands one-past-the-end of the block.
-      (let place ((specs specs) (i 0) (running 0))
-        (when (pair? specs)
-          (let* ((spec (car specs))
-                 (bv (car spec)) (start (cadr spec)) (len (caddr spec))
-                 (buf (+ block bufs-offset (* i (sizeof-uv-buf-t))))
-                 (base (if (zero? len) payload-base (+ payload-base running))))
-            (unless (or (zero? len)
-                        (eq? (try-copy-in! base bv start len) 'copied))
-              (free! block)
-              (raise (make-uv-invalid-argument 'uv-write*!
-                                               'segment-span-out-of-range)))
-            (uv-buf-set! buf base len)
-            (place (cdr specs) (+ i 1) (+ running len)))))
-      (let ((req (%make-uv-req-record block 'write stream on-complete)))
-        (registry-register! block 'write-req (handle-loop stream) req)
-        (count-write-req-new!)
-        (let ((status (uv-write-native block stream-ptr (+ block bufs-offset) n)))
-          (unless (zero? status)
-            (abandon-request! req)
-            (count-write-req-free!)
-            (raise (uv-errno-condition status 'uv-write*!))))
-        req)))
+           (size (+ payload-offset (max total 1)))
+           (started
+            (one-step
+             (let ((ptr (open-handle-ptr stream)))
+               (cond ((symbol? ptr) ptr)
+                     ((not (spans-fit? specs)) 'segment-span-out-of-range)
+                     (else
+                      (let ((block (alloc-block size)))
+                        (if (zero? block)
+                            'no-memory
+                            (let ((bufs (+ block bufs-offset)))
+                              (place-spans! specs bufs (+ block payload-offset))
+                              (start-write! stream ptr block bufs n
+                                            on-complete))))))))))
+      (if (uv-req? started)
+          started
+          (raise (step-refusal started 'uv-write*! stream)))))
 
   ;; uv-shutdown! : uv-stream procedure -> uv-request
   (define (uv-shutdown! stream on-shutdown)
     (require-open-stream stream 'uv-shutdown!)
     (require-callback on-shutdown 'uv-shutdown! 'on-shutdown-not-a-procedure)
-    (let* ((stream-ptr (handle-pointer stream 'uv-shutdown!))
-           (block (alloc-zeroed (uv-req-size (uv-shutdown-req-type))))
-           (req (%make-uv-req-record block 'shutdown stream on-shutdown)))
-      (registry-register! block 'shutdown-req (handle-loop stream) req)
-      (let ((status (uv-shutdown-native block stream-ptr)))
-        (unless (zero? status)
-          (abandon-request! req)
-          (raise (uv-errno-condition status 'uv-shutdown!))))
-      req))
+    (let* ((size (uv-req-size (uv-shutdown-req-type)))
+           (started
+            (one-step
+             (let ((ptr (open-handle-ptr stream)))
+               (if (symbol? ptr)
+                   ptr
+                   (let ((block (alloc-block size)))
+                     (if (zero? block)
+                         'no-memory
+                         (let* ((req (%make-uv-req-record block 'shutdown stream
+                                                          on-shutdown))
+                                (registered (registry-add! block 'shutdown-req
+                                                           (handle-loop stream)
+                                                           req)))
+                           (if (eq? registered 'registered)
+                               (let ((rc (uv-shutdown-native block ptr)))
+                                 (if (zero? rc)
+                                     req
+                                     (begin (registry-remove! block)
+                                            (free-block! block)
+                                            (set-req-ptr! req 0)
+                                            rc)))
+                               (begin (free-block! block) registered))))))))))
+      (if (uv-req? started)
+          started
+          (raise (step-refusal started 'uv-shutdown! stream)))))
 
   (define default-read-buffer-size 65536)
 
@@ -168,7 +227,8 @@
       ((stream on-data on-eof on-error buffer-size)
        (start-reading! stream on-data on-eof on-error buffer-size))))
 
-  ;; Store callbacks only after libuv accepts the read start.
+  ;; The callbacks are stored only once libuv accepts the start, and in the
+  ;; same step, so no read can be delivered between the two.
   (define (start-reading! stream on-data on-eof on-error buffer-size)
     (require-open-stream stream 'uv-read-start!)
     (require-callback on-data 'uv-read-start! 'on-data-not-a-procedure)
@@ -179,36 +239,65 @@
                    (positive? buffer-size))
         (raise (make-uv-invalid-argument 'uv-read-start!
                                          'buffer-size-out-of-range))))
-    (ensure-read-buffer! stream buffer-size)
-    (uv-check (uv-read-start-native (handle-pointer stream 'uv-read-start!))
-              'uv-read-start!)
-    (set-stream-on-data! stream on-data)
-    (set-stream-on-eof! stream on-eof)
-    (set-stream-on-error! stream on-error)
-    (set-stream-reading! stream #t))
+    (let ((started
+           (one-step
+            (let ((ptr (open-handle-ptr stream)))
+              (if (symbol? ptr)
+                  ptr
+                  (let ((buffer (ensure-read-buffer! stream buffer-size)))
+                    (if (not (eq? buffer 'ready))
+                        buffer
+                        (let ((rc (uv-read-start-native ptr)))
+                          (when (zero? rc)
+                            (set-stream-on-data! stream on-data)
+                            (set-stream-on-eof! stream on-eof)
+                            (set-stream-on-error! stream on-error)
+                            (set-stream-reading! stream #t))
+                          rc))))))))
+      (unless (eqv? started 0)
+        (raise (step-refusal started 'uv-read-start! stream)))))
 
-  ;; The first start fixes one reusable buffer until close. A stopped read may
-  ;; restart without specifying a size, but may not resize the existing buffer.
-  ;; A start whose stream began to close while it was suspended installs
-  ;; nothing, and is refused as closed.
+  ;; ensure-read-buffer! : uv-stream (or exact-positive-integer #f)
+  ;;                       -> (or 'ready 'buffer-size-fixed symbol)
+  ;; Inside the read start's step. The first start fixes one reusable buffer
+  ;; until close, installed with the descriptor libuv's alloc callback
+  ;; answers (install-read-buffer!, whose refusal it answers: 'no-memory, as
+  ;; the step has found the stream open and without a buffer). A stopped read
+  ;; may restart without specifying a size, but may not resize the existing
+  ;; buffer.
   (define (ensure-read-buffer! stream buffer-size)
-    (unless (install-read-buffer! stream (or buffer-size default-read-buffer-size))
-      (require-open-stream stream 'uv-read-start!)
-      (when (and buffer-size (not (= buffer-size (stream-read-buf-len stream))))
-        (raise (make-uv-invalid-argument 'uv-read-start!
-                                         'buffer-size-fixed)))))
+    (if (zero? (stream-read-buf stream))
+        (let ((installed (install-read-buffer!
+                          stream (or buffer-size default-read-buffer-size))))
+          (if (eq? installed 'installed) 'ready installed))
+        (if (and buffer-size (not (= buffer-size (stream-read-buf-len stream))))
+            'buffer-size-fixed
+            'ready)))
 
   ;; uv-read-stop! : uv-stream -> unspecified
   ;; Stop retains callbacks and the buffer so it can implement backpressure.
   (define (uv-read-stop! stream)
     (require-open-stream stream 'uv-read-stop!)
-    (uv-check (uv-read-stop (handle-pointer stream 'uv-read-stop!))
-              'uv-read-stop!)
-    (set-stream-reading! stream #f))
+    (let ((stopped
+           (one-step
+            (let ((ptr (open-handle-ptr stream)))
+              (if (symbol? ptr)
+                  ptr
+                  (let ((rc (uv-read-stop ptr)))
+                    (when (zero? rc) (set-stream-reading! stream #f))
+                    rc))))))
+      (unless (eqv? stopped 0)
+        (raise (step-refusal stopped 'uv-read-stop! stream)))))
 
   ;; uv-stream-write-queue-size : uv-stream -> exact-nonnegative-integer
   ;; This platform-dependent value is a congestion signal, not a memory gauge.
   (define (uv-stream-write-queue-size stream)
     (require-open-stream stream 'uv-stream-write-queue-size)
-    (uv-stream-get-write-queue-size-native
-     (handle-pointer stream 'uv-stream-write-queue-size))))
+    (let ((size (one-step
+                 (let ((ptr (open-handle-ptr stream)))
+                   (if (symbol? ptr)
+                       ptr
+                       (uv-stream-get-write-queue-size-native ptr))))))
+      (if (symbol? size)
+          (raise (step-refusal size 'uv-stream-write-queue-size stream))
+          size))))

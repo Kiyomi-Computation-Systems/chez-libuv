@@ -39,14 +39,17 @@
 ;;; arm64, Linux aarch64 and x86_64 agree to the byte), and less than any
 ;;; undone change adds back: a second guard around the user's call, or one
 ;;; around a write's native start. The idle run's margin is half a
-;;; dynamic-wind instead, for the one uv-run held.
+;;; dynamic-wind instead, for the one uv-run held, and so is the stream
+;;; verbs': their steps are bare interrupt pairs, and with-interrupts-disabled
+;;; in their place is a dynamic-wind.
 ;;;
 ;;; One row holds a difference instead. A read through libuv crosses into
 ;;; Scheme once, as a timer does, so each costs over its delivery straight
 ;;; through the slot what the other does. An alloc callback answered in
 ;;; Scheme would add a crossing to every read, under half a guard when it
 ;;; has no seam around it. The figures are in
-;;; .plans/callback-alloc-mutation-log.md and .plans/shim-alloc-mutation-log.md.
+;;; .plans/callback-alloc-mutation-log.md, .plans/shim-alloc-mutation-log.md
+;;; and .plans/stream-step-mutation-log.md.
 ;;;
 ;;; NOT pure: (libuv) reaches (libuv private native). Never add this to the
 ;;; Makefile's PURE_TESTS.
@@ -196,7 +199,8 @@
     (read-through-libuv 448 1)
     ;; the seam's guard and the callback's own
     (guarded-callback-through-libuv 787 2)
-    (uv-write! 240 0) (uv-write*! 304 0) (uv-shutdown! 128 0)))
+    ;; one interrupt-free step each, with no dynamic-wind
+    (uv-write! 144 0) (uv-write*! 208 0) (uv-shutdown! 128 0)))
 
 ;; bound : symbol -> exact-integer, per the header.
 (define (bound name)
@@ -204,7 +208,7 @@
          (on-10.4.1 (car path))
          (guards (cadr path))
          (margin (case name
-                   ((idle-run) (div a-wind 2))
+                   ((idle-run uv-write! uv-write*! uv-shutdown!) (div a-wind 2))
                    ;; a mean, which a stray stack segment can move
                    ((guarded-callback-through-libuv) (* 2 a-guard))
                    (else (div a-guard 2)))))

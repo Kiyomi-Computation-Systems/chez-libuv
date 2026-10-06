@@ -1679,15 +1679,33 @@
             (alloc-answer (handle-ptr s-freed) 1)
             (stream-read-buf s-freed)))))
 
-(test-equal "install-read-buffer! refuses a size that is not positive, installing nothing"
-  '((uv-alloc-zeroed size-must-be-positive) 0 (0 0))
-  (list (guard (e ((uv-invalid-argument? e)
-                   (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
-                  (#t 'wrong-condition))
-          (install-read-buffer! s-unread 0)
-          'installed)
+;; A read start makes the install inside its own step, where nothing may
+;; raise, so a size the allocator cannot give is answered, not raised.
+(test-equal "install-read-buffer! answers no-memory for a size that is not positive, installing nothing"
+  '(no-memory 0 (0 0))
+  (list (install-read-buffer! s-unread 0)
         (stream-read-buf s-unread)
         (alloc-answer (handle-ptr s-unread) 1)))
+
+;; The install answers what stood in the way rather than raising, and installs
+;; nothing then: a stream that has begun to close (its block is freed once
+;; the loop runs its close), or one that already has its buffer.
+(define s-installed (make-uv-tcp sl))
+(define s-closing (make-uv-tcp sl))
+
+(test-equal "install-read-buffer! answers buffered for a stream that has one, and keeps the first"
+  '(installed buffered 4096)
+  (let* ((first (install-read-buffer! s-installed 4096))
+         (second (install-read-buffer! s-installed 64)))
+    (list first second (stream-read-buf-len s-installed))))
+
+(test-equal "install-read-buffer! answers not-open for a closing stream, installing nothing"
+  '(not-open 0 (0 0))
+  (begin
+    (uv-close! s-closing)
+    (list (install-read-buffer! s-closing 64)
+          (stream-read-buf s-closing)
+          (alloc-answer (handle-ptr s-closing) 1))))
 
 ;; A positive read on a stream with no read buffer cannot come from libuv
 ;; (its alloc callback answers the empty buffer), but copy-out refuses the

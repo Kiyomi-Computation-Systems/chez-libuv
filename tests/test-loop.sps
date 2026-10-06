@@ -46,6 +46,8 @@
               alloc-zeroed
               ;; The uv-update-time! affinity rows compare against it.
               current-thread-id)
+        ;; step-refusal's errno row names an errno by its symbol.
+        (only (libuv private constants) errno-symbol->value)
         ;; The uv-update-time! rows step their loops with the shared capped
         ;; stepper rather than a hand-rolled one.
         (only (uv-testing) run-until)
@@ -593,6 +595,67 @@
             (#t 'wrong-condition))
     (registry-deregister! (car fake-handle))
     'no-raise))
+
+;; --- the registry's step forms --------------------------------------------
+;; A verb registers its request from inside an interrupt-free step, where a
+;; raise would leave interrupts disabled for good (one-step). registry-add!
+;; therefore answers each refusal registry-register! raises, and
+;; registry-remove! tolerates an absent entry. SRFI-64 turns a raise into
+;; #f, which none of these expected values is.
+(define step-req (cons 4244 'fake-write-req))
+
+(test-equal "registry-add! answers registered, and the entry is retrievable"
+  '(registered same 1)
+  (let* ((before (registry-count))
+         (status (registry-add! (car step-req) 'write-req l0 step-req)))
+    (list status
+          (if (eq? step-req (registry-ref (car step-req))) 'same 'different)
+          (- (registry-count) before))))
+
+(test-equal "registry-add! answers each refusal registry-register! raises, and adds nothing"
+  '(pointer-already-registered null-or-invalid-pointer loop-not-a-uv-loop
+    same absent)
+  (list (registry-add! (car step-req) 'timer l0 fake-handle)
+        (registry-add! 0 'write-req l0 step-req)
+        (registry-add! 4245 'write-req 'not-a-loop step-req)
+        (if (eq? step-req (registry-ref (car step-req))) 'same 'replaced)
+        (if (registry-ref 4245) 'present 'absent)))
+
+(test-equal "registry-remove! removes an entry, and raises nothing for an absent one"
+  '(absent absent)
+  (begin
+    (registry-remove! (car step-req))
+    (let ((first (if (registry-ref (car step-req)) 'present 'absent)))
+      (registry-remove! (car step-req))
+      (list first (if (registry-ref (car step-req)) 'present 'absent)))))
+
+;; step-refusal turns what a step answered into what its verb raises. The
+;; closed handle and the missing pointer are what require-open-handle and
+;; handle-pointer raise outside a step, so a verb refuses the same way
+;; whichever check catches it.
+(define (refusal-shape c)
+  (cond ((uv-handle-closed? c) (list 'handle-closed (uv-handle-closed-kind c)))
+        ((uv-invalid-argument? c)
+         (list 'invalid (uv-invalid-argument-who c) (uv-invalid-argument-reason c)))
+        ((uv-errno-error? c) (list 'errno (condition-who c) (uv-errno-error-errno c)))
+        (else (list 'other c))))
+
+(test-equal "step-refusal raises each status as the checks outside a step do"
+  '((handle-closed timer)
+    (invalid uv-test-verb! null-handle-pointer)
+    (errno uv-test-verb! ENOMEM)
+    (invalid uv-registry-register! pointer-already-registered)
+    (invalid uv-test-verb! span-out-of-range)
+    (errno uv-test-verb! EBADF))
+  (let* ((l (make-uv-loop))
+         (t (make-uv-timer l))
+         (shapes (map (lambda (status)
+                        (refusal-shape (step-refusal status 'uv-test-verb! t)))
+                      (list 'not-open 'no-pointer 'no-memory
+                            'pointer-already-registered 'span-out-of-range
+                            (errno-symbol->value 'EBADF)))))
+    (uv-loop-teardown! l)
+    shapes))
 
 ;; --- the callback error policy (design spec S8) -------------------------
 ;; The dispatcher guard that CALLS loop-record-error! arrives with Task 7;

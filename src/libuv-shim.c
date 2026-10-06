@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 
@@ -319,6 +320,9 @@ void chez_uv_count_async_new(void)  { live_async += 1; }
 void chez_uv_count_async_free(void) { live_async -= 1; }
 long chez_uv_live_async(void)       { return live_async; }
 
+static long live_block = 0;
+long chez_uv_live_block(void) { return live_block; }
+
 #else
 
 void chez_uv_count_loop_new(void)  { }
@@ -373,4 +377,27 @@ void chez_uv_count_async_new(void)  { }
 void chez_uv_count_async_free(void) { }
 long chez_uv_live_async(void)       { return 0; }
 
+long chez_uv_live_block(void) { return 0; }
+
 #endif /* CHEZ_LIBUV_DEBUG_COUNTERS */
+
+/* calloc, not malloc and a separate memset: the zeroing is in the one call,
+ * and a fresh mapping comes back zero without being written. */
+void *chez_uv_alloc(size_t n) {
+  void *p = calloc(1, n);
+#ifdef CHEZ_LIBUV_DEBUG_COUNTERS
+  if (p != NULL) {
+    live_block += 1;
+  }
+#endif
+  return p;
+}
+
+void chez_uv_free(void *p) {
+#ifdef CHEZ_LIBUV_DEBUG_COUNTERS
+  if (p != NULL) {
+    live_block -= 1;
+  }
+#endif
+  free(p);
+}

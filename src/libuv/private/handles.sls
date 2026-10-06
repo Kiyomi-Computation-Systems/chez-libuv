@@ -7,6 +7,10 @@
   (export ;; the registry
           registry-register! registry-deregister! registry-ref
           registry-loop-of registry-count registry-snapshot-for-loop
+          registry-add! registry-remove!
+
+          ;; interrupt-free steps
+          one-step open-handle-ptr step-refusal
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -80,13 +84,13 @@
                 count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-new! count-read-buffer-free!
-                alloc-zeroed align-16 uv-buf-set! copy-out
+                alloc-block align-16 uv-buf-set! copy-out
                 uv-handle-set-data
                 uv-errno-condition
                 uv-walk-native
                 current-thread-id
                 dispatcher-names install-callback-dispatchers!)
-          (only (libuv private constants) uv-eof sizeof-uv-buf-t))
+          (only (libuv private constants) uv-eof sizeof-uv-buf-t errno-symbol->value))
 
   ;; A unique sentinel is required because R6RS permits (raise #f).
   (define no-pending (list 'no-pending))
@@ -263,10 +267,11 @@
     handle)
 
   ;; The checked accessor is the only route from a handle record to native code,
-  ;; except in the steps where nothing may raise. The fence's steps
-  ;; (uv-async-send!, begin-close!) make the same check with valid-pointer?
-  ;; and answer a status instead. The read buffer's install and free write a
-  ;; stream's descriptor only while its handle block is alive.
+  ;; except inside an interrupt-free step (one-step, the send fence), where
+  ;; nothing may raise: a step makes the same check with open-handle-ptr, or
+  ;; valid-pointer?, and answers a status instead. The read buffer's install
+  ;; and free write a stream's descriptor only while its handle block is
+  ;; alive.
   (define (handle-pointer handle who)
     (let ((ptr (handle-ptr handle)))
       (unless (valid-pointer? ptr)
@@ -286,21 +291,88 @@
 
   (define dns-request-kinds '(getaddrinfo-req getnameinfo-req))
 
+  ;; registry-add! : uptr symbol uv-loop object
+  ;;                 -> (or 'registered 'null-or-invalid-pointer
+  ;;                        'loop-not-a-uv-loop 'pointer-already-registered)
+  ;; The registry's sole write site. It validates the loop so callback
+  ;; containment can always find a valid error cell without raising from its
+  ;; handler. A refusal is answered, not raised, so a verb can register from
+  ;; inside an interrupt-free step (one-step).
+  (define (registry-add! ptr kind loop object)
+    (cond ((not (valid-pointer? ptr)) 'null-or-invalid-pointer)
+          ((not (uv-loop? loop)) 'loop-not-a-uv-loop)
+          ((hashtable-contains? registry ptr) 'pointer-already-registered)
+          (else (hashtable-set! registry ptr (%make-registry-entry kind loop object))
+                'registered)))
+
   ;; registry-register! : uptr symbol uv-loop object -> object
-  ;; Validate the loop at the sole write site so callback containment can always
-  ;; find a valid error cell without raising from its handler.
+  ;; registry-add!, raising its refusal.
   (define (registry-register! ptr kind loop object)
-    (unless (valid-pointer? ptr)
-      (raise (make-uv-invalid-argument 'uv-registry-register!
-                                       'null-or-invalid-pointer)))
-    (unless (uv-loop? loop)
-      (raise (make-uv-invalid-argument 'uv-registry-register!
-                                       'loop-not-a-uv-loop)))
-    (when (hashtable-contains? registry ptr)
-      (raise (make-uv-invalid-argument 'uv-registry-register!
-                                       'pointer-already-registered)))
-    (hashtable-set! registry ptr (%make-registry-entry kind loop object))
-    object)
+    (let ((status (registry-add! ptr kind loop object)))
+      (unless (eq? status 'registered)
+        (raise (make-uv-invalid-argument 'uv-registry-register! status)))
+      object))
+
+  ;; registry-remove! : uptr -> unspecified
+  ;; registry-deregister! for a step: removes PTR's entry if it has one, and
+  ;; raises nothing.
+  (define (registry-remove! ptr)
+    (hashtable-delete! registry ptr))
+
+  ;; (one-step body ...) runs BODY as one interrupt-free step and answers its
+  ;; value. Neither an engine's timer nor a collect request is taken inside
+  ;; it, so nothing else runs on this thread between a verb's checks and the
+  ;; native call they guard, and an engine is suspended, or dropped, either
+  ;; before the step or after it, never inside.
+  ;; - Split by an engine, a verb's open check stops covering its native
+  ;;   call: a close can free the handle in between (#33 for a send; the
+  ;;   stream verbs' sweeps in test-stream.sps). Dropped there, a verb
+  ;;   strands whatever it had allocated and not yet handed on.
+  ;; - It is a bare disable-interrupts/enable-interrupts pair, not
+  ;;   with-interrupts-disabled, which is a dynamic-wind: about 96 B a step
+  ;;   around a copy (ADR-0019's decision 3 amendment of 2026-10-06).
+  ;; - BODY must not raise: interrupts would stay disabled for good. It
+  ;;   checks what can fail and answers a status, makes only calls that are
+  ;;   total for their arguments (alloc-block, registry-add!), and the verb
+  ;;   raises after the step (step-refusal). A fault in a native call inside
+  ;;   it still leaves interrupts disabled; begin-close! has always accepted
+  ;;   that.
+  ;; - BODY must not wait. This thread stays active throughout, so another
+  ;;   thread's collection waits for the step to end.
+  (define-syntax one-step
+    (syntax-rules ()
+      ((_ body1 body2 ...)
+       (begin (disable-interrupts)
+              (let ((result (begin body1 body2 ...)))
+                (enable-interrupts)
+                result)))))
+
+  ;; open-handle-ptr : uv-handle -> (or uptr 'not-open 'no-pointer)
+  ;; For a step: HANDLE's pointer, when it is open and has one. The open
+  ;; check a verb makes on entry does not cover a native call an engine can
+  ;; suspend it before, so the step checks again.
+  (define (open-handle-ptr handle)
+    (let ((ptr (handle-ptr handle)))
+      (cond ((not (eq? (handle-state handle) 'open)) 'not-open)
+            ((not (valid-pointer? ptr)) 'no-pointer)
+            (else ptr))))
+
+  ;; step-refusal : (or symbol exact-integer) symbol uv-handle -> condition
+  ;; What verb WHO raises, once its step is over, for a step on HANDLE that
+  ;; answered STATUS instead of starting. A closed handle and a missing
+  ;; pointer are the refusals the checked accessors raise outside a step; a
+  ;; refused registration is registry-register!'s; an integer is libuv's
+  ;; errno. Any other symbol is a refusal of WHO's own argument, and names it.
+  (define (step-refusal status who handle)
+    (case status
+      ((not-open) (make-uv-handle-closed (handle-kind handle)))
+      ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
+      ((no-memory) (uv-errno-condition (errno-symbol->value 'ENOMEM) who))
+      ((null-or-invalid-pointer loop-not-a-uv-loop pointer-already-registered)
+       (make-uv-invalid-argument 'uv-registry-register! status))
+      (else (if (symbol? status)
+                (make-uv-invalid-argument who status)
+                (uv-errno-condition status who)))))
 
   (define (registry-deregister! ptr)
     (let ((entry (hashtable-ref registry ptr #f)))
@@ -489,35 +561,33 @@
     (uv-handle-set-data (handle-pointer stream 'uv-attach-stream-descriptor!)
                         (stream-descriptor stream)))
 
-  ;; install-read-buffer! : uv-stream exact-positive-integer -> boolean
-  ;; Gives STREAM its read buffer of SIZE bytes unless it has one or has
-  ;; begun to close, and answers whether it did. The block is allocated and
-  ;; counted first, since allocating can raise. Then one interrupt-free step
-  ;; checks both again and fills the descriptor and the record together, so
-  ;; no engine or interrupt can come between the check and the fill, or into
-  ;; the fill (tests/test-tcp.sps's install sweeps). The open check keeps a
-  ;; start suspended while its stream closed from writing the descriptor
-  ;; into the freed handle block: a stream stops being open when its close
-  ;; begins, before the close dispatcher frees the block. A start that loses
-  ;; either check frees and uncounts its block. The step raises nothing: its
-  ;; writes are of values already checked.
+  ;; install-read-buffer! : uv-stream object
+  ;;                        -> (or 'installed 'not-open 'buffered 'no-memory)
+  ;; Gives an open STREAM with no read buffer one of SIZE bytes, and answers
+  ;; 'installed, or what stood in the way. The checks, the allocation, and the
+  ;; fill of the descriptor and the record are one interrupt-free step. So no
+  ;; engine or interrupt can come between a check and the fill, or into the
+  ;; fill (tests/test-tcp.sps's install sweeps), and none can drop a start
+  ;; holding a block it has not installed (tests/test-stream.sps's drop
+  ;; sweep). The open check keeps a start suspended while its stream closed
+  ;; from writing the descriptor into the freed handle block: a stream stops
+  ;; being open when its close begins, before the close dispatcher frees the
+  ;; block. Nothing in it raises, since alloc-block answers 0 for a size it
+  ;; cannot allocate, so a read start makes it inside its own step
+  ;; (stream.sls), where it nests.
   (define (install-read-buffer! stream size)
-    (and (zero? (stream-read-buf stream))
-         (let* ((block (alloc-zeroed size))
-                (descriptor (stream-descriptor stream)))
-           (count-read-buffer-new!)
-           (disable-interrupts)
-           (let ((won (and (eq? (handle-state stream) 'open)
-                           (zero? (stream-read-buf stream)))))
-             (when won
-               (uv-buf-set! descriptor block size)
-               (set-stream-read-buf! stream block)
-               (set-stream-read-buf-len! stream size))
-             (enable-interrupts)
-             (unless won
-               (free! block)
-               (count-read-buffer-free!))
-             won))))
+    (one-step
+     (cond ((not (eq? (handle-state stream) 'open)) 'not-open)
+           ((not (zero? (stream-read-buf stream))) 'buffered)
+           (else
+            (let ((block (alloc-block size)))
+              (if (zero? block)
+                  'no-memory
+                  (begin (uv-buf-set! (stream-descriptor stream) block size)
+                         (set-stream-read-buf! stream block)
+                         (set-stream-read-buf-len! stream size)
+                         (count-read-buffer-new!)
+                         'installed)))))))
 
   ;; free-read-buffer! : uv-handle -> unspecified
   ;; Empties the descriptor before the block goes, so it never names freed
@@ -620,19 +690,16 @@
   ;; raise (see with-send-fence): the caller raises for 'no-pointer.
   (define (begin-close! handle on-close)
     (define (close-if-open!)
-      (let ((ptr (handle-ptr handle)))
-        (cond ((not (eq? (handle-state handle) 'open)) 'not-open)
-              ((not (valid-pointer? ptr)) 'no-pointer)
-              (else (set-handle-on-close! handle on-close)
-                    (set-handle-state! handle 'closing)
-                    (uv-close-native ptr)
-                    'closing))))
+      (let ((ptr (open-handle-ptr handle)))
+        (if (symbol? ptr)
+            ptr
+            (begin (set-handle-on-close! handle on-close)
+                   (set-handle-state! handle 'closing)
+                   (uv-close-native ptr)
+                   'closing))))
     (if (uv-async-record? handle)
         (with-send-fence handle (close-if-open!))
-        (begin (disable-interrupts)
-               (let ((status (close-if-open!)))
-                 (enable-interrupts)
-                 status))))
+        (one-step (close-if-open!))))
 
   (define close-handle-proc
     (lambda (handle on-close)

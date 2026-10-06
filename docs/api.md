@@ -93,12 +93,25 @@ pipe handle.
 
 | Export | |
 |---|---|
-| `uv-write!` | Write a bytevector or a span of one. The payload is copied during the call, at `memcpy` speed. On a threaded Chez, the copy also holds off other threads' garbage collections while it runs: roughly 0.05 to 0.35 ms per MiB of payload, depending on the platform and on whether the pages are fresh. That matters only for single writes of tens of MiB |
+| `uv-write!` | Write a bytevector or a span of one. The payload is copied during the call, at `memcpy` speed. On a threaded Chez, the whole call holds off other threads' garbage collections: the copy, and libuv's `uv_write`, which on an idle socket hands the kernel as much as it will take before returning. On macOS loopback that was 0.2 to 0.9 ms for 1 MiB and 2.4 to 4.4 ms for 4 MiB. That matters only for single writes of a MiB or more |
 | `uv-write*!` | Vectored write: one request over a list of segments, each a bytevector or a `(bv start end)` span. All segments are copied into one block and sent as `uv_write` with `nbufs = N`. One completion for the whole write. The list must be non-empty |
 | `uv-shutdown!` | Shut the write side down; the read side stays open |
 | `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required |
 | `uv-read-stop!` | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
 | `uv-stream-write-queue-size` | Queued write bytes libuv is holding for this stream. Allocation-free. See Flow control, below |
+
+**Inside an engine.** An engine's fuel can run out anywhere in a stream
+verb, and a scheduler may close the stream before resuming it, or never
+resume it at all. Each verb makes its checks, its allocation and its native
+call in one step that no engine timer interrupts. A verb resumed after its
+stream was closed raises `&uv-handle-closed` without touching it. A verb
+whose engine is never resumed leaves nothing behind: either it had not
+begun, or libuv holds its request and the request's completion frees it.
+The other verbs do not promise this yet
+([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
+decision 3, amended 2026-10-06). Until they do, close a handle only from
+the task that is using it, and do not abandon an engine inside a
+constructor, `uv-tcp-connect!`, a DNS request or `uv-spawn!`.
 
 ## Flow control
 

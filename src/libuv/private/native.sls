@@ -17,6 +17,7 @@
           ;; foreign memory and copying
           c-string->string
           alloc-zeroed zero-out! free! copy-in! try-copy-in! copy-out
+          alloc-block free-block! copy-in-unchecked!
           c-int-size c-int-ref c-int-set! c-uptr-ref read-net-u16
           c-uptr-size c-uptr-set! c-u32-set!
 
@@ -199,6 +200,14 @@
   ;; the stream's own read buffer, is fixed per handle and needs no Scheme.
   ;; uv-read-start-native hands libuv this address.
   (define alloc-cb-entry (shim-entry "chez_uv_alloc_cb"))
+
+  ;; The binding's blocks come from the shim: zeroed, 0 when the allocator
+  ;; refuses, and counted alive by the debug shim (live-counts' 'block).
+  ;; foreign-alloc raises when malloc fails, so it cannot be used inside an
+  ;; interrupt-free step; neither of these raises for arguments in range.
+  (define raw-alloc (shim-procedure "chez_uv_alloc" (size_t) uptr))
+  (define raw-free (shim-procedure "chez_uv_free" (uptr) void))
+  (define live-block (shim-procedure "chez_uv_live_block" () long))
 
   ;; Counter symbols exist in every build; production implementations are no-ops.
   (define count-loop-new!  (shim-procedure "chez_uv_count_loop_new" () void))
@@ -493,20 +502,53 @@
       (raise (make-uv-invalid-argument 'uv-zero-out! 'length-out-of-range)))
     (raw-zero addr len))
 
+  ;; alloc-block, free-block! and copy-in-unchecked! are the forms a verb
+  ;; uses inside an interrupt-free step, where nothing may raise (stream.sls).
+  ;; Each is total: it answers or ignores what it cannot use, so no argument
+  ;; can make it raise. alloc-zeroed and free! check their arguments and
+  ;; raise; everything else allocates and frees through them.
+
+  ;; alloc-block : object -> uptr
+  ;; A zeroed block of N bytes, or 0 when N is not a positive fixnum or the
+  ;; allocator refuses.
+  (define (alloc-block n)
+    (if (and (fixnum? n) (fx>? n 0))
+        (raw-alloc n)
+        0))
+
+  ;; free-block! : object -> unspecified
+  ;; Frees a block alloc-block answered. Anything that cannot be an address
+  ;; is ignored, 0 included.
+  (define (free-block! addr)
+    (when (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616))
+      (raw-free addr)))
+
+  ;; copy-in-unchecked! : uptr bytevector exact-nonnegative-integer
+  ;;                      exact-nonnegative-integer -> unspecified
+  ;; copy-in!'s copy without its checks, for a step that has checked the span
+  ;; against the bytevector itself: with interrupts disabled since, no
+  ;; handler on this thread can truncate it in between.
+  (define (copy-in-unchecked! dst bv start len)
+    (raw-copy-in dst bv start len))
+
   ;; alloc-zeroed : exact-positive-integer -> uptr
+  ;; A block the allocator refuses is &uv-errno-error ENOMEM, as libuv
+  ;; reports its own.
   (define (alloc-zeroed n)
     (unless (and (integer? n) (exact? n) (positive? n))
       (raise (make-uv-invalid-argument 'uv-alloc-zeroed 'size-must-be-positive)))
-    (let ((addr (foreign-alloc n)))
-      (zero-out! addr n)
+    (let ((addr (alloc-block n)))
+      (when (zero? addr)
+        (raise (uv-errno-condition (errno-symbol->value 'ENOMEM) 'uv-alloc-zeroed)))
       addr))
 
   ;; free! : uptr -> unspecified
-  ;; Reject zero because stored pointers are cleared immediately after free.
+  ;; Reject zero because stored pointers are cleared immediately after free,
+  ;; and anything past the address space, which free-block! would ignore.
   (define (free! addr)
-    (unless (and (integer? addr) (exact? addr) (positive? addr))
+    (unless (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616))
       (raise (make-uv-invalid-argument 'uv-free! 'null-or-invalid-pointer)))
-    (foreign-free addr))
+    (free-block! addr))
 
   ;; try-copy-in! : uptr bytevector exact-nonnegative-integer
   ;;                exact-nonnegative-integer -> (or 'copied 'span-out-of-range)
@@ -701,7 +743,8 @@
           (cons 'process       (live-process))
           (cons 'spawn-options (live-spawn-options))
           (cons 'signal        (live-signal))
-          (cons 'async         (live-async))))
+          (cons 'async         (live-async))
+          (cons 'block         (live-block))))
 
   ;; One process-global slot and locked trampoline per callback type that
   ;; crosses into Scheme. libuv's alloc callback does not: the shim answers
