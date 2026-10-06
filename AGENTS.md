@@ -148,6 +148,16 @@ None is obvious from reading the code.
   after activity can return before the timer comes due. This flaked exactly
   once in five CI runs. Always step with a capped `'once` loop
   (`run-until`-style), never a single call and never wall-clock.
+* **A completed write is not a byte in the peer's receive queue.** The write
+  callback means the bytes reached the sending socket. The kernel delivers
+  them to the peer after that, and under load the gap outlasts any fixed
+  number of `'nowait` turns. test-tcp's reset section closed after two such
+  turns. Under a loopback flood, up to one run in five closed on an empty
+  queue, sent a FIN instead of an RST, and failed its contract rows with EOF.
+  CPU load alone (load average 106) never did it. A fixture that depends on
+  the peer's kernel state has to look at it: the section now waits on
+  `recv(MSG_PEEK)` and asserts what it saw as a named precondition
+  (`.plans/reset-precondition-mutation-log.md`).
 * **Chez resolves its boot files by argv[0], not by the executable's path.**
   A Chez child spawned with `file` = the real binary but argv[0] hardcoded to
   another name (e.g. `"chez"` against an install whose binary is `scheme`)
