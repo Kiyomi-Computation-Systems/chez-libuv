@@ -62,8 +62,9 @@
         (uv-testing)
         (only (uv-evidence) live-count describe)
         ;; foreign-procedure calls the shim's alloc callback, libuv's
-        ;; handle-data getter and the allocator's size query; make-engine
-        ;; suspends a read start anywhere (the install sweep).
+        ;; handle-data getter and the allocator's size query, and binds the
+        ;; reset section's look into a receive queue (queued-bytes, below);
+        ;; make-engine suspends a read start anywhere (the install sweep).
         (only (chezscheme) collect foreign-entry? foreign-entry foreign-procedure
               make-engine))
 
@@ -2142,7 +2143,7 @@
 ;; unread data is still sitting in its receive queue sends RST instead (the
 ;; abortive close of RFC 1122 4.2.2.13, implemented by both Darwin and
 ;; Linux). So the SERVER writes, the client never reads a byte, and the
-;; client is then closed.
+;; client is closed once those bytes are seen waiting in its receive queue.
 ;;
 ;; WHAT IS ASSERTED IS THE DISPATCH, NOT THE KERNEL'S CHOICE OF ERRNO. That
 ;; the failure reaches on-error as an &uv-errno-error carrying a SYMBOL --
@@ -2156,6 +2157,41 @@
 (define x-data-fires 0)
 (define x-connect-err 'connect-cb-never-fired)
 (define x-write-err 'write-cb-never-fired)
+
+;; (queued-bytes tcp n) -> how many bytes, up to n, sit unread in tcp's
+;; receive queue, read with recv(2)'s MSG_PEEK so that they stay there. When
+;; it cannot look, it answers a list naming what refused: (handle closing)
+;; or (handle closed) for a handle no longer open, (uv_fileno <status>) or
+;; (recv -1) for a call that failed. An empty queue is (recv -1) too: libuv's
+;; sockets are non-blocking, so recv answers at once instead of waiting for
+;; bytes. Never raises: a look that fails reaches the precondition row with
+;; its evidence instead of aborting the suite (AGENTS.md).
+;;
+;; MSG_PEEK is 2 on Darwin, Linux and the BSDs. A flag that drained the queue
+;; would hand the close an empty one, which the precondition row reads.
+(define msg-peek 2)
+(define uv-fileno
+  (and (foreign-entry? "uv_fileno")
+       (foreign-procedure "uv_fileno" (uptr u8*) int)))
+(define c-recv
+  (and (foreign-entry? "recv")
+       (foreign-procedure "recv" (int u8* size_t int) ssize_t)))
+
+(define (queued-bytes tcp n)
+  (guard (e (#t (list 'raised
+                      (if (message-condition? e) (condition-message e) e)
+                      (if (irritants-condition? e) (condition-irritants e) '()))))
+    (cond ((not (uv-handle-open? tcp)) (list 'handle (uv-handle-state tcp)))
+          ((not uv-fileno) '(uv_fileno unavailable))
+          ((not c-recv) '(recv unavailable))
+          (else
+           (let* ((fd-box (make-bytevector 8 0))
+                  (rc (uv-fileno (handle-ptr tcp) fd-box)))
+             (if (not (zero? rc))
+                 (list 'uv_fileno rc)
+                 (let ((got (c-recv (bytevector-s32-native-ref fd-box 0)
+                                    (make-bytevector n 0) n msg-peek)))
+                   (if (negative? got) (list 'recv got) got))))))))
 
 (define xserver (make-uv-tcp xl))
 (define xport (bind-loopback! xserver))
@@ -2193,11 +2229,23 @@
                    (lambda () (not (eq? x-write-err 'write-cb-never-fired)))
                    cap)
 
-;; A completed write means libuv handed the bytes to the kernel; two further
-;; turns cost nothing and remove any question about whether they have been
-;; queued on the client's side before it is closed.
-(uv-run xl 'nowait)
-(uv-run xl 'nowait)
+;; A COMPLETED WRITE IS NOT A QUEUED READ. The write callback means libuv
+;; handed the bytes to the server's socket; the kernel delivers them to the
+;; client's receive queue after that, and under load that can outlast any
+;; fixed number of loop turns. This section used to take two 'nowait turns
+;; here and close. Under a loopback flood, up to one suite run in five then
+;; closed on an empty queue, sent a FIN, and failed the two contract rows
+;; below with EOF (.plans/reset-precondition-mutation-log.md). So the close
+;; waits until the queue is seen to hold every byte, capped and counted in
+;; loop steps like every other wait here.
+(define x-queue-wait
+  (run-until/ticking xl
+                     (lambda () (eqv? 4096 (queued-bytes xclient 4096)))
+                     cap))
+
+;; Read again right before the close, with no loop step between: this is the
+;; queue the close finds, and a second look shows the wait's did not drain it.
+(define x-queued-at-close (queued-bytes xclient 4096))
 
 (uv-close! xclient)
 
@@ -2211,8 +2259,21 @@
 (display x-error)
 (display " (on-eof fires: ")
 (display x-eof-fires)
+(display "; queued at the close: ")
+(display x-queued-at-close)
+(display ", queue wait ")
+(display x-queue-wait)
 (display ")")
 (newline)
+
+;; The fixture's own assumption, checked rather than trusted: the close finds
+;; the bytes unread only if they reached the client first. Asserted first, so
+;; a close that went out as a FIN fails HERE, by name, ahead of the contract
+;; rows it takes down with it. The wait's outcome is part of the value, so a
+;; wait that could never be satisfied fails here too, instead of passing
+;; after spending its whole cap.
+(test-equal "precondition: all 4096 bytes reached the client's receive queue before it was closed"
+  '(satisfied 4096) (list x-queue-wait x-queued-at-close))
 
 (test-equal "the abrupt peer close reached the reader"
   'satisfied x-outcome)
