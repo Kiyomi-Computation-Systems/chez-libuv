@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet. Amended 2026-10-06 (segment lists): `uv-write*!` reads its segment list once, each pair checked as it is read — see the same bullet.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -275,3 +275,25 @@ for that API when it is added.
   libuv those bytes as `u8*`, refusing anything that is not one C string.
   `tests/test-address.sps`'s sweeps hold the three verbs;
   `.plans/address-snapshot-mutation-log.md` has the evidence.
+
+  `uv-write*!` read its segment list twice too, the second time without
+  checking what it read (#64). It asked `list?`, then parsed the list with
+  Chez's `map`, which counts a list and then walks it without checking its
+  pairs again. A non-pair put into the list during the walk, by an engine's
+  timer handler or another thread, was read through: `invalid memory
+  reference` at fuels 19 to 23 of `tests/test-stream.sps`'s cut sweep (Chez
+  10.4.1, macOS arm64). A list made circular there was walked without end,
+  in a walk no engine's fuel stops, until the process held about 6 GB.
+  `proper-length`, which `fold-flags` counts with, had the same fault in two
+  smaller forms. Its tortoise took the cdr of whatever it found behind the
+  hare, and raised for a list of twelve cut during the count. And the two
+  walked separate paths, so two changes could leave them on separate cycles,
+  where the count never ended (found in the PR's review). Now
+  `proper-length` is one walk with Brent's check: it takes each cdr once, of
+  a value just found to be a pair, compares its mark with `eq?` only, and
+  ends once the changes stop. A count can still be stale when it returns,
+  so `uv-write*!` walks at most that many pairs, checking each and requiring
+  the list's end after them, and reads each `(bv start end)` span once the
+  same way. `tests/test-stream.sps`'s segment-list sweeps and span race hold
+  the verb, `tests/test-native.sps`'s sweeps, random trials and race hold
+  the count, and `.plans/write-segments-mutation-log.md` has the evidence.

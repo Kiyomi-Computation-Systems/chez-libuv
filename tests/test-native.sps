@@ -30,11 +30,14 @@
         ;; and collect drive the copy-in! truncation scan. None collides with
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
         ;; bytes-allocated, bytes-deallocated and collect-request-handler
-        ;; meter fold-flags.
+        ;; meter fold-flags. random draws proper-length's random trials, and
+        ;; the thread primitives run its cross-thread race.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
               make-engine bytevector-truncate! collect
-              bytes-allocated bytes-deallocated collect-request-handler void)
+              bytes-allocated bytes-deallocated collect-request-handler void
+              random random-seed fork-thread make-mutex make-condition
+              with-mutex condition-wait condition-broadcast)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1734,6 +1737,222 @@
              (circular '(a b c) 0)
              (circular '(a b c d) 2)
              (circular '(a b c d e) 1))))
+
+;; --- proper-length: a list changed during the count (#64) ------------------
+;; proper-length counts with a hare and a tortoise, and the tortoise walks
+;; pairs the hare has passed, which a change made during the count (by an
+;; engine's handler or another thread) can have cut behind the hare. It took
+;; the cdr of whatever it found there: `cdr: ... is not a pair` for a list of
+;; twelve cut during the count, and at optimize-level 3 an unchecked read.
+;; Each sweep counts a fresh twelve-element list in an engine at rising
+;; fuel and changes it at the first expiry: the third pair's cdr becomes a
+;; vector, or the list's head. A run must answer #f or 12, the count the
+;; list began with, without raising; a count it answers can be stale, which
+;; is why uv-write*! walks to the end it counted. Each sweep stops at the
+;; first run no expiry reached, or a run whose resumes ran out.
+(define (length-sweep change!)
+  (let next ((fuel 1) (acc '()))
+    (let* ((l (iota* 12))
+           (expired #f)
+           (answer
+            (let run ((eng (make-engine
+                            (lambda ()
+                              (guard (e (#t (list 'raised (describe e))))
+                                (proper-length l)))))
+                      (ticks fuel)
+                      (resumes 0))
+              (eng ticks
+                   (lambda (left v) v)
+                   (lambda (more)
+                     (unless expired
+                       (set! expired #t)
+                       (change! l))
+                     (if (= resumes 100)
+                         'stuck
+                         (run more 100000 (+ resumes 1)))))))
+           (acc (cons (list fuel answer expired) acc)))
+      (if (and expired (not (eq? answer 'stuck)) (< fuel 400))
+          (next (+ fuel 1) acc)
+          (reverse acc)))))
+
+;; Two cycles at once: the fifth pair's cdr back to the fourth, and the
+;; twelfth's back to the eleventh. A count that walked a second pointer
+;; behind the first could be left on one cycle while the first went round
+;; the other, and never end (#64's review).
+(define (two-cycles! l)
+  (let ((p4 (list-tail l 4)) (p5 (list-tail l 5))
+        (p10 (list-tail l 10)) (p11 (list-tail l 11)))
+    (set-cdr! p5 p4)
+    (set-cdr! p11 p10)))
+
+(define length-sweeps
+  (list (cons 'cut (length-sweep
+                    (lambda (l) (set-cdr! (cddr l) (vector 'not 'a 'pair)))))
+        (cons 'made-circular (length-sweep
+                              (lambda (l) (set-cdr! (cddr l) l))))
+        (cons 'two-cycles (length-sweep two-cycles!))))
+
+(test-equal "proper-length answers #f or the count it began with for a list changed during the count, never raising"
+  '()
+  (apply append
+         (map (lambda (s)
+                (map (lambda (run) (cons (car s) run))
+                     (filter (lambda (run) (not (memv (cadr run) '(#f 12))))
+                             (cdr s))))
+              length-sweeps)))
+
+;; The row above finds no bad answer, which says nothing unless each sweep
+;; changed the list before the count began and ran the last count whole.
+(test-equal "each proper-length sweep changed the list before the count began and ended with a count no expiry reached"
+  '((cut (1 #f #t) 12) (made-circular (1 #f #t) 12) (two-cycles (1 #f #t) 12))
+  (map (lambda (s)
+         (let ((runs (cdr s)))
+           (list (car s)
+                 (car runs)
+                 (let ((last-run (list-ref runs (- (length runs) 1))))
+                   (if (caddr last-run) 'expired (cadr last-run))))))
+       length-sweeps))
+
+;; --- proper-length against changes nobody chose ---------------------------
+;; The sweeps above make the changes a reader thought of; one reader thought
+;; only of single changes, and the count above hung on two. These trials
+;; make changes at random: a list of 1 to 16 pairs, counted in an engine
+;; whose fuel runs out somewhere in the count (a count of N pairs takes
+;; N + 1 ticks), and one or two changes at each of its first one or two
+;; expiries. A change points a random pair's cdr at a random pair of the
+;; list, at '() or at a vector. The count may then answer #f or any length,
+;; since the list may now have it, but it must end and raise nothing. The
+;; seed is fixed, so every run makes the same trials.
+(define count-trials 3000)
+
+;; count-trial : -> (list changed? answer)
+(define (count-trial)
+  (let* ((len (+ 1 (random 16)))
+         (l (iota* len))
+         (pairs (let collect ((p l) (acc '()))
+                  (if (pair? p) (collect (cdr p) (cons p acc)) (reverse acc))))
+         (fuel (+ 1 (random (+ len 1))))
+         (expiries (+ 1 (random 2)))
+         (seen 0))
+    (define (change!)
+      (let ((p (list-ref pairs (random len))))
+        (case (random 3)
+          ((0) (set-cdr! p (list-ref pairs (random len))))
+          ((1) (set-cdr! p '()))
+          (else (set-cdr! p (vector 'not 'a 'pair))))))
+    (let ((answer
+           (let run ((eng (make-engine
+                           (lambda ()
+                             (guard (e (#t (list 'raised (describe e))))
+                               (proper-length l)))))
+                     (ticks fuel)
+                     (resumes 0))
+             (eng ticks
+                  (lambda (left v) v)
+                  (lambda (more)
+                    (when (< seen expiries)
+                      (set! seen (+ seen 1))
+                      (change!)
+                      (when (zero? (random 2)) (change!)))
+                    (if (= resumes 100)
+                        'stuck
+                        (run more (if (< seen expiries) fuel 100000)
+                             (+ resumes 1))))))))
+      (list (positive? seen) answer))))
+
+(random-seed 64)
+(define trial-results
+  (let run ((i 0) (acc '()))
+    (if (= i count-trials) (reverse acc) (run (+ i 1) (cons (count-trial) acc)))))
+
+(test-equal "proper-length ends and raises nothing for a list changed at random during the count"
+  '()
+  (let collect ((results trial-results) (i 0) (bad '()))
+    (if (null? results)
+        (reverse bad)
+        (let ((answer (cadr (car results))))
+          (collect (cdr results) (+ i 1)
+                   (if (or (not answer)
+                           (and (integer? answer) (exact? answer) (>= answer 0)))
+                       bad
+                       (cons (list i answer) bad)))))))
+
+;; The row above says nothing unless the changes landed mid-count.
+(define trials-changed (length (filter car trial-results)))
+(display "  [informational] proper-length trials: ")
+(display trials-changed)
+(display " of ")
+(display count-trials)
+(display " changed their list during the count")
+(newline)
+
+(test-equal "precondition: at least a third of the trials changed their list during the count"
+  'changed-mid-count
+  (if (>= (* 3 trials-changed) count-trials)
+      'changed-mid-count
+      (list 'changed trials-changed)))
+
+;; --- proper-length against a list another thread changes ------------------
+;; Another thread can change a list between any two instructions, where an
+;; engine stops only at a trap check. A flipper turns the third pair's cdr
+;; between a vector and the rest of the list while this thread counts the
+;; list, and every count must answer #f or 12 without raising. A count that
+;; read a cdr twice, checking it the first time, would take the cdr of the
+;; vector the second: the shape #61's count had, which no engine sweep can
+;; split. As in test-addrinfo's cross-thread row, the row asserts only what
+;; no schedule can make fail on a right answer, and the informational line
+;; counts the counts the flipper's change reached. Not under Valgrind,
+;; which runs one thread at a time.
+(define count-race-rounds 100000)
+
+;; count-race : -> (list rounds bad first-bad cut)
+;; Every exit stops the flipper and waits for it.
+(define (count-race)
+  (let* ((l (iota* 12))
+         (p (list-tail l 2))
+         (rest (cdr p))
+         (v (vector 'not 'a 'pair))
+         (stop #f)
+         (stopped #f)
+         (m (make-mutex))
+         (c (make-condition)))
+    (fork-thread
+     (lambda ()
+       (let flip ()
+         (unless stop
+           (set-cdr! p v)
+           (set-cdr! p rest)
+           (flip)))
+       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+    (let ((result
+           (let round ((r 0) (bad 0) (first-bad #f) (cut 0))
+             (if (= r count-race-rounds)
+                 (list r bad first-bad cut)
+                 (let ((answer (guard (e (#t (list 'raised (describe e))))
+                                 (proper-length l))))
+                   (cond ((eqv? answer 12) (round (+ r 1) bad first-bad cut))
+                         ((not answer) (round (+ r 1) bad first-bad (+ cut 1)))
+                         (else (round (+ r 1) (+ bad 1)
+                                      (or first-bad (list r answer)) cut))))))))
+      (set! stop #t)
+      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
+      result)))
+
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (begin
+      (display "  [informational] proper-length race: skipped under Valgrind,")
+      (display " which runs one thread at a time")
+      (newline))
+    (let ((race (count-race)))
+      (display "  [informational] proper-length race: ")
+      (display (cadddr race))
+      (display " of ")
+      (display (car race))
+      (display " counts found the list cut")
+      (newline)
+      (test-equal "proper-length answers #f or 12 for a list another thread changes, never raising"
+        (list count-race-rounds 0 #f)
+        (list (car race) (cadr race) (caddr race)))))
 
 
 ;; The flags were measured with a guarded length, and a guard costs a few
