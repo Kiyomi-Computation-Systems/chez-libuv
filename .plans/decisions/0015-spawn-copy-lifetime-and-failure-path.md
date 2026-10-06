@@ -2,7 +2,9 @@
 
 - **Status:** Accepted (2026-08-21) — evidence: spike/process/FINDINGS.md SQ1
   (`spike/process/07-spawn-failure.ss`, both platforms, Linux leg under
-  valgrind)
+  valgrind). Amended 2026-10-06: decision 1's block is sized and filled from
+  the caller's data as read once, never from the data itself — see the dated
+  note after decision 1.
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.3
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.3-process-design.md) §4.3, §5.5, §5.6, §7 (V1, V3),
@@ -90,6 +92,34 @@ up (design spec §5.5 step 3). V1 licenses the free: the block is dead the
 instant the call returns, on both paths. One alloc site, one free site, no
 conditional — the `uv-write!` discipline, and the ADR-0009 boundary applied
 to a struct instead of a payload.
+
+> **Amended 2026-10-06: the block is built from the caller's data as read
+> once.** Until then `uv-spawn!` checked its caller's strings and lists,
+> sized the block from them, and read them again to fill it, and an engine's
+> timer handler (or another thread) could change them in between. Engine
+> sweeps on a0ea0ca (`tests/test-process.sps`) measured each way that went
+> wrong. Strings and args or env lists that grew were written past the
+> block's end (Valgrind: `Invalid write … chez_uv_copy_in`, 667 and 909
+> errors). A list that grew also wrote argv's NULL slot, so argv ran on into
+> the env strings or the child's `execve` failed with EFAULT. A stdio list
+> that grew wrote a container over argv[0]: EFAULT natively, an empty argv
+> under Valgrind, whose gate stayed green because the write landed inside
+> the block. A pipe swapped in after the check reached libuv, and a NUL set
+> after the check cut the child's strings short (exit status 0 for
+> `exit 7`).
+>
+> Now `uv-spawn!` reads file, args, options, env, cwd and the stdio specs
+> once, in one interrupt-free step, into fresh bytevectors, lists and
+> records nothing else can reach. The checks (the NUL check on the encoded
+> bytes), the block's sizing and filling, and the marking of pipes read only
+> that. The step holds an engine off, but not another thread, so it never
+> trusts the data to keep still while it reads it. Chez's own
+> `string->utf8` sizes its result in one pass and fills it, unchecked, in a
+> second, so each string is copied (a fixed-width copy) and the copy
+> encoded; Chez's `map` walks a list it has measured without checking it
+> again, so lists are walked a checked pair at a time. The fill refuses a
+> string that would not fit in the block, a bound `copy-in!` does not have.
+> Evidence and the mutations: `.plans/spawn-read-once-mutation-log.md`.
 
 **2. Cleanup after a nonzero rc is class-dependent, and the class is decided
 by whether the loop still owns the handle — never by the errno.** Both

@@ -299,7 +299,7 @@ Deliberately minimal (design spec §1): no `bind`/`connect`/`listen`, no
 `file`/`args` are libuv's own execvp/argv contract — unresolved and
 unvalidated by the binding. The `options` alist covers `env` (a list of
 `"K=V"` strings, libuv's own format, not an alist encoding), `cwd`,
-`stdio`, `detached`, and `uid`/`gid`. Seven behaviours worth knowing before
+`stdio`, `detached`, and `uid`/`gid`. Eight behaviours worth knowing before
 the design spec (§4–§6):
 
 - **The spawn surface.** Each child fd (index = slot; 0/1/2 are
@@ -349,6 +349,17 @@ the design spec (§4–§6):
   so a raising `uv-spawn!` still leaves its pipes needing an explicit
   `uv-close!`; naming an already-consumed pipe again raises
   `'pipe-already-used`.
+- **The arguments are read once.** `uv-spawn!` reads `file`, `args` and
+  `options`, with every string, list and stdio spec in them, once, early in
+  the call and in one step no engine's timer can split. Everything after
+  that, the checks included, works from what it read. So if an engine's
+  timer handler changes them while the call runs, the child gets them as
+  they were before the change or as they were after it, never a mix. A NUL
+  that appears in a string during the call is refused, or never reaches the
+  child. Another thread changing them during the call races that read, which
+  no lock here can order: the child may get part of each version, or the
+  call may raise on a list that stopped being one, but the read never takes
+  bytes a string did not hold.
 
 **Root lane.** Exercising `uid`/`gid` (which map to
 `UV_PROCESS_SETUID`/`SETGID`) needs to actually run as root, so that

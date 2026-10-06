@@ -26,12 +26,29 @@
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
-        (only (uv-evidence) live-count)
+        (only (uv-evidence) live-count describe)
         (only (chezscheme) collect putenv mkdir
-              get-string-all open-file-output-port port-file-descriptor))
+              get-string-all open-file-output-port port-file-descriptor
+              ;; The changing-data sweeps drive a spawn in an engine, or race
+              ;; it from another thread, and change the caller's lists and
+              ;; strings mid-call.
+              make-engine last-pair list-head set-car! set-cdr! string-set!
+              fork-thread make-mutex make-condition with-mutex
+              condition-wait condition-broadcast getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. The sweep rows
+;; return their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 (test-begin "process")
 
@@ -305,6 +322,23 @@
                                         (list (list 'pipe (make-uv-pipe loop)
                                                     'sideways))))
                             #f)))
+   ;; A (pipe ...) spec is exactly a pipe and a direction.
+   (test-equal "a (pipe) spec with no pipe" 'stdio-spec-unknown
+     (reason-of (spawn-with "/bin/sh" ok-args '((stdio . ((pipe)))) #f)))
+   (test-equal "a (pipe ...) spec with no direction" 'stdio-spec-unknown
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            (list (cons 'stdio
+                                        (list (list 'pipe (make-uv-pipe loop)))))
+                            #f)))
+   (test-equal "a (pipe ...) spec with more than a pipe and a direction"
+     'stdio-spec-unknown
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            (list (cons 'stdio
+                                        (list (list 'pipe (make-uv-pipe loop)
+                                                    'from-child 'extra))))
+                            #f)))
+   (test-equal "a NUL inside cwd" 'embedded-nul
+     (reason-of (spawn-with "/bin/sh" ok-args '((cwd . "/\x0;tmp")) #f)))
    (test-equal "an inherit-fd value that is not an fd" 'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
                             '((stdio . ((inherit-fd . not-a-number)))) #f)))
@@ -502,6 +536,13 @@
        (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
          (uv-spawn! loop "/bin/cat" '("cat")
                     (list (cons 'stdio (list (list 'pipe foreign-pipe 'to-child))))
+                    #f)
+         'no-raise))
+     (test-equal "an inherit-stream handle from another loop is refused by name"
+       'pipe-wrong-loop
+       (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
+         (uv-spawn! loop "/bin/cat" '("cat")
+                    (list (cons 'stdio (list (cons 'inherit-stream foreign-pipe))))
                     #f)
          'no-raise))
      (uv-loop-teardown! other))))
@@ -811,6 +852,485 @@
           (positive? (cadr exit-result))))
    (uv-close! proc)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
+
+;; --- the caller's data changing during the call ---------------------------
+;; uv-spawn! reads what its caller passed (file, args, env, cwd and the stdio
+;; specs) once, into copies nothing else can reach, and checks, sizes and
+;; fills its options block from those alone. It used to check the caller's
+;; data, size the block from it, and read it again to fill the block, and an
+;; engine's timer handler (or another thread) could change it in between.
+;; Strings and lists that grew were written past the block's end, a stdio
+;; list that grew wrote a container over argv, a pipe swapped in after the
+;; check reached libuv unchecked, and a NUL set after the check cut the
+;; child's strings short.
+;;
+;; Each sweep runs a spawn in an engine at rising fuel. At the first expiry it
+;; changes the caller's data, then resumes the spawn. Fuel 1 expires before
+;; the spawn reads anything, and the sweep stops at the first run no expiry
+;; reached, whatever its verdict, so between them it visits every point in
+;; the verb. The spawn reads in one step no timer can split, so each run has
+;; two right answers: the outcome of the data as it was before the change, or
+;; as it was after. Each child reports what it saw on a pipe (its operands,
+;; three environment variables and the last part of its working directory)
+;; and exits 7, so a child run on a mix of the two, or on bytes nobody passed,
+;; matches neither. Each change touches several strings or lists at once for
+;; that reason: one of them read again after the others shows up as a mix.
+;;
+;; An overrun that leaves the child's view intact is invisible to these rows.
+;; `make test-memory` reports its invalid write: Valgrind on Linux, ASan on
+;; macOS. Sixteen children run at a time: waiting for each child in turn
+;; took about 10 ms a run on macOS, and sixteen at a time take about 2.5.
+
+(define sweep-loop (make-uv-loop))
+;; The stdio sweep swaps in a pipe of this loop, which a spawn must refuse.
+(define other-loop (make-uv-loop))
+(define sweep-process-baseline (live-count 'process))
+(define sweep-registry-baseline (registry-count))
+
+(define report-script
+  "printf '%s|' \"$0\" \"$@\" \"V=$V\" \"W=$W\" \"X=$X\" \"cwd=${PWD##*/}\"; exit 7")
+(define four-lambdas (make-string 4 (integer->char #x3bb)))
+
+;; The strings sweep's working directory, as it was before the change and
+;; after it.
+(for-each (lambda (d) (unless (file-exists? d) (mkdir d)))
+          (list "tests/tmp" "tests/tmp/spawn-cwd-aaaa"
+                (string-append "tests/tmp/spawn-cwd-" four-lambdas)))
+
+(define (overwrite-tail! s tail)
+  (let ((at (- (string-length s) (string-length tail))))
+    (do ((i 0 (+ i 1))) ((= i (string-length tail)))
+      (string-set! s (+ at i) (string-ref tail i)))))
+
+(define (stdout-to pipe) (list 'ignore (list 'pipe pipe 'from-child)))
+
+;; A variant's setup builds one run's copy of the caller's data around the
+;; pipe its child reports on: (list args options change! pipes), where PIPES
+;; are the pipes whose marks the run reports, that one first. BEFORE and
+;; AFTER are what a run comes to on the data before the change and after it.
+(define-record-type sweep-variant
+  (fields name setup before after))
+
+(define sweep-variants
+  (list
+   ;; Each "aaaa" becomes four lambdas, two bytes each in UTF-8.
+   (make-sweep-variant
+    'strings-grow
+    (lambda (pipe)
+      (let ((arg (string-copy "aaaa"))
+            (var (string-copy "V=aaaa"))
+            (cwd (string-copy "tests/tmp/spawn-cwd-aaaa")))
+        (list (list "sh" "-c" report-script "zero" arg)
+              (list (cons 'env (list var "W=w"))
+                    (cons 'cwd cwd)
+                    (cons 'stdio (stdout-to pipe)))
+              (lambda ()
+                (for-each (lambda (s) (overwrite-tail! s four-lambdas))
+                          (list arg var cwd)))
+              (list pipe))))
+    '(ran (7 #f) "zero|aaaa|V=aaaa|W=w|X=|cwd=spawn-cwd-aaaa|" (marked))
+    (list 'ran '(7 #f)
+          (string-append "zero|" four-lambdas "|V=" four-lambdas
+                         "|W=w|X=|cwd=spawn-cwd-" four-lambdas "|")
+          '(marked)))
+   (make-sweep-variant
+    'lists-grow
+    (lambda (pipe)
+      (let ((args (list "sh" "-c" report-script "zero" "one"))
+            (env (list "V=v" "W=w")))
+        (list args
+              (list (cons 'env env) (cons 'cwd "/") (cons 'stdio (stdout-to pipe)))
+              (lambda ()
+                (set-cdr! (last-pair args) (list "xxxx"))
+                (set-cdr! (last-pair env) (list "X=xxxx")))
+              (list pipe))))
+    '(ran (7 #f) "zero|one|V=v|W=w|X=|cwd=|" (marked))
+    '(ran (7 #f) "zero|one|xxxx|V=v|W=w|X=xxxx|cwd=|" (marked)))
+   ;; The pipe the child would report on is swapped for another loop's, which
+   ;; the spawn must refuse, and the list gains a fourth spec.
+   (make-sweep-variant
+    'stdio-changes
+    (lambda (pipe)
+      (let ((specs (list 'ignore (list 'pipe pipe 'from-child) 'ignore))
+            (other (make-uv-pipe other-loop)))
+        (list (list "sh" "-c" report-script "zero")
+              (list (cons 'env (list "V=v" "W=w")) (cons 'cwd "/")
+                    (cons 'stdio specs))
+              (lambda ()
+                (set-car! (cdr (cadr specs)) other)
+                (set-cdr! (cddr specs) (list 'ignore)))
+              (list pipe other))))
+    '(ran (7 #f) "zero|V=v|W=w|X=|cwd=|" (marked unmarked))
+    '(refused uv-spawn! pipe-wrong-loop (unmarked unmarked)))
+   (make-sweep-variant
+    'nuls-appear
+    (lambda (pipe)
+      (let ((script (string-copy report-script))
+            (arg (string-copy "abcd"))
+            (var (string-copy "V=abcd")))
+        (list (list "sh" "-c" script "zero" arg)
+              (list (cons 'env (list var "W=w")) (cons 'cwd "/")
+                    (cons 'stdio (stdout-to pipe)))
+              (lambda ()
+                ;; Cut short at the NUL, "exit 7" is "exit ", which exits
+                ;; with printf's status, 0.
+                (string-set! script (- (string-length script) 1) #\nul)
+                (string-set! arg 2 #\nul)
+                (string-set! var 4 #\nul))
+              (list pipe))))
+    '(ran (7 #f) "zero|abcd|V=abcd|W=w|X=|cwd=|" (marked))
+    '(refused uv-spawn! embedded-nul (unmarked)))))
+
+;; One engine run of a sweep, and what its child has reported so far.
+(define-record-type spawn-run
+  (fields fuel pipes report
+          (mutable expired run-expired? set-run-expired!)
+          (mutable outcome run-outcome set-run-outcome!)
+          (mutable status run-status set-run-status!)
+          (mutable eof run-eof set-run-eof!))
+  (protocol
+   (lambda (new)
+     (lambda (fuel pipes)
+       (new fuel pipes (make-byte-collector) #f '(not-run) 'not-yet 'not-yet)))))
+
+;; start-run! : sweep-variant exact-positive-integer -> spawn-run
+;; Spawns in an engine with FUEL ticks, makes the variant's change at the
+;; first expiry, resumes, and starts reading the child's report.
+(define (start-run! variant fuel)
+  (let* ((pipe (make-uv-pipe sweep-loop))
+         (data ((sweep-variant-setup variant) pipe))
+         (run (make-spawn-run fuel (cadddr data))))
+    (set-run-outcome!
+     run
+     (let step ((eng (make-engine
+                      (lambda ()
+                        (guard (e ((uv-invalid-argument? e)
+                                   (list 'refused (uv-invalid-argument-who e)
+                                         (uv-invalid-argument-reason e)))
+                                  ((uv-errno-error? e)
+                                   (list 'errno (uv-errno-error-errno e)))
+                                  (#t (list 'raised (describe e))))
+                          (list 'spawned
+                                (uv-spawn! sweep-loop "/bin/sh" (car data) (cadr data)
+                                           (lambda (status signal)
+                                             (collect)
+                                             (set-run-status! run (list status signal)))))))))
+                (ticks fuel))
+       (eng ticks
+            (lambda (left v) v)
+            (lambda (next)
+              (unless (run-expired? run)
+                (set-run-expired! run #t)
+                ((caddr data)))
+              (step next 100000)))))
+    (when (eq? (car (run-outcome run)) 'spawned)
+      (guard (e (#t (set-run-eof! run (list 'read-refused (describe e)))))
+        (uv-read-start! pipe
+                        (lambda (bv start end)
+                          (collect)
+                          (collect-span! (spawn-run-report run) bv start end))
+                        (lambda () (collect) (set-run-eof! run 'eof))
+                        (lambda (err) (collect) (set-run-eof! run (list 'read-error err))))))
+    run))
+
+(define (run-spawned? run) (eq? (car (run-outcome run)) 'spawned))
+
+(define (run-finished? run)
+  (or (not (run-spawned? run))
+      (and (pair? (run-status run)) (not (eq? (run-eof run) 'not-yet)))))
+
+;; run-seen : spawn-run -> list
+;; What a run came to, in the shape of a variant's before and after.
+(define (run-seen run)
+  (let ((outcome (run-outcome run))
+        (marks (map (lambda (p) (if (pipe-connected? p) 'marked 'unmarked))
+                    (spawn-run-pipes run))))
+    (cond ((not (run-spawned? run)) (append outcome (list marks)))
+          ((eq? (run-eof run) 'eof)
+           (list 'ran (run-status run)
+                 (utf8->string (collector-bytes (spawn-run-report run))) marks))
+          (else
+           (list 'ran (run-status run) 'report-ended (run-eof run)
+                 (utf8->string (collector-bytes (spawn-run-report run))) marks)))))
+
+;; run-verdict : sweep-variant spawn-run -> verdict
+;; A verdict is 'before, 'after or 'untouched, or else the evidence, a list.
+(define (run-verdict variant run)
+  (let ((seen (run-seen run)))
+    (cond ((not (run-finished? run)) (list 'unfinished seen))
+          ((not (run-expired? run))
+           (if (equal? seen (sweep-variant-before variant))
+               'untouched
+               (list 'untouched-but seen)))
+          ((equal? seen (sweep-variant-before variant)) 'before)
+          ((equal? seen (sweep-variant-after variant)) 'after)
+          (else (list 'neither seen)))))
+
+(define (unfinished? verdict) (and (pair? verdict) (eq? (car verdict) 'unfinished)))
+
+(define (sweep-residue)
+  (list (live-count 'spawn-options)
+        (- (live-count 'process) sweep-process-baseline)
+        (- (registry-count) sweep-registry-baseline)))
+
+;; finish-batch! : sweep-variant (list-of spawn-run) -> (list-of (list fuel verdict))
+;; Waits for every child in BATCH, closes the batch's handles, and gives each
+;; run its verdict. If the batch leaves an options block, a process or a
+;; registry entry behind, its last run carries the residue instead.
+(define (finish-batch! variant batch)
+  (run-until/ticking sweep-loop (lambda () (for-all run-finished? batch)) 20000)
+  (let ((rows (map (lambda (run) (list (spawn-run-fuel run) (run-verdict variant run)))
+                   batch)))
+    (for-each (lambda (run)
+                (when (run-spawned? run) (uv-close! (cadr (run-outcome run))))
+                (for-each (lambda (p) (when (uv-handle-open? p) (uv-close! p)))
+                          (spawn-run-pipes run)))
+              batch)
+    ;; Closes on the other loop finish when it runs.
+    (run-until sweep-loop
+               (lambda ()
+                 (uv-run other-loop 'nowait)
+                 (equal? (sweep-residue) '(0 0 0)))
+               64)
+    (let ((residue (sweep-residue)))
+      (if (equal? residue '(0 0 0))
+          rows
+          (let ((last-row (list-ref rows (- (length rows) 1))))
+            (append (list-head rows (- (length rows) 1))
+                    (list (list (car last-row) (list 'residue residue (cadr last-row))))))))))
+
+(define spawn-max-fuel 3000)
+(define spawn-batch-size 16)
+
+;; spawn-sweep : sweep-variant -> (list-of (list fuel verdict))
+;; Stops at the first run no expiry reached, at the fuel cap, or after a batch
+;; whose children did not all finish. A raise between runs would abort the
+;; suite, so the whole sweep is caught and its evidence handed to the rows.
+(define (spawn-sweep variant)
+  (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
+    (let next ((fuel 1) (batch '()) (rows '()))
+      (let* ((run (start-run! variant fuel))
+             (batch (cons run batch))
+             (last? (or (not (run-expired? run)) (= fuel spawn-max-fuel))))
+        (if (or last? (= (length batch) spawn-batch-size))
+            (let* ((done (finish-batch! variant (reverse batch)))
+                   (rows (append rows done)))
+              (if (or last? (exists (lambda (row) (unfinished? (cadr row))) done))
+                  rows
+                  (next (+ fuel 1) '() rows)))
+            (next (+ fuel 1) batch rows))))))
+
+;; In order, one after another: Chez's map applies its procedure in no fixed
+;; order.
+(define spawn-sweeps
+  (let next ((vs sweep-variants) (acc '()))
+    (if (null? vs)
+        (reverse acc)
+        (next (cdr vs)
+              (cons (cons (sweep-variant-name (car vs)) (spawn-sweep (car vs)))
+                    acc)))))
+
+(uv-loop-teardown! sweep-loop)
+(uv-loop-teardown! other-loop)
+
+(for-each
+ (lambda (sweep)
+   (let ((count (lambda (v) (length (filter (lambda (row) (eq? (cadr row) v))
+                                             (cdr sweep))))))
+     (display "  [informational] spawn sweep ")
+     (display (car sweep))
+     (display ": ")
+     (display (length (cdr sweep)))
+     (display " runs, ")
+     (display (count 'after))
+     (display " after the change, ")
+     (display (count 'before))
+     (display " before it\n")))
+ spawn-sweeps)
+
+;; The rows below look for wrong verdicts and must find none, which says
+;; nothing unless each sweep saw the change land before the spawn read its
+;; data and ran the spawn to its end.
+(test-equal "each spawn sweep saw the change before the spawn read its data, and ended in a run no expiry reached"
+  (map (lambda (v) (list (sweep-variant-name v) 'after 'untouched)) sweep-variants)
+  (map (lambda (sweep)
+         (let ((rows (cdr sweep)))
+           (list (car sweep)
+                 (cadr (car rows))
+                 (cadr (list-ref rows (- (length rows) 1))))))
+       spawn-sweeps))
+
+;; wrong-runs : symbol -> (list-of (list fuel verdict))
+(define (wrong-runs name)
+  (filter (lambda (row) (not (memq (cadr row) '(before after untouched))))
+          (cdr (assq name spawn-sweeps))))
+
+(test-equal "a spawn whose strings grew during the call ran its child on them as they were before the change or after it"
+  '() (wrong-runs 'strings-grow))
+
+(test-equal "a spawn whose args and env lists grew during the call ran its child on them as they were before the change or after it"
+  '() (wrong-runs 'lists-grow))
+
+(test-equal "a spawn whose stdio specs changed during the call ran on them as they were before the change, or refused them as they were after it"
+  '() (wrong-runs 'stdio-changes))
+
+(test-equal "a spawn whose strings gained a NUL during the call ran on them as they were before the change, or refused them as they were after it"
+  '() (wrong-runs 'nuls-appear))
+
+;; --- an argument another thread changes during the call -------------------
+;; No engine is needed for a string to change while uv-spawn! reads it:
+;; another thread can, and an interrupt-free step does not hold another
+;; thread off. A narrower thread turns every λ of an argument back into a,
+;; over and over, while this thread widens it to all λ before each spawn. It
+;; only narrows, because a race that narrows leaves the end of Chez's
+;; string->utf8 answer unwritten, while one that widens writes past it and
+;; would take the evidence with the heap. Each round's child must report
+;; race-length characters, each an a or a λ, and exit 7.
+;;
+;; Each round spawns once the narrower has turned the argument's first
+;; character back, so the narrower is mid-pass when the spawn reads it; a
+;; round that waits race-wait-cap steps for that ends the race, naming the
+;; narrower dead. The narrower spins race-spin steps after each character,
+;; so that its pass outlasts the read. Without the spin a pass took about as
+;; long as the read, and was often over, or its thread off the CPU, by the
+;; time the read began: under load averages near 200 from other sessions,
+;; 2 to 17 of 200 rounds overlapped, and the read without its copy passed.
+;; With it, 167 to 182 overlapped at that load, and that read failed 184 to
+;; 190 rounds. Whether a pass overlaps the read is still up to the
+;; scheduler, so the row asserts only what no schedule can make fail on a
+;; right answer, and an informational line counts the rounds whose child
+;; reported a mix, which only an overlap produces. These callbacks do not
+;; collect: an explicit collection raises while another thread is active.
+;;
+;; Not under Valgrind, which runs one thread at a time, so no round could
+;; overlap there (tests/test-addrinfo.sps measured 0 of 200).
+(define race-length 4096)
+(define race-rounds 200)
+(define race-wait-cap 100000000)
+(define race-spin 200)
+
+;; race-reading : list -> (or 'all-wide 'all-narrow 'mixed #f)
+;; What a round's child reported, if it is one reading of the argument.
+(define (race-reading seen)
+  (and (equal? (list (car seen) (cadr seen)) '(ran (7 #f)))
+       (let ((text (caddr seen)))
+         (and (string? text)
+              (= (string-length text) race-length)
+              (let ((chars (string->list text)))
+                (cond ((for-all (lambda (c) (char=? c #\x3bb)) chars) 'all-wide)
+                      ((for-all (lambda (c) (char=? c #\a)) chars) 'all-narrow)
+                      ((for-all (lambda (c) (memv c '(#\a #\x3bb))) chars) 'mixed)
+                      (else #f)))))))
+
+;; race-spawn : uv-loop string -> list
+;; Spawns a child that prints ARG, and answers what came of it.
+(define (race-spawn loop arg)
+  (let ((pipe (make-uv-pipe loop))
+        (out (make-byte-collector))
+        (status 'not-yet)
+        (eof 'not-yet))
+    (let ((outcome
+           (guard (e ((uv-invalid-argument? e)
+                      (list 'refused (uv-invalid-argument-who e)
+                            (uv-invalid-argument-reason e)))
+                     (#t (list 'raised (describe e))))
+             (uv-spawn! loop "/bin/sh"
+                        (list "sh" "-c" "printf '%s' \"$1\"; exit 7" "zero" arg)
+                        (list (cons 'stdio (stdout-to pipe)))
+                        (lambda (s g) (set! status (list s g)))))))
+      (let ((seen
+             (if (uv-process? outcome)
+                 (begin
+                   (uv-read-start! pipe
+                                   (lambda (bv start end) (collect-span! out bv start end))
+                                   (lambda () (set! eof 'eof))
+                                   (lambda (err) (set! eof (list 'read-error err))))
+                   (run-until/ticking loop
+                                      (lambda () (and (pair? status)
+                                                      (not (eq? eof 'not-yet))))
+                                      20000)
+                   (uv-close! outcome)
+                   (list 'ran status (utf8->string (collector-bytes out)) eof))
+                 outcome)))
+        (when (uv-handle-open? pipe) (uv-close! pipe))
+        (run-until loop (lambda () (eq? 'closed (uv-handle-state pipe))) 64)
+        seen))))
+
+;; race-evidence : list -> list
+;; A wrong round, without its 8 KiB report.
+(define (race-evidence seen)
+  (if (and (eq? (car seen) 'ran) (string? (caddr seen)))
+      (let ((text (caddr seen)))
+        (list 'ran (cadr seen) 'length (string-length text)
+              'first-other
+              (let scan ((i 0))
+                (cond ((= i (string-length text)) 'none)
+                      ((memv (string-ref text i) '(#\a #\x3bb)) (scan (+ i 1)))
+                      (else (list i (char->integer (string-ref text i))))))))
+      seen))
+
+;; race-sweep : -> (list rounds-run (list-of bad-round) mixed-rounds)
+;; Every exit, a raise included, stops the narrower and waits for it.
+(define (race-sweep)
+  (let ((arg (make-string race-length #\a))
+        (loop (make-uv-loop))
+        (stop #f)
+        (stopped #f)
+        (m (make-mutex))
+        (c (make-condition)))
+    (fork-thread
+     (lambda ()
+       (let narrow ()
+         (unless stop
+           (let pass ((i 0))
+             (when (< i race-length)
+               (string-set! arg i #\a)
+               (let spin ((k 0)) (when (< k race-spin) (spin (+ k 1))))
+               (pass (+ i 1))))
+           (narrow)))
+       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+    (let ((result
+           (guard (e (#t (list 0 (list (list 'raised (describe e))) 0)))
+             (let round ((r 0) (bad '()) (mixed 0))
+               (if (= r race-rounds)
+                   (list r (reverse bad) mixed)
+                   (begin
+                     (let widen ((i 0))
+                       (when (< i race-length)
+                         (string-set! arg i #\x3bb)
+                         (widen (+ i 1))))
+                     (let wait ((k 0))
+                       (cond ((char=? (string-ref arg 0) #\a) 'narrowing)
+                             ((= k race-wait-cap)
+                              (raise (list 'the-narrower-never-narrowed 'round r)))
+                             (else (wait (+ k 1)))))
+                     (let* ((seen (race-spawn loop arg))
+                            (reading (race-reading seen)))
+                       (round (+ r 1)
+                              (if reading
+                                  bad
+                                  (cons (list r (race-evidence seen)) bad))
+                              (if (eq? reading 'mixed) (+ mixed 1) mixed)))))))))
+      (set! stop #t)
+      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
+      (uv-loop-teardown! loop)
+      result)))
+
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (begin
+      (display "  [informational] cross-thread race: skipped under Valgrind,")
+      (display " which runs one thread at a time")
+      (newline))
+    (let ((race (race-sweep)))
+      (display "  [informational] cross-thread race: ")
+      (display (caddr race))
+      (display " of ")
+      (display (car race))
+      (display " children reported the argument mid-change")
+      (newline)
+      (test-equal "a spawn whose argument another thread narrows during the call ran its child on one reading of it"
+        (list race-rounds '())
+        (list (car race) (cadr race)))))
 
 (collect)
 (test-assert "counters all zero at suite end"
