@@ -51,6 +51,9 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
   { "SIZEOF_SOCKADDR_IN6",     (long)sizeof(struct sockaddr_in6) },
 
   { "OFFSETOF_UV_BUF_T_BASE", (long)offsetof(uv_buf_t, base) },
+  /* Where uv_read_start keeps the alloc callback: tests/test-tcp.sps reads it
+   * back to check that libuv holds chez_uv_alloc_cb. */
+  { "OFFSETOF_UV_STREAM_T_ALLOC_CB", (long)offsetof(uv_stream_t, alloc_cb) },
   { "OFFSETOF_UV_BUF_T_LEN",  (long)offsetof(uv_buf_t, len) },
   { "OFFSETOF_SOCKADDR_IN_SIN_PORT",
     (long)offsetof(struct sockaddr_in, sin_port) },
@@ -217,6 +220,35 @@ void chez_uv_copy_out(unsigned char *dst, const void *src, size_t len) {
 
 void chez_uv_zero(void *dst, size_t len) {
   memset(dst, 0, len);
+}
+
+/* The type libuv's alloc callback must have. chez_uv_alloc_cb is declared
+ * with it, so its definition must match it, and one object is declared both
+ * as this type and as libuv's uv_alloc_cb, so the two declarations conflict
+ * unless the types are the same. That fails the build under any compiler
+ * flags (measured: clang 21, gcc 12 and 13, with -w as well as -Werror).
+ * Scheme hands libuv only the address, so no call site would catch a
+ * mismatch. */
+typedef void chez_uv_alloc_cb_fn(uv_handle_t *handle, size_t suggested_size,
+                                 uv_buf_t *buf);
+chez_uv_alloc_cb_fn chez_uv_alloc_cb;
+extern uv_alloc_cb chez_uv_alloc_cb_type_check;
+extern chez_uv_alloc_cb_fn *chez_uv_alloc_cb_type_check;
+
+/* A stream's descriptor lives in its handle block, after libuv's handle, and
+ * data points at it from the stream's creation. It is empty until the first
+ * read start fills it, and emptied again before the read buffer is freed.
+ * libuv itself never reads or writes a handle's data. */
+void chez_uv_alloc_cb(uv_handle_t *handle, size_t suggested_size,
+                      uv_buf_t *buf) {
+  const uv_buf_t *descriptor = (const uv_buf_t *)handle->data;
+  (void)suggested_size;
+  if (descriptor == NULL) {
+    buf->base = NULL;
+    buf->len = 0;
+  } else {
+    *buf = *descriptor;
+  }
 }
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS

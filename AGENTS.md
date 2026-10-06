@@ -129,6 +129,16 @@ None is obvious from reading the code.
   first use, so the error points nowhere near the mistake.
 * **A struct tag first named in a prototype's parameter list has prototype scope
   only** (C99 6.2.1p7). Forward-declare it at file scope before the prototype.
+* **A few bytes in front of a power-of-two allocation cost a whole macOS size
+  class.** macOS malloc rounds 65,552 B (a 64 KiB read buffer behind a
+  16-byte header) up to 81,920 B, and zeroing the request touches every
+  16 KiB page of that: #48's review measured 65,823 B resident per reading
+  stream become 82,289 B. glibc rounds to 16 bytes, so neither Linux nor
+  either memory gate shows it. The alloc callback's descriptor lives in the
+  stream's handle block instead, which keeps its 320 B class, and
+  `tests/test-tcp.sps` holds the read buffer to its length within one malloc
+  granule. Compare `malloc_size` of both sizes before putting a header on an
+  allocation.
 
 ### The event loop and child processes
 

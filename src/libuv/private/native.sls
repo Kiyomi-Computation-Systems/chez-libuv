@@ -40,7 +40,7 @@
           uv-tcp-nodelay uv-tcp-keepalive
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
-          uv-read-start-native uv-read-stop
+          uv-read-start-native uv-read-stop uv-handle-set-data alloc-cb-entry
           uv-stream-get-write-queue-size-native
           uv-ip4-addr uv-ip6-addr
 
@@ -95,7 +95,7 @@
           ;; threaded Chez (#41; tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme)
-                load-shared-object foreign-procedure foreign-entry?
+                load-shared-object foreign-procedure foreign-entry? foreign-entry
                 foreign-ref foreign-set!
                 foreign-alloc foreign-free foreign-sizeof
                 with-interrupts-disabled
@@ -152,18 +152,25 @@
 
   (define shim-loaded (load-shim resolved-shim-path))
 
-  ;; shim-procedure : like foreign-procedure, for an entry the shim exports.
-  ;; A shim built from older sources loads cleanly but lacks newer entries,
-  ;; and foreign-procedure would then fail the whole import with a bare
-  ;; "no entry" assertion. Checking the entry first raises &uv-shim-unavailable
-  ;; naming the shim, the condition every other unusable shim raises
-  ;; (test-shim-loading.sps).
+  ;; shim-entry : string -> exact-integer
+  ;; The address of an entry the shim exports, or &uv-shim-unavailable naming
+  ;; the shim. A shim built from older sources loads cleanly but lacks newer
+  ;; entries, and resolving one unchecked would fail the whole import with a
+  ;; bare "no entry" assertion instead of the condition every other unusable
+  ;; shim raises (test-shim-loading.sps). Every shim entry is resolved
+  ;; through here (tests/test-source-rules.sps).
+  (define (shim-entry entry)
+    (if (foreign-entry? entry)
+        (foreign-entry entry)
+        (raise (make-uv-shim-unavailable resolved-shim-path))))
+
+  ;; shim-procedure : like foreign-procedure, for an entry the shim exports,
+  ;; resolved through shim-entry. foreign-procedure resolves an address
+  ;; expression when the form is evaluated, as it does a name.
   (define-syntax shim-procedure
     (syntax-rules ()
       ((_ entry (arg ...) result)
-       (if (foreign-entry? entry)
-           (foreign-procedure entry (arg ...) result)
-           (raise (make-uv-shim-unavailable resolved-shim-path))))))
+       (foreign-procedure (shim-entry entry) (arg ...) result))))
 
   (define shim-compiled-version
     (shim-procedure "chez_uv_shim_compiled_version" () int))
@@ -186,6 +193,12 @@
   (define raw-copy-out
     (shim-procedure "chez_uv_copy_out" (u8* uptr size_t) void))
   (define raw-zero (shim-procedure "chez_uv_zero" (uptr size_t) void))
+
+  ;; libuv's alloc callback for reads is the shim's own C function, not a
+  ;; trampoline (#45; ADR-0002 and ADR-0008, amended 2026-10-05): its answer,
+  ;; the stream's own read buffer, is fixed per handle and needs no Scheme.
+  ;; uv-read-start-native hands libuv this address.
+  (define alloc-cb-entry (shim-entry "chez_uv_alloc_cb"))
 
   ;; Counter symbols exist in every build; production implementations are no-ops.
   (define count-loop-new!  (shim-procedure "chez_uv_count_loop_new" () void))
@@ -285,8 +298,9 @@
   ;; __collect_safe (#19): a thread blocked here is deactivated, so it does not
   ;; hold Chez's collect interlock and other Scheme threads can GC. This forces
   ;; every callable uv_run can invoke to be __collect_safe too (CSUG §4.3/4.8) —
-  ;; the twelve trampolines below carry the attribute; `walk` alone does not,
-  ;; because it fires only from the plain, synchronous uv_walk, never from here.
+  ;; every trampoline below carries the attribute but `walk`, which fires only
+  ;; from the plain, synchronous uv_walk, never from here. libuv's alloc
+  ;; callback, the shim's, needs none: it never enters Scheme.
   (define uv-loop-run   (foreign-procedure __collect_safe "uv_run" (uptr int) int))
   (define uv-loop-stop  (foreign-procedure "uv_stop"       (uptr) void))
   (define uv-loop-alive (foreign-procedure "uv_loop_alive" (uptr) int))
@@ -355,6 +369,12 @@
   (define uv-read-stop
     (foreign-procedure "uv_read_stop" (uptr) int))
 
+  ;; libuv never reads or writes a handle's data. The read path owns it: it
+  ;; points at the stream's descriptor in its handle block, which
+  ;; alloc-cb-entry answers, and has one writer (tests/test-source-rules.sps).
+  (define uv-handle-set-data
+    (foreign-procedure "uv_handle_set_data" (uptr uptr) void))
+
   ;; size_t is required: this field cannot be negative and has no error channel.
   (define uv-stream-get-write-queue-size-native
     (foreign-procedure "uv_stream_get_write_queue_size" (uptr) size_t))
@@ -395,8 +415,17 @@
   ;; offsets, and field widths with the C shim and fails closed on mismatch.
   (define-ftype uv-buf (struct (base uptr) (len size_t)))
 
-  ;; Deliberately unvalidated: alloc-dispatch must remain unable to raise.
+  ;; uv-buf-set! : uptr exact-nonnegative-integer exact-nonnegative-integer
+  ;;               -> unspecified
+  ;; Checked like the other setters. Its callers write a write request's
+  ;; buffers and a stream's read descriptor, inside steps that must not
+  ;; raise, so each passes values it has already checked.
   (define (uv-buf-set! addr base len)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-buf-set! 'null-or-invalid-destination)))
+    (unless (and (integer? base) (exact? base) (>= base 0)
+                 (integer? len) (exact? len) (>= len 0))
+      (raise (make-uv-invalid-argument 'uv-buf-set! 'value-out-of-range)))
     (let ((p (make-ftype-pointer uv-buf addr)))
       (ftype-set! uv-buf (base) p base)
       (ftype-set! uv-buf (len) p len)))
@@ -674,9 +703,11 @@
           (cons 'signal        (live-signal))
           (cons 'async         (live-async))))
 
-  ;; One process-global slot and locked trampoline per callback type.
+  ;; One process-global slot and locked trampoline per callback type that
+  ;; crosses into Scheme. libuv's alloc callback does not: the shim answers
+  ;; it (alloc-cb-entry).
   (define dispatcher-names
-    '(alloc read connection write-done close timer shutdown connect
+    '(read connection write-done close timer shutdown connect
       getaddrinfo getnameinfo exit walk signal async))
 
   (define dispatchers (make-eq-hashtable))
@@ -724,11 +755,6 @@
     (set! dispatchers-installed #t))
 
   ;; Callback signatures mirror libuv exactly; notably nread is ssize_t.
-  (define alloc-callable
-    (foreign-callable __collect_safe (lambda (handle suggested buf)
-                        ((dispatcher-ref 'alloc) handle suggested buf))
-                      (uptr size_t uptr) void))
-
   (define read-callable
     (foreign-callable __collect_safe (lambda (stream nread buf)
                         ((dispatcher-ref 'read) stream nread buf))
@@ -810,21 +836,21 @@
   ;; libuv retains these addresses, so lock the fixed set for process lifetime.
   (define trampolines-locked
     (for-each lock-object
-              (list alloc-callable read-callable connection-callable
+              (list read-callable connection-callable
                     write-done-callable close-callable timer-callable
                     shutdown-callable connect-callable
                     getaddrinfo-callable getnameinfo-callable
                     exit-callable walk-callable signal-callable
                     async-callable)))
 
-  ;; Entry-point addresses remain private and leave only through wrappers below.
+  ;; Entry-point addresses leave only through the wrappers below, except the
+  ;; shim's alloc-cb-entry, which tests/test-tcp.sps calls as libuv does.
   (define close-cb-entry      (foreign-callable-entry-point close-callable))
   (define timer-cb-entry      (foreign-callable-entry-point timer-callable))
   (define connection-cb-entry (foreign-callable-entry-point connection-callable))
   (define write-cb-entry      (foreign-callable-entry-point write-done-callable))
   (define connect-cb-entry    (foreign-callable-entry-point connect-callable))
   (define shutdown-cb-entry   (foreign-callable-entry-point shutdown-callable))
-  (define alloc-cb-entry      (foreign-callable-entry-point alloc-callable))
   (define read-cb-entry       (foreign-callable-entry-point read-callable))
   (define getaddrinfo-cb-entry
     (foreign-callable-entry-point getaddrinfo-callable))
@@ -858,7 +884,8 @@
   (define (uv-shutdown-native req-ptr stream-ptr)
     (raw-shutdown req-ptr stream-ptr shutdown-cb-entry))
 
-  ;; Keep alloc and read entry points paired in this single wrapper.
+  ;; libuv's alloc callback is the shim's and its read callback the
+  ;; trampoline's, paired in this one wrapper.
   (define (uv-read-start-native stream-ptr)
     (raw-read-start stream-ptr alloc-cb-entry read-cb-entry))
 

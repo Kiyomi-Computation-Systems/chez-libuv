@@ -22,9 +22,8 @@
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 (import (rnrs)
         (srfi :64)
-        (only (chezscheme)
-              directory-list file-directory?
-              eval interaction-environment display-condition))
+        (uv-source)
+        (only (chezscheme) eval interaction-environment display-condition))
 
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
@@ -64,25 +63,6 @@
             ((equal? name guard-library) (scan (cdr specs) #t))
             ((member name thread-libraries) (if guarded? 'ordered 'unguarded))
             (else (scan (cdr specs) guarded?)))))))
-
-;; sls-file? : string -> boolean
-;; A library source: named *.sls, and not a dotfile (see the row below).
-(define (sls-file? name)
-  (let ((n (string-length name)))
-    (and (> n 4)
-         (not (char=? (string-ref name 0) #\.))
-         (string=? (substring name (- n 4) n) ".sls"))))
-
-;; sls-files : string -> (list-of string)
-;; Every .sls file under dir, depth first, in a stable order.
-(define (sls-files dir)
-  (apply append
-         (map (lambda (name)
-                (let ((path (string-append dir "/" name)))
-                  (cond ((file-directory? path) (sls-files path))
-                        ((sls-file? name) (list path))
-                        (else '()))))
-              (list-sort string<? (directory-list dir)))))
 
 (define (library-form? form)
   (and (list? form)
@@ -160,9 +140,7 @@
 ;; --- the real tree ------------------------------------------------------------
 ;; Run from the repo root, as `make test` does.
 
-(define libraries                      ; ((path . form) ...)
-  (map (lambda (path) (cons path (call-with-input-file path read)))
-       (sls-files "src")))
+(define libraries (src-libraries))     ; ((path . form) ...), tests/uv-source.sls
 
 (define library-names (map (lambda (e) (form-name (cdr e))) libraries))
 

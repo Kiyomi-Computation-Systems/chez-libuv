@@ -200,6 +200,39 @@ lookup itself.
 > The invariant this ADR records, that every trampoline body is guarded,
 > stands: there is one guard, and it is the seam's.
 
+> **Amendment (2026-10-05, issue #45 item 5): thirteen trampolines, and
+> alloc leaves Scheme.**
+> For the first time the set shrinks, from fourteen to thirteen. libuv's
+> alloc callback is answered in the shim, by `chez_uv_alloc_cb`
+> ([ADR-0002](0002-direct-ffi-with-constants-only-shim.md), amended the
+> same day). The `alloc` foreign-callable, its slot and `alloc-dispatch` are
+> gone, and `dispatcher-names` no longer names `alloc`.
+>
+> Kept as a slot nothing calls, it would have been a locked trampoline no C
+> code reaches, and its rows would have pinned a dispatcher no read uses.
+> UDP's receive start takes the same `uv_alloc_cb` type, so a UDP binding
+> can hand libuv the same function.
+>
+> The rule, restated: **one locked trampoline per callback type that
+> crosses into Scheme**, a constant small set per process. A callback whose
+> answer needs nothing from Scheme can be answered in C, and alloc's never
+> did: it was always the stream's own read buffer.
+>
+> - Twelve of the thirteen carry `__collect_safe`, and `walk` alone stays
+>   plain. The shim's alloc callback needs no attribute: it never enters
+>   Scheme, so libuv calls it while the loop thread stays deactivated.
+> - `alloc-dispatch` had to stay unable to raise, by care. The C function
+>   cannot raise, and allocates nothing.
+> - The two frozen literals (tests/test-loop.sps, tests/test-native.sps)
+>   narrow to the thirteen-name literal, watched to fail first.
+>   tests/test-tcp.sps reads the alloc callback libuv holds for a reading
+>   stream, requires the shim's, and calls it as libuv does.
+>   tests/test-callback-alloc.sps meters a read through libuv, 448 B
+>   against 864 B with the trampoline, and a relative row there holds that
+>   a read crosses into Scheme once, as a timer does.
+>
+> The evidence is in `.plans/shim-alloc-mutation-log.md`.
+
 The store-and-reraise error policy this trampoline design carries was
 originally justified by the assumption that a Scheme `raise` cannot cross
 libuv's C stack frames safely. **Stage 0 spike Q2 measured it, and that

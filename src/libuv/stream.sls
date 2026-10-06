@@ -189,15 +189,14 @@
 
   ;; The first start fixes one reusable buffer until close. A stopped read may
   ;; restart without specifying a size, but may not resize the existing buffer.
+  ;; A start whose stream began to close while it was suspended installs
+  ;; nothing, and is refused as closed.
   (define (ensure-read-buffer! stream buffer-size)
-    (if (zero? (stream-read-buf stream))
-        (let ((size (or buffer-size default-read-buffer-size)))
-          (set-stream-read-buf! stream (alloc-zeroed size))
-          (set-stream-read-buf-len! stream size)
-          (count-read-buffer-new!))
-        (when (and buffer-size (not (= buffer-size (stream-read-buf-len stream))))
-          (raise (make-uv-invalid-argument 'uv-read-start!
-                                           'buffer-size-fixed)))))
+    (unless (install-read-buffer! stream (or buffer-size default-read-buffer-size))
+      (require-open-stream stream 'uv-read-start!)
+      (when (and buffer-size (not (= buffer-size (stream-read-buf-len stream))))
+        (raise (make-uv-invalid-argument 'uv-read-start!
+                                         'buffer-size-fixed)))))
 
   ;; uv-read-stop! : uv-stream -> unspecified
   ;; Stop retains callbacks and the buffer so it can implement backpressure.

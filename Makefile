@@ -135,8 +135,9 @@ MEMORY_TESTS := $(TESTS)
 # (srfi :64), and pure private libraries only -- (libuv private conditions)
 # imports (rnrs) alone, (libuv private addrinfo) imports (rnrs) plus
 # conditions -- so neither chain ever reaches (libuv private native).
-# test-require-threaded.sps (#41) imports no library of this repo at all: it
-# reads src/'s import forms as data.
+# test-require-threaded.sps (#41) and test-source-rules.sps (#48's review)
+# import no library of this repo at all: they read src/'s forms as data,
+# through the pure tests/uv-source.sls.
 # test-native.sps and test-shim-loading.sps are deliberately NOT here --
 # both import native code by design, and test-shim-loading.sps sets
 # CHEZ_LIBUV_SHIM itself in its children.
@@ -146,7 +147,8 @@ MEMORY_TESTS := $(TESTS)
 # pure suite is a deliberate edit here. $(wildcard) is kept only so a
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
-                           tests/test-require-threaded.sps)
+                           tests/test-require-threaded.sps \
+                           tests/test-source-rules.sps)
 
 .PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
@@ -358,9 +360,15 @@ $(FLAVOR_STAMP): | $(LIB_DIR)
 	rm -f $(BUILD_DIR)/.flavor-*
 	touch $@
 
+# The one link line, shared by the shim and its stale fixture below, so that
+# the fixture differs from the shim only by the flags $(1) adds. $(call), not
+# a target-specific variable: make hands a target's variables on to its
+# prerequisites, and the shim is the fixture's.
+LINK_SHIM = $(CC) $(CFLAGS_SHIM) $(1) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
+            -o $@ src/libuv-shim.c $(UV_LIBS)
+
 $(SHIM): src/libuv-shim.c src/libuv-shim.h $(ACQ_STAMP) $(FLAVOR_STAMP) | $(LIB_DIR)
-	$(CC) $(CFLAGS_SHIM) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
-	      -o $@ src/libuv-shim.c $(UV_LIBS)
+	$(call LINK_SHIM,)
 
 # THE STAMPS ABOVE RECORD THE PROVENANCE; THIS TARGET ENFORCES IT. Depending
 # on them was not enough, and that was MEASURED rather than assumed:
@@ -386,6 +394,18 @@ relink-guard: ## Delete the shim when the build flavor or acquisition path chang
 	  echo "relink-guard: shim provenance changed (flavor=$(FLAVOR), acquisition=$(ACQ_MODE)); relinking"; \
 	  rm -f $(SHIM); \
 	fi
+
+# A shim built from older sources, for tests/test-shim-loading.sps: this
+# shim's own source with its newest export, libuv's alloc callback (#45),
+# renamed away. So it loads cleanly and has every entry but that one, which
+# is what a consumer has after upgrading without `make build`, and the
+# import must refuse it with &uv-shim-unavailable naming the shim. The suite
+# finds it beside build/lib by this path.
+STALE_SHIM := $(BUILD_DIR)/stale-shim/libchezlibuv.$(SHLIB_EXT)
+
+$(STALE_SHIM): src/libuv-shim.c src/libuv-shim.h $(SHIM)
+	mkdir -p $(dir $@)
+	$(call LINK_SHIM,-Dchez_uv_alloc_cb=chez_uv_alloc_cb_withheld)
 
 # config.sls carries the shim's ABSOLUTE path so the loader never searches.
 # Kept as a canned recipe from when `prod` linked the shim itself and had to
@@ -444,7 +464,7 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 # $(TESTS) is a $(wildcard), so a later task's new tests/test-*.sps file is
 # picked up automatically -- no edit needed here, same reasoning as
 # PURE_TESTS above.
-test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
+test: build deps check-pins $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
 	@test -n "$(TIMEOUT_BIN)" || echo "note: no timeout(1) on PATH; a hung suite will not be capped (brew install coreutils)"
 	@fail=0; \
 	for t in $(TESTS); do \
@@ -516,7 +536,7 @@ test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `ma
 # `make test-memory ASAN_DYLIB_PATTERN=/nonexistent/x.dylib` must fail loudly.
 ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
 
-test-memory: build deps check-pins ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
+test-memory: build deps check-pins $(STALE_SHIM) ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
 ifeq ($(UNAME_S),Linux)
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
 # seccomp profiles, containers that disallow the io_uring syscalls) reject

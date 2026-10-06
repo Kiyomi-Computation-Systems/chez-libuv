@@ -39,8 +39,9 @@
           stream-on-data set-stream-on-data!
           stream-on-eof set-stream-on-eof!
           stream-on-error set-stream-on-error!
-          stream-read-buf set-stream-read-buf!
-          stream-read-buf-len set-stream-read-buf-len!
+          stream-read-buf stream-read-buf-len stream-descriptor
+          stream-block-size attach-stream-descriptor!
+          install-read-buffer! free-read-buffer!
           stream-reading? set-stream-reading!
           pipe-connected? set-pipe-connected!
           process-on-exit process-exited? set-process-exited!
@@ -78,13 +79,14 @@
                 count-pipe-free! count-process-free!
                 count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
-                count-read-buffer-free!
-                uv-buf-set! copy-out
+                count-read-buffer-new! count-read-buffer-free!
+                alloc-zeroed align-16 uv-buf-set! copy-out
+                uv-handle-set-data
                 uv-errno-condition
                 uv-walk-native
                 current-thread-id
                 dispatcher-names install-callback-dispatchers!)
-          (only (libuv private constants) uv-eof))
+          (only (libuv private constants) uv-eof sizeof-uv-buf-t))
 
   ;; A unique sentinel is required because R6RS permits (raise #f).
   (define no-pending (list 'no-pending))
@@ -163,7 +165,10 @@
        (lambda (ptr loop) ((pargs->new ptr 'timer loop) #f)))))
 
   ;; The reusable read buffer belongs to the handle and is freed only at close.
-  ;; reading records caller intent; EOF and read errors do not clear it.
+  ;; read-buf is its block, the payload alone, and read-buf-len its length.
+  ;; descriptor is the address of the uv_buf_t in the handle block that
+  ;; libuv's alloc callback answers (stream-block-size). reading records
+  ;; caller intent; EOF and read errors do not clear it.
   (define-record-type (uv-stream-record %make-uv-stream-record uv-stream-record?)
     (parent uv-handle-record)
     (fields (mutable on-data      stream-on-data      set-stream-on-data!)
@@ -171,17 +176,22 @@
             (mutable on-error     stream-on-error     set-stream-on-error!)
             (mutable read-buf     stream-read-buf     set-stream-read-buf!)
             (mutable read-buf-len stream-read-buf-len set-stream-read-buf-len!)
-            (mutable reading      stream-reading?     set-stream-reading!))
+            (mutable reading      stream-reading?     set-stream-reading!)
+            (immutable descriptor stream-descriptor))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr kind loop) ((pargs->new ptr kind loop) #f #f #f 0 0 #f)))))
+       (lambda (ptr kind loop descriptor)
+         ((pargs->new ptr kind loop) #f #f #f 0 0 #f descriptor)))))
 
+  ;; A stream record takes the size of libuv's handle, which places its
+  ;; descriptor in the block stream-block-size allocated.
   (define-record-type (uv-tcp-record %make-uv-tcp-record uv-tcp-record?)
     (parent uv-stream-record)
     (fields (mutable on-connection tcp-on-connection set-tcp-on-connection!))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop) ((pargs->new ptr 'tcp loop) #f)))))
+       (lambda (ptr loop handle-size)
+         ((pargs->new ptr 'tcp loop (+ ptr (descriptor-offset handle-size))) #f)))))
 
   ;; connected means consumed by a spawn, independently of handle state.
   (define-record-type (uv-pipe-record %make-uv-pipe-record uv-pipe-record?)
@@ -189,7 +199,8 @@
     (fields (mutable connected pipe-connected? set-pipe-connected!))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop) ((pargs->new ptr 'pipe loop) #f)))))
+       (lambda (ptr loop handle-size)
+         ((pargs->new ptr 'pipe loop (+ ptr (descriptor-offset handle-size))) #f)))))
 
   ;; Exit updates this record but does not close it.
   (define-record-type (uv-process-record %make-uv-process-record uv-process-record?)
@@ -252,9 +263,10 @@
     handle)
 
   ;; The checked accessor is the only route from a handle record to native code,
-  ;; except in the fence's steps (uv-async-send!, begin-close!), where nothing
-  ;; may raise: they make the same check with valid-pointer? and answer a
-  ;; status instead.
+  ;; except in the steps where nothing may raise. The fence's steps
+  ;; (uv-async-send!, begin-close!) make the same check with valid-pointer?
+  ;; and answer a status instead. The read buffer's install and free write a
+  ;; stream's descriptor only while its handle block is alive.
   (define (handle-pointer handle who)
     (let ((ptr (handle-ptr handle)))
       (unless (valid-pointer? ptr)
@@ -413,14 +425,6 @@
     (complete-request! 'shutdown 'uv-shutdown! no-request-counter
                        req req-ptr status))
 
-  ;; This dispatcher must remain infallible: it can only return the existing
-  ;; handle buffer or a zero-length buffer. libuv provides no alloc error path.
-  (define (alloc-dispatch handle handle-ptr suggested buf-ptr)
-    (if (and (uv-stream-record? handle)
-             (valid-pointer? (stream-read-buf handle)))
-        (uv-buf-set! buf-ptr (stream-read-buf handle) (stream-read-buf-len handle))
-        (uv-buf-set! buf-ptr 0 0)))
-
   ;; nread is signed so UV_EOF cannot masquerade as a huge positive read. The
   ;; buffer argument is ignored; the registered handle owns the trusted base.
   (define (read-dispatch handle stream-ptr nread buf-ptr)
@@ -460,15 +464,76 @@
             (when on-close (on-close))))
         (record-orphan-callback! 'close handle-ptr)))
 
-  ;; A zero buffer means reading never started; free! deliberately rejects zero.
+  ;; A stream's handle block is libuv's handle, then, at the first 16-byte
+  ;; boundary after it, the uv_buf_t descriptor that the shim's alloc callback
+  ;; answers libuv with before every read (#45; ADR-0002, amended
+  ;; 2026-10-05). The handle's data points at it from creation, and it
+  ;; outlives every alloc callback because libuv is done with the handle
+  ;; block only once the close dispatcher frees it. The read buffer is then
+  ;; exactly its payload: behind a 16-byte header, a 64 KiB buffer took the
+  ;; next malloc size class on macOS, 81,920 B, while a 264 B uv_tcp_t and
+  ;; its 288 B block both take 320 B.
+  (define (descriptor-offset handle-size) (align-16 handle-size))
+
+  ;; stream-block-size : exact-positive-integer -> exact-positive-integer
+  ;; The bytes to allocate for a stream whose libuv handle is HANDLE-SIZE.
+  (define (stream-block-size handle-size)
+    (+ (descriptor-offset handle-size) (sizeof-uv-buf-t)))
+
+  ;; attach-stream-descriptor! : uv-stream -> unspecified
+  ;; Points the handle's data at its descriptor, for the stream's whole life:
+  ;; the one write of data in src/ (tests/test-source-rules.sps). The block
+  ;; is zeroed, so until the first read start the descriptor is the empty
+  ;; buffer, which libuv reports as UV_ENOBUFS.
+  (define (attach-stream-descriptor! stream)
+    (uv-handle-set-data (handle-pointer stream 'uv-attach-stream-descriptor!)
+                        (stream-descriptor stream)))
+
+  ;; install-read-buffer! : uv-stream exact-positive-integer -> boolean
+  ;; Gives STREAM its read buffer of SIZE bytes unless it has one or has
+  ;; begun to close, and answers whether it did. The block is allocated and
+  ;; counted first, since allocating can raise. Then one interrupt-free step
+  ;; checks both again and fills the descriptor and the record together, so
+  ;; no engine or interrupt can come between the check and the fill, or into
+  ;; the fill (tests/test-tcp.sps's install sweeps). The open check keeps a
+  ;; start suspended while its stream closed from writing the descriptor
+  ;; into the freed handle block: a stream stops being open when its close
+  ;; begins, before the close dispatcher frees the block. A start that loses
+  ;; either check frees and uncounts its block. The step raises nothing: its
+  ;; writes are of values already checked.
+  (define (install-read-buffer! stream size)
+    (and (zero? (stream-read-buf stream))
+         (let* ((block (alloc-zeroed size))
+                (descriptor (stream-descriptor stream)))
+           (count-read-buffer-new!)
+           (disable-interrupts)
+           (let ((won (and (eq? (handle-state stream) 'open)
+                           (zero? (stream-read-buf stream)))))
+             (when won
+               (uv-buf-set! descriptor block size)
+               (set-stream-read-buf! stream block)
+               (set-stream-read-buf-len! stream size))
+             (enable-interrupts)
+             (unless won
+               (free! block)
+               (count-read-buffer-free!))
+             won))))
+
+  ;; free-read-buffer! : uv-handle -> unspecified
+  ;; Empties the descriptor before the block goes, so it never names freed
+  ;; memory, in the same interrupt-free step as clearing the record. A zero
+  ;; buffer means reading never started; free! deliberately rejects zero.
   (define (free-read-buffer! handle)
     (when (uv-stream-record? handle)
+      (disable-interrupts)
       (let ((buf (stream-read-buf handle)))
         (when (valid-pointer? buf)
-          (free! buf)
-          (count-read-buffer-free!)
+          (uv-buf-set! (stream-descriptor handle) 0 0)
           (set-stream-read-buf! handle 0)
-          (set-stream-read-buf-len! handle 0)))))
+          (set-stream-read-buf-len! handle 0)
+          (count-read-buffer-free!))
+        (enable-interrupts)
+        (when (valid-pointer? buf) (free! buf)))))
 
   (define (count-handle-free! kind)
     (case kind
@@ -684,10 +749,9 @@
                       (cons 'write-done write-done-dispatch)
                       (cons 'shutdown   shutdown-dispatch)
                       (cons 'connect    connect-dispatch)
-                      (cons 'alloc      alloc-dispatch)
                       (cons 'read       read-dispatch)))
       (install-callback-dispatchers!
-       (seams alloc read connection write-done close timer shutdown connect
+       (seams read connection write-done close timer shutdown connect
               getaddrinfo getnameinfo exit walk signal async))
       (install-close-handle! real-close-handle!)
       'wired)))

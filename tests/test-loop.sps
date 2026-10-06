@@ -3,7 +3,7 @@
 ;;; (libuv private handles) -- design spec S5 (loop operations, the registry
 ;;; as GC root), S8 (the store-and-reraise callback error policy), S10 (debug
 ;;; counters), S11 (testing strategy), and ADR-0008 (thirteen dispatcher
-;;; slots, as amended through v0.4).
+;;; slots, as amended through #45).
 ;;;
 ;;; This suite is NOT pure: (libuv loop) reaches (libuv private native),
 ;;; which loads libuv and the shim at library instantiation. It must never
@@ -449,8 +449,8 @@
 ;; whose import chain never reaches handles.sls and whose process therefore
 ;; still has empty slots. Moving those rows there rather than deleting them
 ;; is what keeps the uninstalled behaviour covered at all.
-(test-equal "dispatcher-names names the fourteen callback types the design commits to"
-  '(alloc read connection write-done close timer shutdown connect
+(test-equal "dispatcher-names names the thirteen callback types that cross into Scheme"
+  '(read connection write-done close timer shutdown connect
     getaddrinfo getnameinfo exit walk signal async)
   dispatcher-names)
 

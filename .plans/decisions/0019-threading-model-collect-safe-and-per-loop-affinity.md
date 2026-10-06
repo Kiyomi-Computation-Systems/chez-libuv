@@ -39,6 +39,14 @@ trampolines carry the attribute; `walk` alone stays plain because it fires only
 from the synchronous `uv_walk`, never from `uv_run` (ADR-0008). Cost: ~60 ns per
 callback, single-threaded.
 
+> **Amended 2026-10-05 (issue #45, item 5): twelve of thirteen.** libuv's
+> alloc callback is now the shim's own C function
+> ([ADR-0002](0002-direct-ffi-with-constants-only-shim.md) and
+> [ADR-0008](0008-static-trampolines-and-handle-registry.md), amended the
+> same day), so thirteen trampolines remain, and twelve carry the
+> attribute. The shim's function needs none: it never enters Scheme, so
+> libuv calls it while the loop thread stays deactivated.
+
 **2. The binding is loop-thread-only, and that rule is *enforced*, not
 documented.** Each loop record carries an owner-thread id:
 

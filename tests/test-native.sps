@@ -1331,6 +1331,22 @@
     5 (uv-buf-len buf))
   (test-equal "the base pointer is readable at the shim's offsetof(uv_buf_t, base)"
     payload (foreign-ref 'uptr buf (offsetof-uv-buf-t-base)))
+  ;; uv-buf-set! checks its arguments like the other setters, before it
+  ;; writes: a refused call leaves the buffer as it was.
+  (test-equal "uv-buf-set! refuses a null destination and a negative length, naming who and why"
+    '((uv-buf-set! null-or-invalid-destination)
+      (uv-buf-set! value-out-of-range)
+      (left payload 5))
+    (map (lambda (call)
+           (guard (e ((uv-invalid-argument? e)
+                      (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                     (#t 'wrong-condition))
+             (call)
+             (list 'left (if (= (uv-buf-base buf) payload) 'payload (uv-buf-base buf))
+                   (uv-buf-len buf))))
+         (list (lambda () (uv-buf-set! 0 payload 5))
+               (lambda () (uv-buf-set! buf payload -1))
+               (lambda () 'no-call))))
   (free! payload)
   (free! buf))
 
@@ -1822,8 +1838,8 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the fourteen callback types the design commits to"
-  '(alloc read connection write-done close timer shutdown connect
+(test-equal "dispatcher-names names the thirteen callback types that cross into Scheme"
+  '(read connection write-done close timer shutdown connect
     getaddrinfo getnameinfo exit walk signal async)
   dispatcher-names)
 
@@ -1879,7 +1895,7 @@
     ((dispatcher-ref 'async) 0)
     #f))
 
-(test-equal "dispatcher-ref rejects a name that is not one of the fourteen"
+(test-equal "dispatcher-ref rejects a name that is not one of the thirteen"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1890,7 +1906,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the fourteen is refused, naming who and why"
+(test-equal "an install missing one of the thirteen is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
