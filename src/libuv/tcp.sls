@@ -39,19 +39,17 @@
 
   ;; bind-flags->bits : (listof symbol) symbol -> exact-integer
   ;; Fold a bind-flag list into the unsigned bitmask uv_tcp_bind's third
-  ;; argument takes. 'reuseport is the only flag today; any other symbol is a
-  ;; named refusal. 'reuseport on a libuv without UV_TCP_REUSEPORT surfaces as
-  ;; &uv-constant-unavailable from uv-tcp-reuseport (see (libuv private
-  ;; constants)), never as a silent bind with the flag dropped.
+  ;; argument takes, reading the list once (fold-flags). 'reuseport is the
+  ;; only flag today; any other symbol is a named refusal. 'reuseport on a
+  ;; libuv without UV_TCP_REUSEPORT surfaces as &uv-constant-unavailable from
+  ;; uv-tcp-reuseport (see (libuv private constants)), never as a silent bind
+  ;; with the flag dropped.
   (define (bind-flags->bits flags who)
-    (unless (list? flags)
-      (raise (make-uv-invalid-argument who 'flags-not-a-list)))
-    (fold-left
-     (lambda (bits flag)
-       (case flag
-         ((reuseport) (bitwise-ior bits (uv-tcp-reuseport)))
-         (else (raise (make-uv-invalid-argument who 'unknown-bind-flag)))))
-     0 flags))
+    (fold-flags flags who 'flags-not-a-list
+                (lambda (flag)
+                  (case flag
+                    ((reuseport) (uv-tcp-reuseport))
+                    (else (raise (make-uv-invalid-argument who 'unknown-bind-flag)))))))
 
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer -> unspecified
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer (listof symbol)
@@ -60,7 +58,8 @@
   ;; across processes or loops. Flags are resolved to a bitmask BEFORE any
   ;; allocation, so a malformed flag list (or one naming reuseport on a libuv
   ;; that lacks it) leaves no scratch behind. The sockaddr is synchronous
-  ;; scratch and is freed on every exit path.
+  ;; scratch and is freed on every exit path. The address is read once, by
+  ;; validate-address, and libuv parses that copy (tests/test-address.sps).
   (define uv-tcp-bind!
     (case-lambda
       ((tcp ip port) (bind! tcp ip port '()))
@@ -68,18 +67,18 @@
 
   (define (bind! tcp ip port flags)
     (require-open-tcp tcp 'uv-tcp-bind!)
-    (require-address ip 'uv-tcp-bind!)
-    (require-port port 'uv-tcp-bind!)
-    ;; Resolve flags first, in its own let: a raise here (bad flag, or reuseport
-    ;; on a libuv without it) must happen before alloc-zeroed, or the scratch
-    ;; leaks -- the guard below covers only the allocated window.
-    (let ((flag-bits (bind-flags->bits flags 'uv-tcp-bind!)))
-      (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-        (guard (e (#t (free! addr) (raise e)))
-          (fill-sockaddr! addr ip port 'uv-tcp-bind!)
-          (uv-check (uv-tcp-bind (handle-pointer tcp 'uv-tcp-bind!) addr flag-bits)
-                    'uv-tcp-bind!))
-        (free! addr))))
+    (let ((ip-bytes (validate-address ip 'uv-tcp-bind!)))
+      (require-port port 'uv-tcp-bind!)
+      ;; Resolve flags first, in its own let: a raise here (bad flag, or
+      ;; reuseport on a libuv without it) must happen before alloc-zeroed, or
+      ;; the scratch leaks -- the guard below covers only the allocated window.
+      (let ((flag-bits (bind-flags->bits flags 'uv-tcp-bind!)))
+        (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+          (guard (e (#t (free! addr) (raise e)))
+            (fill-sockaddr! addr ip-bytes port 'uv-tcp-bind!)
+            (uv-check (uv-tcp-bind (handle-pointer tcp 'uv-tcp-bind!) addr flag-bits)
+                      'uv-tcp-bind!))
+          (free! addr)))))
 
   ;; uv-tcp-getsockname-port : uv-tcp -> exact-nonnegative-integer
   ;; Read the in/out length and the network-order port before freeing scratch.
@@ -187,25 +186,26 @@
   ;; uv-tcp-connect! : uv-tcp string exact-nonnegative-integer procedure
   ;;                   -> uv-request
   ;; Co-allocate the sockaddr with the request because retention varies by OS.
+  ;; The address is read once, by validate-address, and libuv parses that copy.
   (define (uv-tcp-connect! tcp ip port on-connect)
     (require-open-tcp tcp 'uv-tcp-connect!)
-    (require-address ip 'uv-tcp-connect!)
-    (require-port port 'uv-tcp-connect!)
-    (require-callback on-connect 'uv-tcp-connect! 'on-connect-not-a-procedure)
-    (let* ((addr-offset (align-16 (uv-req-size (uv-connect-req-type))))
-           (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
-           (addr (+ block addr-offset)))
-      (guard (e (#t (free! block) (raise e)))
-        (fill-sockaddr! addr ip port 'uv-tcp-connect!))
-      (let ((req (%make-uv-req-record block 'connect tcp on-connect)))
-        (registry-register! block 'connect-req (handle-loop tcp) req)
-        (count-connect-req-new!)
-        (guard (e (#t (abandon-request! req) (count-connect-req-free!)
-                      (raise e)))
-          (uv-check (uv-tcp-connect-native
-                     block (handle-pointer tcp 'uv-tcp-connect!) addr)
-                    'uv-tcp-connect!))
-        req)))
+    (let ((ip-bytes (validate-address ip 'uv-tcp-connect!)))
+      (require-port port 'uv-tcp-connect!)
+      (require-callback on-connect 'uv-tcp-connect! 'on-connect-not-a-procedure)
+      (let* ((addr-offset (align-16 (uv-req-size (uv-connect-req-type))))
+             (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
+             (addr (+ block addr-offset)))
+        (guard (e (#t (free! block) (raise e)))
+          (fill-sockaddr! addr ip-bytes port 'uv-tcp-connect!))
+        (let ((req (%make-uv-req-record block 'connect tcp on-connect)))
+          (registry-register! block 'connect-req (handle-loop tcp) req)
+          (count-connect-req-new!)
+          (guard (e (#t (abandon-request! req) (count-connect-req-free!)
+                        (raise e)))
+            (uv-check (uv-tcp-connect-native
+                       block (handle-pointer tcp 'uv-tcp-connect!) addr)
+                      'uv-tcp-connect!))
+          req))))
 
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
   ;; Require a boolean because Scheme's 0 is true while C's 0 is false.

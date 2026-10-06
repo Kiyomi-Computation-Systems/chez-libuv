@@ -129,21 +129,13 @@ STRESS_TESTS := tests/test-threading-stress.sps
 TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test-*.sps))
 MEMORY_TESTS := $(TESTS)
 
-# check-purity poisons CHEZ_LIBUV_SHIM and runs every test file that MUST
-# stay free of native imports. Five suites qualify: test-conditions.sps
-# (v0.1 Task 5) and test-addrinfo.sps (v0.2 Stage 4) import (rnrs),
-# (srfi :64), and pure private libraries only -- (libuv private conditions)
-# imports (rnrs) alone, (libuv private addrinfo) imports (rnrs), conditions,
-# the threaded-Chez refusal and with-interrupts-disabled from (chezscheme)
-# -- so neither chain ever reaches (libuv private native).
-# test-require-threaded.sps (#41) and test-source-rules.sps (#48's review)
-# import no library of this repo at all: they read src/'s forms as data,
-# through the pure tests/uv-source.sls.
-# test-seed-gates.sps (#52) imports only (rnrs) and (srfi :64): it reads
-# tests/test-tcp.sps as data.
-# test-native.sps and test-shim-loading.sps are deliberately NOT here --
-# both import native code by design, and test-shim-loading.sps sets
-# CHEZ_LIBUV_SHIM itself in its children.
+# check-purity poisons CHEZ_LIBUV_SHIM and runs every suite listed here, so a
+# suite whose run reaches (libuv private native) fails it. That run, not a
+# description of each suite's imports, is what keeps this list honest.
+# test-native.sps and test-shim-loading.sps are deliberately NOT here:
+# test-native.sps imports native code by design, and test-shim-loading.sps
+# binds or unsets CHEZ_LIBUV_SHIM in each child it starts, so the poison
+# cannot reach the native code those children load.
 #
 # This is an explicit, per-suite list, NOT a tests/test-*.sps wildcard: the
 # default for a new suite must be "not claimed pure", so adding a genuinely

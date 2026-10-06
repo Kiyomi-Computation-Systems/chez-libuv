@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -261,3 +261,17 @@ for that API when it is added.
   and `tests/test-native.sps` holds that only one C string crosses. Valgrind
   holds the free. `.plans/getaddrinfo-snapshot-mutation-log.md` has the
   evidence.
+
+  The address verbs had the same two readings, from v0.1 and v0.2 on:
+  `require-address` checked only that the address was a string, and Chez's
+  `string` argument encoded it during `uv_ip4_addr`, then again during
+  `uv_ip6_addr`. An embedded NUL was never refused, so
+  `"127.0.0.1\x0;anything"` was bound, connected to and reverse-resolved as
+  `127.0.0.1`, and a NUL written into `"::1"` during the call made it `"::"`:
+  `uv-tcp-bind!` bound every interface instead of loopback, `uv-tcp-connect!`
+  was handed the unspecified address, and `uv-getnameinfo!` resolved `"::"`. `validate-address` now answers the
+  address's C string, from the copy above (`c-string-bytes`, which
+  `(libuv private c-string)` holds for both), and `fill-sockaddr!` passes
+  libuv those bytes as `u8*`, refusing anything that is not one C string.
+  `tests/test-address.sps`'s sweeps hold the three verbs;
+  `.plans/address-snapshot-mutation-log.md` has the evidence.

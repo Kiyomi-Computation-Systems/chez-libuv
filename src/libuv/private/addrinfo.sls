@@ -11,10 +11,8 @@
           uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname
           validate-hints validate-node-and-service)
   (import (rnrs)
-          ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
-          (libuv private require-threaded)
-          (only (chezscheme) with-interrupts-disabled)
-          (libuv private conditions))
+          (libuv private conditions)
+          (only (libuv private c-string) c-string-bytes))
 
   ;; make-uv-addrinfo : symbol (or symbol exact-integer)
   ;;                    (or symbol exact-integer) (or string #f)
@@ -107,27 +105,4 @@
     (let* ((node-bytes (and node (c-string-bytes node who 'node-contains-nul)))
            (service-bytes
             (and service (c-string-bytes service who 'service-contains-nul))))
-      (cons node-bytes service-bytes)))
-
-  ;; c-string-bytes : string symbol symbol -> bytevector
-  ;; S's UTF-8 and a terminating NUL, or a refusal with REASON when S holds a
-  ;; NUL of its own, which C would read as the end of the string.
-  ;;
-  ;; Both steps run on a private copy of S, never on S. Chez's string->utf8
-  ;; counts a string's bytes, allocates, and then encodes, and an engine's
-  ;; handler or another thread that widens S in between makes it write past
-  ;; what it allocated. Its string-copy reads S's length before it copies,
-  ;; and a handler that truncates S and collects in between makes it read
-  ;; past S. So the copy is taken with interrupts disabled, which runs no
-  ;; handler and no collection inside it. A copy is fixed-width, so another
-  ;; thread cannot make it overrun. tests/test-addrinfo.sps's node sweeps
-  ;; and cross-thread race hold each of these (measured on Chez 10.4.1).
-  (define (c-string-bytes s who reason)
-    (let* ((utf8 (string->utf8 (with-interrupts-disabled (string-copy s))))
-           (n (bytevector-length utf8))
-           (bytes (make-bytevector (+ n 1) 0)))
-      (bytevector-copy! utf8 0 bytes 0 n)
-      (let scan ((i 0))
-        (cond ((= i n) bytes)
-              ((zero? (bytevector-u8-ref bytes i)) (refuse who reason))
-              (else (scan (+ i 1))))))))
+      (cons node-bytes service-bytes))))

@@ -290,6 +290,14 @@ success — the `status->err` convention unchanged.
 the closed set `{numeric-host numeric-serv name-required dgram}` (reason
 `'unknown-nameinfo-flag`).
 
+*(Amended 2026-10-06: `require-address` checked only that `ip` was a
+string, and §4.1's NUL refusal was never applied to it, so
+`"127.0.0.1\x0;anything"` reverse-resolved as `127.0.0.1`. It is now
+`validate-address`, which refuses a NUL (`'address-contains-nul`) and
+answers the C string libuv parses, from a copy, as §4.1's amendment does
+for node and service. [ADR-0012](decisions/0012-address-vocabulary.md)'s
+amendment has the details.)*
+
 ```scheme
 (uv-cancel! req) => #t | #f
 ```

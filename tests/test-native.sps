@@ -15,6 +15,7 @@
 ;;; of times -- which is the precise way to check the condition TYPE and its
 ;;; path field, something a subprocess exit code cannot show.
 (import (rnrs)
+        (rnrs mutable-pairs)
         (srfi :64)
         (libuv private native)
         (libuv private constants)
@@ -28,9 +29,12 @@
         ;; by the resolve-shim-path matrix; make-engine, bytevector-truncate!
         ;; and collect drive the copy-in! truncation scan. None collides with
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
+        ;; bytes-allocated, bytes-deallocated and collect-request-handler
+        ;; meter fold-flags.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
-              make-engine bytevector-truncate! collect)
+              make-engine bytevector-truncate! collect
+              bytes-allocated bytes-deallocated collect-request-handler void)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1583,11 +1587,17 @@
 
 ;; Round trip, hermetic (no resolver): uv_ip4_addr parses the text into a
 ;; real sockaddr_in, uv_ip_name renders it back. Expecting the dotted quad
-;; itself means only the genuine parse-then-render path can pass.
+;; itself means only the genuine parse-then-render path can pass. The parse
+;; runs inside the row, so a fill-sockaddr! that refuses good bytes fails
+;; this row by name instead of aborting the suite.
 (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-  (fill-sockaddr! addr "127.0.0.1" 8080 'test-sockaddr-round-trip)
   (test-equal "sockaddr->address-string renders back the dotted quad uv_ip4_addr parsed"
-    "127.0.0.1" (sockaddr->address-string addr))
+    "127.0.0.1"
+    (guard (e ((uv-invalid-argument? e)
+               (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+              (#t (list 'wrong-condition (describe e))))
+      (fill-sockaddr! addr (string->utf8 "127.0.0.1\x0;") 8080 'test-sockaddr-round-trip)
+      (sockaddr->address-string addr)))
   (free! addr))
 
 ;; The nonzero-rc arm: a zeroed sockaddr_storage carries sa_family 0
@@ -1600,26 +1610,161 @@
     (or (sockaddr->address-string addr) 'refused-family))
   (free! addr))
 
-;; --- require-address / require-port (post-v0.2 lift) --------------------
+;; --- validate-address / require-port (post-v0.2 lift) -------------------
 ;; The ADR-0012 input vocabulary's validators, asserted at their shared
 ;; home: tcp.sls and dns.sls both import THIS copy, so these rows pin the
 ;; semantics every verb boundary observes. `who` is a symbol no real
 ;; caller passes: each raise must name the caller handed in, not the
 ;; helper or a baked-in verb name.
-(test-equal "require-address refuses a non-string, naming its caller and why"
+(test-equal "validate-address refuses a non-string, naming its caller and why"
   '(test-lift address-not-a-string)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
-    (require-address 42 'test-lift)
+    (validate-address 42 'test-lift)
     'no-raise))
 
-;; Address-ness here is string?-ness BY DESIGN: parse refusal is
-;; fill-sockaddr!'s job (spike FINDINGS Q3), so a validator tightened to
-;; pre-parse would fail this row by name.
-(test-equal "require-address accepts a string it cannot parse (parsing is fill-sockaddr!'s job)"
-  'accepted
-  (begin (require-address "not-an-ip" 'test-lift) 'accepted))
+;; C reads an address only up to its first NUL, so "127.0.0.1\x0;x" would
+;; parse as 127.0.0.1 (tests/test-address.sps has the verbs' rows).
+(test-equal "validate-address refuses a string holding a NUL, naming its caller and why"
+  '((test-lift address-contains-nul) (test-lift address-contains-nul))
+  (map (lambda (ip)
+         (guard (e ((uv-invalid-argument? e)
+                    (list (uv-invalid-argument-who e)
+                          (uv-invalid-argument-reason e)))
+                   (#t 'wrong-condition))
+           (validate-address ip 'test-lift)
+           'no-raise))
+       '("127.0.0.1\x0;x" "\x0;")))
+
+;; Address-ness here is C-string-ness, a string holding no NUL, BY DESIGN:
+;; parse refusal is fill-sockaddr!'s job (spike FINDINGS Q3), so a validator
+;; tightened to pre-parse would fail this row by name. What it answers is
+;; the string's C string, the bytes libuv parses: UTF-8 and one terminating
+;; NUL.
+(test-equal "validate-address answers a string it cannot parse as that string's C string (parsing is fill-sockaddr!'s job)"
+  (list (string->utf8 "not-an-ip\x0;") (u8-list->bytevector '(120 206 187 0)))
+  (list (validate-address "not-an-ip" 'test-lift)
+        (validate-address "x\x3bb;" 'test-lift)))
+
+;; --- fill-sockaddr!'s address ---------------------------------------------
+;; libuv reads it as a C string, so fill-sockaddr! takes the bytes and
+;; refuses any that are not one C string: one NUL, the last byte. A NUL
+;; inside is the case a missing check would let through: libuv would parse
+;; "127.0.0.1" and the row would carry that parse instead of the refusal.
+(define (fill-sockaddr-answer ip)
+  (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+    (let ((answer
+           (guard (e ((uv-invalid-argument? e)
+                      (list (uv-invalid-argument-who e)
+                            (uv-invalid-argument-reason e)))
+                     (#t (list 'wrong-condition (describe e))))
+             (fill-sockaddr! addr ip 8080 'test-fill)
+             (list 'parsed (sockaddr->address-string addr)))))
+      (free! addr)
+      answer)))
+
+(test-equal "fill-sockaddr! refuses an address that is not one C string, before calling libuv"
+  '((uv-fill-sockaddr! not-a-c-string)    ; a NUL inside, then the terminator
+    (uv-fill-sockaddr! not-a-c-string)    ; no terminator
+    (uv-fill-sockaddr! not-a-c-string)    ; empty: no terminator either
+    (uv-fill-sockaddr! not-a-c-string))   ; a string, not its bytes
+  (map fill-sockaddr-answer
+       (list (string->utf8 "127.0.0.1\x0;9\x0;")
+             (string->utf8 "127.0.0.1")
+             (u8-list->bytevector '())
+             "127.0.0.1")))
+
+;; The other side: C strings reach libuv, IPv4 and IPv6 alike, and a parse
+;; refusal names the caller handed in.
+(test-equal "fill-sockaddr! passes C strings through to libuv"
+  '((parsed "127.0.0.1") (parsed "::1") (test-fill bad-address))
+  (map fill-sockaddr-answer
+       (list (string->utf8 "127.0.0.1\x0;")
+             (string->utf8 "::1\x0;")
+             (string->utf8 "not-an-ip\x0;"))))
+
+;; --- fold-flags: a caller's flag list, read once ---------------------------
+;; uv-tcp-bind! and uv-getnameinfo! fold their flag lists through fold-flags,
+;; which measures the list without raising and then walks at most that many
+;; pairs, each checked as it is read. A list that is improper or circular,
+;; or is made one during the call, is refused under the caller's own name and
+;; reason, never walked forever (tests/test-address.sps sweeps the change).
+;; Each call here runs in an engine whose resumes are capped, so a walk that
+;; loops answers 'stuck instead of hanging the suite.
+(define (fold-flags-answer flags)
+  (let run ((eng (make-engine
+                  (lambda ()
+                    (guard (e ((uv-invalid-argument? e)
+                               (list (uv-invalid-argument-who e)
+                                     (uv-invalid-argument-reason e)))
+                              (#t (list 'wrong-condition (describe e))))
+                      (fold-flags flags 'test-flags 'flags-not-a-list
+                                  (lambda (flag)
+                                    (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
+            (resumes 0))
+    (eng 100000
+         (lambda (left v) v)
+         (lambda (next)
+           (if (= resumes 100) 'stuck (run next (+ resumes 1)))))))
+
+;; A list whose last pair points back at its pair number K (0-based).
+(define (circular items k)
+  (let ((l (list-copy-of items)))
+    (let last ((p l))
+      (if (pair? (cdr p)) (last (cdr p)) (set-cdr! p (list-tail l k))))
+    l))
+
+(define (list-copy-of l) (map (lambda (x) x) l))
+
+(define (iota* n) (let up ((i 0)) (if (= i n) '() (cons i (up (+ i 1))))))
+
+(test-equal "fold-flags folds a proper list's flags, odd and even lengths alike"
+  '(0 1 3 7 4)
+  (map fold-flags-answer '(() (a) (a b) (a b c) (c c c c c))))
+
+(test-equal "fold-flags refuses an improper or circular list under its caller's name, never walking it forever"
+  (map (lambda (x) '(test-flags flags-not-a-list)) (iota* 8))
+  (map fold-flags-answer
+       (list 'a
+             '(a . b)
+             '(a b . c)
+             (circular '(a) 0)
+             (circular '(a b) 0)
+             (circular '(a b c) 0)
+             (circular '(a b c d) 2)
+             (circular '(a b c d e) 1))))
+
+
+;; The flags were measured with a guarded length, and a guard costs a few
+;; hundred bytes a call even when nothing raises; the walk that replaced it
+;; allocates nothing. The meter reads (+ (bytes-allocated)
+;; (bytes-deallocated)) around each call with the collector held off, and
+;; takes the fewest bytes of 64 calls (tests/test-callback-alloc.sps's
+;; meter); its second element shows the meter sees an allocation.
+(define (fewest-bytes call)
+  (let ((saved (collect-request-handler)))
+    (dynamic-wind
+     (lambda () (collect-request-handler void))
+     (lambda ()
+       (let run ((i 0) (fewest #f))
+         (if (= i 64)
+             fewest
+             (let* ((before (+ (bytes-allocated) (bytes-deallocated)))
+                    (ignored (call))
+                    (after (+ (bytes-allocated) (bytes-deallocated))))
+               (run (+ i 1) (let ((b (- after before)))
+                              (if fewest (min fewest b) b)))))))
+     (lambda () (collect-request-handler saved)))))
+
+(test-equal "fold-flags allocates nothing, where the meter sees a 64-byte allocation"
+  '(0 meter-live)
+  (let ((flags (list 'a 'b 'c))
+        (bit (lambda (flag) (case flag ((a) 1) ((b) 2) ((c) 4) (else 64)))))
+    (list (fewest-bytes (lambda () (fold-flags flags 'test-flags 'flags-not-a-list bit)))
+          (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
+              'meter-live
+              'meter-blind))))
 
 (test-equal "require-port refuses 65536, naming its caller and why"
   '(test-lift port-out-of-range)
