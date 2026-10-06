@@ -25,16 +25,19 @@
     tcp)
 
   ;; make-uv-tcp : uv-loop -> uv-tcp
+  ;; The block holds libuv's handle and the stream's read descriptor.
   (define (make-uv-tcp loop)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-tcp)
-    (let ((ptr (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
+    (let* ((handle-size (uv-handle-size (uv-tcp-type)))
+           (ptr (alloc-zeroed (stream-block-size handle-size))))
       (guard (e (#t (free! ptr) (raise e)))
         (uv-check (uv-tcp-init (loop-pointer loop 'make-uv-tcp) ptr)
                   'make-uv-tcp))
-      (let ((tcp (%make-uv-tcp-record ptr loop)))
+      (let ((tcp (%make-uv-tcp-record ptr loop handle-size)))
         (registry-register! ptr 'tcp loop tcp)
         (count-tcp-new!)
+        (attach-stream-descriptor! tcp)
         tcp)))
 
   ;; bind-flags->bits : (listof symbol) symbol -> exact-integer

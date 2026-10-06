@@ -40,7 +40,7 @@
           uv-tcp-nodelay uv-tcp-keepalive
           uv-listen-native uv-accept uv-tcp-connect-native
           uv-write-native uv-shutdown-native
-          uv-read-start-native uv-read-stop uv-handle-set-data
+          uv-read-start-native uv-read-stop uv-handle-set-data alloc-cb-entry
           uv-stream-get-write-queue-size-native
           uv-ip4-addr uv-ip6-addr
 
@@ -152,26 +152,25 @@
 
   (define shim-loaded (load-shim resolved-shim-path))
 
-  ;; shim-procedure : like foreign-procedure, for an entry the shim exports.
-  ;; A shim built from older sources loads cleanly but lacks newer entries,
-  ;; and foreign-procedure would then fail the whole import with a bare
-  ;; "no entry" assertion. Checking the entry first raises &uv-shim-unavailable
-  ;; naming the shim, the condition every other unusable shim raises
-  ;; (test-shim-loading.sps).
-  (define-syntax shim-procedure
-    (syntax-rules ()
-      ((_ entry (arg ...) result)
-       (if (foreign-entry? entry)
-           (foreign-procedure entry (arg ...) result)
-           (raise (make-uv-shim-unavailable resolved-shim-path))))))
-
   ;; shim-entry : string -> exact-integer
-  ;; The address of a function the shim exports for libuv to call, checked
-  ;; as shim-procedure checks its entry.
+  ;; The address of an entry the shim exports, or &uv-shim-unavailable naming
+  ;; the shim. A shim built from older sources loads cleanly but lacks newer
+  ;; entries, and resolving one unchecked would fail the whole import with a
+  ;; bare "no entry" assertion instead of the condition every other unusable
+  ;; shim raises (test-shim-loading.sps). Every shim entry is resolved
+  ;; through here (tests/test-source-rules.sps).
   (define (shim-entry entry)
     (if (foreign-entry? entry)
         (foreign-entry entry)
         (raise (make-uv-shim-unavailable resolved-shim-path))))
+
+  ;; shim-procedure : like foreign-procedure, for an entry the shim exports,
+  ;; resolved through shim-entry. foreign-procedure resolves an address
+  ;; expression when the form is evaluated, as it does a name.
+  (define-syntax shim-procedure
+    (syntax-rules ()
+      ((_ entry (arg ...) result)
+       (foreign-procedure (shim-entry entry) (arg ...) result))))
 
   (define shim-compiled-version
     (shim-procedure "chez_uv_shim_compiled_version" () int))
@@ -371,7 +370,8 @@
     (foreign-procedure "uv_read_stop" (uptr) int))
 
   ;; libuv never reads or writes a handle's data. The read path owns it: it
-  ;; points at the read buffer's descriptor, which alloc-cb-entry answers.
+  ;; points at the stream's descriptor in its handle block, which
+  ;; alloc-cb-entry answers, and has one writer (tests/test-source-rules.sps).
   (define uv-handle-set-data
     (foreign-procedure "uv_handle_set_data" (uptr uptr) void))
 
@@ -415,9 +415,17 @@
   ;; offsets, and field widths with the C shim and fails closed on mismatch.
   (define-ftype uv-buf (struct (base uptr) (len size_t)))
 
-  ;; Unvalidated: each caller writes into a block it has just allocated, a
-  ;; write request's buffers or a read buffer's descriptor.
+  ;; uv-buf-set! : uptr exact-nonnegative-integer exact-nonnegative-integer
+  ;;               -> unspecified
+  ;; Checked like the other setters. Its callers write a write request's
+  ;; buffers and a stream's read descriptor, inside steps that must not
+  ;; raise, so each passes values it has already checked.
   (define (uv-buf-set! addr base len)
+    (unless (and (integer? addr) (exact? addr) (positive? addr))
+      (raise (make-uv-invalid-argument 'uv-buf-set! 'null-or-invalid-destination)))
+    (unless (and (integer? base) (exact? base) (>= base 0)
+                 (integer? len) (exact? len) (>= len 0))
+      (raise (make-uv-invalid-argument 'uv-buf-set! 'value-out-of-range)))
     (let ((p (make-ftype-pointer uv-buf addr)))
       (ftype-set! uv-buf (base) p base)
       (ftype-set! uv-buf (len) p len)))
@@ -835,7 +843,8 @@
                     exit-callable walk-callable signal-callable
                     async-callable)))
 
-  ;; Entry-point addresses remain private and leave only through wrappers below.
+  ;; Entry-point addresses leave only through the wrappers below, except the
+  ;; shim's alloc-cb-entry, which tests/test-tcp.sps calls as libuv does.
   (define close-cb-entry      (foreign-callable-entry-point close-callable))
   (define timer-cb-entry      (foreign-callable-entry-point timer-callable))
   (define connection-cb-entry (foreign-callable-entry-point connection-callable))

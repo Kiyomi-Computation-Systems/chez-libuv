@@ -1331,6 +1331,22 @@
     5 (uv-buf-len buf))
   (test-equal "the base pointer is readable at the shim's offsetof(uv_buf_t, base)"
     payload (foreign-ref 'uptr buf (offsetof-uv-buf-t-base)))
+  ;; uv-buf-set! checks its arguments like the other setters, before it
+  ;; writes: a refused call leaves the buffer as it was.
+  (test-equal "uv-buf-set! refuses a null destination and a negative length, naming who and why"
+    '((uv-buf-set! null-or-invalid-destination)
+      (uv-buf-set! value-out-of-range)
+      (left payload 5))
+    (map (lambda (call)
+           (guard (e ((uv-invalid-argument? e)
+                      (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                     (#t 'wrong-condition))
+             (call)
+             (list 'left (if (= (uv-buf-base buf) payload) 'payload (uv-buf-base buf))
+                   (uv-buf-len buf))))
+         (list (lambda () (uv-buf-set! 0 payload 5))
+               (lambda () (uv-buf-set! buf payload -1))
+               (lambda () 'no-call))))
   (free! payload)
   (free! buf))
 

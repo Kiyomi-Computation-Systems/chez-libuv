@@ -116,7 +116,8 @@
 ;; Each case asserts BOTH that the child failed and that it failed with the
 ;; structured condition. Checking only the exit code would pass against a
 ;; raw dlopen error escaping uncaught, which is precisely the regression
-;; design spec S4 rule 1 forbids.
+;; design spec S4 rule 1 forbids. Answers the child's stderr, for a row that
+;; asks more of the same refusal.
 (define (check-rejected label override)
   (let-values (((code out err) (run-probe override)))
     (test-equal (string-append label ": fails closed (non-zero exit)")
@@ -124,7 +125,8 @@
     (test-equal (string-append label ": raises uv-shim-unavailable, not a raw dlopen error")
       #t (contains? err "uv-shim-unavailable"))
     (test-equal (string-append label ": never reached the end of the probe body")
-      #t (not (contains? out "PROBE-OK: native loaded and initialised")))))
+      #t (not (contains? out "PROBE-OK: native loaded and initialised")))
+    err))
 
 (check-rejected "a nonexistent override" "/no/such/path/libchezlibuv.dylib")
 (check-rejected "a non-absolute override" "relative/path.dylib")
@@ -164,9 +166,8 @@
               'alloc-cb-withheld
               'no-withheld-alloc-cb))))
 
-(check-rejected "a shim built before libuv's alloc callback was added" stale-shim)
-
-(let-values (((code out err) (run-probe stale-shim)))
+(let ((err (check-rejected "a shim built before libuv's alloc callback was added"
+                          stale-shim)))
   (test-equal "...and the refusal names that shim"
     #t (contains? err stale-shim)))
 

@@ -317,10 +317,13 @@
 (define-tally data-tally data-tally!)
 (define-tally eof-tally eof-tally!)
 (define-tally error-tally error-tally!)
-(uv-read-start! r-peer
-                (lambda (bv start end) (data-tally!))
-                (lambda () (eof-tally!))
-                (lambda (err) (error-tally!)))
+;; Gated on the seed: without a peer, the rows below fail by name, carrying
+;; the raise as their evidence, instead of this line aborting the suite.
+(when (uv-tcp? r-peer)
+  (uv-read-start! r-peer
+                  (lambda (bv start end) (data-tally!))
+                  (lambda () (eof-tally!))
+                  (lambda (err) (error-tally!))))
 
 (row 'read-data "delivering 16 bytes read, with their copy"
      (let ((slot (dispatcher-ref 'read)) (ptr (handle-ptr r-peer)))
@@ -501,30 +504,30 @@
 (define wr-connected #f)
 (connect-loopback! wr-client rd-port (lambda (err) (set! wr-connected #t)))
 
-;; The handshake needs both loops run, so neither step may block.
-(define (run-both-until pred cap)
-  (let step ((i 0))
-    (cond ((pred) 'satisfied)
-          ((>= i cap) 'iterations-exhausted)
-          (else (uv-run wr-loop 'nowait)
-                (uv-run rd-loop 'nowait)
-                (step (+ i 1))))))
-
+;; The kernel completes a loopback handshake into the listen backlog by
+;; itself, so each loop can be waited on in turn.
 (test-equal "seed: the read pair connected across its two loops and was accepted"
-  'satisfied
-  (run-both-until (lambda () (and wr-connected rd-peer)) 100000))
+  '(satisfied satisfied)
+  (let* ((connected (run-until/ticking wr-loop (lambda () wr-connected) 4000))
+         (accepted (run-until/ticking rd-loop (lambda () rd-peer) 4000)))
+    (list connected accepted)))
 
 (define-tally read-tally read-tally!)
 (define read-span 0)
-(uv-read-start! rd-peer
-                (lambda (bv start end) (set! read-span (- end start)) (read-tally!))
-                (lambda () #f) (lambda (err) #f))
+;; Gated on the seed, as r-peer's start is.
+(when (uv-tcp? rd-peer)
+  (uv-read-start! rd-peer
+                  (lambda (bv start end) (set! read-span (- end start)) (read-tally!))
+                  (lambda () #f) (lambda (err) #f)))
 (define rd-msg (make-bytevector 16 98))
 (define-tally rd-written-tally rd-written-tally!)
 (define (on-rd-written err) (rd-written-tally!))
 
 ;; Should a read never arrive, the watchdog ends the run that waits for it,
-;; and that call does not count, rather than the suite hanging there.
+;; and that call does not count, rather than the suite hanging there. 50 ms
+;; is plenty: a 'once run polls for I/O before it runs any timer, so a read
+;; already on its way is delivered first, and a read took 2 ms at most under
+;; Valgrind. At 1 s, a change that stopped reads cost 64 s to report.
 (define rd-watchdog (make-uv-timer rd-loop))
 (define (on-watchdog t) #f)
 
@@ -533,7 +536,7 @@
      (let ((before 0))
        (fewest-bytes (lambda ()
                        (set! before (read-tally))
-                       (uv-timer-start! rd-watchdog on-watchdog 1000 0)
+                       (uv-timer-start! rd-watchdog on-watchdog 50 0)
                        (let ((issued (rd-written-tally)))
                          (uv-write! wr-client rd-msg on-rd-written)
                          (run-until wr-loop (lambda () (> (rd-written-tally) issued)) 64)))

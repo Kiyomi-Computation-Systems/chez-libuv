@@ -26,6 +26,8 @@
         (libuv loop)
         (libuv handle)
         (libuv tcp)
+        ;; A pipe is the other stream: its handle block holds a descriptor too.
+        (only (libuv pipe) make-uv-pipe)
         ;; A timer is the stand-in for "a handle that is not a tcp handle":
         ;; every uv_tcp_* entry point would be undefined behaviour against
         ;; one, so the rejection has to be tested with a real handle of
@@ -35,33 +37,35 @@
         (libuv private conditions)
         ;; `only`, for the same reason as tests/test-timer.sps: this library
         ;; also exports names the public libraries above define differently.
-        ;; alloc-zeroed / count-read-buffer-new! are here for the ONE row that
-        ;; reaches the close dispatcher's read-buffer arm -- Stage 5 owns the
-        ;; code that fills that field, but the arm that frees it ships now, so
-        ;; it is exercised now rather than left dead (AGENTS.md).
         ;; uv-req-size / uv-buf-base / uv-buf-len / copy-out are the ONE row
         ;; group that looks inside a write block while it is still in flight
         ;; -- see "a written span" below for why that is the only place the
         ;; copied bytes are observable without a read on the other end.
-        ;; uv-buf-set! seeds a scratch uv_buf_t for the alloc-callback rows,
-        ;; which is the only way to observe what alloc_cb hands libuv back;
-        ;; copy-in! plants the bytes those rows read back through on-data.
-        ;; shim-compiled-version tells the reuseport row which answer is right.
+        ;; alloc-cb-entry is the alloc callback uv-read-start! hands libuv,
+        ;; and the alloc-callback rows call it as libuv does: uv-buf-set!
+        ;; seeds their scratch uv_buf_t, copy-in! plants the bytes they read
+        ;; back through on-data, c-uptr-ref reads the callback libuv holds,
+        ;; and align-16 / uv-handle-size place the descriptor in the stream's
+        ;; handle block. shim-compiled-version tells the reuseport row which
+        ;; answer is right.
         (only (libuv private native)
-              live-counts alloc-zeroed free! count-read-buffer-new!
-              dispatcher-ref
+              live-counts alloc-zeroed free!
+              dispatcher-ref alloc-cb-entry c-uptr-ref align-16 uv-handle-size
               uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-in! copy-out
               shim-compiled-version)
         ;; uv-eof and errno-symbol->value are read from the SHIM's table, not
         ;; transcribed (ADR-0005): the read dispatcher's arms are driven with
         ;; the same values libuv would deliver.
         (only (libuv private constants)
-              uv-write-req-type sizeof-uv-buf-t uv-eof errno-symbol->value)
+              uv-write-req-type sizeof-uv-buf-t uv-eof errno-symbol->value
+              uv-tcp-type uv-named-pipe-type constant-ref)
         (uv-testing)
-        (only (uv-evidence) live-count)
-        ;; foreign-entry and foreign-procedure call the shim's alloc
-        ;; callback, and libuv's handle-data getter, as libuv would.
-        (only (chezscheme) collect foreign-entry? foreign-entry foreign-procedure))
+        (only (uv-evidence) live-count describe)
+        ;; foreign-procedure calls the shim's alloc callback, libuv's
+        ;; handle-data getter and the allocator's size query; make-engine
+        ;; suspends a read start anywhere (the install sweep).
+        (only (chezscheme) collect foreign-entry? foreign-entry foreign-procedure
+              make-engine))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -908,16 +912,13 @@
   0 (live-count 'read-buffer))
 
 ;; The close dispatcher frees the per-handle read buffer (design spec S5's
-;; "pop registry entry -> free read buffer -> free handle pointer"). Stage 5
-;; owns the code that FILLS that field; the arm that frees it ships now, so
-;; it is exercised now rather than left as dead code until then. The buffer
-;; is a real foreign-alloc, so a close that forgot it leaks (Valgrind) and a
-;; close that freed it twice traps (ASan).
+;; "pop registry entry -> free read buffer -> free handle pointer"), on a
+;; handle that never started reading, so only the install put it there. The
+;; buffer is a real foreign-alloc, so a close that forgot it leaks (Valgrind)
+;; and a close that freed it twice traps (ASan).
 (define buffered-tcp (make-uv-tcp cl))
 
-(set-stream-read-buf! buffered-tcp (alloc-zeroed 64))
-(set-stream-read-buf-len! buffered-tcp 64)
-(count-read-buffer-new!)
+(install-read-buffer! buffered-tcp 64)
 
 (test-equal "seed: the handle holds a live read buffer before it is closed"
   1 (live-count 'read-buffer))
@@ -1523,51 +1524,117 @@
 (set-handle-state! s-peer 'open)
 
 ;; --- libuv's alloc callback, called as libuv calls it ---------------------
-;; The only way to see what alloc_cb hands libuv back is to call it with a
-;; uv_buf_t of one's own. Since #45 it is the shim's chez_uv_alloc_cb, not a
-;; Scheme dispatcher: it answers the uv_buf_t descriptor a reading handle's
-;; data field points at, and the empty buffer when data is NULL (ADR-0002,
-;; amended 2026-10-05). The scratch is seeded with values no success path
-;; can leave behind (AGENTS.md), so "the callback wrote nothing" is
-;; distinguishable from "the callback wrote an empty buffer". Against a shim
-;; without the callback, each row fails by name.
+;; Since #45 libuv's alloc callback is the shim's chez_uv_alloc_cb. It answers
+;; the uv_buf_t descriptor a stream's data field points at, and the empty
+;; buffer when data is NULL (ADR-0002, amended 2026-10-05). The descriptor
+;; sits in the stream's own handle block, at the first 16-byte boundary after
+;; libuv's handle, and data points at it from the stream's creation. It is
+;; empty until the first read start installs the read buffer, and the close
+;; dispatcher empties it again before it frees that buffer.
+;;
+;; The rows call alloc-cb-entry, the address uv-read-start-native hands
+;; uv_read_start, with a uv_buf_t of their own. Its scratch is seeded with
+;; values no success path can leave behind (AGENTS.md), so "the callback
+;; wrote nothing" cannot pass for "the callback wrote an empty buffer".
 (define shim-alloc-cb
-  (and (foreign-entry? "chez_uv_alloc_cb")
-       (foreign-procedure (foreign-entry "chez_uv_alloc_cb")
-                          (uptr size_t uptr) void)))
+  (foreign-procedure alloc-cb-entry (uptr size_t uptr) void))
 
 (define handle-data (foreign-procedure "uv_handle_get_data" (uptr) uptr))
 
 (define s-scratch-buf (alloc-zeroed (sizeof-uv-buf-t)))
 
-;; alloc-answer : uptr exact-nonnegative-integer -> (list 'answered base len)
+;; alloc-answer : uptr exact-nonnegative-integer -> (list base len)
 ;; What the callback leaves in a freshly seeded scratch uv_buf_t.
 (define (alloc-answer handle-ptr suggested)
   (uv-buf-set! s-scratch-buf 999 999)
-  (if shim-alloc-cb
-      (begin (shim-alloc-cb handle-ptr suggested s-scratch-buf)
-             (list 'answered (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
-      'no-alloc-callback-in-this-shim))
+  (shim-alloc-cb handle-ptr suggested s-scratch-buf)
+  (list (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
 
-;; One block holds the descriptor and the buffer it describes, so the
-;; descriptor lives exactly as long as the buffer: from the first read start
-;; until the close dispatcher frees the block, after libuv's last alloc
-;; callback for the handle.
-(test-equal "once a handle has started reading, its data points at the head of its own read buffer"
-  (stream-read-buf s-peer) (handle-data (handle-ptr s-peer)))
+;; A stream that never starts reading, beside s-peer, which has.
+(define s-unread (make-uv-tcp sl))
+
+;; tcp-descriptor : uv-tcp -> uptr, where a tcp stream's descriptor must be.
+(define (tcp-descriptor tcp)
+  (+ (handle-ptr tcp) (align-16 (uv-handle-size (uv-tcp-type)))))
+
+;; uv_stream_t keeps the alloc callback uv_read_start was handed in a field
+;; of its own, so reading it back shows what libuv will call: these rows then
+;; call that very function. A reading stream is needed, since uv_read_stop
+;; clears the field.
+(uv-read-start! s-peer s-on-data s-on-eof s-on-error)
+
+(test-equal "uv-read-start! hands libuv the shim's own alloc callback"
+  (list 'alloc-cb (foreign-entry "chez_uv_alloc_cb"))
+  (list 'alloc-cb
+        (c-uptr-ref (+ (handle-ptr s-peer)
+                       (constant-ref 'OFFSETOF_UV_STREAM_T_ALLOC_CB)))))
+
+(uv-read-stop! s-peer)
+
+(test-equal "...and these rows call that same callback"
+  (foreign-entry "chez_uv_alloc_cb") alloc-cb-entry)
+
+;; A stream's handle block carries its descriptor past libuv's own handle, so
+;; that the read buffer can be exactly the payload: a 64 KiB buffer behind a
+;; 16-byte header took the next malloc size class on macOS, 81,920 B.
+(test-equal "a stream's data points at its descriptor, at the first 16-byte boundary after libuv's handle"
+  (list (tcp-descriptor s-peer) (tcp-descriptor s-unread))
+  (list (handle-data (handle-ptr s-peer)) (handle-data (handle-ptr s-unread))))
 
 ;; `suggested` is 1: libuv's hint is deliberately ignored, and a callback
 ;; that answered the hint instead of the buffer's real length would put a 1
-;; here -- and then libuv would read one byte at a time forever. s-peer has
-;; been read into by now, so a payload that overlapped its own descriptor
-;; would have overwritten it already.
+;; here -- and then libuv would read one byte at a time forever. The base is
+;; the read buffer's own address: the payload is the whole block.
 (define s-alloc-answer (alloc-answer (handle-ptr s-peer) 1))
 
-(test-equal "libuv's alloc callback answers the handle's own buffer, at its full length"
-  (list 'answered (stream-read-buf-len s-peer))
-  (if (pair? s-alloc-answer)
-      (list (car s-alloc-answer) (caddr s-alloc-answer))
-      s-alloc-answer))
+(test-equal "libuv's alloc callback answers the stream's own read buffer, whole, at its full length"
+  (list (stream-read-buf s-peer) (stream-read-buf-len s-peer))
+  s-alloc-answer)
+
+;; The length libuv is told must fit the block it reads into. The allocator
+;; is asked the block's size: malloc_size on macOS, malloc_usable_size on
+;; glibc and musl. Both round a request up, so a shortfall hides in the
+;; rounding, but under the memory gates the answer is the size requested.
+(define allocation-size
+  (cond ((foreign-entry? "malloc_size")
+         (foreign-procedure "malloc_size" (uptr) size_t))
+        ((foreign-entry? "malloc_usable_size")
+         (foreign-procedure "malloc_usable_size" (uptr) size_t))
+        (else #f)))
+
+(test-equal "the length libuv is told fits inside the block it reads into"
+  'fits
+  (cond ((not allocation-size) 'no-allocator-size-query)
+        ((>= (allocation-size (car s-alloc-answer)) (cadr s-alloc-answer)) 'fits)
+        (else (list 'block (allocation-size (car s-alloc-answer))
+                    'told (cadr s-alloc-answer)))))
+
+;; ...and the block is that length and no more: the read buffer is its
+;; payload. Behind a 16-byte header, a 64 KiB buffer took the next macOS
+;; size class, 81,920 B. glibc rounds to 16 bytes and the memory gates'
+;; allocators to none, so only macOS can see a header here.
+(test-equal "the read buffer's block is its length, within one malloc granule"
+  'payload-only
+  (let ((len (stream-read-buf-len s-peer)))
+    (cond ((not allocation-size) 'no-allocator-size-query)
+          ((<= len (allocation-size (stream-read-buf s-peer)) (+ len 63)) 'payload-only)
+          (else (list 'block (allocation-size (stream-read-buf s-peer)) 'length len)))))
+
+;; Each stream's handle block must have room for its descriptor, past
+;; libuv's handle. macOS's size classes hide a block allocated without it
+;; (a 264 B uv_tcp_t takes 320 B either way); glibc's 16-byte rounding and
+;; the memory gates' allocators do not. Both stream constructors allocate.
+(define s-pipe (make-uv-pipe sl))
+
+(test-equal "a tcp's and a pipe's handle blocks have room for their descriptors"
+  '(room room)
+  (map (lambda (h type)
+         (let ((need (+ (align-16 (uv-handle-size type)) (sizeof-uv-buf-t))))
+           (cond ((not allocation-size) 'no-allocator-size-query)
+                 ((>= (allocation-size (handle-ptr h)) need) 'room)
+                 (else (list 'block (allocation-size (handle-ptr h)) 'need need)))))
+       (list s-peer s-pipe)
+       (list (uv-tcp-type) (uv-named-pipe-type))))
 
 ;; What libuv reads into the answered buffer is what on-data must deliver.
 ;; So a row-unique pattern planted at the answer's base has to come back
@@ -1577,19 +1644,208 @@
 
 (test-equal "...and on-data delivers the bytes read into that buffer"
   s-planted
-  (if (pair? s-alloc-answer)
-      (let ((saved (stream-on-data s-peer)))
-        (copy-in! (cadr s-alloc-answer) s-planted 0 (bytevector-length s-planted))
-        (set-stream-on-data! s-peer (lambda (bv start end) (set! s-delivered bv)))
-        ((dispatcher-ref 'read) (handle-ptr s-peer) (bytevector-length s-planted) 0)
-        (set-stream-on-data! s-peer saved)
-        s-delivered)
-      s-alloc-answer))
-
-(define s-unread (make-uv-tcp sl))
+  (let ((saved (stream-on-data s-peer)))
+    (copy-in! (car s-alloc-answer) s-planted 0 (bytevector-length s-planted))
+    (set-stream-on-data! s-peer (lambda (bv start end) (set! s-delivered bv)))
+    ((dispatcher-ref 'read) (handle-ptr s-peer) (bytevector-length s-planted) 0)
+    (set-stream-on-data! s-peer saved)
+    s-delivered))
 
 (test-equal "a tcp handle that never started reading gets the EMPTY buffer libuv turns into UV_ENOBUFS"
-  '(answered 0 0) (alloc-answer (handle-ptr s-unread) 65536))
+  '(0 0) (alloc-answer (handle-ptr s-unread) 65536))
+
+;; The callback's other branch, data NULL, is unreachable through a stream
+;; (each has a descriptor from creation); a timer's data is NULL.
+(define s-plain-timer (make-uv-timer sl))
+
+(test-equal "a handle whose data is NULL gets the EMPTY buffer too"
+  '(0 0) (alloc-answer (handle-ptr s-plain-timer) 65536))
+
+;; free-read-buffer! empties the descriptor before the block goes, so a
+;; descriptor never names freed memory. Only the close dispatcher calls it,
+;; and frees the handle block right after, so it is called directly here.
+(define s-freed (make-uv-tcp sl))
+
+(test-equal "freeing a stream's read buffer empties its descriptor"
+  '(installed (0 0) 0)
+  (begin
+    (install-read-buffer! s-freed 4096)
+    (let ((installed (if (equal? (alloc-answer (handle-ptr s-freed) 1)
+                                 (list (stream-read-buf s-freed) 4096))
+                         'installed
+                         (list 'not-installed (alloc-answer (handle-ptr s-freed) 1)))))
+      (free-read-buffer! s-freed)
+      (list installed
+            (alloc-answer (handle-ptr s-freed) 1)
+            (stream-read-buf s-freed)))))
+
+(test-equal "install-read-buffer! refuses a size that is not positive, installing nothing"
+  '((uv-alloc-zeroed size-must-be-positive) 0 (0 0))
+  (list (guard (e ((uv-invalid-argument? e)
+                   (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                  (#t 'wrong-condition))
+          (install-read-buffer! s-unread 0)
+          'installed)
+        (stream-read-buf s-unread)
+        (alloc-answer (handle-ptr s-unread) 1)))
+
+;; A positive read on a stream with no read buffer cannot come from libuv
+;; (its alloc callback answers the empty buffer), but copy-out refuses the
+;; missing block by name rather than copying from wherever it would be.
+(test-equal "a read delivered to a stream with no read buffer is refused by name"
+  '(uv-copy-out null-or-invalid-source)
+  (begin
+    (set-stream-on-data! s-unread (lambda (bv start end) #f))
+    ((dispatcher-ref 'read) (handle-ptr s-unread) 5 0)
+    (set-stream-on-data! s-unread #f)
+    (guard (e ((uv-callback-error? e)
+               (let ((cause (uv-callback-error-cause e)))
+                 (if (uv-invalid-argument? cause)
+                     (list (uv-invalid-argument-who cause)
+                           (uv-invalid-argument-reason cause))
+                     (list 'cause (describe cause)))))
+              (#t 'wrong-condition))
+      (uv-run sl 'nowait)
+      'no-raise)))
+
+;; --- the read buffer's install is one step -------------------------------
+;; The first uv-read-start! on a stream installs its read buffer: the block,
+;; the descriptor libuv's alloc callback answers, and the record. A
+;; green-thread scheduler on the loop thread can suspend a start anywhere.
+;; Wherever the sweep below suspends one, the descriptor must agree with the
+;; record: no buffer and an empty descriptor, or the record's buffer, whole.
+;; Then a second start runs and the first resumes, and once the stream
+;; closes no buffer may be left unfreed. Measured before the fix (#48's
+;; review): suspended between recording the block and pointing data at it,
+;; the stream answered UV_ENOBUFS to every read, for good once the engine
+;; was dropped; and a second start meanwhile leaked a buffer.
+;;
+;; Each start runs on a fresh unconnected tcp, which installs its buffer and
+;; then has the start refused (ENOTCONN), so no read can interfere.
+(define install-sweep-max-fuel 120)
+
+;; descriptor-verdict : uv-stream -> (or 'empty 'whole list)
+(define (descriptor-verdict h)
+  (let ((answer (alloc-answer (handle-ptr h) 1))
+        (buf (stream-read-buf h)))
+    (cond ((and (zero? buf) (equal? answer '(0 0))) 'empty)
+          ((and (not (zero? buf))
+                (equal? answer (list buf (stream-read-buf-len h))))
+           'whole)
+          (else (list 'record buf (stream-read-buf-len h) 'answer answer)))))
+
+(define (ignore-read . args) #f)
+
+;; start-then-start : exact-positive-integer -> (or symbol list)
+(define (start-then-start fuel)
+  (let* ((loop (make-uv-loop))
+         (h (make-uv-tcp loop))
+         (buffers-before (live-count 'read-buffer))
+         (start (lambda ()
+                  (guard (c (#t 'refused))
+                    (uv-read-start! h ignore-read ignore-read ignore-read)
+                    'started)))
+         (first (make-engine start)))
+    (define (finish verdict)
+      (uv-loop-teardown! loop)
+      (if (= (live-count 'read-buffer) buffers-before)
+          verdict
+          (list fuel 'buffer-left-after-close verdict)))
+    (first fuel
+           (lambda (ticks v) (finish 'finished))
+           (lambda (suspended)
+             (let ((at-suspension (descriptor-verdict h)))
+               (start)
+               (suspended 10000000 (lambda (ticks v) v) (lambda (more) 'still-running))
+               (let ((after (descriptor-verdict h)))
+                 (cond ((not (symbol? at-suspension))
+                        (finish (list fuel 'suspended at-suspension)))
+                       ((not (eq? after 'whole))
+                        (finish (list fuel 'resumed after)))
+                       (else (finish at-suspension)))))))))
+
+(define install-sweep
+  (guard (e (#t (list (list 'sweep-raised (describe e)))))
+    (let run ((fuel 1) (acc '()))
+      (if (> fuel install-sweep-max-fuel)
+          (reverse acc)
+          (run (+ fuel 1) (cons (start-then-start fuel) acc))))))
+
+(test-equal "a first read start suspended anywhere leaves the descriptor agreeing with the record, and leaks nothing"
+  '() (filter (lambda (row) (not (memq row '(empty whole finished)))) install-sweep))
+
+;; The sweep is live only if it caught a start before its install, caught one
+;; after it, and ran one to the end.
+(test-equal "the install sweep caught a start before and after the install, and ran one to the end"
+  '(empty whole finished)
+  (list (if (memq 'empty install-sweep) 'empty 'never-before-the-install)
+        (if (memq 'whole install-sweep) 'whole 'never-after-the-install)
+        (let ((last-row (list-ref install-sweep (- (length install-sweep) 1))))
+          (if (eq? last-row 'finished) 'finished last-row))))
+
+;; --- a start suspended while its stream closes ---------------------------
+;; The descriptor lives in the handle block, which the close dispatcher
+;; frees. A start suspended before its install, while its stream closed,
+;; must install nothing when it resumes: it would write the descriptor into
+;; the freed block, and leave a buffer that no close frees. So this sweep
+;; suspends a first start at every fuel value, closes the stream and runs
+;; the loop until the block is freed. A start that had not installed is
+;; then resumed, and must be refused as closed, leaving no buffer. One that
+;; had installed is dropped, and the close must have freed its buffer:
+;; resumed, it could reach uv_read_start with the freed handle's address,
+;; the engine split every stream verb has (Valgrind: an invalid read in
+;; uv_read_start), which nothing here fences. The condition is described
+;; outside the engine, which would otherwise spend the sweep's fuel on it.
+;;
+;; start-then-close : exact-positive-integer -> (or symbol list)
+(define (start-then-close fuel)
+  (let* ((loop (make-uv-loop))
+         (h (make-uv-tcp loop))
+         (buffers-before (live-count 'read-buffer))
+         (first (make-engine
+                 (lambda ()
+                   (guard (c (#t c))
+                     (uv-read-start! h ignore-read ignore-read ignore-read)
+                     'started)))))
+    (define (finish verdict)
+      (uv-loop-teardown! loop)
+      verdict)
+    (first fuel
+           (lambda (ticks v) (finish 'finished))
+           (lambda (suspended)
+             (let ((at-suspension (if (zero? (stream-read-buf h)) 'before 'installed)))
+               (uv-close! h)
+               (uv-run loop 'default)
+               (let* ((outcome (if (eq? at-suspension 'before)
+                                   (suspended 10000000 (lambda (ticks v) v)
+                                              (lambda (more) 'still-running))
+                                   'dropped))
+                      (left (- (live-count 'read-buffer) buffers-before)))
+                 (finish
+                  (cond ((not (zero? left))
+                         (list fuel at-suspension 'buffers-left left))
+                        ((eq? outcome 'dropped) at-suspension)
+                        ((symbol? outcome) (list fuel at-suspension outcome))
+                        ((not (uv-handle-closed? outcome))
+                         (list fuel at-suspension 'refused (describe outcome)))
+                        (else at-suspension)))))))))
+
+(define close-sweep
+  (guard (e (#t (list (list 'sweep-raised (describe e)))))
+    (let run ((fuel 1) (acc '()))
+      (if (> fuel install-sweep-max-fuel)
+          (reverse acc)
+          (run (+ fuel 1) (cons (start-then-close fuel) acc))))))
+
+(test-equal "a read start suspended anywhere while its stream closes installs nothing, leaks nothing, and is refused"
+  '() (filter (lambda (row) (not (memq row '(before installed finished)))) close-sweep))
+
+(test-equal "the close sweep caught a start before and after its install, and ran one to the end"
+  '(before installed finished)
+  (list (if (memq 'before close-sweep) 'before 'never-before-the-install)
+        (if (memq 'installed close-sweep) 'installed 'never-after-the-install)
+        (let ((last-row (list-ref close-sweep (- (length close-sweep) 1))))
+          (if (eq? last-row 'finished) 'finished last-row))))
 
 (free! s-scratch-buf)
 
