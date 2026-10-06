@@ -304,6 +304,25 @@ was clean on macOS.
 
 ## Gates
 
+On 82ffbdb (the review fixes), macOS arm64:
+
+- `make test`: 20 suites pass (test-stream 25, test-native 284, test-tcp
+  210).
+- `make test-threading`: 12 rows.
+- `make test-memory` (ASan) passes all 20 suites, and `make
+  check-memory-gate` still goes red on a planted libc overrun.
+- `make check-purity` holds, and `make check-help` is silent.
+
+`make test-memory-docker` from a `--no-hardlinks` clone of 82ffbdb:
+- `check-memory-gate` caught all four planted defects and printed MEMORY
+  GATE CAN FAIL.
+- Every suite's own Valgrind summary shows 0 errors and 0 bytes definitely
+  lost, at 778 to 5,324 allocations each (`test-stream.sps`: 1,414).
+- The fork artifacts are the known 131 B and 117 B.
+
+The real recipe on test-stream with M2 and with M5 still fails: 12 blocks
+definitely lost, and 45 plus 2 possibly lost.
+
 On df8d0f0's tree, macOS arm64:
 
 - `make test`: 20 suites pass.
