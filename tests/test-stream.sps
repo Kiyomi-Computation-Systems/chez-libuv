@@ -87,8 +87,12 @@
 ;; The assertion accepts the symbol family rather than one platform's
 ;; spelling; the informational row prints the observed symbol so the
 ;; pinned value is recorded in every run's output.
+;;
+;; Any other raise is kept as the evidence, so that the row below fails by
+;; name rather than this plumbing aborting the suite (the #49 review's M8).
 (define unconnected-errno
-  (guard (e ((uv-errno-error? e) (uv-errno-error-errno e)))
+  (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+            (#t (list 'raised (describe e))))
     (uv-write! pipe (make-bytevector 1 7) nop)
     'no-error))
 (test-assert "uv-write! on an unconnected pipe surfaces an errno symbol"
@@ -402,16 +406,23 @@
     (uv-write! tcp (make-bytevector 1 0) nop) #t))
 
 ;; --- the refuses-process row (deferred here from Task 7) -----------------
+;; A spawn that raises is kept as the evidence, so that the rows below fail
+;; by name rather than this plumbing aborting the suite. They require a
+;; process first: anything else is refused as 'not-a-uv-stream too.
 (define loop2 (make-uv-loop))
-(define proc (uv-spawn! loop2 "/bin/sh" '("sh" "-c" "exit 0") #f))
+(define proc
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-spawn! loop2 "/bin/sh" '("sh" "-c" "exit 0") #f)))
 (test-assert "uv-write! refuses a process handle"
-  (guard (e (#t (and (uv-invalid-argument? e)
-                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
-    (uv-write! proc (make-bytevector 1 0) (lambda (err) #f)) #f))
+  (and (uv-process? proc)
+       (guard (e (#t (and (uv-invalid-argument? e)
+                          (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+         (uv-write! proc (make-bytevector 1 0) (lambda (err) #f)) #f)))
 (test-assert "uv-write*! refuses a process handle"
-  (guard (e (#t (and (uv-invalid-argument? e)
-                     (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
-    (uv-write*! proc (list (make-bytevector 1 0)) (lambda (err) #f)) #f))
+  (and (uv-process? proc)
+       (guard (e (#t (and (uv-invalid-argument? e)
+                          (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
+         (uv-write*! proc (list (make-bytevector 1 0)) (lambda (err) #f)) #f)))
 (uv-loop-teardown! loop2)
 
 ;; --- a CLOSED handle of the WRONG kind (Task 7's mutation probe 2 forward
@@ -706,7 +717,11 @@
                                                                    (link-peer-got new))))
                                                      stray-steps))))
                            (when new (close-link! new))
+                           ;; A reuse run without its new connection has
+                           ;; nothing to see a misdirected write with.
                            (cond (stray (list 'the-new-connection-got-bytes outcome))
+                                 ((and (eq? mode 'reuse) (not new))
+                                  (list 'no-new-connection outcome))
                                  ((and (eq? outcome 'refused) (not made-before)) 'refused)
                                  ((and (eq? outcome 'returned) landed) 'made-before-close)
                                  (else (list outcome
@@ -752,16 +767,22 @@
 (define (untouched? verdict)
   (or (eq? verdict 'untouched) (and (pair? verdict) (eq? (car verdict) 'untouched))))
 
+;; A run whose connection failed: the next would wait the same handshake out
+;; again, at every fuel up to the cap.
+(define (unconnected? verdict)
+  (and (pair? verdict) (memq (car verdict) '(connect-failed no-new-connection)) #t))
+
 ;; sweep : (exact-positive-integer -> verdict) -> (list-of (cons fuel verdict))
 ;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
-;; to the cap. A raise between runs would abort the suite, so the sweep is
-;; caught and its evidence handed to the rows.
+;; to the first run whose connection failed, or to the cap. A raise between
+;; runs would abort the suite, so the sweep is caught and its evidence handed
+;; to the rows.
 (define (sweep run)
   (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
     (let next ((fuel 1) (acc '()))
       (let* ((verdict (run fuel))
              (acc (cons (cons fuel verdict) acc)))
-        (if (or (untouched? verdict) (= fuel sweep-fuel-cap))
+        (if (or (untouched? verdict) (unconnected? verdict) (= fuel sweep-fuel-cap))
             (reverse acc)
             (next (+ fuel 1) acc))))))
 

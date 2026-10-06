@@ -677,12 +677,16 @@
                           (when (not err)
                             (set! accepted (uv-accept! server)))))
    (connect-loopback! client port-num (lambda (err) (set! connected (or err 'ok))))
-   (run-until/ticking loop (lambda () (and (uv-tcp? accepted)
-                                           (eq? 'ok connected))) 2048)
-   (set! proc
-     (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf over-the-socket")
-                (list (cons 'stdio (list 'ignore (cons 'inherit-stream accepted))))
-                (lambda (s g) (collect) (set! exit-result (list s g)))))
+   (test-equal "seed: the inherit-stream pair connected and was accepted"
+     'satisfied (run-until/ticking loop (lambda () (and (uv-tcp? accepted)
+                                                        (eq? 'ok connected))) 2048))
+   ;; Gated on the seed: without a peer, the rows below fail by name instead
+   ;; of the spawn aborting the suite (AGENTS.md).
+   (when (uv-tcp? accepted)
+     (set! proc
+       (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf over-the-socket")
+                  (list (cons 'stdio (list 'ignore (cons 'inherit-stream accepted))))
+                  (lambda (s g) (collect) (set! exit-result (list s g))))))
    (uv-read-start! client
                    (lambda (bv s e) (collect) (collect-span! out bv s e))
                    (lambda () (collect) (set! eof 'eof))
@@ -699,10 +703,10 @@
    ;; EOF observable. Closing the accepted end is what lets the row exist:
    ;; the child's dup is gone (exit waited above), so this close releases
    ;; the last copy and the client's read must reach EOF.
-   (uv-close! accepted)
+   (when (uv-tcp? accepted) (uv-close! accepted))
    (test-equal "client sees EOF once the parent's accepted end closes too"
      'satisfied (run-until/ticking loop (lambda () (eq? eof 'eof)) 4096))
-   (uv-close! proc)))
+   (when (uv-process? proc) (uv-close! proc))))
    ;; server/client swept by with-loop's teardown -- also an assertion (the
    ;; suite-end counter/registry rows are what confirm it). accepted is
    ;; closed above, where the eof row needs it.
