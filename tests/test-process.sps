@@ -33,8 +33,7 @@
               ;; it from another thread, and change the caller's lists and
               ;; strings mid-call.
               make-engine last-pair list-head set-car! set-cdr! string-set!
-              fork-thread make-mutex make-condition with-mutex
-              condition-wait condition-broadcast getenv))
+              fork-thread thread-join getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -1270,25 +1269,25 @@
       seen))
 
 ;; race-sweep : -> (list rounds-run (list-of bad-round) mixed-rounds)
-;; Every exit, a raise included, stops the narrower and waits for it.
+;; Every exit, a raise included, stops the narrower and joins it. Until its
+;; thread has exited, an explicit collection raises "cannot collect when
+;; multiple threads are active", and the suite's last one did, under load,
+;; while the narrower was on its way out after signalling it had stopped.
 (define (race-sweep)
-  (let ((arg (make-string race-length #\a))
-        (loop (make-uv-loop))
-        (stop #f)
-        (stopped #f)
-        (m (make-mutex))
-        (c (make-condition)))
-    (fork-thread
-     (lambda ()
-       (let narrow ()
-         (unless stop
-           (let pass ((i 0))
-             (when (< i race-length)
-               (string-set! arg i #\a)
-               (let spin ((k 0)) (when (< k race-spin) (spin (+ k 1))))
-               (pass (+ i 1))))
-           (narrow)))
-       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+  (let* ((arg (make-string race-length #\a))
+         (loop (make-uv-loop))
+         (stop #f)
+         (narrower
+          (fork-thread
+           (lambda ()
+             (let narrow ()
+               (unless stop
+                 (let pass ((i 0))
+                   (when (< i race-length)
+                     (string-set! arg i #\a)
+                     (let spin ((k 0)) (when (< k race-spin) (spin (+ k 1))))
+                     (pass (+ i 1))))
+                 (narrow)))))))
     (let ((result
            (guard (e (#t (list 0 (list (list 'raised (describe e))) 0)))
              (let round ((r 0) (bad '()) (mixed 0))
@@ -1312,7 +1311,7 @@
                                   (cons (list r (race-evidence seen)) bad))
                               (if (eq? reading 'mixed) (+ mixed 1) mixed)))))))))
       (set! stop #t)
-      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
+      (thread-join narrower)
       (uv-loop-teardown! loop)
       result)))
 
