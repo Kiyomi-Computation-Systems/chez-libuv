@@ -1,6 +1,7 @@
 # A failed loopback seed fails test-tcp.sps by name: mutation log
 
-Evidence for `test/tcp-seed-gates`, on `main` at a0ea0ca. The change is
+Evidence for `test/tcp-seed-gates`, built on `main` at a0ea0ca and then
+rebased onto 309c376, #48's squash ("Rebased onto #48", below). The change is
 test-only: `tests/test-tcp.sps`, a new pure suite `tests/test-seed-gates.sps`,
 and that suite's entry in the Makefile's `PURE_TESTS`.
 
@@ -75,8 +76,9 @@ next abort.
 - Each top-level call on a placeholder is gated on the peer:
   `(when (uv-tcp? p) ...)`, or `(if (uv-tcp? p) ... 'never-accepted)` for a
   definition.
-- The alloc row compares inside its tested expression and expects
-  `'own-buffer`.
+- A row whose expected value read a placeholder now compares inside its
+  tested expression: on a0ea0ca the alloc-dispatcher row, and after the
+  rebase #48's descriptor and alloc-answer rows.
 - Every handshake wait whose outcome was discarded is now a named seed row:
   pending-write, cancelled-write, backpressure, reset, vectored round-trip
   and keepalive. The pending-write wait now also requires the accept, and the
@@ -163,7 +165,7 @@ Each step re-ran its plants before the next change:
 | the same | b-nodata | **exit 255**: the same exception, deterministically |
 | the restart as a row | b-nodata | exit 1, 4 named, summary |
 
-## GREEN: this branch
+## GREEN: this branch, on a0ea0ca
 
 Load ~7 to ~38. Two control runs bracket the sweep: 217 passes each.
 
@@ -276,20 +278,69 @@ Rule 2 also holds the cancelled-write wait's tick, which q-norec held first
   (`'never-accepted`), `test-callback-alloc` (`#f`). They were not audited,
   and the scan reads `test-tcp.sps` only.
 
+## Rebased onto #48 (309c376)
+
+#48 landed first. It replaced the read path's alloc-dispatcher rows with rows
+that call the shim's alloc callback, and added `tests/test-source-rules.sps`
+to `PURE_TESTS`. The rebase took #48's rows and keeps both pure suites.
+
+On the rebased file, the scan's rule 1 named five of #48's forms, six uses.
+They are the five it named against #48's branch before it merged:
+
+- the top-level `uv-read-start!` and `uv-read-stop!` around "uv-read-start!
+  hands libuv the shim's own alloc callback";
+- `(define s-alloc-answer …)`;
+- the expected values of "a stream's data points at its descriptor…" and
+  "libuv's alloc callback answers the stream's own read buffer…" (two uses).
+
+The two calls and the definition are gated. The two rows compare inside
+their tested expressions, and expect `'at-its-descriptor` and `'own-buffer`.
+
+#48's row "a read delivered to a stream with no read buffer is refused by
+name" runs `(uv-run sl 'nowait)`. After a seed wait that gave up, that is the
+read path's first loop run, so a late handshake's callbacks fire there.
+Neither raises: the accept callback records the peer before starting its
+read, and the connect callback writes on a client the skipped EOF section
+never shut. s-late below shows it.
+
+Re-run on the rebased tree, at load ~15 to ~50:
+
+- **Forced failures:** every plant exits 1 with the summary and names its own
+  section, except graise-norec (exit 0, as before). s-norec and s-late name
+  27 rows each: the 21 above and #48's six rows that read `s-peer`. The two
+  controls pass 230 rows each: main's 223, the six seed rows and the restart.
+- **The scanner's sweep:** 24 of 24 as predicted, plus the control. T6
+  against main's file now finds 19 exposed uses and the cancelled-write
+  wait: the 13 that remain from a0ea0ca, and #48's six.
+
 ## Gates
 
-On macOS, on this tree:
+On macOS, on the rebased tree:
 
-- `make test`: 19 suites, `ALL SUITES PASSED` (`test-tcp` 217,
-  `test-seed-gates` 6);
-- `make check-purity`: the four pure suites hold;
+- `make test`: 22 suites, `ALL SUITES PASSED` (`test-tcp` 230,
+  `test-seed-gates` 6, `test-source-rules` 8);
+- `make check-purity`: the five pure suites hold;
 - `make check-help`: silent;
-- `make test-memory`: the ASan arm, 19 suites passed.
+- `make test-memory`: the ASan arm, 22 suites passed.
 
-On Linux: `make test-memory-docker` ran from a `--no-hardlinks` clone of
-143de89. This commit differs from 143de89 by one AGENTS.md sentence and one
-comment in the new suite. The gate exited 0 in 3:46: Valgrind 3.19 in the
-`chez-libuv-valgrind:10.4.1` image, vendored libuv 1.52.1.
+The same gates passed over 21 suites on a0ea0ca, before the rebase
+(`test-tcp` 217).
+
+On Linux, `make test-memory-docker` ran from a `--no-hardlinks` clone of the
+rebased branch at 4a6e367; the commit after it adds only this log's rebase
+notes. It exited 0 in 9:04:
+
+- `check-memory-gate` printed `MEMORY GATE CAN FAIL`.
+- Each of the 22 suites' own processes had 0 errors and 0 bytes definitely
+  lost. That includes `test-tcp` (230 passes), `test-seed-gates` (6) and
+  `test-source-rules` (8).
+- test-process's forked children show their documented 131 and 117 bytes
+  (ADR-0003).
+
+Before the rebase, `make test-memory-docker` ran from a `--no-hardlinks`
+clone of 143de89, which differs from the a0ea0ca branch only by one AGENTS.md
+sentence and one comment in the new suite. It exited 0 in 3:46: Valgrind 3.19
+in the `chez-libuv-valgrind:10.4.1` image, vendored libuv 1.52.1.
 
 - `check-memory-gate` printed `MEMORY GATE CAN FAIL`.
 - Every suite's own process had 0 errors and 0 bytes definitely lost. That
