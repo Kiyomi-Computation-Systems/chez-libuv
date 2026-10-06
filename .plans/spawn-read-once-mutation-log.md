@@ -207,7 +207,8 @@ Each mutation was an exact text replacement in a fresh copy of the fix's
 `src/` (or of `tests/`), aborted unless its target occurred once and
 re-checked after. `tests/test-process.sps` ran against the copy; a mutation
 counts as caught only if the predicted rows failed by name. The whole table
-ran on the final tree.
+ran on 9c50b89's tree, and the race's two (M19, H4) again once 0d3487e
+joined the narrower.
 
 | id | mutation | caught by |
 |---|---|---|
@@ -288,6 +289,15 @@ deterministic form.
   and 42 s, 45 and 69 s), so the callbacks collect, as the suite's rule
   says. The 17 s had been the machine: load averages of 40 to 116, from
   other sessions.
+- **Join a racing thread; do not wait for its flag.** The race row first
+  stopped its narrower and waited for a flag the narrower set, under a
+  mutex, just before its thunk returned. The thread was still alive after
+  that, and an explicit collection raises "cannot collect when multiple
+  threads are active" while one is. The suite's last `(collect)` did, under
+  load, and test-process exited 255 with every row passed: 2 of 27 runs at
+  load averages of 30 to 60, found by the uv-spawn! stdio-fence session.
+  With the narrower lingering after it stopped, that shape exited 255 in 2
+  of 2 runs, and `thread-join` passed 2 of 2 (0d3487e).
 
 ## Found on the way, not fixed here
 
@@ -316,11 +326,11 @@ deterministic form.
 
 ## Gates
 
-On 9c50b89's tree (eb2851b), macOS arm64:
+On 0d3487e's tree (f63712a), macOS arm64:
 
-- `make test`: 22 suites pass (test-process: 124 rows; 179 of 200 race
+- `make test`: 22 suites pass (test-process: 124 rows; 192 of 200 race
   rounds overlapped).
-- `make test-memory` (ASan): 22 suites pass, the race row included (175 of
+- `make test-memory` (ASan): 22 suites pass, the race row included (195 of
   200 rounds overlapped). That arm sees the shim's own `memcpy` (it
   aborts on cases 1 and 2 on a0ea0ca's code, above); an earlier belief that
   it could not came from probes run under `timeout`.
@@ -329,15 +339,16 @@ On 9c50b89's tree (eb2851b), macOS arm64:
 - `make check-purity` holds, and `make check-help` is silent.
 
 `make test-memory-docker` (Linux aarch64, Valgrind, vendored libuv 1.52.1)
-from a `--no-hardlinks` clone of 9c50b89, make exit 0:
+from a `--no-hardlinks` clone of 9c50b89, and again of 0d3487e, make exit 0
+both times:
 
 - `check-memory-gate` caught the store overrun, the libc overrun and the
   leak, stayed consistent on the possible leak, and printed MEMORY GATE CAN
   FAIL.
 - Every one of the 22 suites' own Valgrind summaries: 0 errors and 0 bytes
   definitely lost, at 773 to 16,198 allocations each (`test-process.sps`:
-  16,198, its sweeps taking the same 403, 376, 374 and 380 runs as on
-  macOS, its race row skipped). No invalid read or write anywhere in the
+  16,198, and 16,196 on 0d3487e, its sweeps taking the same 403, 376, 374
+  and 380 runs as on macOS, its race row skipped). No invalid read or write anywhere in the
   log.
 - The two forked children that `_exit` before exec report 131 B and 117 B
   definitely lost: the known fork artifacts, which never gate (ADR-0003).
