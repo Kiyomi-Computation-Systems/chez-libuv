@@ -42,19 +42,17 @@
 
   ;; bind-flags->bits : (listof symbol) symbol -> exact-integer
   ;; Fold a bind-flag list into the unsigned bitmask uv_tcp_bind's third
-  ;; argument takes. 'reuseport is the only flag today; any other symbol is a
-  ;; named refusal. 'reuseport on a libuv without UV_TCP_REUSEPORT surfaces as
-  ;; &uv-constant-unavailable from uv-tcp-reuseport (see (libuv private
-  ;; constants)), never as a silent bind with the flag dropped.
+  ;; argument takes, reading the list once (fold-flags). 'reuseport is the
+  ;; only flag today; any other symbol is a named refusal. 'reuseport on a
+  ;; libuv without UV_TCP_REUSEPORT surfaces as &uv-constant-unavailable from
+  ;; uv-tcp-reuseport (see (libuv private constants)), never as a silent bind
+  ;; with the flag dropped.
   (define (bind-flags->bits flags who)
-    (unless (list? flags)
-      (raise (make-uv-invalid-argument who 'flags-not-a-list)))
-    (fold-left
-     (lambda (bits flag)
-       (case flag
-         ((reuseport) (bitwise-ior bits (uv-tcp-reuseport)))
-         (else (raise (make-uv-invalid-argument who 'unknown-bind-flag)))))
-     0 flags))
+    (fold-flags flags who 'flags-not-a-list
+                (lambda (flag)
+                  (case flag
+                    ((reuseport) (uv-tcp-reuseport))
+                    (else (raise (make-uv-invalid-argument who 'unknown-bind-flag)))))))
 
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer -> unspecified
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer (listof symbol)

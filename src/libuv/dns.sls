@@ -123,21 +123,18 @@
          (memq (req-kind x) '(getaddrinfo getnameinfo))
          #t))
 
+  ;; The flag list is read once (fold-flags).
   (define (nameinfo-flag-symbols->int flags)
-    (unless (list? flags)
-      (raise (make-uv-invalid-argument 'uv-getnameinfo!
-                                       'nameinfo-flags-not-a-list)))
-    (fold-left (lambda (acc flag)
-                 (bitwise-ior acc
-                              (case flag
-                                ((numeric-host)  (ni-numerichost))
-                                ((numeric-serv)  (ni-numericserv))
-                                ((name-required) (ni-namereqd))
-                                ((dgram)         (ni-dgram))
-                                (else (raise (make-uv-invalid-argument
-                                              'uv-getnameinfo!
-                                              'unknown-nameinfo-flag))))))
-               0 flags))
+    (fold-flags flags 'uv-getnameinfo! 'nameinfo-flags-not-a-list
+                (lambda (flag)
+                  (case flag
+                    ((numeric-host)  (ni-numerichost))
+                    ((numeric-serv)  (ni-numericserv))
+                    ((name-required) (ni-namereqd))
+                    ((dgram)         (ni-dgram))
+                    (else (raise (make-uv-invalid-argument
+                                  'uv-getnameinfo!
+                                  'unknown-nameinfo-flag)))))))
 
   ;; uv-getnameinfo! : uv-loop string exact-nonnegative-integer procedure
   ;;                   -> uv-dns-request

@@ -17,10 +17,15 @@
 ;;; exposes it: the address a bound socket reports, the sockaddr in an
 ;;; in-flight connect request, the host a reverse lookup answers.
 ;;;
+;;; uv-tcp-bind!'s and uv-getnameinfo!'s flag lists are read once too, and a
+;;; list changed during the call is refused by the call itself or not seen:
+;;; the flags sweeps at the end of the sweep list.
+;;;
 ;;; NOT pure: (libuv tcp) and (libuv dns) reach (libuv private native).
 ;;; Never add this to the Makefile's PURE_TESTS.
 (import (rnrs)
         (rnrs mutable-strings)
+        (rnrs mutable-pairs)
         (srfi :64)
         (libuv loop)
         (libuv handle)
@@ -225,6 +230,36 @@
              answered)
            answer)))))
 
+;; The same two calls, with the flag list as the argument instead.
+(define (bind-flags-run)
+  (let ((t (make-uv-tcp l)))
+    (values
+     (lambda (flags) (uv-tcp-bind! t "::1" 0 flags) 'bound)
+     (lambda (answer)
+       (close-and-drain! t)
+       answer))))
+
+(define (nameinfo-flags-run)
+  (let ((answered 'callback-never-fired))
+    (values
+     (lambda (flags)
+       (uv-getnameinfo! l "::1" 80 flags
+                        (lambda (err host service)
+                          (collect)
+                          (set! answered
+                                (if err
+                                    (list 'lookup-failed (err->symbol err))
+                                    (list 'host host)))))
+       'submitted)
+     (lambda (answer)
+       (if (eq? answer 'submitted)
+           (begin
+             (run-until/ticking
+              l (lambda () (not (eq? answered 'callback-never-fired)))
+              landing-cap)
+             answered)
+           answer)))))
+
 ;; observe : (-> (values call finish)) object -> observation
 ;; One call, run to its end: an engine only caps it, and nothing changes the
 ;; argument.
@@ -342,10 +377,12 @@
     c))
 
 ;; A variant names its sweep, the fixtures it needs, the run it sweeps, the
-;; address it starts from, the change, and what the call answers for each
-;; reading.
+;; argument it starts from and how to copy it fresh for each run, the
+;; change, and what the call answers for each reading.
 (define-record-type sweep-variant
-  (fields name needs make-run address change! original changed))
+  (fields name needs make-run argument copy change! original changed))
+
+(define (list-copy* l) (map (lambda (x) x) l))
 
 ;; The fixtures a sweep needs that are missing here.
 (define (missing-fixtures needs)
@@ -361,19 +398,19 @@
 
 (define bind-nul
   (make-sweep-variant
-   'bind-nul '(v6-loopback) bind-run "::1" nul-at-2!
+   'bind-nul '(v6-loopback) bind-run "::1" string-copy nul-at-2!
    '(bound "::1")
    '(refused uv-tcp-bind! address-contains-nul)))
 
 (define connect-nul
   (make-sweep-variant
-   'connect-nul '(v6-loopback) connect-run "::1" nul-at-2!
+   'connect-nul '(v6-loopback) connect-run "::1" string-copy nul-at-2!
    (list 'parsed "::1" (libuv-ip6-parse "::1" connect-port))
    '(refused uv-tcp-connect! address-contains-nul)))
 
 (define getnameinfo-nul
   (make-sweep-variant
-   'getnameinfo-nul '() nameinfo-run "::1" nul-at-2!
+   'getnameinfo-nul '() nameinfo-run "::1" string-copy nul-at-2!
    '(host "::1")
    '(refused uv-getnameinfo! address-contains-nul)))
 
@@ -383,7 +420,7 @@
   (let ((address (zoned-address v6-loopback-full)))
     (make-sweep-variant
      'connect-widened '(v6-loopback loopback-zone) connect-run address
-     widen-and-zero!
+     string-copy widen-and-zero!
      (list 'parsed "::1" (libuv-ip6-parse address connect-port))
      (list 'parsed "::"
            (libuv-ip6-parse (changed-copy widen-and-zero! address)
@@ -394,12 +431,46 @@
 (define getnameinfo-widened
   (make-sweep-variant
    'getnameinfo-widened '(loopback-zone) nameinfo-run
-   (zoned-address v6-link-local-full) widen-and-zero!
+   (zoned-address v6-link-local-full) string-copy widen-and-zero!
    (list 'host (string-append "fe80::1%" zone))
    (list 'host (string-append "fe80::%" zone))))
 
+;; The flags sweeps. Before the fix each verb asked list? and then folded
+;; the list with fold-left, which walks a list made circular in between
+;; forever, or raises its own condition for one made improper. bind's only
+;; flag is reuseport, whose answer differs by platform and libuv, so its
+;; sweep starts from a flag it refuses everywhere: either refusal is right,
+;; for the reading the call made.
+(define (make-circular! flags)
+  (let last ((p flags))
+    (if (pair? (cdr p)) (last (cdr p)) (set-cdr! p flags))))
+
+(define (cut-after-first! flags) (set-cdr! flags 'oops))
+
+(define bind-flags-circular
+  (make-sweep-variant
+   'bind-flags-circular '(v6-loopback) bind-flags-run '(bogus-flag) list-copy*
+   make-circular!
+   '(refused uv-tcp-bind! unknown-bind-flag)
+   '(refused uv-tcp-bind! flags-not-a-list)))
+
+(define getnameinfo-flags-circular
+  (make-sweep-variant
+   'getnameinfo-flags-circular '() nameinfo-flags-run
+   '(numeric-host numeric-serv) list-copy* make-circular!
+   '(host "::1")
+   '(refused uv-getnameinfo! nameinfo-flags-not-a-list)))
+
+(define getnameinfo-flags-improper
+  (make-sweep-variant
+   'getnameinfo-flags-improper '() nameinfo-flags-run
+   '(numeric-host numeric-serv) list-copy* cut-after-first!
+   '(host "::1")
+   '(refused uv-getnameinfo! nameinfo-flags-not-a-list)))
+
 (define sweep-variants
-  (list bind-nul connect-nul getnameinfo-nul connect-widened getnameinfo-widened))
+  (list bind-nul connect-nul getnameinfo-nul connect-widened getnameinfo-widened
+        bind-flags-circular getnameinfo-flags-circular getnameinfo-flags-improper))
 
 ;; The widened sweeps can see a split only because the given address has a
 ;; scope and a zone name one byte longer names no interface, so its scope
@@ -415,35 +486,34 @@
         (sweep-variant-changed connect-widened)
         (sweep-variant-original getnameinfo-widened)
         (sweep-variant-changed getnameinfo-widened))
-  (let ((longer (lambda (v) (string-append (sweep-variant-address v) "x")))
+  (let ((longer (lambda (v) (string-append (sweep-variant-argument v) "x")))
         (changed (lambda (v)
                    (changed-copy (sweep-variant-change! v)
-                                 (sweep-variant-address v)))))
-    (list (if (equal? (libuv-ip6-parse (sweep-variant-address connect-widened)
+                                 (sweep-variant-argument v)))))
+    (list (if (equal? (libuv-ip6-parse (sweep-variant-argument connect-widened)
                                        connect-port)
                       (libuv-ip6-parse "::1" connect-port))
               'unscoped
               'scoped)
           (libuv-ip6-parse (longer connect-widened) connect-port)
           (observe nameinfo-run (longer getnameinfo-widened))
-          (observe connect-run (sweep-variant-address connect-widened))
+          (observe connect-run (sweep-variant-argument connect-widened))
           (observe connect-run (changed connect-widened))
-          (observe nameinfo-run (sweep-variant-address getnameinfo-widened))
+          (observe nameinfo-run (sweep-variant-argument getnameinfo-widened))
           (observe nameinfo-run (changed getnameinfo-widened)))))
 
 ;; run-in-engine : sweep-variant exact-positive-integer
 ;;                 -> (list expired? observation)
-;; The run's address is a fresh copy, so each run starts from the same
-;; string.
+;; The run's argument is a fresh copy, so each run starts from the same one.
 (define (run-in-engine variant fuel)
-  (let ((address (string-copy (sweep-variant-address variant)))
+  (let ((argument ((sweep-variant-copy variant) (sweep-variant-argument variant)))
         (expired #f))
     (let-values (((call finish) ((sweep-variant-make-run variant))))
       (let ((answer
              (let run ((eng (make-engine
                              (lambda ()
                                (guard (e (#t (raise->observation e)))
-                                 (call address)))))
+                                 (call argument)))))
                        (ticks fuel)
                        (resumes 0))
                (eng ticks
@@ -451,7 +521,7 @@
                     (lambda (next)
                       (unless expired
                         (set! expired #t)
-                        ((sweep-variant-change! variant) address))
+                        ((sweep-variant-change! variant) argument))
                       (if (= resumes resume-cap)
                           (list 'stuck-after-resumes resumes)
                           (run next resume-fuel (+ resumes 1))))))))
@@ -535,7 +605,7 @@
          (pair? (cadr v)) (eq? (car (cadr v)) kind))))
 
 ;; The rows below look for bad verdicts and must find none, which says
-;; nothing unless each sweep began before the call read its address and ran
+;; nothing unless each sweep began before the call read its argument and ran
 ;; the call to the end.
 (test-equal "each sweep's first run saw its change and its last run none"
   (map (lambda (v) (list (sweep-variant-name v) 'changed 'untouched))
@@ -547,7 +617,7 @@
                  (cadr (list-ref rows (- (length rows) 1))))))
        sweeps))
 
-(test-equal "a call refused during a sweep was refused by the call itself, for the NUL it saw"
+(test-equal "a call refused during a sweep was refused by the call itself, for the reading it made"
   '()
   (rows-where (answered-with? 'refused)))
 

@@ -51,7 +51,7 @@
 
           ;; shared validators and boundary helpers
           fill-sockaddr! align-16
-          validate-address require-port
+          validate-address require-port fold-flags
           require-callback
           signal-symbol->int term-signal->value
 
@@ -678,6 +678,45 @@
   (define (require-port port who)
     (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
       (raise (make-uv-invalid-argument who 'port-out-of-range))))
+
+  ;; fold-flags : object symbol symbol (object -> exact-integer)
+  ;;              -> exact-integer
+  ;; The bitwise-ior of (BIT flag) over a caller's flag list, which is read
+  ;; once: its length from proper-length, #f for an improper or circular list
+  ;; and then the refusal (WHO, REASON), then at most that many pairs, each
+  ;; checked as it is read. A list changed during the walk is refused, or
+  ;; read as each pair stood when the walk reached it, and never walked
+  ;; forever. Asking list? first would leave a gap an engine's handler can
+  ;; change the list in, and fold-left walks a list made circular there
+  ;; forever (tests/test-address.sps's flags sweeps). Nothing here
+  ;; allocates (tests/test-native.sps).
+  (define (fold-flags flags who reason bit)
+    (let ((n (proper-length flags)))
+      (unless n
+        (raise (make-uv-invalid-argument who reason)))
+      (let walk ((rest flags) (left n) (bits 0))
+        (cond ((zero? left) bits)
+              ((not (pair? rest))
+               (raise (make-uv-invalid-argument who reason)))
+              (else
+               (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest)))))))))
+
+  ;; proper-length : object -> (or exact-nonnegative-integer #f)
+  ;; X's length when it is a proper list, else #f. A tortoise-and-hare walk:
+  ;; it ends at the list's end, at a pair whose cdr is not a pair or '(), or
+  ;; where the hare meets the tortoise in a cycle, so it raises nothing and
+  ;; allocates nothing, where length raises and a guard around it allocates.
+  (define (proper-length x)
+    (let walk ((hare x) (tortoise x) (n 0))
+      (cond ((null? hare) n)
+            ((not (pair? hare)) #f)
+            ((null? (cdr hare)) (+ n 1))
+            ((not (pair? (cdr hare))) #f)
+            (else
+             (let ((hare (cddr hare)) (tortoise (cdr tortoise)))
+               (if (eq? hare tortoise)
+                   #f
+                   (walk hare tortoise (+ n 2))))))))
 
   (define (require-callback proc who reason)
     (unless (procedure? proc)

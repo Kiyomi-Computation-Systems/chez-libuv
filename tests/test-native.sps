@@ -15,6 +15,7 @@
 ;;; of times -- which is the precise way to check the condition TYPE and its
 ;;; path field, something a subprocess exit code cannot show.
 (import (rnrs)
+        (rnrs mutable-pairs)
         (srfi :64)
         (libuv private native)
         (libuv private constants)
@@ -28,9 +29,12 @@
         ;; by the resolve-shim-path matrix; make-engine, bytevector-truncate!
         ;; and collect drive the copy-in! truncation scan. None collides with
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
+        ;; bytes-allocated, bytes-deallocated and collect-request-handler
+        ;; meter fold-flags.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
-              make-engine bytevector-truncate! collect)
+              make-engine bytevector-truncate! collect
+              bytes-allocated bytes-deallocated collect-request-handler void)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1679,6 +1683,88 @@
        (list (string->utf8 "127.0.0.1\x0;")
              (string->utf8 "::1\x0;")
              (string->utf8 "not-an-ip\x0;"))))
+
+;; --- fold-flags: a caller's flag list, read once ---------------------------
+;; uv-tcp-bind! and uv-getnameinfo! fold their flag lists through fold-flags,
+;; which measures the list without raising and then walks at most that many
+;; pairs, each checked as it is read. A list that is improper or circular,
+;; or is made one during the call, is refused under the caller's own name and
+;; reason, never walked forever (tests/test-address.sps sweeps the change).
+;; Each call here runs in an engine whose resumes are capped, so a walk that
+;; loops answers 'stuck instead of hanging the suite.
+(define (fold-flags-answer flags)
+  (let run ((eng (make-engine
+                  (lambda ()
+                    (guard (e ((uv-invalid-argument? e)
+                               (list (uv-invalid-argument-who e)
+                                     (uv-invalid-argument-reason e)))
+                              (#t (list 'wrong-condition (describe e))))
+                      (fold-flags flags 'test-flags 'flags-not-a-list
+                                  (lambda (flag)
+                                    (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
+            (resumes 0))
+    (eng 100000
+         (lambda (left v) v)
+         (lambda (next)
+           (if (= resumes 100) 'stuck (run next (+ resumes 1)))))))
+
+;; A list whose last pair points back at its pair number K (0-based).
+(define (circular items k)
+  (let ((l (list-copy-of items)))
+    (let last ((p l))
+      (if (pair? (cdr p)) (last (cdr p)) (set-cdr! p (list-tail l k))))
+    l))
+
+(define (list-copy-of l) (map (lambda (x) x) l))
+
+(define (iota* n) (let up ((i 0)) (if (= i n) '() (cons i (up (+ i 1))))))
+
+(test-equal "fold-flags folds a proper list's flags, odd and even lengths alike"
+  '(0 1 3 7 4)
+  (map fold-flags-answer '(() (a) (a b) (a b c) (c c c c c))))
+
+(test-equal "fold-flags refuses an improper or circular list under its caller's name, never walking it forever"
+  (map (lambda (x) '(test-flags flags-not-a-list)) (iota* 8))
+  (map fold-flags-answer
+       (list 'a
+             '(a . b)
+             '(a b . c)
+             (circular '(a) 0)
+             (circular '(a b) 0)
+             (circular '(a b c) 0)
+             (circular '(a b c d) 2)
+             (circular '(a b c d e) 1))))
+
+
+;; The flags were measured with a guarded length, and a guard costs a few
+;; hundred bytes a call even when nothing raises; the walk that replaced it
+;; allocates nothing. The meter reads (+ (bytes-allocated)
+;; (bytes-deallocated)) around each call with the collector held off, and
+;; takes the fewest bytes of 64 calls (tests/test-callback-alloc.sps's
+;; meter); its second element shows the meter sees an allocation.
+(define (fewest-bytes call)
+  (let ((saved (collect-request-handler)))
+    (dynamic-wind
+     (lambda () (collect-request-handler void))
+     (lambda ()
+       (let run ((i 0) (fewest #f))
+         (if (= i 64)
+             fewest
+             (let* ((before (+ (bytes-allocated) (bytes-deallocated)))
+                    (ignored (call))
+                    (after (+ (bytes-allocated) (bytes-deallocated))))
+               (run (+ i 1) (let ((b (- after before)))
+                              (if fewest (min fewest b) b)))))))
+     (lambda () (collect-request-handler saved)))))
+
+(test-equal "fold-flags allocates nothing, where the meter sees a 64-byte allocation"
+  '(0 meter-live)
+  (let ((flags (list 'a 'b 'c))
+        (bit (lambda (flag) (case flag ((a) 1) ((b) 2) ((c) 4) (else 64)))))
+    (list (fewest-bytes (lambda () (fold-flags flags 'test-flags 'flags-not-a-list bit)))
+          (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
+              'meter-live
+              'meter-blind))))
 
 (test-equal "require-port refuses 65536, naming its caller and why"
   '(test-lift port-out-of-range)
