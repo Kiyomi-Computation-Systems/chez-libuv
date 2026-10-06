@@ -1,8 +1,15 @@
 # A write's block freed when its payload shrinks: mutation log
 
-Evidence for `fix/write-copy-leak`, built on `fix/callback-alloc` (#45, PR
-#46). Found by reading the code during #45 and confirmed here before any
-change.
+Evidence for `fix/write-copy-leak`, built on #45's write verbs (PR #46).
+Found by reading the code during #45 and confirmed here before any change.
+
+The work began on `fix/callback-alloc` at 2e55a3c. It was rebased onto
+7415410, #46's last head, which leaves `stream.sls` and `native.sls` as they
+were, and then onto `main`'s 0e6a8e1, #46's squash, whose tree is 7415410's.
+The probe and the comparison of fixes below ran on 2e55a3c. The rows' red,
+the allocation rows, the mutation sweep and the gates ran again on 7415410
+and on the fix rebased onto it, whose tree is df8d0f0's, and the figures
+given for them are those.
 
 `uv-write!` checks its span against the bytevector, allocates the request
 block, and then calls `copy-in!`, which checks the span again in the same
@@ -59,7 +66,8 @@ ALLOCATION BELOW".
 
 Bytes one call allocates, fewest of 64, on a connected loopback pair
 (`tests/test-callback-alloc.sps`'s meter), macOS arm64, two runs each, every
-run identical. Segments are 16 bytes each:
+run identical, on 2e55a3c. Segments are 16 bytes each. On 7415410,
+test-callback-alloc reads the same 240 B and 304 B for the base and for A:
 
 | shape | base (leaks) | **A: status** | A, one status per write | B: allocate inside the copy's step | B2: copy, then allocate |
 |---|---|---|---|---|---|
@@ -101,14 +109,16 @@ block exists), 7 in each sweep are written, and the last is untouched.
 
 `tests/test-native.sps` gains two rows for `try-copy-in!`'s answer.
 
-**Red on the base:** "a write whose payload shrank during the call is
-refused by the verb itself, leaving no request" fails by name, listing 12,
-19 and 28 runs refused as `uv-copy-in!`. Under Valgrind the suite's
-summary reads 58 blocks definitely lost (186,743 B = 31 × 3,209 B +
-27 × 3,232 B), 1 possibly lost, exit 9.
+**Red on the base (7415410, the tree of 0e6a8e1):** "a write whose payload shrank during the
+call is refused by the verb itself, leaving no request" fails by name,
+listing 12, 19 and 28 runs refused as `uv-copy-in!`. The real recipe, `make
+CHEZ=scheme HAVE_PKG=no test-memory MEMORY_TESTS=tests/test-stream.sps`,
+fails with 189,975 B in 59 blocks definitely lost (31 × 3,209 B +
+28 × 3,232 B), make exit 2. On 2e55a3c, run straight under Valgrind, the
+same suite left 58 blocks definitely lost and 1 possibly lost, exit 9.
 
-**Green on the fix:** 25 rows; under Valgrind, nothing lost, and the
-control's 10 blocks (3,106 B) in use at exit.
+**Green on the fix (df8d0f0's tree):** 25 rows. The same recipe exits 0 with
+nothing lost and the control's 10 blocks (3,106 B) in use at exit.
 
 ## Mutations
 
@@ -124,7 +134,7 @@ every expected row failed by name.
 | M3 | `uv-write!` raises as `uv-copy-in!` | a write whose payload shrank … is refused by the verb itself, leaving no request |
 | M3b | `uv-write!` raises `segment-span-out-of-range` | the same |
 | M4 | `uv-write*!` ignores the copy's status | a write the sweep let through sent the peer exactly the bytes it was given |
-| M5 | `uv-write*!` raises without freeing the block | plain rows pass; **`make test-memory` (Linux)**: 151,467 B in 47 blocks definitely lost (19 × 3,209 + 28 × 3,232 B), make exit 2 |
+| M5 | `uv-write*!` raises without freeing the block | plain rows pass; **`make test-memory` (Linux)**: 145,003 B in 45 blocks definitely lost and 6,464 B in 2 possibly lost (19 × 3,209 + 28 × 3,232 B in all), make exit 2 |
 | M6 | `uv-write*!` raises as `uv-copy-in!` | a write whose payload shrank … is refused by the verb itself, leaving no request |
 | M7 | `try-copy-in!` answers `copied` for a span that does not fit | test-native: try-copy-in! answers span-out-of-range …; copy-in! rejects a span that runs past the end …; both truncation-scan rows; test-stream: the bytes-sent row |
 | M8 | `try-copy-in!` answers `#t` after copying | test-native: try-copy-in! answers copied …; copy-in! copies the requested span …, and four more |
@@ -135,8 +145,10 @@ every expected row failed by name.
 
 M2 and M5 ran through the real recipe, `make CHEZ=scheme HAVE_PKG=no
 test-memory MEMORY_TESTS=tests/test-stream.sps`, with the unmutated tree as
-its control (exit 0, nothing lost). Every one of the leaked blocks is
-definitely lost there, so the gate fails on each.
+its control (exit 0, nothing lost). How many of the two-segment blocks
+Valgrind counts definitely rather than possibly lost varies by run (before
+the rebase, M5 left all 47 definitely lost), but every run leaves blocks
+definitely lost, so the gate fails on each.
 
 Notes:
 
@@ -183,4 +195,23 @@ allocating:
 
 ## Gates
 
-See the PR.
+On df8d0f0's tree, macOS arm64:
+
+- `make test`: 20 suites pass.
+- `make test-threading`: 12 rows.
+- `make test-memory` (ASan) passes all 20 suites, and `make
+  check-memory-gate` shows the recipe still goes red on a planted libc
+  overrun. As found above, that arm cannot see an overrun made by the
+  shim's own copies.
+- `make check-purity` holds, and `make check-help` is silent.
+
+`make test-memory-docker` (Linux aarch64, Valgrind, vendored libuv 1.52.1),
+from a `--no-hardlinks` clone of that tree:
+
+- `check-memory-gate` caught the store overrun, the libc overrun and the
+  leak, stayed consistent on the possible leak, and printed MEMORY GATE CAN
+  FAIL.
+- Every suite's own Valgrind summary: 0 errors and 0 bytes definitely lost,
+  at 778 to 5,324 allocations each (`test-stream.sps`: 1,409).
+- The two forked children that `_exit` before exec report 131 B and 117 B
+  definitely lost: the known fork artifacts, which never gate (ADR-0003).
