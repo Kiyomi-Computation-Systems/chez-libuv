@@ -474,10 +474,15 @@ behaviours worth knowing before the design spec:
   `'((socktype . stream))` is the one-liner for one entry per address.
 - **`uv-getaddrinfo!` reads its arguments once, at the start of the
   call.** `node`, `service` and `hints` are checked as they are copied, and
-  the request is built from the copies. A change made to them while the
-  call runs — from an engine's timer handler, say, or another thread — is
-  either seen by that check or not seen at all. `uv-getnameinfo!` reads
-  its address the same way (TCP, above).
+  the request is built from the copies: nothing changed after a value was
+  read reaches libuv, and every value that does was checked. The copies are
+  not one snapshot, though. `node` and `service` are each copied in one step
+  no handler runs inside, but they and each `hints` entry are read in
+  separate steps, so an engine's timer handler that changes both `node` and
+  `service`, or two hints entries, can be seen in one and not the other.
+  Another thread can do that even within one string. `uv-getnameinfo!`
+  reads its address the same way (TCP, above), and it and `uv-tcp-bind!`
+  read their flag lists once.
 - **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**
   ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
   link-local result renders as `"fe80::1"` with its zone silently absent.
