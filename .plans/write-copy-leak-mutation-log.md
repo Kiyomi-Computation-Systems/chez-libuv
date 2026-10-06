@@ -281,6 +281,18 @@ planted through `chez_uv_copy_in` went unreported with ASan live
 `memset` directly, so it passes all the same. That is why the spawn sweep
 was clean on macOS.
 
+> **Corrected 2026-10-06: the arm does see these overruns.** The probes
+> above were launched as `DYLD_INSERT_LIBRARIES=… timeout N chez …`, so
+> ASan loaded into `timeout`, and the banner came from `timeout`'s
+> process. Chez ran unchecked. With the preload on Chez, as `make
+> test-memory` sets it, the 16-byte overrun is reported in
+> `chez_uv_copy_in`. So is the spawn sweep's overrun, `0 bytes after
+> 196-byte region`. The fortified `__memcpy_chk` tail-calls `memcpy`, which
+> ASan interposes. `check-memory-gate` now plants an overrun through
+> `copy-in!` (its `shim-overrun` mode). The evidence is in
+> `.plans/memory-gate-mutation-log.md`, under "The shim's own copies
+> (2026-10-06)".
+
 ## Review
 
 /code-review (max), 2026-10-05: 15 verified findings.
@@ -330,7 +342,7 @@ On df8d0f0's tree, macOS arm64:
 - `make test-memory` (ASan) passes all 20 suites, and `make
   check-memory-gate` shows the recipe still goes red on a planted libc
   overrun. As found above, that arm cannot see an overrun made by the
-  shim's own copies.
+  shim's own copies (since corrected: it can; see the note above).
 - `make check-purity` holds, and `make check-help` is silent.
 
 `make test-memory-docker` (Linux aarch64, Valgrind, vendored libuv 1.52.1),

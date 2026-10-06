@@ -619,8 +619,8 @@ else
 #   - ASan's Darwin runtime removes itself from DYLD_INSERT_LIBRARIES in
 #     whatever process it loads into (its strip_env default), so a wrapper
 #     such as timeout(1) gets ASan and the Chez it starts does not.
-# `make check-memory-gate` plants a memset overrun and requires this arm to
-# fail on it.
+# `make check-memory-gate` plants a memset overrun, and an overrun by the
+# shim's own memcpy, and requires this arm to fail on each.
 	@asan="$$(command ls $(ASAN_DYLIB_PATTERN) 2>/dev/null | head -1)"; \
 	test -n "$$asan" || { \
 	  echo "test-memory: no ASan runtime matched $(ASAN_DYLIB_PATTERN); refusing to run un-sanitized" >&2; \
@@ -653,6 +653,13 @@ endif
 #      below, measured). A gate that fails for another reason -- no valgrind,
 #      a build error, a crash -- is not evidence the tool is looking.
 #
+# shim-overrun's report must also name the shim function that made the
+# overrun (its site). The mode exists to show that the gate sees the
+# binding's own bulk copies, and a report of a 19-byte block overrun from
+# anywhere else would not show that. It is the one mode that loads the
+# binding, so its plain run needs the library path, and this target
+# builds the shim first.
+#
 # possible-leak (Linux) is the exception to those three: not a defect the
 # gate must catch, but a block Valgrind counts "possibly lost". Valgrind
 # fails a run on the leak kinds --errors-for-leak-kinds names, and prints
@@ -666,17 +673,17 @@ endif
 # `make check-memory-gate MEMORY_SABOTAGE_MODES=` looped over nothing and
 # printed MEMORY GATE CAN FAIL.
 #
-# The Linux libc-overrun marker names only the planted block, not where in
-# it the bad store landed. How wide memset's stores are, and so whether
-# Memcheck reports "0 bytes after" or "N bytes inside" the block, belongs to
-# whichever memset runs (Valgrind's replacement, or the platform's own), not
-# to the defect. The Scheme store's width is Chez's (one byte), so that
-# marker stays exact.
+# The Linux libc-overrun and shim-overrun markers name only the planted
+# block, not where in it the bad store landed. How wide memset's and
+# memcpy's stores are, and so whether Memcheck reports "0 bytes after" or
+# "N bytes inside" the block, belongs to whichever implementation runs
+# (Valgrind's replacement, or the platform's own), not to the defect. The
+# Scheme store's width is Chez's (one byte), so that marker stays exact.
 MEMORY_SABOTAGE := tests/memory-gate-sabotage.sps
 ifeq ($(UNAME_S),Linux)
-  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun leak possible-leak
+  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun shim-overrun leak possible-leak
 else
-  MEMORY_SABOTAGE_MODES := libc-overrun
+  MEMORY_SABOTAGE_MODES := libc-overrun shim-overrun
 endif
 
 # The recipe re-enters make through this alias, never through a literal
@@ -689,22 +696,25 @@ endif
 # (.plans/memory-gate-mutation-log.md).
 MEMORY_GATE_MAKE = $(MAKE)
 
-check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the gate can go red)
+check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (the gate can go red)
 	@mkdir -p $(BUILD_DIR); fail=0; ran=0; \
 	for m in $(MEMORY_SABOTAGE_MODES); do \
-	  ran=$$((ran + 1)); \
+	  ran=$$((ran + 1)); site=; \
 	  case "$(UNAME_S):$$m" in \
 	    Linux:store-overrun) marker="0 bytes after a block of size 23 alloc'd" ;; \
 	    Linux:libc-overrun)  marker="a block of size 29 alloc'd" ;; \
+	    Linux:shim-overrun)  marker="a block of size 19 alloc'd"; site="chez_uv_copy_in" ;; \
 	    Linux:leak)          marker="777 bytes in 1 blocks are definitely lost" ;; \
 	    Linux:possible-leak) marker="possibly lost: 555 bytes in 1 blocks"; \
 	                         record="555 bytes in 1 blocks are possibly lost" ;; \
 	    *:libc-overrun)      marker="0 bytes after 29-byte region" ;; \
+	    *:shim-overrun)      marker="0 bytes after 19-byte region"; site="chez_uv_copy_in" ;; \
 	    *) echo "check-memory-gate: no expected report for $$m on $(UNAME_S)" >&2; exit 1 ;; \
 	  esac; \
 	  log=$(BUILD_DIR)/check-memory-gate-$$m.log; \
 	  echo "=== check-memory-gate: $$m ==="; \
-	  plain=$$(CHEZ_LIBUV_SABOTAGE=$$m $(CHEZ) --program $(MEMORY_SABOTAGE) 2>&1); rc=$$?; \
+	  plain=$$(CHEZ_LIBUV_SABOTAGE=$$m CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) \
+	    $(CHEZ) --program $(MEMORY_SABOTAGE) 2>&1); rc=$$?; \
 	  if [ $$rc -ne 0 ] || ! printf '%s\n' "$$plain" | grep -qx "memory-gate-sabotage: planted $$m"; then \
 	    echo "SABOTAGE NOT CLEAN: the $$m program exited $$rc with no memory tool, or never" >&2; \
 	    echo "printed its planted line, so a red gate would prove nothing. Its output:" >&2; \
@@ -729,12 +739,13 @@ check-memory-gate: ## Verify test-memory FAILS on planted memory defects (the ga
 	    echo "MEMORY GATE VACUOUS: make test-memory exited 0 with the $$m defect planted;" >&2; \
 	    echo "the memory tool is not checking the Chez process. Tail of $$log:" >&2; \
 	    tail -n 30 $$log >&2; fail=1; \
-	  elif ! grep -qF "$$marker" $$log; then \
+	  elif ! grep -qF "$$marker" $$log || \
+	       { [ -n "$$site" ] && ! grep -qF "$$site" $$log; }; then \
 	    echo "check-memory-gate: make test-memory failed, but not on the planted $$m" >&2; \
-	    echo "defect: no \"$$marker\" in $$log. Tail:" >&2; \
+	    echo "defect: no \"$$marker\"$${site:+ made in $$site} in $$log. Tail:" >&2; \
 	    tail -n 30 $$log >&2; fail=1; \
 	  else \
-	    echo "gate caught $$m: $$marker"; \
+	    echo "gate caught $$m: $$marker$${site:+, in $$site}"; \
 	  fi; \
 	done; \
 	if [ $$ran -eq 0 ]; then \

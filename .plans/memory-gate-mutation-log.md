@@ -620,3 +620,248 @@ their sabotage program is byte-identical.
   do `check-help`, `check-purity` and `check-pins`. Under `env -u
   MallocNanoZone`, `check-memory-gate` catches libc-overrun, and
   `test-memory` passes all 17 suites with 0 ASan reports.
+
+---
+
+## The shim's own copies (2026-10-06)
+
+A task from #49's session reported a gap. It said the macOS arm cannot see
+an overrun made by the C shim's own bulk copies: `chez_uv_copy_in`,
+`chez_uv_copy_out` and `chez_uv_zero`, which have been behind `copy-in!`,
+`copy-out` and `zero-out!` since #35. The reason given was that Apple's SDK
+fortifies `memcpy` and `memset` even at `-O0`.
+
+The task suggested three steps:
+
+- build the Darwin dev shim with `-D_FORTIFY_SOURCE=0`;
+- add a `check-memory-gate` mode that plants an overrun through the shim;
+- prove that mode with "the fortified build must fail".
+
+Each step was measured before anything changed. The fortification is real
+and the blindness is not. The mode was added anyway, because nothing held
+the answer.
+
+Environment:
+
+- **macOS:** 26.6.2 (25G83), arm64, Apple clang 21.0.0
+  (clang-2100.1.1.101), SDK 26.5, Xcode's ASan runtime, Chez 10.4.1
+  (`tarm64osx`), brew libuv 1.52.1, make 3.81, SIP enabled.
+- **Linux:** the `chez-libuv-valgrind:10.4.1` image: Debian bookworm on
+  aarch64, Valgrind 3.19.0, gcc 12.2, glibc 2.36, vendored libuv 1.52.1,
+  run as `dev`. Nothing here ran on x86_64.
+
+### The fortification is real
+
+- The dev shim (`-g -O0`) imports `___memcpy_chk`, `___memset_chk` and
+  `_strcmp` (`nm -u build/lib/libchezlibuv.dylib`).
+- The SDK does it, not the compiler. `cc -std=c99 -g -O0 -dM -E -x c
+  /dev/null` predefines no `_FORTIFY_SOURCE`. The SDK's `_types.h` defines
+  it as 2, "on by default", whenever it is undefined; it is 0 only for a
+  deployment target below 10.5. `<string.h>` then includes
+  `<secure/_string.h>`.
+- `-U_FORTIFY_SOURCE` changes nothing, because there is no predefined macro
+  to undefine. The shim still imports `___memcpy_chk` and `___memset_chk`.
+- `-D_FORTIFY_SOURCE=0` gives `_memcpy` and `_bzero`: clang turns
+  `memset(p, 0, n)` into `bzero`.
+- The prod shim (`-O2`, built in scratch with `CFLAGS_PROD`) imports
+  `_memcpy` and `_bzero`. At `-O2` clang folds the unknown-size checks away.
+- The Linux dev shim (gcc 12, `-O0`) imports `memcpy@GLIBC_2.17` and
+  `memset@GLIBC_2.17`.
+
+### ...and ASan sees through it
+
+- **The check cannot fire.** Both copy functions pass the object size as
+  unknown: otool shows `mov x3, #-0x1` before `bl ___memcpy_chk`.
+- **The call still ends in `memcpy`.** This was read with lldb in a running
+  `chez`. libsystem_c's `__memcpy_chk` has a `bl __chk_fail_overflow` on its
+  failure path. Otherwise it ends in a tail `b` to a stub
+  (`adrp`/`add`/`ldr`/`braa`).
+  - In a plain process, that stub's slot holds
+    `libsystem_platform.dylib`_platform_memmove`.
+  - With ASan preloaded, it holds
+    `libclang_rt.asan_osx_dynamic.dylib`wrap_memcpy`.
+  - `__memset_chk` is the same, with `_platform_memset` and `wrap_memset`.
+- **ASan intercepts the plain functions, not the `_chk` ones.** Its runtime
+  exports no `_chk` interceptor. It interposes `memcpy`, `memset` and
+  `__bzero` (its `substitution_*` tuples).
+
+Each entry point was probed with the preload on `chez` itself and
+`ASAN_OPTIONS=detect_leaks=0:verbosity=1`. Each probe moved 32 bytes
+through a 16-byte block:
+
+| entry point | exit | report |
+|---|---|---|
+| `copy-in!` | 134 | `WRITE of size 32`, `#0 memcpy` (ASan's), `#1 chez_uv_copy_in libuv-shim.c:211`, `0 bytes after 16-byte region` |
+| `copy-out` | 134 | `READ of size 32`, `#1 chez_uv_copy_out libuv-shim.c:215` |
+| `zero-out!` | 134 | `WRITE of size 32`, `#0 memset` (ASan's), `#1 chez_uv_zero libuv-shim.c:219` |
+
+- No `__memcpy_chk` frame appears, because it is a tail call.
+- Through the real recipe, `make test-memory MEMORY_TESTS=<the copy-in!
+  probe>` exits 2 with the same report.
+- The `-D_FORTIFY_SOURCE=0` shim gives the same three reports, with one
+  byte over (20 bytes into 19). `chez_uv_zero` then goes through `bzero`.
+
+### Why the probes said otherwise
+
+All four ASan runs behind the claim were launched as
+`DYLD_INSERT_LIBRARIES=… ASAN_OPTIONS=… timeout N chez --program …`. They
+were one shim probe and three runs of a `uv-spawn!` engine sweep, all in
+#49's session on 2026-10-05.
+
+That launch is mutation A2 above. ASan loads into `timeout` and strips
+itself from the environment, so Chez runs unchecked. The `verbosity=1`
+banner that the probes took as their witness came from `timeout`.
+
+#49's probe was re-run on main, with one line added to print Chez's own PID
+(`uv-os-getpid`):
+
+| launch | banner PID | Chez PID | exit | report |
+|---|---|---|---|---|
+| `DYLD_INSERT_LIBRARIES=… timeout 120 chez …`, #49's shape | 33501 | 33507 | 0 | none |
+| `DYLD_INSERT_LIBRARIES=… chez …` | 33520 | 33520 | 134 | heap-buffer-overflow in `chez_uv_copy_in` |
+| `make test-memory MEMORY_TESTS=…`, the unmodified probe | — | — | 2 | heap-buffer-overflow, `0 bytes after 16-byte region` |
+
+- **Why #49's run exited 0.** Its probe never freed its block, so plain
+  malloc never noticed the overrun either. A probe that frees the block,
+  launched the same way, died of plain malloc's SIGTRAP (exit 133), still
+  with no ASan report.
+- **The real overflow is caught too.** The `uv-spawn!` sweep, with the
+  preload on Chez (`timeout 900 env DYLD_INSERT_LIBRARIES=… chez …`), exits
+  134 after 6 s: `WRITE of size 128 … 0 bytes after 196-byte region`, with
+  `#1 chez_uv_copy_in`. That is the block Valgrind reported in #49's
+  session.
+
+### The check: `shim-overrun`
+
+`tests/memory-gate-sabotage.sps` gains a mode that writes one byte past a
+19-byte block with `copy-in!`: `alloc-zeroed 19`, then 20 bytes.
+
+- **Only this mode loads the binding.** It does so at run time, through
+  `environment` and `eval`, so the other modes stay the programs whose
+  reports were measured. That is why the plain run gets
+  `CHEZSCHEMELIBDIRS`, and why `check-memory-gate` builds the shim first.
+- **The plain run is clean on both platforms.** malloc's slack for a
+  19-byte block absorbs the extra byte.
+
+The report must name both the block and the site, `chez_uv_copy_in`:
+
+| platform | marker | report |
+|---|---|---|
+| macOS | `0 bytes after 19-byte region` | `WRITE of size 20`, `#1 chez_uv_copy_in libuv-shim.c:211` |
+| Linux | `a block of size 19 alloc'd` | `Invalid write of size 2 at __GI_memcpy` (`vgpreload_memcheck`), `by chez_uv_copy_in (libuv-shim.c:211)`, `18 bytes inside a block of size 19 alloc'd` |
+
+Valgrind's `memcpy` replacement stores two bytes at a time here. So Linux
+reports "18 bytes inside", not "0 bytes after", as review finding 1 above
+anticipated, and the Linux marker names only the block.
+
+### Mutations
+
+**macOS.** The sweep base was committed in a scratch clone (scratch only).
+Before each row, `git reset --hard` and `git clean -fdx` ran, so every row
+rebuilt its own shim.
+
+| # | mutation | check-memory-gate |
+|---|---|---|
+| — | control: the fortified dev shim (`___memcpy_chk`) | exit 0, `gate caught shim-overrun: 0 bytes after 19-byte region, in chez_uv_copy_in` |
+| F1 | `-D_FORTIFY_SOURCE=0` (`_memcpy`, `_bzero`) | exit 0, the same |
+| M1 | `chez_uv_copy_in` copies with a C byte loop | exit 2: libc-overrun caught, **shim-overrun `VACUOUS`** |
+| M2 | the macOS arm runs `chez` under `timeout 120` | exit 2: both modes `VACUOUS` |
+| C1 | the plant writes 22 bytes into a 21-byte block | exit 2, `failed, but not on the planted shim-overrun` |
+| C1′ | C1, with the block clause disabled | **exit 0, `gate caught`** |
+| C2 | the 19-byte overrun made by libc `memset` instead | exit 2, `not on the planted` |
+| C2′ | C2, with the site clause disabled | **exit 0, `gate caught`** |
+| C3 | the plain run without `CHEZSCHEMELIBDIRS` | exit 2, `SABOTAGE NOT CLEAN … exited 255`: `library (libuv private native) not found` |
+| C4 | no `build` prerequisite, from a clean tree | exit 0 with the default modes: libc-overrun's sub-make builds first |
+| C4′ | C4, with `MEMORY_SABOTAGE_MODES=shim-overrun` | exit 2, `SABOTAGE NOT CLEAN`: `library (libuv private config) not found`. With the prerequisite: exit 0 |
+| C5 | the plant stays in bounds (19 bytes into 19) | exit 2, `MEMORY GATE VACUOUS … shim-overrun` |
+
+- **The counterfactual the task asked for cannot be run.** It said the mode
+  must fail on the fortified build. The fortified build is the control,
+  and the mode passes on it.
+- **M1 is the mutation only this mode kills.** A shim copy that never
+  reaches libc is as invisible to ASan as a Scheme store. libc-overrun
+  cannot show that, because its `memset` is called from Scheme.
+- **Each clause has its own counterfactual.** C1′ and C2′ pass once that
+  clause alone is removed.
+
+**Linux.** One container held `/work-a`, vendored with `HAVE_PKG=no`, so
+the shim relinks on every build. Mutated files were copied in, and the
+pristine files copied back after each row. Only shim-overrun ran.
+
+| # | mutation | check-memory-gate |
+|---|---|---|
+| — | control | exit 0, `gate caught shim-overrun: a block of size 19 alloc'd, in chez_uv_copy_in` |
+| M1 | the C byte loop | **exit 0, caught**: Valgrind instruments the loop |
+| M14 | the #14 shape: the cap inside Valgrind | exit 2, `VACUOUS`, with `Command: /usr/bin/timeout 900 scheme …` |
+| C1 | 22 bytes into 21 | exit 2, `not on the planted`: `20 bytes inside a block of size 21 alloc'd` |
+| C2 | the 19-byte overrun by libc `memset` | exit 2, `not on the planted`: the block matches, the site does not |
+
+On Linux the mode kills nothing that the other modes do not, because
+Valgrind sees the shim's code however it copies. It runs there so that CI
+exercises the planted program on every push. Otherwise it would run only
+when someone runs the check on macOS.
+
+### Full runs
+
+Main moved under this work five times. The sweeps above ran on 0e6a8e1,
+and the change was rebased twice: onto a0ea0ca (#49), then onto eb5b719
+(#48, #50, #54, #53 and #52). The final gates ran on that last tree, and
+the commit differs from it only in this section. Two of those merges
+reached the plant:
+
+- **#49 made `copy-in!` a wrapper over `try-copy-in!`.** The plant still
+  reaches `chez_uv_copy_in` through it.
+- **#48 moved the binding's blocks to the shim's own allocator.**
+  `alloc-zeroed` is now `chez_uv_alloc`, a plain `calloc(1, n)`. The
+  planted block is still exactly 19 bytes to both tools, and the markers
+  hold. The dev shim still imports `___memcpy_chk` and `___memset_chk`,
+  and now `_calloc` too.
+
+**macOS, on eb5b719 with this change:**
+
+- `make check-memory-gate` catches both modes: `0 bytes after 19-byte
+  region, in chez_uv_copy_in`.
+- M1, re-run in a clone of that commit, still turns shim-overrun
+  `VACUOUS`.
+- `make check-help` passes, and `make check-purity` holds for 5 suites.
+- `make test` passes 22 suites.
+- `make test-memory` passes 22 suites with 0 ASan reports.
+- Both suite runs were at a load average near 175, from other sessions'
+  work.
+- `make -n check-memory-gate` exits 0, runs nothing and writes no log, and
+  `make -q` exits 1 and writes none. Both were measured on 0e6a8e1, with
+  the same recipe.
+
+**Linux:** the unmodified `make test-memory-docker`, from a
+`--no-hardlinks` clone of that commit, exits 0 in 536 s.
+
+- `check-memory-gate` catches all four defects, shim-overrun with `a block
+  of size 19 alloc'd, in chez_uv_copy_in`, and stays consistent on
+  possible-leak.
+- `test-memory` runs 22 suites as `scheme --program tests/test-*.sps`,
+  with 773 to 5,639 allocations apiece. Each reports 0 errors and 0 bytes
+  definitely lost.
+- The only other summaries are the two fork-artifact children (131 and 117
+  bytes).
+- The same target also exited 0 on 0e6a8e1 (482 s) and on a0ea0ca (331 s).
+- A run on 32ea8d7 was stopped by a signal partway through
+  `check-memory-gate` (exit 144, no verdict), and is not counted.
+
+**test-tcp died twice under heavy load, for a reason outside this change.**
+
+- Once was `make test` on 0e6a8e1: test-tcp.sps died of an uncaught
+  `uv-write!` refusal in its reset section.
+- Once was `make test-memory` on a0ea0ca: test-tcp failed five rows, then
+  died in `stream-read-buf` in its read section.
+- Both times a capped wait had ended before the accept landed, and
+  top-level plumbing then used a peer still seeded `'never-accepted`.
+  Deleting the reset section's wait in a scratch copy reproduces the first
+  output exactly.
+- This change touches neither section. #52 (eb5b719), merged during this
+  work, makes such a peer fail its own named row instead.
+
+### Not adopted
+
+- **`-D_FORTIFY_SOURCE=0` for the Darwin dev shim.** It changes nothing
+  ASan can see (F1 above): the shim then imports `memcpy` and `bzero`, both
+  intercepted. No build flag changed, on either platform or either flavor.

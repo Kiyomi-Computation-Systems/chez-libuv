@@ -223,6 +223,15 @@ None is obvious from reading the code.
   `make check-memory-gate` holds this: it plants defects and requires the
   real recipe to fail on each, with the tool's own report in the log. Watch
   it go red whenever you touch either `test-memory` recipe.
+  - Ad-hoc probes fall into this too, and ASan's `verbosity=1` banner will
+    not show it: the banner prints in whichever process loaded ASan. On
+    2026-10-05, probes run as `DYLD_INSERT_LIBRARIES=… timeout N chez …`
+    reported no overrun. They took the banner in their logs as proof that
+    ASan was live, and concluded that it cannot see the C shim's copies.
+    With the preload on Chez, every one of those overruns was reported.
+    The banner shows ASan is in Chez only when its `==PID==` is Chez's own.
+    Better, ask through `check-memory-gate`: its `shim-overrun` mode now
+    holds that answer.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.

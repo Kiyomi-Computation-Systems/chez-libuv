@@ -241,9 +241,10 @@ jobs:
       # could not: from #14 (2026-08-30) Valgrind's client was timeout(1), Chez
       # ran unchecked, and this job stayed green (ADR-0003's 2026-09-27
       # amendment). check-memory-gate plants a one-byte heap overrun (by a
-      # Scheme store, then by libc's memset) and a definite leak, runs the real
-      # test-memory recipe on each, and requires it to FAIL with Valgrind's own
-      # report of that defect. It also plants a possibly-lost block, and
+      # Scheme store, by libc's memset, and by the C shim's own memcpy behind
+      # copy-in!) and a definite leak, runs the real test-memory recipe on
+      # each, and requires it to FAIL with Valgrind's own report of that
+      # defect. It also plants a possibly-lost block, and
       # requires the gate never to fail on it without printing its loss
       # record. It runs first because it is the precondition for reading the
       # next step's green as evidence.

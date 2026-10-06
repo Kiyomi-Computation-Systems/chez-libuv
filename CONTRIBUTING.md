@@ -35,7 +35,8 @@ A PR must keep these green — they are exactly what CI runs:
   that can support a leak claim.
 - `make check-memory-gate` — the memory gate still fails on planted
   defects. CI runs it before `test-memory`; run it yourself after touching
-  either `test-memory` recipe.
+  either `test-memory` recipe, and on macOS after touching the C shim's
+  copies (CI's Linux run cannot tell when ASan loses sight of them).
 - **Tests accompany code changes.** A behavior change without a test that
   fails against the old behavior will be asked for one.
 - Every new test suite ends with its own `(exit …)` — SRFI-64 does not set
