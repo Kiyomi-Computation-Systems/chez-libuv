@@ -211,6 +211,21 @@
            (raise (make-uv-invalid-argument who 'pipe-wrong-loop)))))
      specs))
 
+  ;; libuv opens each (pipe ...) spec's end into its pipe after it forks, so
+  ;; a pipe named twice fails its second open with the child running:
+  ;; ADR-0015 decision 5's unclassifiable state. One spawn consumes a pipe
+  ;; once.
+  (define (require-distinct-pipes! specs who)
+    (let scan ((specs specs) (seen '()))
+      (unless (null? specs)
+        (let ((spec (car specs)))
+          (if (eq? (stdio-spec-kind spec) 'pipe)
+              (let ((p (stdio-spec-value spec)))
+                (when (memq p seen)
+                  (raise (make-uv-invalid-argument who 'pipe-already-used)))
+                (scan (cdr specs) (cons p seen)))
+              (scan (cdr specs) seen))))))
+
   ;; Mark pipe handles consumed on both successful and failed spawns; retrying
   ;; with a pipe that libuv may already have opened is unsafe.
   (define (mark-consumed-pipes! specs)
@@ -238,6 +253,9 @@
                       (else (raise (make-uv-invalid-argument
                                     'uv-spawn! 'stdio-spec-unknown))))))))
 
+  ;; The stdio containers' offset in the options block.
+  (define (stdio-offset) (align-16 (sizeof-uv-process-options-t)))
+
   ;; One zeroed allocation contains options, stdio, pointer arrays, and UTF-8
   ;; strings. libuv consumes it synchronously during uv_spawn.
   (define (build-options-block file args options)
@@ -246,7 +264,7 @@
            (specs       (spawn-options-stdio options))
            (ptr-size    (c-uptr-size))
            (n-stdio     (length specs))
-           (stdio-off   (align-16 (sizeof-uv-process-options-t)))
+           (stdio-off   (stdio-offset))
            (argv-off    (align-16 (+ stdio-off
                                      (* n-stdio (sizeof-uv-stdio-container-t)))))
            (env-off     (align-16 (+ argv-off (* (+ 1 (length args)) ptr-size))))
@@ -307,7 +325,8 @@
                      (+ block env-off)))))
 
   ;; Write the stdio union at the width of the active member: int for an fd,
-  ;; pointer width for a stream.
+  ;; pointer width for a stream. A stream's pointer is left to the step that
+  ;; checks its handle (fill-stream-pointers!).
   (define (fill-stdio-containers! block specs stdio-off)
     (let stdio-loop ((ss specs) (i 0))
       (unless (null? ss)
@@ -315,15 +334,23 @@
               (spec (car ss)))
           (c-int-set! (+ c (offsetof-uv-stdio-container-t-flags))
                       (stdio-spec-flags spec))
-          (case (stdio-spec-kind spec)
-            ((inherit-fd)
-             (c-int-set! (+ c (offsetof-uv-stdio-container-t-data))
-                         (stdio-spec-value spec)))
-            ((inherit-stream pipe)
-             (c-uptr-set! (+ c (offsetof-uv-stdio-container-t-data))
-                          (handle-pointer (stdio-spec-value spec) 'uv-spawn!)))
-            (else #f)))
+          (when (eq? (stdio-spec-kind spec) 'inherit-fd)
+            (c-int-set! (+ c (offsetof-uv-stdio-container-t-data))
+                        (stdio-spec-value spec))))
         (stdio-loop (cdr ss) (+ i 1)))))
+
+  ;; The step's half of the fill: each stream spec's handle pointer, read
+  ;; from the handle the step has just checked.
+  (define (fill-stream-pointers! block specs)
+    (let fill ((ss specs) (i 0))
+      (unless (null? ss)
+        (let ((h (stdio-spec-handle (car ss))))
+          (when h
+            (c-uptr-set! (+ block (stdio-offset)
+                            (* i (sizeof-uv-stdio-container-t))
+                            (offsetof-uv-stdio-container-t-data))
+                         (handle-ptr h))))
+        (fill (cdr ss) (+ i 1)))))
 
   ;; Setting uid or gid must also set the corresponding libuv flag.
   (define (fill-scalars! block options n-stdio stdio-off)
@@ -369,37 +396,109 @@
         (raise (make-uv-invalid-argument 'uv-spawn! 'on-exit-not-a-procedure)))
       (let ((options (check-options (spawn-request-options request) 'uv-spawn!)))
         (require-same-loop-stdio! (spawn-options-stdio options) loop 'uv-spawn!)
+        (require-distinct-pipes! (spawn-options-stdio options) 'uv-spawn!)
         (let* ((ptr (alloc-zeroed (uv-handle-size (uv-process-type))))
                (proc (%make-uv-process-record ptr loop on-exit))
                (block (guard (e (#t (free! ptr) (raise e)))
                         (build-options-block (spawn-request-file request)
                                              (spawn-request-args request)
-                                             options))))
-          (let ((rc (uv-spawn-native (loop-pointer loop 'uv-spawn!) ptr block)))
-            (free-options-block! block)
-            (mark-consumed-pipes! (spawn-options-stdio options))
-            (if (zero? rc)
-                (begin
-                  (registry-register! ptr 'process loop proc)
-                  (count-process-new!)
-                  proc)
-                (begin
-                  (clean-up-failed-spawn! loop proc)
-                  (uv-check rc 'uv-spawn!))))))))
+                                             options)))
+               (status (with-interrupts-disabled
+                         (spawn-step! loop proc block
+                                      (spawn-options-stdio options)))))
+          (unless (eq? status 'spawned)
+            (raise (spawn-refusal status)))
+          proc))))
 
+  ;; --- the step that spawns ---------------------------------------------------
+  ;; The checks above see the loop and the stdio handles as they were on
+  ;; entry, and the loop and the handles stay the caller's: an engine's timer
+  ;; handler can close a handle, consume a pipe in a spawn of its own, or
+  ;; tear the loop down before uv_spawn runs. libuv then opened a closing
+  ;; pipe's end into it, a descriptor nothing ever closed; reached a freed
+  ;; pipe through an address another pipe could hold by then; forked, then
+  ;; failed to open a consumed pipe (ADR-0015 decision 5's state); or spawned
+  ;; on a freed loop. A teardown between uv_spawn and the registration left
+  ;; the process in the loop where the teardown could not close it.
+  ;;
+  ;; So once the options block is built, one interrupt-free step checks the
+  ;; loop and each handle again, hands libuv the pointers it just checked,
+  ;; spawns, frees the options block, marks the pipes, and registers the
+  ;; process or cleans up after a failure. An engine that expires during
+  ;; uv-spawn! is suspended before the step or after it (test-process.sps's
+  ;; state sweeps). One suspended between the allocations and the step and
+  ;; never resumed still strands the process handle and the options block.
+  ;;
+  ;; The step raises nothing. It answers 'spawned or a status, and the verb
+  ;; raises after it (spawn-refusal). It frees what a refusal leaves, so a
+  ;; refused spawn holds nothing. with-interrupts-disabled, a dynamic-wind,
+  ;; costs 32 B a spawn over one-step, a bare interrupt pair, and keeps
+  ;; interrupts from staying off should anything in the step raise after all:
+  ;; a fault in uv_spawn arrives as a Scheme condition.
+
+  ;; spawn-step! : uv-loop uv-process uptr (listof stdio-spec)
+  ;;               -> (or 'spawned status)
+  (define (spawn-step! loop proc block specs)
+    (let* ((loop-address (open-loop-ptr loop))
+           (refusal (if (symbol? loop-address)
+                        loop-address
+                        (stdio-refusal specs))))
+      (if refusal
+          (begin (free-options-block! block)
+                 (discard-failed-handle! proc)
+                 refusal)
+          (let ((ptr (handle-ptr proc)))
+            (fill-stream-pointers! block specs)
+            (let ((rc (uv-spawn-native loop-address ptr block)))
+              (free-options-block! block)
+              (mark-consumed-pipes! specs)
+              (if (zero? rc)
+                  (begin (registry-register! ptr 'process loop proc)
+                         (count-process-new!)
+                         'spawned)
+                  (clean-up-failed-spawn! loop proc rc)))))))
+
+  ;; stdio-refusal : (listof stdio-spec) -> (or status #f)
+  ;; The first spec the entry checks would now refuse for its handle's state:
+  ;; open-handle-ptr's refusal paired with the handle, or 'pipe-already-used.
+  (define (stdio-refusal specs)
+    (exists (lambda (spec)
+              (let ((h (stdio-spec-handle spec)))
+                (and h
+                     (let ((ptr (open-handle-ptr h)))
+                       (cond ((symbol? ptr) (cons ptr h))
+                             ((and (eq? (stdio-spec-kind spec) 'pipe)
+                                   (pipe-connected? h))
+                              'pipe-already-used)
+                             (else #f))))))
+            specs))
+
+  ;; spawn-refusal : status -> condition
+  ;; What uv-spawn! raises for a status the step answered: what the checks
+  ;; on entry raise for the same state, or libuv's errno. A handle's refusal
+  ;; comes paired with the handle (stdio-refusal).
+  (define (spawn-refusal status)
+    (if (pair? status)
+        (step-refusal (car status) 'uv-spawn! (cdr status))
+        (step-refusal status 'uv-spawn! #f)))
+
+  ;; clean-up-failed-spawn! : uv-loop uv-process exact-integer -> status
   ;; Spawn failures have opposite cleanups depending on whether libuv left the
   ;; handle in its loop queue. Ask uv_walk; errno values cannot classify this.
-  ;; A nonzero pid is an unclassifiable partial-success state and is left intact.
-  (define (clean-up-failed-spawn! loop proc)
-    (unless (zero? (uv-process-get-pid (handle-pointer proc 'uv-spawn!)))
-      (raise (make-uv-invalid-argument 'uv-spawn!
-                                       'spawn-failure-state-unclassifiable)))
-    (if (handle-in-loop-queue? loop proc)
-        (begin
-          (registry-register! (handle-pointer proc 'uv-spawn!) 'process loop proc)
-          (count-process-new!)
-          (close-handle! proc))
-        (discard-failed-handle! proc)))
+  ;; A nonzero pid is an unclassifiable partial-success state and is left
+  ;; intact. Answers the status the verb raises, RC unless unclassifiable.
+  (define (clean-up-failed-spawn! loop proc rc)
+    (let ((ptr (handle-ptr proc)))
+      (cond ((not (zero? (uv-process-get-pid ptr)))
+             'spawn-failure-state-unclassifiable)
+            ((handle-in-loop-queue? loop proc)
+             (registry-register! ptr 'process loop proc)
+             (count-process-new!)
+             (close-handle! proc)
+             rc)
+            (else
+             (discard-failed-handle! proc)
+             rc))))
 
   ;; uv-process-kill! : uv-process (or symbol 0) -> unspecified
   ;; Sending a signal after exit can race operating-system pid reuse.
