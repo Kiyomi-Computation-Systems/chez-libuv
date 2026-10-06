@@ -97,6 +97,12 @@ None is obvious from reading the code.
   Plumbing that can fail (kills, reads of another process's output) belongs
   inside a named row that fails *carrying the evidence*: gate every wait on
   `(or acked (pair? done))`, guard kills on the child being alive.
+  A row's name and expected value count as plumbing: SRFI-64 evaluates them
+  outside its catch, and only the tested expression, the last argument, is
+  caught. test-tcp.sps's loopback placeholders, `(define p 'never-accepted)`,
+  raised from bare plumbing and from an expected value when a handshake
+  missed its cap under load (2026-10-06). `tests/test-seed-gates.sps` now
+  holds that suite to this.
 * **`with-mutex` does not fence a check-then-call, even around
   `with-interrupts-disabled`.** It is a `dynamic-wind`. An engine that runs
   out of fuel inside the body releases the mutex, and on resuming carries on

@@ -148,7 +148,7 @@ MEMORY_TESTS := $(TESTS)
 # DELETED file drops out silently instead of failing the target.
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
                            tests/test-require-threaded.sps \
-                           tests/test-source-rules.sps)
+                           tests/test-source-rules.sps tests/test-seed-gates.sps)
 
 .PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
