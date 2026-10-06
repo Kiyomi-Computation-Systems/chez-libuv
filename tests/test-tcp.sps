@@ -90,6 +90,12 @@
 ;; small enough that a genuinely stuck loop is a failure rather than a hang.
 (define cap 64)
 
+;; The cap for a ticking wait that spans a loopback handshake. Every 1 ms
+;; tick spends an iteration, so a ticking cap is a time budget, and during
+;; other runs' loopback floods a handshake has outlasted 64 of them
+;; (2026-10-06).
+(define handshake-cap 4000)
+
 (test-begin "tcp")
 
 ;; --- seeds ---------------------------------------------------------------
@@ -748,7 +754,7 @@
   (run-until/ticking pa-loop
                      (lambda () (and (not (eq? pa-peer 'never-accepted))
                                      (not (eq? pa-connect-err 'connect-cb-never-fired))))
-                     4000))
+                     handshake-cap))
 
 ;; The expected IPv4 string is REQUIRED, not tolerated: a row accepting #f
 ;; passes against an implementation whose address conversion returns #f.
@@ -812,8 +818,11 @@
 ;; routing. Non-interleaving itself is structural (head-of-queue drain,
 ;; unix/stream.c:1043) and is logged as an uncovered property, not asserted.
 (define pa-col (make-byte-collector))
-(uv-read-start! pa-peer (lambda (bv s e) (collect-span! pa-col bv s e) (collect))
-                (lambda () #f) (lambda (c) #f))
+;; Gated on the seed: without a peer, the row below fails by name instead of
+;; this line aborting the suite (AGENTS.md).
+(when (uv-tcp? pa-peer)
+  (uv-read-start! pa-peer (lambda (bv s e) (collect-span! pa-col bv s e) (collect))
+                  (lambda () #f) (lambda (c) #f)))
 ;; Chez has NO bytevector-append -- it is R7RS, and absent from both (rnrs)
 ;; and (chezscheme). Verified: "variable bytevector-append is not bound".
 ;; R6RS bytevector-copy! is (source source-start target target-start count).
@@ -963,8 +972,16 @@
 (connect-loopback! pclient pserver-port
                    (lambda (err) (collect) (set! pending-connect-err err)))
 
-(run-until pl (lambda () (not (eq? pending-connect-err 'connect-cb-never-fired)))
-           cap)
+;; The ticking wait, asserted by name: a plain 'once would block for good on a
+;; peer that is never accepted, since the listening server keeps the loop
+;; alive. This one gives up at its cap, and the row says which handshake
+;; failed.
+(test-equal "seed: the pending-write pair connected and was accepted"
+  'satisfied
+  (run-until/ticking pl
+                     (lambda () (and (not (eq? pending-connect-err 'connect-cb-never-fired))
+                                     (uv-tcp? pending-peer)))
+                     handshake-cap))
 
 (define write-req-live-before-pending (live-count 'write-req))
 
@@ -1041,10 +1058,12 @@
 (connect-loopback! qclient qport
                    (lambda (err) (collect) (set! q-connect-err err)))
 
-(run-until ql
-           (lambda () (and (not (eq? q-connect-err 'connect-cb-never-fired))
-                           (uv-tcp? q-peer)))
-           cap)
+(test-equal "seed: the cancelled-write pair connected and was accepted"
+  'satisfied
+  (run-until/ticking ql
+                     (lambda () (and (not (eq? q-connect-err 'connect-cb-never-fired))
+                                     (uv-tcp? q-peer)))
+                     handshake-cap))
 
 (uv-write! qclient (make-bytevector 4194304 65)
            (lambda (err)
@@ -1321,16 +1340,20 @@
 (define s-payload (string->utf8 "hello, read path"))
 (define s-write-err 'write-cb-never-fired)
 
+;; Only a connected stream is written to: a handshake still pending at
+;; teardown completes as 'ECANCELED, and writing then, on the closing stream,
+;; raises out of uv-loop-teardown! (measured 2026-10-06).
 (connect-loopback! sclient sport
                    (lambda (err)
                      (collect)
-                     (uv-write! sclient s-payload
-                                (lambda (werr)
-                                  (collect)
-                                  (set! s-write-err werr)))))
+                     (when (not err)
+                       (uv-write! sclient s-payload
+                                  (lambda (werr)
+                                    (collect)
+                                    (set! s-write-err werr))))))
 
 (define s-outcome
-  (run-until/ticking sl (lambda () (positive? s-data-fires)) cap))
+  (run-until/ticking sl (lambda () (positive? s-data-fires)) handshake-cap))
 
 (test-equal "the peer's on-data callback delivered the client's write"
   'satisfied s-outcome)
@@ -1352,9 +1375,12 @@
   'reading (if (stream-reading? s-peer) 'reading 'not-reading))
 
 ;; --- stop, start, and the ONE buffer -------------------------------------
-(define s-buffer-before-cycles (stream-read-buf s-peer))
+;; Gated on the seed, here and at each call on s-peer below: without a peer,
+;; the rows fail by name instead of the call aborting the suite (AGENTS.md).
+(define s-buffer-before-cycles
+  (if (uv-tcp? s-peer) (stream-read-buf s-peer) 'never-accepted))
 
-(uv-read-stop! s-peer)
+(when (uv-tcp? s-peer) (uv-read-stop! s-peer))
 
 (test-equal "uv-read-stop! outside a callback clears the reading flag"
   'not-reading (if (stream-reading? s-peer) 'reading 'not-reading))
@@ -1369,11 +1395,12 @@
 ;; the counter sees; one that freed the old buffer each time would keep the
 ;; counter at 1 and still hand out a different address, which only the
 ;; pointer sees. Both are asserted, because they fail differently.
-(let cycle ((i 0))
-  (when (< i 50)
-    (uv-read-start! s-peer s-on-data s-on-eof s-on-error)
-    (uv-read-stop! s-peer)
-    (cycle (+ i 1))))
+(when (uv-tcp? s-peer)
+  (let cycle ((i 0))
+    (when (< i 50)
+      (uv-read-start! s-peer s-on-data s-on-eof s-on-error)
+      (uv-read-stop! s-peer)
+      (cycle (+ i 1)))))
 
 (test-equal "50 read-start/stop cycles leave exactly one live read buffer"
   1 (live-count 'read-buffer))
@@ -1444,14 +1471,21 @@
 (uv-read-stop! sclient)
 
 ;; --- EOF, and that it is not an error ------------------------------------
-(uv-read-start! s-peer s-on-data s-on-eof s-on-error)
+(when (uv-tcp? s-peer) (uv-read-start! s-peer s-on-data s-on-eof s-on-error))
 
 (define s-shutdown-err 'shutdown-cb-never-fired)
 
-(uv-shutdown! sclient (lambda (err) (collect) (set! s-shutdown-err err)))
+;; Gated on the first delivery, which proves the connect callback has issued
+;; its write. A handshake that completes after this shutdown instead runs
+;; that write on a stream already shut, and the EPIPE it raises would surface
+;; from the wait below, aborting the suite (measured 2026-10-06).
+(when (eq? s-outcome 'satisfied)
+  (uv-shutdown! sclient (lambda (err) (collect) (set! s-shutdown-err err))))
 
 (define s-eof-outcome
-  (run-until/ticking sl (lambda () (positive? s-eof-fires)) cap))
+  (if (eq? s-outcome 'satisfied)
+      (run-until/ticking sl (lambda () (positive? s-eof-fires)) cap)
+      'no-first-delivery))
 
 (test-equal "the peer's on-eof fired when the client shut its write side down"
   'satisfied s-eof-outcome)
@@ -1485,13 +1519,14 @@
 (define s-fires-before-direct s-data-fires)
 (define s-eof-before-direct s-eof-fires)
 
-((dispatcher-ref 'read) (handle-ptr s-peer) 0 0)
+(when (uv-tcp? s-peer) ((dispatcher-ref 'read) (handle-ptr s-peer) 0 0))
 
 (test-equal "a read callback with nread = 0 delivers nothing: not data, not EOF, not an error"
   (list s-fires-before-direct s-eof-before-direct 'on-error-never-fired)
   (list s-data-fires s-eof-fires s-error))
 
-((dispatcher-ref 'read) (handle-ptr s-peer) (errno-symbol->value 'ENOBUFS) 0)
+(when (uv-tcp? s-peer)
+  ((dispatcher-ref 'read) (handle-ptr s-peer) (errno-symbol->value 'ENOBUFS) 0))
 
 (test-equal "a negative nread that is not UV_EOF reaches on-error as a condition object"
   'ENOBUFS s-error)
@@ -1515,14 +1550,14 @@
 ;; be queued behind a uv_close, and the handle it names is 'closing by the
 ;; time it is delivered. Refusing to deliver there would drop the EOF a
 ;; caller's own bookkeeping may be waiting for.
-(set-handle-state! s-peer 'closing)
-
-((dispatcher-ref 'read) (handle-ptr s-peer) (uv-eof) 0)
+(when (uv-tcp? s-peer)
+  (set-handle-state! s-peer 'closing)
+  ((dispatcher-ref 'read) (handle-ptr s-peer) (uv-eof) 0))
 
 (test-equal "a read callback that raced a close is still delivered ('closing is tolerated)"
   (+ s-eof-before-direct 1) s-eof-fires)
 
-(set-handle-state! s-peer 'open)
+(when (uv-tcp? s-peer) (set-handle-state! s-peer 'open))
 
 ;; --- libuv's alloc callback, called as libuv calls it ---------------------
 ;; Since #45 libuv's alloc callback is the shim's chez_uv_alloc_cb. It answers
@@ -1562,7 +1597,7 @@
 ;; of its own, so reading it back shows what libuv will call: these rows then
 ;; call that very function. A reading stream is needed, since uv_read_stop
 ;; clears the field.
-(uv-read-start! s-peer s-on-data s-on-eof s-on-error)
+(when (uv-tcp? s-peer) (uv-read-start! s-peer s-on-data s-on-eof s-on-error))
 
 (test-equal "uv-read-start! hands libuv the shim's own alloc callback"
   (list 'alloc-cb (foreign-entry "chez_uv_alloc_cb"))
@@ -1570,7 +1605,7 @@
         (c-uptr-ref (+ (handle-ptr s-peer)
                        (constant-ref 'OFFSETOF_UV_STREAM_T_ALLOC_CB)))))
 
-(uv-read-stop! s-peer)
+(when (uv-tcp? s-peer) (uv-read-stop! s-peer))
 
 (test-equal "...and these rows call that same callback"
   (foreign-entry "chez_uv_alloc_cb") alloc-cb-entry)
@@ -1578,19 +1613,30 @@
 ;; A stream's handle block carries its descriptor past libuv's own handle, so
 ;; that the read buffer can be exactly the payload: a 64 KiB buffer behind a
 ;; 16-byte header took the next malloc size class on macOS, 81,920 B.
+;; Compared inside the tested expression, as the alloc-answer row below is:
+;; SRFI-64 evaluates a row's expected value outside its catch, so reading
+;; s-peer there aborts the suite when the seed failed.
 (test-equal "a stream's data points at its descriptor, at the first 16-byte boundary after libuv's handle"
-  (list (tcp-descriptor s-peer) (tcp-descriptor s-unread))
-  (list (handle-data (handle-ptr s-peer)) (handle-data (handle-ptr s-unread))))
+  'at-its-descriptor
+  (let ((descriptors (list (tcp-descriptor s-peer) (tcp-descriptor s-unread)))
+        (data (list (handle-data (handle-ptr s-peer)) (handle-data (handle-ptr s-unread)))))
+    (if (equal? data descriptors)
+        'at-its-descriptor
+        (list 'data data 'descriptors descriptors))))
 
 ;; `suggested` is 1: libuv's hint is deliberately ignored, and a callback
 ;; that answered the hint instead of the buffer's real length would put a 1
 ;; here -- and then libuv would read one byte at a time forever. The base is
 ;; the read buffer's own address: the payload is the whole block.
-(define s-alloc-answer (alloc-answer (handle-ptr s-peer) 1))
+(define s-alloc-answer
+  (if (uv-tcp? s-peer) (alloc-answer (handle-ptr s-peer) 1) 'never-accepted))
 
 (test-equal "libuv's alloc callback answers the stream's own read buffer, whole, at its full length"
-  (list (stream-read-buf s-peer) (stream-read-buf-len s-peer))
-  s-alloc-answer)
+  'own-buffer
+  (let ((own (list (stream-read-buf s-peer) (stream-read-buf-len s-peer))))
+    (if (equal? s-alloc-answer own)
+        'own-buffer
+        (list 'answered s-alloc-answer 'own own))))
 
 ;; The length libuv is told must fit the block it reads into. The allocator
 ;; is asked the block's size: malloc_size on macOS, malloc_usable_size on
@@ -1950,7 +1996,7 @@
                    (lambda ()
                      (and (uv-tcp? m-peer)
                           (not (eq? m-connect-err 'connect-cb-never-fired))))
-                   cap)
+                   handshake-cap)
 
 (test-equal "seed: the 1 MiB transfer's connection is up at both ends"
   '(a-tcp no-error) (list (if (uv-tcp? m-peer) 'a-tcp 'never-accepted)
@@ -2087,11 +2133,13 @@
 (connect-loopback! bclient bport
                    (lambda (err) (collect) (set! b-connect-err err)))
 
-(run-until/ticking bl
-                   (lambda ()
-                     (and (uv-tcp? b-peer)
-                          (not (eq? b-connect-err 'connect-cb-never-fired))))
-                   cap)
+(test-equal "seed: the backpressure pair connected and was accepted"
+  'satisfied
+  (run-until/ticking bl
+                     (lambda ()
+                       (and (uv-tcp? b-peer)
+                            (not (eq? b-connect-err 'connect-cb-never-fired))))
+                     handshake-cap))
 
 (define (b-write! from to)
   (uv-write! bclient b-payload from to
@@ -2133,8 +2181,15 @@
 (uv-timer-stop! btimer)
 
 ;; Restarting with the same three callbacks: the buffer and the stored
-;; callbacks are reused, and the bytes held back arrive now, in order.
-(uv-read-start! b-peer b-on-data b-on-eof b-on-error)
+;; callbacks are reused, and the bytes held back arrive now, in order. The
+;; restart is a row, not plumbing: it raises EALREADY when the first chunk
+;; never arrived to stop the read (seen during a loopback flood,
+;; 2026-10-06), and without a peer it raises for want of one. Either way the
+;; rows after it then fail by name instead of the suite aborting (AGENTS.md).
+(test-equal "the stopped reader restarts with the same three callbacks"
+  'restarted
+  (begin (uv-read-start! b-peer b-on-data b-on-eof b-on-error)
+         'restarted))
 
 (define b-resume-outcome
   (run-until/ticking bl
@@ -2232,20 +2287,24 @@
 (connect-loopback! xclient xport
                    (lambda (err) (collect) (set! x-connect-err err)))
 
-(run-until/ticking xl
-                   (lambda ()
-                     (and (uv-tcp? x-peer)
-                          (not (eq? x-connect-err 'connect-cb-never-fired))))
-                   cap)
+(test-equal "seed: the reset pair connected and was accepted"
+  'satisfied
+  (run-until/ticking xl
+                     (lambda ()
+                       (and (uv-tcp? x-peer)
+                            (not (eq? x-connect-err 'connect-cb-never-fired))))
+                     handshake-cap))
 
 ;; The client never calls uv-read-start!, so these bytes stay unread in its
 ;; receive queue -- which is exactly what makes the close below abortive.
-(uv-write! x-peer (make-bytevector 4096 88)
-           (lambda (err) (collect) (set! x-write-err err)))
-
-(run-until/ticking xl
-                   (lambda () (not (eq? x-write-err 'write-cb-never-fired)))
-                   cap)
+;; Gated on the seed: without a peer, the rows below fail by name instead of
+;; the write aborting the suite (AGENTS.md).
+(when (uv-tcp? x-peer)
+  (uv-write! x-peer (make-bytevector 4096 88)
+             (lambda (err) (collect) (set! x-write-err err)))
+  (run-until/ticking xl
+                     (lambda () (not (eq? x-write-err 'write-cb-never-fired)))
+                     cap))
 
 ;; A COMPLETED WRITE IS NOT A QUEUED READ. The write callback means libuv
 ;; handed the bytes to the server's socket; the kernel delivers them to the
@@ -2398,7 +2457,7 @@
   (run-until/ticking wv-loop
                      (lambda () (and (not (eq? wv-peer 'never-accepted))
                                      (not (eq? wv-connect-err 'connect-cb-never-fired))))
-                     4000))
+                     handshake-cap))
 
 ;; --- argument validation, all of it BEFORE any allocation ----------------
 ;; The same right-to-left trap as uv-write!'s span rows (AGENTS.md): a `let*`
@@ -2558,10 +2617,12 @@
 (connect-loopback! rt-client rt-port
                    (lambda (err) (collect) (set! rt-connect-err err)))
 
-(run-until/ticking rt-loop
-                   (lambda () (and (not (eq? rt-peer 'never-accepted))
-                                   (not (eq? rt-connect-err 'connect-cb-never-fired))))
-                   4000)
+(test-equal "seed: the vectored round-trip pair connected and was accepted"
+  'satisfied
+  (run-until/ticking rt-loop
+                     (lambda () (and (not (eq? rt-peer 'never-accepted))
+                                     (not (eq? rt-connect-err 'connect-cb-never-fired))))
+                     handshake-cap))
 
 ;; Seeded by index, like every other payload in this suite: two runs compare
 ;; the same bytes. Only [100,600) of the middle segment is sent, so a span
@@ -2624,10 +2685,12 @@
 (connect-loopback! ka-client ka-port
                    (lambda (err) (collect) (set! ka-connect-err err)))
 
-(run-until/ticking ka-loop
-                   (lambda () (and (not (eq? ka-peer 'never-accepted))
-                                   (not (eq? ka-connect-err 'connect-cb-never-fired))))
-                   4000)
+(test-equal "seed: the keepalive pair connected and was accepted"
+  'satisfied
+  (run-until/ticking ka-loop
+                     (lambda () (and (not (eq? ka-peer 'never-accepted))
+                                     (not (eq? ka-connect-err 'connect-cb-never-fired))))
+                     handshake-cap))
 
 (test-equal "uv-tcp-keepalive! enables on a connected handle with an idle delay"
   'set
