@@ -183,3 +183,47 @@ should it appear.
 >   old justification, that Chez's runtime "routinely" makes such blocks,
 >   was never measured, and a run shows otherwise. No suite's own process
 >   has one. Only forked children do, and they never gate.
+
+> **Amended 2026-10-06: the macOS arm sees the shim's own copies, and a
+> check now holds that.** Probes on 2026-10-05 (during #49) reported that
+> the macOS arm could not see an overrun made by the C shim's bulk copies:
+> `chez_uv_copy_in`, `chez_uv_copy_out` and `chez_uv_zero`, behind
+> `copy-in!`, `copy-out` and `zero-out!`. The cause they proposed was that
+> Apple's SDK compiles the shim's `memcpy` and `memset` to the fortified
+> `__memcpy_chk` and `__memset_chk`, which ASan does not intercept.
+>
+> - **The fortification is real.** The SDK's `_types.h` defines
+>   `_FORTIFY_SOURCE` as 2 whenever it is undefined, at every optimization
+>   level, so the `-O0` dev shim imports `___memcpy_chk` and
+>   `___memset_chk`. `-U_FORTIFY_SOURCE` changes nothing, since there is no
+>   predefined macro to undefine.
+> - **The blindness is not.** The shim passes an unknown size
+>   (`(size_t)-1`), so the check cannot fire. libsystem_c's `__memcpy_chk`
+>   then tail-calls `memcpy` through a bound pointer, and with ASan loaded
+>   that pointer is ASan's own `memcpy` wrapper. `__memset_chk` does the
+>   same with `memset`. With the preload on Chez, as the recipe sets it, an
+>   overrun through each of the three entry points was reported, naming the
+>   shim function.
+> - **Every probe that said otherwise had launched
+>   `DYLD_INSERT_LIBRARIES=… timeout N chez …`**, the trap the 2026-09-27
+>   amendment records. ASan loaded into `timeout`, and the `verbosity=1`
+>   banner that three of the four runs took as their witness came from
+>   `timeout`'s process. Re-run that way, the same probe printed a
+>   banner whose PID was not Chez's, and no report. The real `uv-spawn!`
+>   overflow those probes "missed" is reported once ASan is in Chez:
+>   `0 bytes after 196-byte region`, in `chez_uv_copy_in`.
+>
+> **Check.** `make check-memory-gate` gains a `shim-overrun` mode on both
+> platforms. `copy-in!` writes one byte past a 19-byte block, and the
+> report must name both the block and `chez_uv_copy_in`. On macOS it is
+> the mode that notices if the shim's copies stop reaching libc: with
+> `chez_uv_copy_in` rewritten as a C loop, it goes vacuous while the
+> `memset` mode still passes. On Linux, Valgrind sees the loop too, so
+> there the mode keeps the planted program honest on every CI run.
+>
+> **Not adopted: `-D_FORTIFY_SOURCE=0` for the dev shim**, the fix the
+> report proposed. It changes nothing ASan can see: the shim then imports
+> `memcpy` and `bzero`, both intercepted, and all three entry points are
+> still reported. The prod shim (`-O2`) already imports plain `memcpy` and
+> `bzero`. Evidence: `.plans/memory-gate-mutation-log.md`, "The shim's own
+> copies (2026-10-06)".

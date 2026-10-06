@@ -148,9 +148,10 @@ at all about leaks
 ([ADR-0003](../.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md)).
 It sees less than you might expect about everything else, too. Chez's
 generated code is not instrumented, so ASan checks only what passes
-through libc and the allocator: an overrun inside `memcpy` or `memset`, a
-double or invalid `free`. A Scheme `foreign-set!` one byte past a block,
-or a `foreign-ref` of freed memory, gets past it; Valgrind catches both.
+through libc and the allocator: an overrun inside `memcpy` or `memset`
+(the C shim's bulk copies included), a double or invalid `free`. A Scheme
+`foreign-set!` one byte past a block, or a `foreign-ref` of freed memory,
+gets past it; Valgrind catches both.
 The Linux leg sets `UV_USE_IO_URING=0`: some CI kernels reject `io_uring`
 setup calls that Valgrind's syscall emulation does not model, which
 produces failures that have nothing to do with this binding. That is an
@@ -165,15 +166,19 @@ proves the memory gate can still fail. It plants real defects
 (`tests/memory-gate-sabotage.sps`), runs `make test-memory` on each, and
 passes only if the gate fails *and* the log carries the tool's own report
 of that defect. On Linux the defects are a one-byte overrun by a Scheme
-store, the same by `memset`, and a definite leak. On macOS only the
-`memset` overrun applies, because ASan cannot see the others. On Linux it
-also plants a block that only a pointer into its middle reaches, which
-Valgrind counts as "possibly lost". The gate may pass on that block, but
-it must never fail on it without printing the block's loss record. CI and
-`make test-memory-docker` run it before the memory gate. Run it yourself
-after touching either `test-memory` recipe. Both arms once passed while
-checking nothing: Valgrind was handed `timeout(1)` instead of Chez, and
-the ASan preload was lost on its way through `sh -c`.
+store, the same by `memset`, the same by the binding's own bulk copy
+(`copy-in!`, one `memcpy` in the C shim), and a definite leak. On macOS
+the `memset` and `copy-in!` overruns apply, because ASan cannot see the
+others. The `copy-in!` report must also name the shim function that made
+the overrun. On Linux it also plants a block that only a pointer into its
+middle reaches, which Valgrind counts as "possibly lost". The gate may
+pass on that block, but it must never fail on it without printing the
+block's loss record. CI and `make test-memory-docker` run it before the
+memory gate. Run it yourself after touching either `test-memory` recipe,
+and on macOS after touching the shim's copies: only the macOS arm can lose
+sight of them, which happens if they stop going through libc. Both arms
+once passed while checking nothing: Valgrind was handed `timeout(1)`
+instead of Chez, and the ASan preload was lost on its way through `sh -c`.
 
 If you develop on macOS, that leaves a real hole: the leak gate you most
 need is the one leg you cannot run. v0.5 measured what it costs — four

@@ -23,6 +23,14 @@
 ;;;   libc-overrun   one byte past a 29-byte foreign block, written by libc's
 ;;;                  memset. Valgrind sees it, and so does ASan's memset
 ;;;                  interceptor, which makes it the macOS arm's witness.
+;;;   shim-overrun   one byte past a 19-byte foreign block, written by the
+;;;                  binding's own bulk copy: copy-in!, which is one memcpy
+;;;                  in src/libuv-shim.c (chez_uv_copy_in). Valgrind sees it.
+;;;                  ASan sees it only because that memcpy ends in libc's,
+;;;                  which ASan interposes; a copy that bypassed libc would
+;;;                  be as invisible to it as a Scheme store. The only mode
+;;;                  that loads the binding, at run time, so that the others
+;;;                  stay the programs their reports were measured on.
 ;;;   leak           777 bytes allocated and never freed. Valgrind only; the
 ;;;                  macOS arm makes no leak claim (no LeakSanitizer on arm64).
 ;;;   possible-leak  555 bytes whose only reference is an interior pointer,
@@ -85,6 +93,14 @@
           (p (foreign-alloc 29)))
      (memset p 0 30)
      (foreign-free p)))
+  ((equal? mode "shim-overrun")
+   (let* ((native (environment '(libuv private native)))
+          (alloc-zeroed (eval 'alloc-zeroed native))
+          (copy-in! (eval 'copy-in! native))
+          (free! (eval 'free! native))
+          (p (alloc-zeroed 19)))
+     (copy-in! p (make-bytevector 20 1) 0 20)
+     (free! p)))
   ((equal? mode "leak")
    (foreign-alloc 777))
   ((equal? mode "possible-leak")
@@ -92,7 +108,7 @@
      (bytevector-uint-set! interior-pointer-holder 8 (+ p 8)
                            (native-endianness) (foreign-sizeof 'uptr))))
   (else
-   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, leak or possible-leak\n"
+   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, shim-overrun, leak or possible-leak\n"
             (current-error-port))
    (exit 2)))
 (say "planted")
