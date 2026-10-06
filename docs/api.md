@@ -81,6 +81,19 @@ exit like any other: the loop is torn down, and resuming the engine raises
 | `uv-tcp-keepalive!` | `SO_KEEPALIVE`. `(tcp #f)` disables; `(tcp #t idle-seconds)` enables — the idle delay is in whole seconds and is required (and must be positive) when enabling. `uv_tcp_keepalive` |
 | `uv-tcp-peer-address` | `(values address-string-or-#f port)` for the remote end. `uv_tcp_getpeername` |
 
+**An address is read once, at the start of the call.** `uv-tcp-bind!`,
+`uv-tcp-connect!` and `uv-getnameinfo!` copy the address string and hand
+libuv only the copy, as the C string libuv parses. An address holding a
+NUL is refused (`&uv-invalid-argument`, reason `'address-contains-nul`):
+C reads a string only up to its first NUL, so `"127.0.0.1\x0;anything"`
+would otherwise bind, connect or resolve as `127.0.0.1`. The copy is taken
+in one step that no handler on the calling thread runs inside, so a change
+an engine's timer handler makes to the address during the call is wholly
+in that copy or wholly absent from it. Another thread is not held off: if
+it writes the address while the copy is taken, the copy can hold some of
+those writes and not others. What libuv gets is still checked for a NUL
+and is still one C string, and nothing written after the copy reaches it.
+
 `uv-write!`, `uv-shutdown!`, `uv-read-start!` and `uv-read-stop!` moved to
 `(libuv stream)` in v0.3 (below); `(libuv tcp)` re-exports all four
 unchanged, so existing importers compile without touching an import line.
@@ -463,10 +476,13 @@ behaviours worth knowing before the design spec:
   call.** `node`, `service` and `hints` are checked as they are copied, and
   the request is built from the copies. A change made to them while the
   call runs — from an engine's timer handler, say, or another thread — is
-  either seen by that check or not seen at all.
-- **IPv6 scope IDs are dropped**
+  either seen by that check or not seen at all. `uv-getnameinfo!` reads
+  its address the same way (TCP, above).
+- **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**
   ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
   link-local result renders as `"fe80::1"` with its zone silently absent.
+  `uv-getnameinfo!`'s host is the system resolver's own rendering, which
+  on macOS and glibc names a link-local address's zone: `"fe80::1%lo0"`.
 - **Teardown cancels, then drains.** `uv-loop-teardown!` best-effort-cancels
   the loop's in-flight DNS requests before its close sweep, and every
   in-flight `on-complete` runs before teardown returns — with

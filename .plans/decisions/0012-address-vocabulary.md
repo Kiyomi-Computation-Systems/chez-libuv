@@ -73,6 +73,20 @@ results speak the same terms back.
 > duplication. The vocabulary itself is unchanged; the citation above is
 > where the definitions sat when this was accepted.
 
+> **Amended 2026-10-06 (address strings).** `require-address` became
+> `validate-address`, which answers the address as the C string libuv
+> parses: its UTF-8 and one terminating NUL, encoded from a copy taken with
+> interrupts disabled. An address holding a NUL is refused with
+> `'address-contains-nul`, because C reads a string only up to its first
+> NUL. Before this, `"127.0.0.1\x0;anything"` passed the string check and
+> parsed as `127.0.0.1`: the prefix resolution the v0.2 design refused for
+> node names. `fill-sockaddr!` now takes those bytes, passes them to
+> `uv_ip4_addr` and `uv_ip6_addr` as `u8*`, and refuses anything that is
+> not one C string. The vocabulary is unchanged: an address is still a
+> presentation-form string, and libuv still does all the parsing.
+> [ADR-0009](0009-copy-at-the-boundary.md) has the rule;
+> `.plans/address-snapshot-mutation-log.md` has the evidence.
+
 ## Consequences
 
 - `uv-addrinfo-address`/`uv-addrinfo-port` compose directly with
@@ -82,6 +96,12 @@ results speak the same terms back.
 - Strings are immutable Scheme values, so ADR-0009 is satisfied trivially at
   this surface: no foreign lifetime ever attaches to a result, and nothing a
   callback stores can dangle.
+  *(Corrected 2026-10-06: Chez strings are mutable, by `string-set!` and
+  `string-truncate!`. The conclusion holds for results only, because each
+  is a fresh copy the binding never reads again (ADR-0009's copy-out). An
+  address handed in can change during the call, so it is copied once
+  before C sees it: the 2026-10-06 amendment above, and ADR-0009's
+  2026-10-06 bullet.)*
 - A future `uv-tcp-getsockname` sibling (address and port, beside the v0.1
   port-only accessor) needs no new vocabulary decision. That sibling is
   explicitly **not** scoped into v0.2; this ADR only guarantees that when it

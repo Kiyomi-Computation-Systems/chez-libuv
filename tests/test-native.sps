@@ -1583,11 +1583,17 @@
 
 ;; Round trip, hermetic (no resolver): uv_ip4_addr parses the text into a
 ;; real sockaddr_in, uv_ip_name renders it back. Expecting the dotted quad
-;; itself means only the genuine parse-then-render path can pass.
+;; itself means only the genuine parse-then-render path can pass. The parse
+;; runs inside the row, so a fill-sockaddr! that refuses good bytes fails
+;; this row by name instead of aborting the suite.
 (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-  (fill-sockaddr! addr "127.0.0.1" 8080 'test-sockaddr-round-trip)
   (test-equal "sockaddr->address-string renders back the dotted quad uv_ip4_addr parsed"
-    "127.0.0.1" (sockaddr->address-string addr))
+    "127.0.0.1"
+    (guard (e ((uv-invalid-argument? e)
+               (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+              (#t (list 'wrong-condition (describe e))))
+      (fill-sockaddr! addr (string->utf8 "127.0.0.1\x0;") 8080 'test-sockaddr-round-trip)
+      (sockaddr->address-string addr)))
   (free! addr))
 
 ;; The nonzero-rc arm: a zeroed sockaddr_storage carries sa_family 0
@@ -1600,26 +1606,79 @@
     (or (sockaddr->address-string addr) 'refused-family))
   (free! addr))
 
-;; --- require-address / require-port (post-v0.2 lift) --------------------
+;; --- validate-address / require-port (post-v0.2 lift) -------------------
 ;; The ADR-0012 input vocabulary's validators, asserted at their shared
 ;; home: tcp.sls and dns.sls both import THIS copy, so these rows pin the
 ;; semantics every verb boundary observes. `who` is a symbol no real
 ;; caller passes: each raise must name the caller handed in, not the
 ;; helper or a baked-in verb name.
-(test-equal "require-address refuses a non-string, naming its caller and why"
+(test-equal "validate-address refuses a non-string, naming its caller and why"
   '(test-lift address-not-a-string)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             (#t 'wrong-condition))
-    (require-address 42 'test-lift)
+    (validate-address 42 'test-lift)
     'no-raise))
 
-;; Address-ness here is string?-ness BY DESIGN: parse refusal is
-;; fill-sockaddr!'s job (spike FINDINGS Q3), so a validator tightened to
-;; pre-parse would fail this row by name.
-(test-equal "require-address accepts a string it cannot parse (parsing is fill-sockaddr!'s job)"
-  'accepted
-  (begin (require-address "not-an-ip" 'test-lift) 'accepted))
+;; C reads an address only up to its first NUL, so "127.0.0.1\x0;x" would
+;; parse as 127.0.0.1 (tests/test-address.sps has the verbs' rows).
+(test-equal "validate-address refuses a string holding a NUL, naming its caller and why"
+  '((test-lift address-contains-nul) (test-lift address-contains-nul))
+  (map (lambda (ip)
+         (guard (e ((uv-invalid-argument? e)
+                    (list (uv-invalid-argument-who e)
+                          (uv-invalid-argument-reason e)))
+                   (#t 'wrong-condition))
+           (validate-address ip 'test-lift)
+           'no-raise))
+       '("127.0.0.1\x0;x" "\x0;")))
+
+;; Address-ness here is C-string-ness, a string holding no NUL, BY DESIGN:
+;; parse refusal is fill-sockaddr!'s job (spike FINDINGS Q3), so a validator
+;; tightened to pre-parse would fail this row by name. What it answers is
+;; the string's C string, the bytes libuv parses: UTF-8 and one terminating
+;; NUL.
+(test-equal "validate-address answers a string it cannot parse as that string's C string (parsing is fill-sockaddr!'s job)"
+  (list (string->utf8 "not-an-ip\x0;") (u8-list->bytevector '(120 206 187 0)))
+  (list (validate-address "not-an-ip" 'test-lift)
+        (validate-address "x\x3bb;" 'test-lift)))
+
+;; --- fill-sockaddr!'s address ---------------------------------------------
+;; libuv reads it as a C string, so fill-sockaddr! takes the bytes and
+;; refuses any that are not one C string: one NUL, the last byte. A NUL
+;; inside is the case a missing check would let through: libuv would parse
+;; "127.0.0.1" and the row would carry that parse instead of the refusal.
+(define (fill-sockaddr-answer ip)
+  (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+    (let ((answer
+           (guard (e ((uv-invalid-argument? e)
+                      (list (uv-invalid-argument-who e)
+                            (uv-invalid-argument-reason e)))
+                     (#t (list 'wrong-condition (describe e))))
+             (fill-sockaddr! addr ip 8080 'test-fill)
+             (list 'parsed (sockaddr->address-string addr)))))
+      (free! addr)
+      answer)))
+
+(test-equal "fill-sockaddr! refuses an address that is not one C string, before calling libuv"
+  '((uv-fill-sockaddr! not-a-c-string)    ; a NUL inside, then the terminator
+    (uv-fill-sockaddr! not-a-c-string)    ; no terminator
+    (uv-fill-sockaddr! not-a-c-string)    ; empty: no terminator either
+    (uv-fill-sockaddr! not-a-c-string))   ; a string, not its bytes
+  (map fill-sockaddr-answer
+       (list (string->utf8 "127.0.0.1\x0;9\x0;")
+             (string->utf8 "127.0.0.1")
+             (u8-list->bytevector '())
+             "127.0.0.1")))
+
+;; The other side: C strings reach libuv, IPv4 and IPv6 alike, and a parse
+;; refusal names the caller handed in.
+(test-equal "fill-sockaddr! passes C strings through to libuv"
+  '((parsed "127.0.0.1") (parsed "::1") (test-fill bad-address))
+  (map fill-sockaddr-answer
+       (list (string->utf8 "127.0.0.1\x0;")
+             (string->utf8 "::1\x0;")
+             (string->utf8 "not-an-ip\x0;"))))
 
 (test-equal "require-port refuses 65536, naming its caller and why"
   '(test-lift port-out-of-range)

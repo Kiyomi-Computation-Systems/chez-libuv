@@ -152,29 +152,31 @@
       ((loop ip port flags on-complete)
        (start-getnameinfo! loop ip port flags on-complete))))
 
+  ;; The address is read once, by validate-address, and libuv parses that
+  ;; copy (tests/test-address.sps).
   (define (start-getnameinfo! loop ip port flags on-complete)
     (require-open-loop loop 'uv-getnameinfo!)
-    (require-address ip 'uv-getnameinfo!)
-    (require-port port 'uv-getnameinfo!)
-    (let ((flags-int (nameinfo-flag-symbols->int flags)))
-      (unless (procedure? on-complete)
-        (raise (make-uv-invalid-argument 'uv-getnameinfo!
-                                         'on-complete-not-a-procedure)))
-      (let* ((addr-offset (align-16 (uv-req-size (uv-getnameinfo-req-type))))
-             (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
-             (addr (+ block addr-offset)))
-        (guard (e (#t (free! block) (raise e)))
-          (fill-sockaddr! addr ip port 'uv-getnameinfo!))
-        (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete)))
-          (registry-register! block 'getnameinfo-req loop req)
-          (count-getnameinfo-req-new!)
-          (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
-                        (raise e)))
-            (uv-check (uv-getnameinfo-native
-                       (loop-pointer loop 'uv-getnameinfo!)
-                       block addr flags-int)
-                      'uv-getnameinfo!))
-          req))))
+    (let ((ip-bytes (validate-address ip 'uv-getnameinfo!)))
+      (require-port port 'uv-getnameinfo!)
+      (let ((flags-int (nameinfo-flag-symbols->int flags)))
+        (unless (procedure? on-complete)
+          (raise (make-uv-invalid-argument 'uv-getnameinfo!
+                                           'on-complete-not-a-procedure)))
+        (let* ((addr-offset (align-16 (uv-req-size (uv-getnameinfo-req-type))))
+               (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
+               (addr (+ block addr-offset)))
+          (guard (e (#t (free! block) (raise e)))
+            (fill-sockaddr! addr ip-bytes port 'uv-getnameinfo!))
+          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete)))
+            (registry-register! block 'getnameinfo-req loop req)
+            (count-getnameinfo-req-new!)
+            (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
+                          (raise e)))
+              (uv-check (uv-getnameinfo-native
+                         (loop-pointer loop 'uv-getnameinfo!)
+                         block addr flags-int)
+                        'uv-getnameinfo!))
+            req)))))
 
   ;; uv-cancel! : uv-dns-request -> boolean
   ;; A true result means cancellation won, but the completion callback still

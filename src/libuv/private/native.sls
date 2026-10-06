@@ -43,7 +43,6 @@
           uv-write-native uv-shutdown-native
           uv-read-start-native uv-read-stop uv-handle-set-data alloc-cb-entry
           uv-stream-get-write-queue-size-native
-          uv-ip4-addr uv-ip6-addr
 
           ;; DNS
           uv-getaddrinfo-native uv-getnameinfo-native
@@ -52,7 +51,7 @@
 
           ;; shared validators and boundary helpers
           fill-sockaddr! align-16
-          require-address require-port
+          validate-address require-port
           require-callback
           signal-symbol->int term-signal->value
 
@@ -107,7 +106,8 @@
                 get-thread-id)
           (libuv private config)
           (libuv private conditions)
-          (libuv private constants))
+          (libuv private constants)
+          (only (libuv private c-string) c-string-bytes c-string?))
 
   ;; resolve-shim-path : string (or string #f) [procedure] -> string
   ;; Accept an absolute regular file only; never search the working directory.
@@ -358,10 +358,14 @@
     (foreign-procedure "uv_tcp_keepalive" (uptr int unsigned-int) int))
   (define uv-accept
     (foreign-procedure "uv_accept" (uptr uptr) int))
-  (define uv-ip4-addr
-    (foreign-procedure "uv_ip4_addr" (string int uptr) int))
-  (define uv-ip6-addr
-    (foreign-procedure "uv_ip6_addr" (string int uptr) int))
+  ;; The address is u8*, not string: Chez's string argument encodes the
+  ;; caller's string during the call, and an engine's handler or another
+  ;; thread can change it after validation (tests/test-address.sps). Plain,
+  ;; not __collect_safe, so no collection moves the bytes during the call.
+  (define raw-ip4-addr
+    (foreign-procedure "uv_ip4_addr" (u8* int uptr) int))
+  (define raw-ip6-addr
+    (foreign-procedure "uv_ip6_addr" (u8* int uptr) int))
 
   (define raw-listen
     (foreign-procedure "uv_listen" (uptr int uptr) int))
@@ -644,19 +648,32 @@
       (raw-copy-out bv src len)
       bv))
 
-  ;; fill-sockaddr! : uptr string exact-nonnegative-integer symbol -> unspecified
-  ;; Try IPv4 then IPv6; neither parser retains the input string.
+  ;; fill-sockaddr! : uptr bytevector exact-nonnegative-integer symbol
+  ;;                  -> unspecified
+  ;; Parse IP, the bytes validate-address answered, into ADDR: IPv4, then
+  ;; IPv6, both from the same bytes. libuv reads them as a C string, so they
+  ;; must be one: a bytevector whose only NUL is its last byte. Neither
+  ;; parser retains them.
   (define (fill-sockaddr! addr ip port who)
-    (unless (or (zero? (uv-ip4-addr ip port addr))
-                (zero? (uv-ip6-addr ip port addr)))
+    (unless (c-string? ip)
+      (raise (make-uv-invalid-argument 'uv-fill-sockaddr! 'not-a-c-string)))
+    (unless (or (zero? (raw-ip4-addr ip port addr))
+                (zero? (raw-ip6-addr ip port addr)))
       (raise (make-uv-invalid-argument who 'bad-address))))
 
   ;; align-16 : exact-nonnegative-integer -> exact-nonnegative-integer
   (define (align-16 n) (* 16 (div (+ n 15) 16)))
 
-  (define (require-address ip who)
+  ;; validate-address : object symbol -> bytevector
+  ;; IP as the bytes libuv parses (c-string-bytes): a refusal unless it is a
+  ;; string holding no NUL, which C would read as its end. The address verbs
+  ;; hand libuv only these bytes, so the caller's string is read once, here,
+  ;; and a change to it during the call reaches nothing. Parsing is
+  ;; fill-sockaddr!'s job.
+  (define (validate-address ip who)
     (unless (string? ip)
-      (raise (make-uv-invalid-argument who 'address-not-a-string))))
+      (raise (make-uv-invalid-argument who 'address-not-a-string)))
+    (c-string-bytes ip who 'address-contains-nul))
 
   (define (require-port port who)
     (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
@@ -947,14 +964,7 @@
                      node service hints-ptr))
 
   (define (c-string-or-false? x)
-    (or (not x)
-        (and (bytevector? x)
-             (let ((last (- (bytevector-length x) 1)))
-               (and (>= last 0)
-                    (let scan ((i 0))
-                      (cond ((= i last) (zero? (bytevector-u8-ref x i)))
-                            ((zero? (bytevector-u8-ref x i)) #f)
-                            (else (scan (+ i 1))))))))))
+    (or (not x) (c-string? x)))
 
   ;; uv-getnameinfo-native : uptr uptr uptr exact-integer -> exact-integer
   (define (uv-getnameinfo-native loop-ptr req-ptr addr-ptr flags)

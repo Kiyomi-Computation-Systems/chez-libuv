@@ -929,7 +929,8 @@
 
 (define (make-synthetic-sockaddr ip port)
   (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-    (fill-sockaddr! addr ip port 'test-dns-synthetic)
+    (fill-sockaddr! addr (string->utf8 (string-append ip "\x0;")) port
+                    'test-dns-synthetic)
     addr))
 
 ;; k1: the skip policy. A non-INET entry (family AF_UNSPEC -- a value the
@@ -1446,8 +1447,8 @@
                                'not-a-procedure))))
 
 ;; The PRE-REGISTRATION guard (S5.5; S9's relabeled garbage-address row):
-;; "not-an-ip" passes require-address (it IS a string) and fails inside
-;; fill-sockaddr! AFTER the block is allocated, BEFORE anything is
+;; "not-an-ip" passes validate-address (it IS a string, with no NUL) and fails
+;; inside fill-sockaddr! AFTER the block is allocated, BEFORE anything is
 ;; registered or counted -- the guard's undo is exactly one free. Driven
 ;; through the THREE-argument arity, so the flags-omitted => '() spelling
 ;; reaches the native boundary logic without any resolver consultation.
