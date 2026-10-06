@@ -76,9 +76,16 @@ constructor mutates the registry before a handle exists to check.
 >   then fails with `'EBUSY`.
 > - `call-with-uv-loop` still tears its own loop down on the way out. It
 >   clears the mark first, but only one this thread left. That is safe
->   there because its entry check refuses every return into the body once
->   the loop is gone. A loop another thread is running keeps its mark, and
->   the teardown refuses it.
+>   there because its entry check refuses every return into a body that has
+>   been left. A loop another thread is running keeps its mark, and the
+>   teardown refuses it.
+> - When the body leaves from inside a callback, that teardown can fail:
+>   escaping one close callback strands the rest of libuv's batch, and
+>   `uv_loop_close` answers `EBUSY`. v0.7.3 raised that in the middle of the
+>   escape, and an engine suspended there ended in "no engine active" with
+>   its continuation lost. Now the exit contains the failure and leaves the
+>   loop marked running. The body runs once, so re-entry is refused even
+>   though the loop is still open (PR #46's review).
 >
 > Dropping the `dynamic-wind` also saves 112 of the 128 B an idle `uv-run`
 > allocated. `tests/test-loop.sps` holds the mark, the refusals and both

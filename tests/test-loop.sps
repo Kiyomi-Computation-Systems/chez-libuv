@@ -52,8 +52,10 @@
         (only (uv-evidence) live-count describe)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
-        ;; make-engine suspends a run inside a callback (#45).
-        (only (chezscheme) collect sleep make-time make-engine))
+        ;; make-engine suspends a run inside a callback (#45); getenv and
+        ;; open-process-ports run tests/stranded-exit-child.sps.
+        (only (chezscheme) collect sleep make-time make-engine
+              getenv open-process-ports))
 
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
@@ -1439,6 +1441,59 @@
 
 (test-equal "the forged run's loop tears down once the suite takes it back"
   'torn-down (tear-down-row-loop foreign-run-loop))
+
+;; --- an exit whose teardown libuv cannot finish (#46's review) ----------
+;; Left from inside one close callback while another close waits in libuv's
+;; batch, the exit's teardown cannot close the loop: libuv walks that batch
+;; from a list it has already detached, so the other close never finishes.
+;; The exit contains that failure instead of raising it in the middle of the
+;; escape or the engine's suspension, leaves the loop marked running, as any
+;; abandoned run is, and refuses every return into the body. The loop stays
+;; allocated for good, so tests/stranded-exit-child.sps runs the scenario in
+;; a process of its own, which the memory gate does not follow, and this
+;; suite checks the datum it prints.
+(define chez-for-children (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+
+(define stranded-report
+  (if (not chez-for-children)
+      'no-chez
+      (guard (e (#t (list 'spawn-failed (describe e))))
+        (let-values (((to-child from-child errors pid)
+                      (open-process-ports
+                       (string-append chez-for-children
+                                      " --program tests/stranded-exit-child.sps")
+                       (buffer-mode block) (native-transcoder))))
+          (close-port to-child)
+          (let* ((out (get-string-all from-child))
+                 (err (get-string-all errors)))
+            (close-port from-child)
+            (close-port errors)
+            (let ((datum (guard (e (#t #f)) (read (open-string-input-port out)))))
+              (if (list? datum) datum (list 'unreadable out err))))))))
+
+;; stranded : symbol -> object, one entry of the child's report.
+(define (stranded key)
+  (let ((entry (and (list? stranded-report) (assq key stranded-report))))
+    (if entry (cdr entry) (list 'no-entry key stranded-report))))
+
+(if (eq? stranded-report 'no-chez)
+    (test-equal "stranded-exit rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (begin
+      (test-equal "seed: the child's engine ran out of fuel inside the close callback"
+        #t (stranded 'engine-in-close))
+      (test-equal "an escape out of a close callback, with another close pending, keeps its value"
+        'escaped (stranded 'escape))
+      (test-equal "...leaves the loop marked running, since libuv cannot finish closing it"
+        'running (stranded 'escape-marked))
+      (test-equal "...and refuses a return into the body"
+        '(refused loop) (stranded 'reentry))
+      (test-equal "an engine suspended there expires instead of failing mid-suspension"
+        'expired (stranded 'engine))
+      (test-equal "...leaves its loop marked running"
+        'running (stranded 'engine-marked))
+      (test-equal "...and its resume is refused like any other return into the body"
+        '(refused loop) (stranded 'engine-resume))))
 
 ;; --- balance ------------------------------------------------------------
 ;; l0, other-loop, policy-loop and false-loop are still open at this point;

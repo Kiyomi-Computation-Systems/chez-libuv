@@ -173,25 +173,34 @@
                           "loop still had work after the drain bound")))))))))
 
   ;; call-with-uv-loop : (uv-loop -> object) -> object
-  ;; The before thunk rejects continuation re-entry after teardown. The after
-  ;; thunk tears the loop down however the body left, including from inside
-  ;; one of the loop's callbacks, by a continuation or an engine's
-  ;; suspension, which leaves the loop marked running by this thread (#45).
-  ;; It clears that mark first. That is safe here because the before thunk
-  ;; refuses every return into the body once the loop is gone, so nothing
-  ;; resumes the run the teardown ends. A loop marked running by another
-  ;; thread is live under that thread's uv_run: its mark stays, and the
-  ;; teardown refuses it.
+  ;; The body runs once: the before thunk refuses every return into it after
+  ;; it has been left, whatever became of the loop. The after thunk tears the
+  ;; loop down however the body left.
+  ;; - A body left from inside one of the loop's callbacks, by a continuation
+  ;;   or an engine's suspension, leaves the loop marked running by this
+  ;;   thread (#45). The after thunk clears that mark first, which is safe
+  ;;   because nothing can resume the run the teardown ends.
+  ;; - That teardown can fail: escaping one close callback strands the rest
+  ;;   of libuv's batch of closes, and the loop cannot be closed. The failure
+  ;;   is contained rather than raised in the middle of the escape or the
+  ;;   suspension, and the loop stays marked running, as any abandoned run
+  ;;   is, so no verb touches it.
+  ;; - A loop marked running by another thread is live under that thread's
+  ;;   uv_run: its mark stays, and the teardown refuses it, as from any exit.
   (define (call-with-uv-loop proc)
-    (let ((loop (make-uv-loop)))
+    (let ((loop (make-uv-loop)) (left #f))
       (dynamic-wind
        (lambda ()
-         (unless (loop-open? loop)
+         (when left
            (raise (make-uv-handle-closed 'loop))))
        (lambda () (proc loop))
        (lambda ()
+         (set! left #t)
          (when (loop-open? loop)
-           (when (and (loop-running? loop)
-                      (eqv? (loop-owner-thread loop) (current-thread-id)))
-             (set-loop-running! loop #f))
-           (uv-loop-teardown! loop)))))))
+           (if (and (loop-running? loop)
+                    (eqv? (loop-owner-thread loop) (current-thread-id)))
+               (begin
+                 (set-loop-running! loop #f)
+                 (guard (e (#t (set-loop-running! loop #t)))
+                   (uv-loop-teardown! loop)))
+               (uv-loop-teardown! loop))))))))

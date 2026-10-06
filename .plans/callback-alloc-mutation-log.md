@@ -201,8 +201,10 @@ Each mutation was applied to a fresh copy of `src/` by exact text
 replacement. The harness aborts unless the target occurs once, re-checks the
 edit, then runs the owning suites against the copy. A mutation counts as
 caught only if every expected row fails by name. The final sweep, on the
-tree after the review fixes, caught 36 of 39 by name; M14, M27 and M28 are
-recorded as uncovered below.
+tree after the review fixes, caught 39 of 42 by name; M14, M27 and M28 are
+recorded as uncovered below. The harness exports `CHEZ_LIBUV_TEST_CHEZ`, as
+`make test` does, so the rows that read tests/stranded-exit-child.sps run
+instead of skipping.
 
 | id | mutation | caught by |
 |---|---|---|
@@ -222,15 +224,18 @@ recorded as uncovered below.
 | M15 | the seam contains nothing | test-timer: the re-raised condition satisfies `uv-callback-error?`; the callback-error's cause is the original condition object |
 | M16 | `uv-run` sets and clears the mark in a `dynamic-wind` again | a uv-run with nothing to do; the six running-mark rows of test-loop |
 | M17 | `uv-run` never clears the mark | uv-run leaves the running flag clear after it returns |
-| M18 | `call-with-uv-loop` does not clear its own thread's mark | a continuation that escapes a callback leaves call-with-uv-loop with its value; ...and call-with-uv-loop tore its loop down on the way out |
+| M18 | `call-with-uv-loop` does not clear its own thread's mark | ...and call-with-uv-loop tore its loop down on the way out; an engine suspended in a callback does not keep call-with-uv-loop's loop |
 | M19 | `call-with-uv-loop` clears any mark, whoever left it | call-with-uv-loop's exit refuses a loop another thread is running; ...and leaves that thread's mark in place |
-| M20 | `call-with-uv-loop` skips the teardown of a loop marked running | ...tore its loop down on the way out; an engine suspended in a callback does not keep call-with-uv-loop's loop; ...and resuming it is refused like any other return into the body |
+| M20 | `call-with-uv-loop` skips the teardown of a loop marked running | ...tore its loop down on the way out; an engine suspended in a callback does not keep call-with-uv-loop's loop |
 | M21a–e | `uv-write!` on a refusal: (a) leaves the request registered, (b) does not uncount it, (c) raises as another verb, (d) returns instead of raising; (e) guards its native start again | (a–d) a uv-write! libuv refuses raises its errno as uv-write! and leaves no request; (e) a uv-write! of 16 bytes, the call alone |
 | M22a–e | the same for `uv-write*!` | the matching uv-write*! rows |
 | M23a, c–e | the same for `uv-shutdown!`, which counts nothing | the matching uv-shutdown! rows |
 | M24 | `close-dispatch` marks the handle closed after `on-close` | ...and marked it closed before its on-close raised |
 | M25 | `complete-request!` zeroes the request after `on-complete` | ...and the request was deregistered and zeroed before on-complete raised |
 | M26 | `exit-dispatch` marks the process exited after `on-exit` | the record was marked exited before on-exit raised |
+| M29 | `call-with-uv-loop` raises a failed teardown in the middle of the exit | an escape out of a close callback, with another close pending, keeps its value; an engine suspended there expires instead of failing mid-suspension |
+| M30 | `call-with-uv-loop` admits a return into the body while the loop is open | ...and refuses a return into the body; ...and its resume is refused like any other return into the body |
+| M31 | `call-with-uv-loop` leaves a loop it could not tear down unmarked | ...leaves the loop marked running, since libuv cannot finish closing it; ...leaves its loop marked running |
 
 Notes on individual mutations:
 
@@ -244,6 +249,10 @@ Notes on individual mutations:
   were fixed and re-run, and each is caught by its row.
 - **M15** fails its two named rows and then kills the suite at the next
   uncontained raise, which is spike Q2's process death.
+- **M18 and M20** each lost one expected row when the exit's fix landed.
+  With the teardown contained, M18's escape still keeps its value. With the
+  body running once, M20's resume is refused whether or not the teardown
+  ran. Each is still caught by its other rows, and M30 now owns re-entry.
 - After the review fixes changed the dispatchers' text, the targets became
   short substrings of the code (a call, not the call and its closing
   parentheses), so a mutation keeps its parentheses balanced by
@@ -268,15 +277,43 @@ Notes on individual mutations:
 
 ## Review fixes
 
-PR #46's /code-review (high) reported eight findings. Five were fixed here.
-The other three were left as they are:
+PR #46's /code-review (high) reported eight findings. Six were fixed here.
+The other two were left as they are:
 
 - the write block that leaks when `copy-in!` refuses a span (a follow-up
   task);
-- `call-with-uv-loop`'s exit re-entering `uv_run` under a suspended frame,
-  as v0.7.3 did;
 - an abandoned escape leaving its loop marked running, which is the
   documented contract.
+
+**An exit whose teardown libuv cannot finish.** The body leaves from inside
+one close callback while a second close waits in libuv's batch. The exit's
+teardown cannot close the loop, because libuv walks that batch from a list
+it has already detached. Measured on the branch and on v0.7.3 alike:
+
+- a continuation's escape was replaced by `EBUSY` from `uv-loop-close!`;
+- an engine suspended there ended in "no engine active", and its
+  continuation was lost;
+- had the body been re-entered, the entry check would have admitted it,
+  since the loop was still open, into a half-torn-down loop.
+
+Now the exit contains the failure, leaves the loop marked running as any
+abandoned run is, and runs the body once: a `left` flag refuses every
+re-entry, whatever became of the loop. The stranded loop and handle stay
+allocated, as before: libuv cannot finish that iteration.
+
+The scenario leaks by nature, so tests/stranded-exit-child.sps runs it in a
+child process, which the memory gate does not follow. Valgrind runs with
+`--trace-children=no`, and on macOS the ASan preload never reaches a child
+launched through `/bin/sh`, because SIP purges it. test-loop
+checks the datum the child prints:
+
+- red on the tree before the fix: six rows by name;
+- green after it;
+- each of M29 to M31 is caught by the rows named for it.
+
+The child escapes again through its own continuation as soon as a return
+gets in, so even a regressed build never hands control back to libuv's
+abandoned frame.
 
 **One registry lookup per callback.** The seam looked the pointer up
 (`registry-loop-of`), and then each dispatcher looked it up again
