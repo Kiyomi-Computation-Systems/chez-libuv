@@ -45,10 +45,12 @@
         ;; copied bytes are observable without a read on the other end.
         ;; uv-buf-set! seeds a scratch uv_buf_t for the alloc-dispatcher rows,
         ;; which is the only way to observe what alloc_cb hands libuv back.
+        ;; shim-compiled-version tells the reuseport row which answer is right.
         (only (libuv private native)
               live-counts alloc-zeroed free! count-read-buffer-new!
               dispatcher-ref
-              uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-out)
+              uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-out
+              shim-compiled-version)
         ;; uv-eof and errno-symbol->value are read from the SHIM's table, not
         ;; transcribed (ADR-0005): the read dispatcher's arms are driven with
         ;; the same values libuv would deliver.
@@ -2304,20 +2306,28 @@
 ;;                succeeds -- recorded informationally below).
 ;; A dropped flag would bind plainly and read 'bound on every platform, so the
 ;; same-port duplicate is what makes the supported branch mean "the flag did
-;; something". On the vendored libuv (>= 1.49.0, Linux CI) that branch runs;
-;; on an older SYSTEM libuv this binding otherwise supports, uv-tcp-reuseport
-;; raises &uv-constant-unavailable at the point of use instead (ADR-0005, the
-;; lazy constant-ref path -- pinned by test-native's bogus-name row, not
-;; reachable here). Flags resolve to a bitmask before any allocation, so the
-;; two malformed-flags rows leave nothing behind.
+;; something". On the vendored libuv (>= 1.49.0) that branch runs. On an older
+;; SYSTEM libuv this binding otherwise supports, the shim was compiled without
+;; the flag (libuv-shim.c gates UV_TCP_REUSEPORT on UV_VERSION_HEX), and
+;; uv-tcp-reuseport raises &uv-constant-unavailable naming it at the point of
+;; use (ADR-0005's lazy constant-ref path). CI's pkg-config leg runs exactly
+;; that: Ubuntu 24.04's libuv is 1.48. So the row asks the shim which libuv it
+;; was compiled against, and below 1.49 only the named refusal passes, never a
+;; plain bind with the flag dropped. Flags resolve to a bitmask before any
+;; allocation, so the two malformed-flags rows leave nothing behind.
 (define rp-loop (make-uv-loop))
 (define rp-a (make-uv-tcp rp-loop))
 
 (define rp-flagged-bind
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+            ((uv-constant-unavailable? e)
+             (list 'constant-unavailable (uv-constant-unavailable-name e)))
             (#t (list 'wrong-condition e)))
     (uv-tcp-bind! rp-a "127.0.0.1" 0 '(reuseport))
     'bound))
+
+;; UV_TCP_REUSEPORT arrived in libuv 1.49.0.
+(define rp-shim-has-the-flag (>= (shim-compiled-version) #x013100))
 
 ;; Only meaningful on a supporting platform; 'platform-unsupported keeps the
 ;; paired assertion's count stable across platforms either way.
@@ -2329,9 +2339,13 @@
           'bound))
       'platform-unsupported))
 
-(test-equal "uv-tcp-bind! threads '(reuseport): same-port duplicate where supported, else an errno"
+(test-equal "uv-tcp-bind! threads '(reuseport): same-port duplicate where supported, else an errno, or refused by name below libuv 1.49"
   'paired-outcome
-  (cond ((and (eq? rp-flagged-bind 'bound) (eq? rp-second-same-port 'bound))
+  (cond ((not rp-shim-has-the-flag)
+         (if (equal? rp-flagged-bind '(constant-unavailable UV_TCP_REUSEPORT))
+             'paired-outcome
+             (list 'unpaired-below-1.49 rp-flagged-bind)))
+        ((and (eq? rp-flagged-bind 'bound) (eq? rp-second-same-port 'bound))
          'paired-outcome)
         ((and (symbol? rp-flagged-bind)
               (not (eq? rp-flagged-bind 'bound))
