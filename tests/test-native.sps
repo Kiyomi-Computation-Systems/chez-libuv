@@ -32,7 +32,7 @@
               foreign-sizeof current-directory getenv
               make-engine bytevector-truncate! collect)
         ;; Reaches (libuv private native) only, never handles.sls.
-        (only (uv-evidence) live-count))
+        (only (uv-evidence) live-count describe))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -1102,6 +1102,43 @@
             (#t 'wrong-condition))
     (copy-out 4096 -1)
     'no-raise))
+
+;; --- uv-getaddrinfo-native's node and service ----------------------------
+;; libuv reads each as a C string, with strlen and then a copy, so the
+;; wrapper takes the bytes and refuses any that are not one C string: one
+;; NUL, the last byte. The request pointer here is NULL, which libuv answers
+;; with UV_EINVAL before it reads anything else (getaddrinfo.c), so a
+;; wrapper that skipped its check would answer that errno instead.
+(define (getaddrinfo-native-answer node service)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+            (#t (list 'wrong-condition (describe e))))
+    (list 'returned (errno->symbol (uv-getaddrinfo-native 0 0 node service 0)))))
+
+(test-equal "uv-getaddrinfo-native refuses a node or service that is not one C string, before calling libuv"
+  '((uv-getaddrinfo-native not-a-c-string)    ; no terminator
+    (uv-getaddrinfo-native not-a-c-string)    ; the service, no terminator
+    (uv-getaddrinfo-native not-a-c-string)    ; a NUL inside
+    (uv-getaddrinfo-native not-a-c-string)    ; the service, a NUL inside
+    (uv-getaddrinfo-native not-a-c-string)    ; empty: no terminator either
+    (uv-getaddrinfo-native not-a-c-string))   ; a string, not its bytes
+  (map (lambda (args) (apply getaddrinfo-native-answer args))
+       (list (list (u8-list->bytevector '(49 50)) #f)
+             (list #f (u8-list->bytevector '(56 48)))
+             (list (u8-list->bytevector '(49 0 50 0)) #f)
+             (list #f (u8-list->bytevector '(56 0 48 0)))
+             (list (u8-list->bytevector '()) #f)
+             (list "127.0.0.1" #f))))
+
+;; The other side: C strings, and #f for NULL, pass the check and reach
+;; libuv, which answers EINVAL for the NULL request.
+(test-equal "uv-getaddrinfo-native passes C strings and #f through to libuv"
+  '((returned EINVAL) (returned EINVAL) (returned EINVAL) (returned EINVAL))
+  (map (lambda (args) (apply getaddrinfo-native-answer args))
+       (list (list (u8-list->bytevector '(49 0)) (u8-list->bytevector '(56 48 0)))
+             (list (u8-list->bytevector '(0)) #f)
+             (list #f (u8-list->bytevector '(56 48 0)))
+             (list #f #f))))
 
 ;; --- bulk, not byte-at-a-time (issue #35) --------------------------------
 ;; copy-in!, copy-out and zero-out! each move their span in ONE call into the
