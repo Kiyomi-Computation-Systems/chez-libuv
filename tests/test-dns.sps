@@ -29,6 +29,8 @@
 ;;; NOT pure: (libuv dns) reaches (libuv private native). Never add this to
 ;;; the Makefile's PURE_TESTS.
 (import (rnrs)
+        (rnrs mutable-pairs)
+        (rnrs mutable-strings)
         (srfi :64)
         (libuv loop)
         (libuv handle)
@@ -59,8 +61,9 @@
               offsetof-addrinfo-ai-protocol offsetof-addrinfo-ai-addr
               offsetof-addrinfo-ai-canonname offsetof-addrinfo-ai-next)
         (uv-testing)
-        (only (uv-evidence) live-count)
-        (only (chezscheme) collect putenv))
+        (only (uv-evidence) live-count describe)
+        ;; make-engine drives the changed-arguments sweeps.
+        (only (chezscheme) collect putenv make-engine))
 
 ;; PIN THE THREADPOOL TO ONE WORKER, before any native/threadpool touch.
 ;; libuv reads UV_THREADPOOL_SIZE exactly once, at the first
@@ -74,6 +77,17 @@
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. The sweep rows
+;; return their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 ;; #f is the worst possible expected value (AGENTS.md), so every err
 ;; observation maps to a symbol: 'no-error for success, the errno symbol
@@ -660,6 +674,215 @@
 (test-equal "boundary: every rejection above allocated and registered nothing"
   (list 0 (+ registry-with-loop 1))   ; loop + probe-timer
   (list (live-count 'getaddrinfo-req) (registry-count)))
+
+;; --- arguments that change during the call -------------------------------
+;; uv-getaddrinfo! validates its node, service and hints, allocates the
+;; request block, writes the hints into it, and passes libuv the node and
+;; service. An engine's timer can expire anywhere in that, and its handler
+;; can change the caller's arguments before the call resumes (so can another
+;; thread). The validators answer copies, and the call allocates and writes
+;; from those alone, so a change is either refused before anything is
+;; allocated or reaches nothing.
+;;
+;; Each sweep runs one lookup in an engine at rising fuel, makes its change
+;; at the first expiry, then resumes the lookup. Fuel 1 expires before the
+;; call checks anything, and the sweep stops at the first run no expiry
+;; reached, whatever that run's verdict, so between them every point in the
+;; call is visited and a broken build fails by name instead of running to
+;; the fuel cap. Each run has one right answer:
+;;   'refused   the call refused the change under its own name, with no
+;;              request left registered or counted;
+;;   'resolved  the change came too late to matter: the request carries the
+;;              hints the call was given, and resolves the node and service
+;;              the call was given;
+;;   'untouched the last run, which no expiry reached.
+;; Anything else is the evidence, a list.
+;;
+;; The first sweep is the leak's. Before the fix, a family turned bogus after
+;; the block existed was refused exactly as one turned bogus before it, but
+;; with the block allocated and unregistered, and nothing freed it. The
+;; request counters count from registration on and never saw that block; the
+;; debug shim's block counter does (live-counts' 'block), so a refused run
+;; must leave it where it found it, and Valgrind reports the block definitely
+;; lost when `make test-memory` runs this suite. The other three fail here by
+;; name on a call that reads its arguments again, as the call did before the
+;; fix: a hints change made with valid values lands in the request's hints,
+;; and a NUL written into the node or the service reaches libuv as a shorter
+;; name.
+(define sweep-max-fuel 400)
+
+(define sweep-hints-tail
+  (list (flags->int '(numeric-host numeric-serv)) (af-inet) (sock-stream) 0))
+
+(define sweep-resolution '((inet "127.0.0.1" 8080 stream)))
+
+;; The hints tail of an in-flight request, read as row g reads it.
+(define (in-flight-hints req)
+  (let ((tail (+ (req-ptr req)
+                 (align-16 (uv-req-size (uv-getaddrinfo-req-type))))))
+    (list (c-int-ref (+ tail (offsetof-addrinfo-ai-flags)))
+          (c-int-ref (+ tail (offsetof-addrinfo-ai-family)))
+          (c-int-ref (+ tail (offsetof-addrinfo-ai-socktype)))
+          (c-int-ref (+ tail (offsetof-addrinfo-ai-protocol))))))
+
+(define (resolution err results)
+  (if err
+      (list 'err (err->symbol err))
+      (map (lambda (r) (list (uv-addrinfo-family r) (uv-addrinfo-address r)
+                             (uv-addrinfo-port r) (uv-addrinfo-socktype r)))
+           results)))
+
+;; A variant names its change, the reason the call refuses it with, and the
+;; change itself, made to the run's own fresh node, service and hints.
+(define-record-type sweep-variant
+  (fields name refusal change!))
+
+(define sweep-variants
+  (list
+   ;; The leak's own shape.
+   (make-sweep-variant
+    'family-turned-bogus 'unknown-hint-family
+    (lambda (node service hints) (set-cdr! (assq 'family hints) 'bogus)))
+   ;; Valid values, so a call that reads the hints again after checking them
+   ;; writes inet6 and no socktype into the request rather than refusing.
+   ;; The socktype is walked after the family, so a run that saw its new key
+   ;; was refused for it, and a run that was not saw the family as given.
+   (make-sweep-variant
+    'family-changed-socktype-renamed 'unknown-hint-key
+    (lambda (node service hints)
+      (set-cdr! (assq 'family hints) 'inet6)
+      (set-car! (assq 'socktype hints) 'color)))
+   ;; "127\x0;0.0.1" reads as "127", which resolves as 0.0.0.127.
+   (make-sweep-variant
+    'nul-in-node 'node-contains-nul
+    (lambda (node service hints) (string-set! node 3 #\nul)))
+   ;; "80\x0;0" reads as "80".
+   (make-sweep-variant
+    'nul-in-service 'service-contains-nul
+    (lambda (node service hints) (string-set! service 2 #\nul)))))
+
+;; lookup-verdict : sweep-variant exact-positive-integer
+;;                  -> (list expired? verdict)
+(define (lookup-verdict variant fuel)
+  (let* ((node (string-copy "127.0.0.1"))
+         (service (string-copy "8080"))
+         (hints (suite-hints #t (cons 'family 'inet) (cons 'socktype 'stream)))
+         (delivered 'callback-never-fired)
+         (expired #f)
+         (registry-before (registry-count))
+         (requests-before (live-count 'getaddrinfo-req))
+         (blocks-before (live-count 'block))
+         (outcome
+          (let run ((eng (make-engine
+                          (lambda ()
+                            (guard (e ((uv-invalid-argument? e)
+                                       (list 'refused
+                                             (uv-invalid-argument-who e)
+                                             (uv-invalid-argument-reason e)))
+                                      (#t (list 'raised (describe e))))
+                              (list 'submitted
+                                    (uv-getaddrinfo!
+                                     l node service hints
+                                     (lambda (err results)
+                                       (collect)
+                                       (set! delivered
+                                             (resolution err results)))))))))
+                    (ticks fuel))
+            (eng ticks
+                 (lambda (left v) v)
+                 (lambda (next)
+                   (unless expired
+                     (set! expired #t)
+                     ((sweep-variant-change! variant) node service hints))
+                   (run next 100000)))))
+         (registry-after (registry-count))
+         (requests-after (live-count 'getaddrinfo-req))
+         (blocks-after (live-count 'block)))
+    (list
+     expired
+     (case (car outcome)
+       ((refused)
+        (if (and (equal? (cdr outcome)
+                         (list 'uv-getaddrinfo! (sweep-variant-refusal variant)))
+                 (= registry-after registry-before)
+                 (= requests-after requests-before)
+                 (= blocks-after blocks-before))
+            'refused
+            (list 'refused-as (cdr outcome)
+                  'registered (- registry-after registry-before)
+                  'counted (- requests-after requests-before)
+                  'blocks (- blocks-after blocks-before))))
+       ((submitted)
+        ;; Read before the drain: nothing can deliver before uv-run.
+        (let* ((tail (in-flight-hints (cadr outcome)))
+               (drained (run-until/ticking
+                         l (lambda () (not (eq? delivered 'callback-never-fired)))
+                         cap)))
+          (cond ((not (equal? tail sweep-hints-tail)) (list 'tail-was tail))
+                ((not (equal? delivered sweep-resolution))
+                 (list 'resolved-as delivered drained))
+                (expired 'resolved)
+                (else 'untouched))))
+       (else outcome)))))
+
+;; lookup-sweep : sweep-variant -> (list-of (list fuel verdict))
+;; A raise between runs would abort the suite, so the whole sweep is caught
+;; and its evidence handed to the rows.
+(define (lookup-sweep variant)
+  (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
+    (let run ((fuel 1) (acc '()))
+      (let* ((v (lookup-verdict variant fuel))
+             (row (list fuel (cadr v))))
+        (if (or (not (car v)) (= fuel sweep-max-fuel))
+            (reverse (cons row acc))
+            (run (+ fuel 1) (cons row acc)))))))
+
+(define blocks-before-sweeps (live-count 'block))
+
+(define lookup-sweeps
+  (map (lambda (v) (cons (sweep-variant-name v) (lookup-sweep v)))
+       sweep-variants))
+
+;; rows-where : (verdict -> boolean) -> (list-of (list name fuel verdict))
+(define (rows-where bad?)
+  (apply append
+         (map (lambda (sweep)
+                (map (lambda (row) (cons (car sweep) row))
+                     (filter (lambda (row) (bad? (cadr row))) (cdr sweep))))
+              lookup-sweeps)))
+
+(define (verdict-is? kind) (lambda (v) (and (pair? v) (eq? (car v) kind))))
+
+;; The rows below look for bad verdicts and must find none, which says
+;; nothing unless each sweep saw its change refused and ran the call to the
+;; end.
+(test-equal "each sweep began before the call's own checks and ended in a run no expiry reached"
+  (map (lambda (v) (list (sweep-variant-name v) 'refused 'untouched))
+       sweep-variants)
+  (map (lambda (sweep)
+         (let ((rows (cdr sweep)))
+           (list (car sweep)
+                 (cadr (car rows))
+                 (cadr (list-ref rows (- (length rows) 1))))))
+       lookup-sweeps))
+
+(test-equal "a lookup whose arguments changed during the call is refused by the call itself, leaving no request"
+  '()
+  (rows-where (lambda (v) (or ((verdict-is? 'refused-as) v)
+                              ((verdict-is? 'raised) v)
+                              ((verdict-is? 'sweep-raised) v)))))
+
+(test-equal "a lookup the sweep let through carried the hints it was given"
+  '()
+  (rows-where (verdict-is? 'tail-was)))
+
+(test-equal "a lookup the sweep let through resolved the node and service it was given"
+  '()
+  (rows-where (verdict-is? 'resolved-as)))
+
+(test-equal "the sweeps left no request registered or counted, and no block allocated"
+  (list 0 (+ registry-with-loop 1) blocks-before-sweeps)   ; loop + probe-timer
+  (list (live-count 'getaddrinfo-req) (registry-count) (live-count 'block)))
 
 ;; --- row k: synthetic chains through addrinfo-chain->list ----------------
 ;; Hand-built struct addrinfo nodes: alloc-zeroed memory, fields written at

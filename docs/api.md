@@ -436,7 +436,7 @@ no c-ares, no record types, no caching.
 (socktype . stream) (protocol . tcp) (flags . (canonname numeric-host)))` —
 and errors reach the callback as ordinary `&uv-errno-error` conditions whose
 `errno` is the `EAI_*` symbol (`'EAI_NONAME`, `'EAI_AGAIN`,
-`'EAI_CANCELED`, …); there are no DNS-specific condition types. Five
+`'EAI_CANCELED`, …); there are no DNS-specific condition types. Six
 behaviours worth knowing before the design spec:
 
 - **This is the binding's first threadpool-backed feature.** The resolver
@@ -448,6 +448,11 @@ behaviours worth knowing before the design spec:
   own documented default, which typically answers one entry per (address ×
   socktype): `stream`, `dgram`, and on Linux `raw` too.
   `'((socktype . stream))` is the one-liner for one entry per address.
+- **`uv-getaddrinfo!` reads its arguments once, at the start of the
+  call.** `node`, `service` and `hints` are checked as they are copied, and
+  the request is built from the copies. A change made to them while the
+  call runs — from an engine's timer handler, say, or another thread — is
+  either seen by that check or not seen at all.
 - **IPv6 scope IDs are dropped**
   ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
   link-local result renders as `"fe80::1"` with its zone silently absent.

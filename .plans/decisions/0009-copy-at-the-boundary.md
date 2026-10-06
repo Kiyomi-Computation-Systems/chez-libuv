@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -230,3 +230,34 @@ for that API when it is added.
 - The span-shaped `(bv start end)` read API and the reserved `uv-write*!`
   name exist so that adding zero-copy later is additive to the public API,
   not a breaking redesign of it.
+- **What a call checks, it copies, and only the copy reaches C** (added
+  2026-10-06). A check of caller-owned data and a later read of the same
+  data are two readings, and an engine's timer handler, or another thread,
+  can change the data between them. `uv-getaddrinfo!` read its arguments
+  twice from v0.2.0 on. It validated its node, service and hints, then wrote
+  the hints into the request block after allocating it, and Chez's `string`
+  argument encoded node and service during the native call. A hint turned
+  bogus in between was refused with the block allocated and unregistered,
+  and nothing freed it. A NUL written into the node reached libuv as a
+  shorter name: `"127.0.0.1"` resolved as `0.0.0.127`.
+
+  The validators now answer copies, made by the walk that checks them, and
+  the call allocates and writes from the copies alone: node and service as
+  their NUL-terminated UTF-8, passed as `u8*`, and the hints as ints.
+
+  Chez's own string primitives read twice as well (Chez 10.4.1, measured).
+  `string->utf8` counts a string's bytes, allocates, then encodes. An engine
+  can expire in between once the string is 64 characters or more, and a
+  character widened then is encoded past the end of the result; another
+  thread can do the same without an engine. `string-copy` reads the length,
+  allocates, then copies, and a string truncated and collected in between is
+  read past its end. So a string is copied with interrupts disabled, which
+  runs no handler and no collection inside the copy, and the private copy is
+  what gets encoded. A copy is fixed-width, so another thread cannot make it
+  overrun.
+
+  `tests/test-dns.sps`'s changed-argument sweeps hold the lookup,
+  `tests/test-addrinfo.sps`'s sweeps and cross-thread race hold the copies,
+  and `tests/test-native.sps` holds that only one C string crosses. Valgrind
+  holds the free. `.plans/getaddrinfo-snapshot-mutation-log.md` has the
+  evidence.

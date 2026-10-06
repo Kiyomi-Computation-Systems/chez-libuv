@@ -389,9 +389,13 @@
     (foreign-procedure "uv_stream_get_write_queue_size" (uptr) size_t))
 
   ;; libuv copies node, service, and sockaddr inputs before these calls return.
+  ;; Node and service are u8*, not string: Chez's string argument encodes
+  ;; the caller's string during the call, and an engine's handler or another
+  ;; thread can change it after validation (tests/test-dns.sps). Plain, not
+  ;; __collect_safe, so no collection moves the bytes during the call.
   (define raw-getaddrinfo
     (foreign-procedure "uv_getaddrinfo"
-                       (uptr uptr uptr string string uptr) int))
+                       (uptr uptr uptr u8* u8* uptr) int))
 
   (define raw-getnameinfo
     (foreign-procedure "uv_getnameinfo" (uptr uptr uptr uptr int) int))
@@ -932,11 +936,25 @@
   (define (uv-read-start-native stream-ptr)
     (raw-read-start stream-ptr alloc-cb-entry read-cb-entry))
 
-  ;; uv-getaddrinfo-native : uptr uptr (or string #f) (or string #f) uptr
-  ;;                         -> exact-integer
+  ;; uv-getaddrinfo-native : uptr uptr (or bytevector #f) (or bytevector #f)
+  ;;                         uptr -> exact-integer
+  ;; libuv reads node and service as C strings, so each must be one: a
+  ;; bytevector whose only NUL is its last byte. #f crosses as NULL.
   (define (uv-getaddrinfo-native loop-ptr req-ptr node service hints-ptr)
+    (unless (and (c-string-or-false? node) (c-string-or-false? service))
+      (raise (make-uv-invalid-argument 'uv-getaddrinfo-native 'not-a-c-string)))
     (raw-getaddrinfo loop-ptr req-ptr getaddrinfo-cb-entry
                      node service hints-ptr))
+
+  (define (c-string-or-false? x)
+    (or (not x)
+        (and (bytevector? x)
+             (let ((last (- (bytevector-length x) 1)))
+               (and (>= last 0)
+                    (let scan ((i 0))
+                      (cond ((= i last) (zero? (bytevector-u8-ref x i)))
+                            ((zero? (bytevector-u8-ref x i)) #f)
+                            (else (scan (+ i 1))))))))))
 
   ;; uv-getnameinfo-native : uptr uptr uptr exact-integer -> exact-integer
   (define (uv-getnameinfo-native loop-ptr req-ptr addr-ptr flags)

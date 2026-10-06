@@ -1,11 +1,19 @@
 #!r6rs
 ;;; Pure addrinfo records and symbolic DNS argument validation.
+;;;
+;;; The validators answer copies of what they checked, and (libuv dns)
+;;; allocates and writes from those copies alone. A caller's alist or string
+;;; can change during the call, from an engine's timer handler or another
+;;; thread, and is read once, here (tests/test-addrinfo.sps's sweeps).
 (library (libuv private addrinfo)
   (export uv-addrinfo make-uv-addrinfo uv-addrinfo?
           uv-addrinfo-family uv-addrinfo-socktype uv-addrinfo-protocol
           uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname
           validate-hints validate-node-and-service)
   (import (rnrs)
+          ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
+          (libuv private require-threaded)
+          (only (chezscheme) with-interrupts-disabled)
           (libuv private conditions))
 
   ;; make-uv-addrinfo : symbol (or symbol exact-integer)
@@ -29,42 +37,66 @@
   (define (refuse who reason)
     (raise (make-uv-invalid-argument who reason)))
 
-  ;; validate-hints : (or #f alist) symbol -> (or 'absent 'present)
+  ;; validate-hints : (or #f alist) symbol -> (or 'absent alist)
   ;; Empty and false both mean absent; non-empty hints use closed symbol sets.
+  ;; Present hints answer a copy, made by the walk that checks them: each
+  ;; entry and value is read once, and the copy shares no pair with them.
   (define (validate-hints hints who)
     (cond
       ((or (eq? hints #f) (null? hints)) 'absent)
       ((not (list? hints)) (refuse who 'hints-not-an-alist))
       (else
        (let walk ((rest hints) (seen '()))
-         (if (null? rest)
-             'present
-             (let ((entry (car rest)))
-               (unless (pair? entry) (refuse who 'hints-not-an-alist))
-               (let ((key (car entry)) (value (cdr entry)))
-                 (unless (memq key hint-keys) (refuse who 'unknown-hint-key))
-                 (when (memq key seen) (refuse who 'duplicate-hint-key))
-                 (validate-hint-value key value who)
-                 (walk (cdr rest) (cons key seen)))))))))
+         (cond
+           ((null? rest) '())
+           ((not (pair? rest)) (refuse who 'hints-not-an-alist))
+           (else
+            (let ((entry (car rest)))
+              (unless (pair? entry) (refuse who 'hints-not-an-alist))
+              (let ((key (car entry)) (value (cdr entry)))
+                (unless (memq key hint-keys) (refuse who 'unknown-hint-key))
+                (when (memq key seen) (refuse who 'duplicate-hint-key))
+                (let ((checked (checked-hint-value key value who)))
+                  (cons (cons key checked)
+                        (walk (cdr rest) (cons key seen))))))))))))
 
-  (define (validate-hint-value key value who)
+  ;; checked-hint-value : symbol object symbol -> object
+  ;; VALUE if it is in KEY's closed set; flags answer a fresh list.
+  (define (checked-hint-value key value who)
     (case key
       ((family)
-       (unless (memq value hint-families) (refuse who 'unknown-hint-family)))
+       (if (memq value hint-families) value (refuse who 'unknown-hint-family)))
       ((socktype)
-       (unless (memq value hint-socktypes) (refuse who 'unknown-hint-socktype)))
+       (if (memq value hint-socktypes) value (refuse who 'unknown-hint-socktype)))
       ((protocol)
-       (unless (memq value hint-protocols) (refuse who 'unknown-hint-protocol)))
-      ((flags)
-       (unless (list? value) (refuse who 'hint-flags-not-a-list))
-       (for-each (lambda (flag)
-                   (unless (memq flag hint-flag-set)
-                     (refuse who 'unknown-hint-flag)))
-                 value))))
+       (if (memq value hint-protocols) value (refuse who 'unknown-hint-protocol)))
+      (else (checked-flags value who))))
+
+  ;; checked-flags : object symbol -> (list-of symbol)
+  ;; A fresh list of the flags, each read once and checked as it is copied.
+  ;; The walk takes at most as many steps as the list had when it was found
+  ;; proper, so a list changed during it is refused, never walked forever.
+  ;; The length comes from one call, whose raise for an improper or circular
+  ;; list is the refusal. Asking list? first leaves a gap an engine can
+  ;; expire in, and a list made circular there makes length raise a
+  ;; condition of its own (the flags-made-circular sweep).
+  (define (checked-flags value who)
+    (let ((n (guard (e (#t #f)) (length value))))
+      (unless n (refuse who 'hint-flags-not-a-list))
+      (let copy ((rest value) (left n))
+        (cond
+          ((zero? left) '())
+          ((not (pair? rest)) (refuse who 'hint-flags-not-a-list))
+          (else
+           (let ((flag (car rest)))
+             (unless (memq flag hint-flag-set) (refuse who 'unknown-hint-flag))
+             (cons flag (copy (cdr rest) (- left 1)))))))))
 
   ;; validate-node-and-service : (or string #f) (or string #f) symbol
-  ;;                             -> 'validated
-  ;; At least one value is required; embedded NUL would truncate at the FFI.
+  ;;                             -> (pair (or bytevector #f) (or bytevector #f))
+  ;; At least one value is required. Each present string answers the bytes C
+  ;; reads for it (c-string-bytes), and an absent one #f, which crosses as
+  ;; NULL; node is the car.
   (define (validate-node-and-service node service who)
     (unless (or (eq? node #f) (string? node))
       (refuse who 'node-not-a-string-or-false))
@@ -72,14 +104,30 @@
       (refuse who 'service-not-a-string-or-false))
     (when (and (eq? node #f) (eq? service #f))
       (refuse who 'node-and-service-both-absent))
-    (when (and node (string-contains-nul? node))
-      (refuse who 'node-contains-nul))
-    (when (and service (string-contains-nul? service))
-      (refuse who 'service-contains-nul))
-    'validated)
+    (let* ((node-bytes (and node (c-string-bytes node who 'node-contains-nul)))
+           (service-bytes
+            (and service (c-string-bytes service who 'service-contains-nul))))
+      (cons node-bytes service-bytes)))
 
-  (define (string-contains-nul? s)
-    (let scan ((i 0))
-      (cond ((= i (string-length s)) #f)
-            ((char=? (string-ref s i) #\nul) #t)
-            (else (scan (+ i 1)))))))
+  ;; c-string-bytes : string symbol symbol -> bytevector
+  ;; S's UTF-8 and a terminating NUL, or a refusal with REASON when S holds a
+  ;; NUL of its own, which C would read as the end of the string.
+  ;;
+  ;; Both steps run on a private copy of S, never on S. Chez's string->utf8
+  ;; counts a string's bytes, allocates, and then encodes, and an engine's
+  ;; handler or another thread that widens S in between makes it write past
+  ;; what it allocated. Its string-copy reads S's length before it copies,
+  ;; and a handler that truncates S and collects in between makes it read
+  ;; past S. So the copy is taken with interrupts disabled, which runs no
+  ;; handler and no collection inside it. A copy is fixed-width, so another
+  ;; thread cannot make it overrun. tests/test-addrinfo.sps's node sweeps
+  ;; and cross-thread race hold each of these (measured on Chez 10.4.1).
+  (define (c-string-bytes s who reason)
+    (let* ((utf8 (string->utf8 (with-interrupts-disabled (string-copy s))))
+           (n (bytevector-length utf8))
+           (bytes (make-bytevector (+ n 1) 0)))
+      (bytevector-copy! utf8 0 bytes 0 n)
+      (let scan ((i 0))
+        (cond ((= i n) bytes)
+              ((zero? (bytevector-u8-ref bytes i)) (refuse who reason))
+              (else (scan (+ i 1))))))))

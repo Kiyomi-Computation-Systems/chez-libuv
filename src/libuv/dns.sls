@@ -50,25 +50,29 @@
                                               'unknown-hint-flag))))))
                0 flags))
 
-  ;; struct addrinfo field order differs between glibc and Darwin; always use
-  ;; shim-reported offsets when writing the zeroed tail.
-  (define (write-hints! tail hints)
-    (let ((family   (assq 'family hints))
-          (socktype (assq 'socktype hints))
-          (protocol (assq 'protocol hints))
-          (flags    (assq 'flags hints)))
-      (when family
-        (c-int-set! (+ tail (offsetof-addrinfo-ai-family))
-                    (family-symbol->int (cdr family))))
-      (when socktype
-        (c-int-set! (+ tail (offsetof-addrinfo-ai-socktype))
-                    (socktype-symbol->int (cdr socktype))))
-      (when protocol
-        (c-int-set! (+ tail (offsetof-addrinfo-ai-protocol))
-                    (protocol-symbol->int (cdr protocol))))
-      (when flags
-        (c-int-set! (+ tail (offsetof-addrinfo-ai-flags))
-                    (flag-symbols->int (cdr flags))))))
+  ;; hint-writes : (or 'absent alist) -> (or 'absent (list-of (offset . int)))
+  ;; What to write into the request's zeroed hints tail, and where, worked
+  ;; out from validate-hints's copy before the block exists. Writing it then
+  ;; reads no caller data and cannot raise. struct addrinfo field order
+  ;; differs between glibc and Darwin, so the offsets are the shim's.
+  (define (hint-writes hints)
+    (if (eq? hints 'absent)
+        'absent
+        (map (lambda (entry)
+               (let ((value (cdr entry)))
+                 (case (car entry)
+                   ((family)
+                    (cons (offsetof-addrinfo-ai-family) (family-symbol->int value)))
+                   ((socktype)
+                    (cons (offsetof-addrinfo-ai-socktype) (socktype-symbol->int value)))
+                   ((protocol)
+                    (cons (offsetof-addrinfo-ai-protocol) (protocol-symbol->int value)))
+                   (else
+                    (cons (offsetof-addrinfo-ai-flags) (flag-symbols->int value))))))
+             hints)))
+
+  (define (write-hints! tail writes)
+    (for-each (lambda (w) (c-int-set! (+ tail (car w)) (cdr w))) writes))
 
   ;; uv-getaddrinfo! : uv-loop (or string #f) (or string #f) procedure
   ;;                   -> uv-dns-request
@@ -82,10 +86,15 @@
       ((loop node service hints on-complete)
        (start-getaddrinfo! loop node service hints on-complete))))
 
+  ;; Every argument is read once, by the validators, and everything from the
+  ;; allocation on uses their copies: node and service as the bytes C reads,
+  ;; the hints as the ints the block receives. So nothing the caller can
+  ;; still change reaches C, and nothing between the allocation and the
+  ;; guard can raise (tests/test-dns.sps's sweeps; Valgrind holds the free).
   (define (start-getaddrinfo! loop node service hints on-complete)
     (require-open-loop loop 'uv-getaddrinfo!)
-    (validate-node-and-service node service 'uv-getaddrinfo!)
-    (let ((hints-state (validate-hints hints 'uv-getaddrinfo!)))
+    (let* ((strings (validate-node-and-service node service 'uv-getaddrinfo!))
+           (writes (hint-writes (validate-hints hints 'uv-getaddrinfo!))))
       (unless (procedure? on-complete)
         (raise (make-uv-invalid-argument 'uv-getaddrinfo!
                                          'on-complete-not-a-procedure)))
@@ -94,8 +103,8 @@
              (hints-tail (+ block hints-offset)))
         ;; Absent hints must cross as NULL, not as a zeroed struct: libc may
         ;; assign different defaults to those two forms.
-        (when (eq? hints-state 'present)
-          (write-hints! hints-tail hints))
+        (unless (eq? writes 'absent)
+          (write-hints! hints-tail writes))
         (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete)))
           (registry-register! block 'getaddrinfo-req loop req)
           (count-getaddrinfo-req-new!)
@@ -103,8 +112,8 @@
                         (raise e)))
             (uv-check (uv-getaddrinfo-native
                        (loop-pointer loop 'uv-getaddrinfo!)
-                       block node service
-                       (if (eq? hints-state 'present) hints-tail 0))
+                       block (car strings) (cdr strings)
+                       (if (eq? writes 'absent) 0 hints-tail))
                       'uv-getaddrinfo!))
           req))))
 

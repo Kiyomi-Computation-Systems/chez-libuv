@@ -152,6 +152,19 @@ block before returning and frees that block itself
 argument native.sls:339-345 records for `uv_ip4_addr`. (Chez-side `#f`→NULL
 and UTF-8 transcoding are spike-confirmed, Q1.)
 
+*(Amended 2026-10-06: they no longer do. Validation read the caller's
+strings and alist, and the start call read them again: Chez's `string`
+argument encoded the strings during the native call, and the hints were
+written into the block after it was allocated. An engine's timer handler, or
+another thread, could change them in between. A NUL written then reached
+libuv as a shorter name, and a hint turned bogus then was refused with the
+block allocated and unregistered, which leaked it. The validators now answer
+copies, made by the walk that checks them, and the start call builds the
+request from those alone: node and service cross as their NUL-terminated
+UTF-8 bytes (`u8*`), the hints as ints. `.plans/getaddrinfo-snapshot-mutation-log.md`
+has the evidence, and [ADR-0009](decisions/0009-copy-at-the-boundary.md)
+the rule.)*
+
 Returns the opaque request record — a value only success produces. On a
 synchronous failure nothing is left half-registered (§5.5).
 

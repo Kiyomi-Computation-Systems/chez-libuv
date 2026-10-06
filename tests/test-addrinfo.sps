@@ -8,20 +8,49 @@
 ;;; (a deliberate explicit edit -- that list is not a wildcard).
 ;;;
 ;;; WHAT IS AND IS NOT HERE. Everything symbolic: the uv-addrinfo record,
-;;; validate-hints's closed sets, validate-node-and-service's refusals. The
-;;; symbol->int mapping (AF_INET and friends) is deliberately NOT here -- it
-;;; is boundary work in (libuv dns), tested by tests/test-dns.sps, which is
-;;; what keeps this module shim-free (design spec v0.2 S3).
+;;; validate-hints's closed sets, validate-node-and-service's refusals, and
+;;; the copies both validators answer, which are what (libuv dns) allocates
+;;; and writes from. The symbol->int mapping (AF_INET and friends) is
+;;; deliberately NOT here -- it is boundary work in (libuv dns), tested by
+;;; tests/test-dns.sps, which is what keeps this module shim-free (design
+;;; spec v0.2 S3).
 (import (rnrs)
+        (rnrs mutable-pairs)
+        (rnrs mutable-strings)
         (srfi :64)
         (libuv private conditions)
-        (libuv private addrinfo))
+        (libuv private addrinfo)
+        ;; The sweeps below run the validators in engines and change their
+        ;; arguments mid-call, from a timer handler and from another thread.
+        (only (chezscheme) make-engine string-truncate! collect
+              fork-thread make-mutex make-condition with-mutex
+              condition-wait condition-broadcast display-condition getenv))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
 ;; runner so its fail count can drive the exit status (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. The sweep rows
+;; return their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
+;; describe : object -> string
+;; A raised object's message, for a row to carry as evidence. Total, so a
+;; guard calling it cannot raise in turn. (tests/uv-evidence.sls has the
+;; same procedure, but it imports native code, which this suite must not.)
+(define (describe e)
+  (guard (err (#t "<the raised object could not be printed>"))
+    (call-with-string-output-port
+     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
 ;; Every rejection row asserts (who reason) out of the raised
 ;; &uv-invalid-argument, with a distinct sentinel for "raised something
@@ -104,8 +133,10 @@
   'absent (acceptance (lambda () (validate-hints '() 'test-who))))
 
 ;; --- validate-hints: acceptance of the closed sets -----------------------
+;; Present hints validate to a copy of themselves (see the copy rows below).
 (test-equal "a full well-formed hints alist validates"
-  'present
+  '((family . inet6) (socktype . stream) (protocol . tcp)
+    (flags . (canonname numeric-host)))
   (acceptance
    (lambda ()
      (validate-hints '((family . inet6) (socktype . stream) (protocol . tcp)
@@ -113,26 +144,55 @@
                      'test-who))))
 
 (test-equal "family unspec validates"
-  'present (acceptance (lambda () (validate-hints '((family . unspec)) 'test-who))))
+  '((family . unspec))
+  (acceptance (lambda () (validate-hints '((family . unspec)) 'test-who))))
 
 (test-equal "family inet validates"
-  'present (acceptance (lambda () (validate-hints '((family . inet)) 'test-who))))
+  '((family . inet))
+  (acceptance (lambda () (validate-hints '((family . inet)) 'test-who))))
 
 (test-equal "socktype dgram validates"
-  'present (acceptance (lambda () (validate-hints '((socktype . dgram)) 'test-who))))
+  '((socktype . dgram))
+  (acceptance (lambda () (validate-hints '((socktype . dgram)) 'test-who))))
 
 (test-equal "protocol udp validates"
-  'present (acceptance (lambda () (validate-hints '((protocol . udp)) 'test-who))))
+  '((protocol . udp))
+  (acceptance (lambda () (validate-hints '((protocol . udp)) 'test-who))))
 
 (test-equal "all four flags together validate"
-  'present
+  '((flags . (passive canonname numeric-host numeric-serv)))
   (acceptance
    (lambda ()
      (validate-hints '((flags . (passive canonname numeric-host numeric-serv)))
                      'test-who))))
 
 (test-equal "an empty flags list validates"
-  'present (acceptance (lambda () (validate-hints '((flags . ())) 'test-who))))
+  '((flags . ()))
+  (acceptance (lambda () (validate-hints '((flags . ())) 'test-who))))
+
+;; --- validate-hints answers a copy nothing else can reach ----------------
+;; (libuv dns) writes the request's hints from this copy after allocating
+;; the request block, so the copy may share no pair with the caller's alist:
+;; a shared pair is one the caller can still change after it was checked.
+;; pairs-of walks every pair reachable through car and cdr.
+(define (pairs-of x)
+  (if (pair? x)
+      (cons x (append (pairs-of (car x)) (pairs-of (cdr x))))
+      '()))
+
+;; 8 is the caller's pairs: three of the spine, three entries, two of flags.
+(test-equal "the copy equals the caller's hints and shares none of their pairs"
+  '(equal 8 unshared)
+  (let* ((flags (list 'numeric-host 'canonname))
+         (hints (list (cons 'family 'inet) (cons 'socktype 'stream)
+                      (cons 'flags flags)))
+         (copy (acceptance (lambda () (validate-hints hints 'test-who))))
+         (theirs (pairs-of hints)))
+    (list (if (equal? copy hints) 'equal (list 'copy-was copy))
+          (length theirs)
+          (if (exists (lambda (p) (memq p theirs)) (pairs-of copy))
+              'shared
+              'unshared))))
 
 ;; --- validate-hints: rejections, each by (who reason) --------------------
 (test-equal "hints that are not a list are refused"
@@ -206,17 +266,32 @@
   (rejection (lambda () (validate-hints '((flags . (addrconfig))) 'test-who))))
 
 ;; --- validate-node-and-service: acceptance -------------------------------
-(test-equal "string node + string service validates"
-  'validated
+;; A present string validates to the bytes C reads for it: its UTF-8 and a
+;; terminating NUL. An absent one stays #f, which crosses as NULL. The
+;; answer is a pair, node first.
+(define (c-string . bytes) (u8-list->bytevector (append bytes '(0))))
+
+(test-equal "string node + string service validate to their C strings"
+  (cons (c-string 49 50 55 46 48 46 48 46 49) (c-string 56 48)) ; "127.0.0.1" "80"
   (acceptance (lambda () (validate-node-and-service "127.0.0.1" "80" 'test-who))))
 
 (test-equal "absent node with a service validates (NULL node is legal input)"
-  'validated
+  (cons #f (c-string 56 48))
   (acceptance (lambda () (validate-node-and-service #f "80" 'test-who))))
 
 (test-equal "node with an absent service validates"
-  'validated
+  (cons (c-string 58 58 49) #f)                                  ; "::1"
   (acceptance (lambda () (validate-node-and-service "::1" #f 'test-who))))
+
+(test-equal "a non-ASCII node crosses as UTF-8"
+  (cons (c-string 120 206 187) #f)                               ; "xλ"
+  (acceptance (lambda () (validate-node-and-service "x\x3bb;" #f 'test-who))))
+
+;; libuv refuses the empty name itself (tests/test-dns.sps's row i), so it
+;; must reach libuv as the empty C string, not be dropped or refused here.
+(test-equal "an empty node crosses as the empty C string"
+  (cons (c-string) (c-string 56 48))
+  (acceptance (lambda () (validate-node-and-service "" "80" 'test-who))))
 
 ;; --- validate-node-and-service: rejections -------------------------------
 (test-equal "a non-string non-#f node is refused"
@@ -248,6 +323,330 @@
   '(test-who service-contains-nul)
   (rejection (lambda ()
                (validate-node-and-service "127.0.0.1" "8\x0;0" 'test-who))))
+
+;; --- arguments that change during the call -------------------------------
+;; An engine's timer can expire anywhere in a validator, and its handler can
+;; change the caller's arguments before the validator resumes (so can another
+;; thread, below). Each sweep runs a validator in an engine at fuel 1, 2, ...,
+;; changes its argument at the first expiry, then resumes it. Fuel 1 expires
+;; before the validator reads anything, and the sweep stops at the first run
+;; no expiry reached, so between them every point in the validator is
+;; visited. Every run must answer for ONE reading of the argument, the old or
+;; the changed: refused for the changed one, or exactly the answer for one of
+;; the two. Anything else means the validator read the argument more than
+;; once, or handed back something the change still reached.
+(define sweep-max-fuel 2000)
+(define sweep-max-resumes 10)
+
+;; engine-sweep : (-> state) (state -> answer) (state -> any)
+;;                -> (list-of (list fuel expired? outcome))
+;; OUTCOME is (answered answer), (refused reason), (raised text), or (stuck)
+;; for a call still running after sweep-max-resumes resumptions of 100000
+;; ticks, which a validator that walks a changed list forever comes to.
+(define (engine-sweep make-state call change!)
+  (let run ((fuel 1) (acc '()))
+    (let* ((state (make-state))
+           (expired #f)
+           (outcome
+            (let step ((eng (make-engine
+                             (lambda ()
+                               (guard (e ((uv-invalid-argument? e)
+                                          (list 'refused
+                                                (uv-invalid-argument-reason e)))
+                                         (#t (list 'raised (describe e))))
+                                 (list 'answered (call state))))))
+                       (ticks fuel)
+                       (resumes 0))
+              (eng ticks
+                   (lambda (left v) v)
+                   (lambda (next)
+                     (unless expired
+                       (set! expired #t)
+                       (change! state))
+                     (if (= resumes sweep-max-resumes)
+                         '(stuck)
+                         (step next 100000 (+ resumes 1)))))))
+           (row (list fuel expired outcome)))
+      (if (or (not expired) (= fuel sweep-max-fuel))
+          (reverse (cons row acc))
+          (run (+ fuel 1) (cons row acc))))))
+
+;; sweep-reach : rows -> (list outcome-of-the-first-run expired?-of-the-last)
+(define (sweep-reach rows)
+  (list (caddr (car rows)) (cadr (list-ref rows (- (length rows) 1)))))
+
+;; bad-rows : rows (outcome -> boolean) -> rows
+(define (bad-rows rows legal?)
+  (filter (lambda (row) (not (legal? (caddr row)))) rows))
+
+;; The hints sweeps. Each makes one change at the first expiry, and a run
+;; either refuses the change or answers the hints as they were.
+(define sweep-hints-as-given
+  '((family . inet) (socktype . stream) (flags . (numeric-host numeric-serv))))
+
+(define (sweep-hints)
+  (list (cons 'family 'inet) (cons 'socktype 'stream)
+        (cons 'flags (list 'numeric-host 'numeric-serv))))
+
+;; (name first-refusal legal-refusals change!)
+(define hints-variants
+  (list
+   ;; Values: read once, so a checked value is the one copied.
+   (list 'values-turned-bogus 'unknown-hint-family
+         '(unknown-hint-family unknown-hint-flag)
+         (lambda (hints)
+           (set-cdr! (assq 'family hints) 'bogus)
+           (set-car! (cdr (assq 'flags hints)) 'bogus-flag)))
+   ;; The spine: walked pair by pair, so an end that stops being a list is
+   ;; refused where the walk meets it.
+   (list 'spine-made-improper 'hints-not-an-alist '(hints-not-an-alist)
+         (lambda (hints) (set-cdr! (cdr hints) 'tail)))
+   ;; The flags: walked no further than the list was long when found
+   ;; proper, so a list made circular is not walked forever.
+   (list 'flags-made-circular 'hint-flags-not-a-list '(hint-flags-not-a-list)
+         (lambda (hints)
+           (let ((flags (cdr (assq 'flags hints))))
+             (set-cdr! (cdr flags) flags))))))
+
+(define hints-sweeps
+  (map (lambda (v)
+         (cons (car v)
+               (engine-sweep sweep-hints
+                             (lambda (hints) (validate-hints hints 'test-who))
+                             (cadddr v))))
+       hints-variants))
+
+(test-equal "each hints sweep began before the walk read the hints and ended untouched"
+  (map (lambda (v) (list (car v) (list 'refused (cadr v)) #f)) hints-variants)
+  (map (lambda (sweep) (cons (car sweep) (sweep-reach (cdr sweep))))
+       hints-sweeps))
+
+(test-equal "hints changed during validation are refused or answered as they were"
+  (map (lambda (v) (list (car v))) hints-variants)
+  (map (lambda (v sweep)
+         (cons (car v)
+               (bad-rows (cdr sweep)
+                         (lambda (outcome)
+                           (or (and (eq? (car outcome) 'refused)
+                                    (memq (cadr outcome) (caddr v)))
+                               (equal? outcome
+                                       (list 'answered sweep-hints-as-given)))))))
+       hints-variants hints-sweeps))
+
+;; The node sweeps. A node answers as validate-node-and-service's car.
+(define (node-sweep make-node change!)
+  (engine-sweep make-node
+                (lambda (node)
+                  (car (validate-node-and-service node #f 'test-who)))
+                change!))
+
+(define (answered-c-string s) (list 'answered (c-string-of s)))
+(define (c-string-of s)
+  (let* ((utf8 (string->utf8 s))
+         (out (make-bytevector (+ (bytevector-length utf8) 1) 0)))
+    (bytevector-copy! utf8 0 out 0 (bytevector-length utf8))
+    out))
+
+;; Widening. Chez's string->utf8 counts a string's UTF-8 bytes, allocates,
+;; and then encodes, and an engine can expire in between once the string is
+;; 64 characters or more (measured on Chez 10.4.1). A character widened then
+;; is encoded into room counted for the old one: the encoding runs past the
+;; end of what was allocated, and the answer holds neither string. The
+;; validator encodes a copy of its own, so a widened run answers one string.
+(define wide-length 256)
+(define wide-original (make-string wide-length #\a))
+(define wide-changed
+  (let ((s (make-string wide-length #\a)))
+    (string-set! s (- wide-length 1) #\x3bb)
+    s))
+
+(define widening-sweep
+  (node-sweep (lambda () (make-string wide-length #\a))
+              (lambda (node) (string-set! node (- wide-length 1) #\x3bb))))
+
+(test-equal "the widening sweep began before the copy and ended untouched"
+  (list (answered-c-string wide-changed) #f)
+  (sweep-reach widening-sweep))
+
+(test-equal "a node widened during validation answers the bytes of one reading"
+  '()
+  (bad-rows widening-sweep
+            (lambda (outcome)
+              (member outcome (list (answered-c-string wide-original)
+                                    (answered-c-string wide-changed))))))
+
+;; A NUL written into the node. The check runs on the bytes the copy
+;; encodes, so a run refuses the NUL or answers the node as it was: never
+;; bytes a NUL truncates, which C would read as a shorter name.
+(define nul-sweep
+  (node-sweep (lambda () (string-copy "127.0.0.1"))
+              (lambda (node) (string-set! node 3 #\nul))))
+
+(test-equal "the NUL sweep began before the check and ended untouched"
+  '((refused node-contains-nul) #f)
+  (sweep-reach nul-sweep))
+
+(test-equal "a NUL written into the node during validation is refused, or reaches nothing"
+  '()
+  (bad-rows nul-sweep
+            (lambda (outcome)
+              (member outcome (list '(refused node-contains-nul)
+                                    (answered-c-string "127.0.0.1"))))))
+
+;; Truncating, then collecting. Chez's string-copy reads the length, then
+;; allocates the copy, then copies, and an engine can expire in between. A
+;; string truncated and collected then has fewer characters behind it than
+;; the copy reads: the copy reads past it, into whatever the collector put
+;; next (measured). The validator copies with interrupts disabled, so no
+;; handler runs inside the copy. The z strings make what lies next
+;; recognizable.
+(define trunc-length 512)
+(define trunc-neighbours '())
+
+(define truncation-sweep
+  (node-sweep (lambda () (make-string trunc-length #\a))
+              (lambda (node)
+                (string-truncate! node 1)
+                (collect)
+                (set! trunc-neighbours
+                      (list (make-string trunc-length #\z)
+                            (make-string trunc-length #\z))))))
+
+(test-equal "the truncation sweep began before the copy and ended untouched"
+  (list (answered-c-string "a") #f)
+  (sweep-reach truncation-sweep))
+
+(test-equal "a node truncated during validation answers the bytes of one reading"
+  '()
+  (bad-rows truncation-sweep
+            (lambda (outcome)
+              (member outcome (list (answered-c-string "a")
+                                    (answered-c-string
+                                     (make-string trunc-length #\a)))))))
+
+;; --- a node another thread changes during the call -----------------------
+;; No engine is needed for the widening above: another thread can change the
+;; string while string->utf8 runs. A narrower thread turns every λ of the
+;; node back into a, while this thread widens it to all λ before each call.
+;; It only ever narrows, because a race that narrows leaves the end of
+;; string->utf8's answer unwritten, while one that widens writes past it, and
+;; the evidence would go with the heap. Encoding the node as the caller holds
+;; it failed a quarter of this row's rounds, and 14-40% in the probe the row
+;; came from; the copy, none (macOS arm64). Each round must answer the bytes
+;; of race-length characters, each an a or a λ.
+;;
+;; Each round starts its call once the narrower has turned the node's first
+;; character back, so the narrower is mid-pass when the call reads the node;
+;; a round that waits race-wait-cap steps for that ends the sweep, naming the
+;; narrower dead. Whether a pass then overlaps the call's read is up to the
+;; scheduler, so the row asserts only what no schedule can make fail on a
+;; right answer. The informational line counts the rounds that answered a
+;; mix of a and λ, which only an overlap produces.
+(define race-length 4096)
+(define race-rounds 200)
+(define race-wait-cap 100000000)
+
+;; reading : outcome -> (or 'all-wide 'mixed 'all-narrow #f)
+;; What an answer read, if it is the bytes of one reading; #f otherwise.
+(define (reading outcome)
+  (and (pair? outcome)
+       (eq? (car outcome) 'answered)
+       (let* ((bytes (cadr outcome))
+              (n (- (bytevector-length bytes) 1)))
+         (and (>= n 0)
+              (zero? (bytevector-u8-ref bytes n))
+              (let ((text (utf8->string
+                           (let ((head (make-bytevector n)))
+                             (bytevector-copy! bytes 0 head 0 n)
+                             head))))
+                (and (= (string-length text) race-length)
+                     (equal? (c-string-of text) bytes)
+                     (let ((chars (string->list text)))
+                       (cond ((for-all (lambda (c) (char=? c #\x3bb)) chars)
+                              'all-wide)
+                             ((for-all (lambda (c) (char=? c #\a)) chars)
+                              'all-narrow)
+                             ((for-all (lambda (c) (memv c '(#\a #\x3bb))) chars)
+                              'mixed)
+                             (else #f)))))))))
+
+;; race-sweep : -> (list rounds-run (list-of bad-round) mixed-rounds)
+;; Every exit, a raise included, stops the narrower and waits for it.
+(define (race-sweep)
+  (let ((node (make-string race-length #\a))
+        (stop #f)
+        (stopped #f)
+        (m (make-mutex))
+        (c (make-condition)))
+    (fork-thread
+     (lambda ()
+       (let narrow ()
+         (unless stop
+           (let pass ((i 0))
+             (when (< i race-length)
+               (string-set! node i #\a)
+               (pass (+ i 1))))
+           (narrow)))
+       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+    (let ((result
+           (guard (e (#t (list 0 (list (list 'raised (describe e))) 0)))
+             (let round ((r 0) (bad '()) (mixed 0))
+               (if (= r race-rounds)
+                   (list r (reverse bad) mixed)
+                   (begin
+                     (let widen ((i 0))
+                       (when (< i race-length)
+                         (string-set! node i #\x3bb)
+                         (widen (+ i 1))))
+                     (let wait ((k 0))
+                       (cond ((char=? (string-ref node 0) #\a) 'narrowing)
+                             ((= k race-wait-cap)
+                              (raise (list 'the-narrower-never-narrowed
+                                           'round r)))
+                             (else (wait (+ k 1)))))
+                     (let* ((outcome
+                             (guard (e ((uv-invalid-argument? e)
+                                        (list 'refused
+                                              (uv-invalid-argument-reason e)))
+                                       (#t (list 'raised (describe e))))
+                               (list 'answered
+                                     (car (validate-node-and-service
+                                           node #f 'test-who)))))
+                            (read (reading outcome)))
+                       (round (+ r 1)
+                              (if read
+                                  bad
+                                  (cons (list r (if (eq? (car outcome) 'answered)
+                                                    'not-one-reading
+                                                    outcome))
+                                        bad))
+                              (if (eq? read 'mixed) (+ mixed 1) mixed)))))))))
+      (set! stop #t)
+      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
+      result)))
+
+;; Not under Valgrind. It runs one thread at a time, so no round can overlap
+;; there (0 of 200, measured), and its default scheduler hands its lock back
+;; to the thread that just held it, so this thread's wait starves the
+;; narrower: the row failed 4 of 4 runs that way, and passed 4 of 4 with
+;; --fair-sched=yes. The Linux memory gate says when it is running
+;; (CHEZ_LIBUV_UNDER_VALGRIND, as for tests/test-native.sps's dirty-memory
+;; seed).
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (begin
+      (display "  [informational] cross-thread race: skipped under Valgrind,")
+      (display " which runs one thread at a time")
+      (newline))
+    (let ((race-result (race-sweep)))
+      (display "  [informational] cross-thread race: ")
+      (display (caddr race-result))
+      (display " of ")
+      (display (car race-result))
+      (display " rounds read the node mid-change")
+      (newline)
+      (test-equal "a node another thread narrows during validation answers the bytes of one reading"
+        (list race-rounds '())
+        (list (car race-result) (cadr race-result)))))
 
 ;; --- who passthrough -----------------------------------------------------
 ;; The pure validators are shared vocabulary: the boundary passes its own
