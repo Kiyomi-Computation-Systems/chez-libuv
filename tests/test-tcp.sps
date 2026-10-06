@@ -2524,7 +2524,9 @@
 ;; THUNK's value, run in an engine whose resumes are capped: a call that
 ;; never ends answers 'stuck, so a count that loops on a circular list fails
 ;; its row by name instead of hanging the suite. A raise inside is raised
-;; again outside, for the row's own guard.
+;; again outside, for the row's own guard. The row below wraps it round the
+;; whole of wv-refusal, so that 'stuck is the row's evidence: inside it,
+;; wv-refusal would record the give-up as a call that returned.
 (define (capped thunk)
   (let run ((eng (make-engine
                   (lambda ()
@@ -2543,11 +2545,12 @@
   (list (wv-refusal
          (lambda ()
            (uv-write*! wv-client (cons (string->utf8 "ok") 'tail) (lambda (err) #f))))
-        (wv-refusal
-         (lambda ()
-           (let ((segs (list (string->utf8 "a") (string->utf8 "b"))))
-             (set-cdr! (cdr segs) segs)
-             (capped (lambda () (uv-write*! wv-client segs (lambda (err) #f)))))))))
+        (let ((segs (list (string->utf8 "a") (string->utf8 "b"))))
+          (set-cdr! (cdr segs) segs)
+          (capped
+           (lambda ()
+             (wv-refusal
+              (lambda () (uv-write*! wv-client segs (lambda (err) #f)))))))))
 
 (test-equal "a span that is not exactly (bytevector start end) is refused before allocation"
   '(((uv-write*! segment-not-a-bytevector) (0 0) 0)
@@ -2562,6 +2565,27 @@
              (cons (string->utf8 "hello") (cons 0 5))
              (cons (string->utf8 "hello") 'tail)
              (list "hello" 0 5))))
+
+;; A list holding two malformed segments is refused for the first of them:
+;; the walk parses it in order (#64). Chez's map, which the walk replaced,
+;; parsed a list of three in the order 3, 1, 2 and so named the last of
+;; these. Positions 1 and 3, both ways round, tell the two apart; at
+;; positions 1 and 2 they agree.
+(test-equal "a list with two malformed segments is refused for the first of them"
+  '(((uv-write*! segment-not-a-bytevector) (0 0) 0)
+    ((uv-write*! segment-span-out-of-range) (0 0) 0))
+  (list (wv-refusal
+         (lambda ()
+           (uv-write*! wv-client
+                       (list "bad" (string->utf8 "ok")
+                             (list (make-bytevector 9 1) 0 99))
+                       (lambda (err) #f))))
+        (wv-refusal
+         (lambda ()
+           (uv-write*! wv-client
+                       (list (list (make-bytevector 9 1) 0 99)
+                             (string->utf8 "ok") "bad")
+                       (lambda (err) #f))))))
 
 (test-equal "a segment span out of range is refused before allocation"
   '((uv-write*! segment-span-out-of-range) (0 0) 0)

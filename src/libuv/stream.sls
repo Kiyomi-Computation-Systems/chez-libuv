@@ -99,7 +99,18 @@
   (define (refuse-segments reason)
     (raise (make-uv-invalid-argument 'uv-write*! reason)))
 
-  ;; parse-write-segment : segment -> (list bytevector start len)
+  ;; A spec is one segment as parse-write-segment read it, in the verb's own
+  ;; pairs: (bv . len) for a span from 0, else (bv start . len). Every spec
+  ;; stays live while the walk reads the rest of the list, so a spec is one
+  ;; pair where it can be: as a list of three, a million segments cost a
+  ;; write a dozen collections (#64's review).
+  (define (make-spec bv start len)
+    (if (zero? start) (cons bv len) (cons bv (cons start len))))
+  (define (spec-bv spec) (car spec))
+  (define (spec-start spec) (let ((r (cdr spec))) (if (pair? r) (car r) 0)))
+  (define (spec-len spec) (let ((r (cdr spec))) (if (pair? r) (cdr r) r)))
+
+  ;; parse-write-segment : segment -> spec
   ;; A whole bytevector is the span [0, len); an explicit (bv start end) span
   ;; is range-checked exactly as uv-write! checks its own. Anything else is a
   ;; malformed segment, named before the caller's list is copied anywhere.
@@ -108,7 +119,7 @@
   ;; and length then raised a condition of its own (#64).
   (define (parse-write-segment seg)
     (cond
-      ((bytevector? seg) (list seg 0 (bytevector-length seg)))
+      ((bytevector? seg) (make-spec seg 0 (bytevector-length seg)))
       ((pair? seg)
        (let* ((bv (car seg))
               (after-bv (cdr seg)))
@@ -126,11 +137,10 @@
                           (<= 0 start) (<= start end)
                           (<= end (bytevector-length bv)))
                (refuse-segments 'segment-span-out-of-range))
-             (list bv start (- end start))))))
+             (make-spec bv start (- end start))))))
       (else (refuse-segments 'segment-not-a-bytevector))))
 
-  ;; read-segments : object exact-positive-integer
-  ;;                 -> (listof (list bytevector start len))
+  ;; read-segments : object exact-positive-integer -> (listof spec)
   ;; Parses SEGMENTS, which proper-length found to hold N segments, reading
   ;; each pair once and checking it as it is read. An engine's handler or
   ;; another thread can change the list during the walk. A walk that meets a
@@ -151,17 +161,17 @@
                (cons spec rest)))
             (else (refuse-segments 'segments-not-a-list)))))
 
-  ;; spans-fit? : (listof (list bytevector start len)) -> boolean
+  ;; spans-fit? : (listof spec) -> boolean
   ;; Whether every span still lies inside its bytevector, which can have been
   ;; truncated since parse-write-segment checked it.
   (define (spans-fit? specs)
     (or (null? specs)
         (let ((spec (car specs)))
-          (and (<= (+ (cadr spec) (caddr spec)) (bytevector-length (car spec)))
+          (and (<= (+ (spec-start spec) (spec-len spec))
+                   (bytevector-length (spec-bv spec)))
                (spans-fit? (cdr specs))))))
 
-  ;; place-spans! : (listof (list bytevector start len)) uptr uptr
-  ;;                -> unspecified
+  ;; place-spans! : (listof spec) uptr uptr -> unspecified
   ;; Inside the write's step: copies each span in and fills its uv_buf_t in
   ;; the array at BUFS. Packs non-empty spans consecutively from the payload region's start, and
   ;; points every empty span's base at that same start (always valid, the
@@ -170,7 +180,7 @@
     (let place ((specs specs) (buf bufs) (running 0))
       (when (pair? specs)
         (let* ((spec (car specs))
-               (bv (car spec)) (start (cadr spec)) (len (caddr spec))
+               (bv (spec-bv spec)) (start (spec-start spec)) (len (spec-len spec))
                (base (if (zero? len) payload-base (+ payload-base running))))
           (when (positive? len) (copy-in-unchecked! base bv start len))
           (uv-buf-set! buf base len)
@@ -196,7 +206,7 @@
            (specs (if (zero? n)
                       (refuse-segments 'empty-segment-list)
                       (read-segments segments n)))
-           (total (fold-left (lambda (acc s) (+ acc (caddr s))) 0 specs))
+           (total (fold-left (lambda (acc s) (+ acc (spec-len s))) 0 specs))
            (bufs-offset (align-16 (uv-req-size (uv-write-req-type))))
            (payload-offset (+ bufs-offset (* n (sizeof-uv-buf-t))))
            ;; (max total 1) keeps the payload region addressable even when every

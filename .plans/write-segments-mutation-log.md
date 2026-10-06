@@ -141,10 +141,111 @@ replacement that aborts unless its target occurs once, under a watchdog
 ## Uncovered
 
 P4 re-reads a cdr with no trap check between the two reads, so no engine can
-expire between them, and the sweeps cannot split them. Only another thread
-writing that cdr in the few instructions between could, which no
-single-threaded row can order. It is the shape #61 had; the fix keeps the
-single read without a row to hold it.
+expire between them, and the sweeps cannot split them. This section said only
+another thread could, "which no single-threaded row can order", and left it
+without a row. The review showed that wrong, and that a second double read
+had gone unlisted. Both are held now by two-thread rows (below).
+
+## The review
+
+A /code-review at max effort (ten finder angles, one verifier per
+candidate, then a sweep for gaps) found these in the PR. All are fixed in
+the commit after 139ebe4 unless the list says otherwise.
+
+- **proper-length could still loop forever.** Its tortoise walked the
+  list's links behind the hare, so two changes in one count could leave the
+  two on separate cycles. Four angles found it independently. With
+  `(set-cdr! p5 p4)` and `(set-cdr! p11 p10)` made at one expiry,
+  uv-write*! was still running after 200 resumes of a million ticks, at fuels
+  11 to 13. In 30,000 random trials the count hung 129 times, including on a
+  three-element list, the size of a flag list. Chez's own `list?`, which
+  main used, hangs the same way. Fixed: one walk with Brent's check, whose
+  mark moves to the pair it stands on at each power of two of the count. It
+  takes each cdr once, of a value just found to be a pair, and compares the
+  mark with `eq?` only. A count of N pairs takes N + 1 engine ticks. The
+  contract now says a count can be stale.
+- **A double read went unlisted.** Reading a span's end back as
+  `(caddr seg)` passed every suite and was missing from the table above.
+  Under a racing thread it raises Chez's own "incorrect list structure":
+  6,661 to 8,884 times in 200,000 calls. And P4 could have had a row: a
+  two-thread race catches it every time.
+- **A sweep that could not deliver ran its drain dry at every fuel.** Each
+  segment-list sweep writes three dozen runs. Against a uv-write*! whose
+  completion never arrives, test-stream took 192 s before any row printed,
+  64% of the suite's timeout. sweep-runs now stops at a run whose drain ran
+  out. On the same build the suite fails the same 9 rows by name in 14 s.
+- **The order of a refusal was unpinned.** A list with two malformed
+  segments is refused for the first of them. Chez's map named the first in
+  only 24 of 112 placements, and a walk that parsed the rest first still
+  passed every suite.
+- **`capped`'s give-up never reached its row.** wv-refusal recorded it as a
+  call that returned, `(no-raise (0 0) 0)`. The row now wraps capped round
+  the whole of wv-refusal.
+- **Smaller things.** change-verdict's parameters shadowed `write` and
+  `expected`. The list-variant record had a field nothing read. The reach row
+  was pasted twice, and the two sweep families had bad-verdict predicates of
+  different shapes; the enumerated one missed a stuck shrink run.
+- **A spec was a list of three, 48 B a segment, live for the whole walk.**
+  A million-segment write ran 11 or 12 collections to main's 2, and took
+  15-26% longer. A spec is now `(bv . len)` for a span from 0, else
+  `(bv start . len)`. That brings one segment from 208 to 176 B, and 64
+  segments from 5,248 to 3,200 B.
+- **Not fixed here: the follow-up issue has them.** Three older walks have
+  the faults this PR removed from uv-write*!, and none of the three is in
+  its diff:
+  - addrinfo.sls's checked-flags hangs on circular flags at
+    --optimize-level 3;
+  - process.sls's read-list counts with list? and then length and never
+    requires the end;
+  - process.sls's read-stdio-spec re-reads a checked cdr.
+  Also deferred: one shared counted walk, and one shared engine-sweep
+  driver for the suites.
+
+### The rows the review added
+
+- tests/test-native.sps:
+  - a two-cycles proper-length sweep, beside the cut and the cycle;
+  - 3,000 seeded random trials, in which one or two changes land at one or
+    two expiries, and every count must end and raise nothing (a
+    precondition row requires a third of them to have changed their list
+    mid-count; all 3,000 did);
+  - a two-thread race, in which a flipper turns the third pair's cdr while
+    100,000 counts must answer #f or 12.
+- tests/test-stream.sps:
+  - a segments-two-cycles sweep, behind the same gate as the circular one;
+  - a two-thread race on a span written 20,000 times to an unconnected
+    pipe. Every call must be refused by the parse or by libuv's errno; in
+    the green run the change reached 16,812 of them.
+- tests/test-tcp.sps: the order pin.
+- tests/test-callback-alloc.sps: a 64-segment row. One segment's row cannot
+  see a per-segment cost, which is smaller than its margin. Both race rows
+  skip under Valgrind, which runs one thread at a time, as test-addrinfo's
+  does.
+
+### Mutations, round two
+
+Each ran as before, on a fresh copy of `src/`, under the watchdog. All 23
+were caught by name; none hung.
+
+| id | mutation | caught by |
+|---|---|---|
+| W1-W7 | as in the first table | the same rows |
+| O1 | the walk parses each segment after the rest of the list | test-tcp: the order pin |
+| S1-S4 | as in the first table | the same rows; S4 also fails the span race |
+| S5 | the span's end is read again through the span (`caddr`), as main did | test-stream: the span race |
+| C1 | a spec is a list of three again | test-callback-alloc: the 64-segment row |
+| C2 | a span from 0 takes two pairs too | the 64-segment row |
+| C3 | spec-start answers 0 for every spec | test-tcp: each buf holds the requested span's bytes; the three segments arrive in order |
+| B1 | Brent's mark never moves | test-native: the sweeps' answers and reach, the random trials, fold-flags' circular row; test-tcp: the circular row |
+| B2 | the mark moves at every step, not at powers of two | the same |
+| B3 | the walk never compares the mark | the same |
+| B4 | the walk takes the cdr of a non-pair | test-native: sweeps, trials, the race, fold-flags; test-stream: the list sweeps |
+| B5 | the count is one too many | test-native: fold-flags folds a proper list, the sweeps |
+| P3 | proper-length is #61's shape again (its hare reads each cdr twice) | test-native: the sweeps, the trials and the race; test-stream: the list sweeps |
+| P5 | proper-length is this PR's first count again (a tortoise behind the hare) | test-native: the sweeps' answers and reach, the trials; test-stream: the two-cycles sweep |
+
+The race catches P3 and passes P5, which reads each cdr once; the two-cycles
+sweeps and the random trials catch P5. Nothing is uncovered in this round.
 
 ## Gates
 

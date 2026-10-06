@@ -702,29 +702,32 @@
                (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest)))))))))
 
   ;; proper-length : object -> (or exact-nonnegative-integer #f)
-  ;; X's length when it is a proper list, else #f. A tortoise-and-hare walk:
-  ;; it ends at the list's end, at a pair whose cdr is not a pair or '(), or
-  ;; where the hare meets the tortoise in a cycle, so it raises nothing and
-  ;; allocates nothing, where length raises and a guard around it allocates.
-  ;; The list can change during the walk, from an engine's handler or
-  ;; another thread, so every cdr is taken of a value just found to be a
-  ;; pair, and each is read once. The tortoise walks pairs the hare has
-  ;; passed, which a change can have cut behind the hare: a tortoise that
-  ;; then finds no pair answers #f. It took the cdr of whatever it found,
-  ;; and raised for a list of twelve cut during the walk (#64).
+  ;; X's length when it is a proper list, else #f. One walk, which ends at
+  ;; the list's end, at a non-pair, or back at the pair it last marked. The
+  ;; mark moves to the pair the walk stands on each time the count reaches a
+  ;; power of two (Brent's check), so a cycle of any length is found within
+  ;; twice its length. It raises nothing and allocates nothing, where length
+  ;; raises and a guard around it allocates.
+  ;;
+  ;; The list can change during the count, from an engine's handler or
+  ;; another thread. The walk takes each cdr once, of a value it has just
+  ;; found to be a pair, and only compares the mark with eq?, so no change
+  ;; makes it read through a non-pair, and once the changes stop it ends.
+  ;; #61's count walked a tortoise behind its hare along the list's links:
+  ;; one change could cut the tortoise's way, and two could leave the two on
+  ;; separate cycles, where the count never ended (#64 and its review).
+  ;;
+  ;; A count can be stale all the same: by the time it returns, the list may
+  ;; be improper, circular or of another length. So a caller walks at most
+  ;; that many pairs, checking each one, as fold-flags does, and where a
+  ;; list read twice would matter requires the list's end after them, as
+  ;; read-segments does.
   (define (proper-length x)
-    (let walk ((hare x) (tortoise x) (n 0))
-      (cond ((null? hare) n)
-            ((not (pair? hare)) #f)
-            (else
-             (let ((next (cdr hare)))
-               (cond ((null? next) (+ n 1))
-                     ((not (pair? next)) #f)
-                     (else
-                      (let ((hare (cdr next)) (tortoise (cdr tortoise)))
-                        (cond ((eq? hare tortoise) #f)
-                              ((not (pair? tortoise)) #f)
-                              (else (walk hare tortoise (+ n 2))))))))))))
+    (let walk ((p x) (n 0) (mark #f) (lap 1))
+      (cond ((null? p) n)
+            ((or (not (pair? p)) (eq? p mark)) #f)
+            ((= n lap) (walk (cdr p) (+ n 1) p (* 2 lap)))
+            (else (walk (cdr p) (+ n 1) mark lap)))))
 
   (define (require-callback proc who reason)
     (unless (procedure? proc)

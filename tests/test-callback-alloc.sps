@@ -200,7 +200,10 @@
     ;; the seam's guard and the callback's own
     (guarded-callback-through-libuv 787 2)
     ;; one interrupt-free step each, with no dynamic-wind
-    (uv-write! 144 0) (uv-write*! 208 0) (uv-shutdown! 128 0)))
+    (uv-write! 144 0) (uv-write*! 176 0) (uv-shutdown! 128 0)
+    ;; 32 B a segment: a one-pair spec and the walk's spine pair (#64's
+    ;; review); a list of three per segment cost 64
+    (uv-write*-64 3200 0)))
 
 ;; bound : symbol -> exact-integer, per the header.
 (define (bound name)
@@ -208,7 +211,8 @@
          (on-10.4.1 (car path))
          (guards (cadr path))
          (margin (case name
-                   ((idle-run uv-write! uv-write*! uv-shutdown!) (div a-wind 2))
+                   ((idle-run uv-write! uv-write*! uv-write*-64 uv-shutdown!)
+                    (div a-wind 2))
                    ;; a mean, which a stray stack segment can move
                    ((guarded-callback-through-libuv) (* 2 a-guard))
                    (else (div a-guard 2)))))
@@ -625,6 +629,16 @@
      (fewest-bytes drain-writes!
                    (lambda ()
                      (uv-write*! w-client segs on-written)
+                     (set! issued (+ issued 1)))
+                   always))
+
+;; The per-segment cost, which one segment's row cannot see: what a segment
+;; adds is less than that row's margin.
+(define segs-64 (let make ((i 0)) (if (= i 64) '() (cons msg (make (+ i 1))))))
+(row 'uv-write*-64 "a uv-write*! of 64 16-byte segments, the call alone"
+     (fewest-bytes drain-writes!
+                   (lambda ()
+                     (uv-write*! w-client segs-64 on-written)
                      (set! issued (+ issued 1)))
                    always))
 

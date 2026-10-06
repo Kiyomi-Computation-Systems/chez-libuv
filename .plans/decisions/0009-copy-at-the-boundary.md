@@ -284,12 +284,16 @@ for that API when it is added.
   reference` at fuels 19 to 23 of `tests/test-stream.sps`'s cut sweep (Chez
   10.4.1, macOS arm64). A list made circular there was walked without end,
   in a walk no engine's fuel stops, until the process held about 6 GB.
-  `proper-length`, which `fold-flags` counts with, had a smaller form of the
-  fault: its tortoise took the cdr of whatever it found behind the hare, and
-  raised for a list of twelve cut during the count. Now `proper-length` takes
-  every cdr of a value just found to be a pair. `uv-write*!` counts its list
-  with it, walks at most that many pairs, checking each and requiring the
-  list's end after them, and reads each `(bv start end)` span once the same
-  way. `tests/test-stream.sps`'s segment-list sweeps hold the verb,
-  `tests/test-native.sps`'s sweeps hold the count, and
-  `.plans/write-segments-mutation-log.md` has the evidence.
+  `proper-length`, which `fold-flags` counts with, had the same fault in two
+  smaller forms. Its tortoise took the cdr of whatever it found behind the
+  hare, and raised for a list of twelve cut during the count. And the two
+  walked separate paths, so two changes could leave them on separate cycles,
+  where the count never ended (found in the PR's review). Now
+  `proper-length` is one walk with Brent's check: it takes each cdr once, of
+  a value just found to be a pair, compares its mark with `eq?` only, and
+  ends once the changes stop. A count can still be stale when it returns,
+  so `uv-write*!` walks at most that many pairs, checking each and requiring
+  the list's end after them, and reads each `(bv start end)` span once the
+  same way. `tests/test-stream.sps`'s segment-list sweeps and span race hold
+  the verb, `tests/test-native.sps`'s sweeps, random trials and race hold
+  the count, and `.plans/write-segments-mutation-log.md` has the evidence.
