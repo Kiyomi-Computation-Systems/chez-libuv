@@ -148,4 +148,24 @@ single read without a row to hold it.
 
 ## Gates
 
-(below)
+On 680e0c3:
+
+- `make test`: 24 suites pass.
+- `make test-threading`: passes.
+- `make check-purity` holds, and `make check-help` is silent.
+- macOS ASan: `check-memory-gate` caught its planted overruns and printed
+  MEMORY GATE CAN FAIL, then `make test-memory` passed with no
+  AddressSanitizer report.
+- `make prod` passes check-prod, and `make test` passes again on the
+  rebuilt dev build.
+- `make test-memory-docker` (Linux Valgrind, aarch64, vendored libuv), from a
+  `--no-hardlinks` clone:
+  - `check-memory-gate` printed MEMORY GATE CAN FAIL;
+  - each of the 24 suites reports 0 errors and 0 B definitely lost, at 778
+    to 24,288 allocations (test-stream 5,855, test-tcp 3,050, test-native
+    1,208), and the three this branch touches reach their full pass counts
+    (35, 236 and 303);
+  - forked children report fork artifacts, which never gate (ADR-0003):
+    117 and 131 B, as before, and 147 B in 69 of test-process's spawn
+    children (5 more report none), a block `chez_uv_alloc` gave the parent
+    before the fork, beside the usual 1,576 B possibly lost.
