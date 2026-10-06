@@ -16,7 +16,7 @@
 
           ;; foreign memory and copying
           c-string->string
-          alloc-zeroed zero-out! free! copy-in! copy-out
+          alloc-zeroed zero-out! free! copy-in! try-copy-in! copy-out
           c-int-size c-int-ref c-int-set! c-uptr-ref read-net-u16
           c-uptr-size c-uptr-set! c-u32-set!
 
@@ -479,15 +479,21 @@
       (raise (make-uv-invalid-argument 'uv-free! 'null-or-invalid-pointer)))
     (foreign-free addr))
 
-  ;; copy-in! : uptr bytevector exact-nonnegative-integer
-  ;;            exact-nonnegative-integer -> unspecified
+  ;; try-copy-in! : uptr bytevector exact-nonnegative-integer
+  ;;                exact-nonnegative-integer -> (or 'copied 'span-out-of-range)
   ;; The span is checked against the bytevector's length in the same
   ;; interrupt-free step as the copy. Otherwise an interrupt handler run
   ;; between the two (an engine's timer, say) could truncate the bytevector
   ;; and memcpy would read the heap past its new end (test-native.sps's
   ;; truncation scan). Another thread truncating it mid-copy is that
   ;; program's own race; nothing here can order it.
-  (define (copy-in! dst bv start len)
+  ;;
+  ;; A span that no longer fits is answered, not raised: no check a caller
+  ;; makes beforehand can rule it out, since the bytevector can shrink after
+  ;; it, and a caller holding a block it has not yet handed on must free
+  ;; that block first (the write verbs, stream.sls). The other refusals are
+  ;; the caller's own mistakes and raise.
+  (define (try-copy-in! dst bv start len)
     (unless (and (integer? dst) (exact? dst) (positive? dst))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
     (unless (bytevector? bv)
@@ -495,9 +501,16 @@
     (unless (and (integer? start) (exact? start) (>= start 0)
                  (integer? len) (exact? len) (>= len 0))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
-    (unless (with-interrupts-disabled
-              (and (<= (+ start len) (bytevector-length bv))
-                   (begin (raw-copy-in dst bv start len) #t)))
+    (with-interrupts-disabled
+      (if (<= (+ start len) (bytevector-length bv))
+          (begin (raw-copy-in dst bv start len) 'copied)
+          'span-out-of-range)))
+
+  ;; copy-in! : uptr bytevector exact-nonnegative-integer
+  ;;            exact-nonnegative-integer -> unspecified
+  ;; try-copy-in!, raising when the span does not fit.
+  (define (copy-in! dst bv start len)
+    (unless (eq? (try-copy-in! dst bv start len) 'copied)
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range))))
 
   (define (c-int-size) (foreign-sizeof 'int))

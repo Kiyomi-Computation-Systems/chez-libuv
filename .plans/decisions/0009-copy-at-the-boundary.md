@@ -184,6 +184,19 @@ for that API when it is added.
   > end, and a `uv-write!` would send the heap behind it to the peer. The old
   > loop re-checked every index.
   >
+  > **A refusal from that step frees the write's block** (added
+  > 2026-10-05). A write verb allocates its block after its own span check
+  > and before the copy, so the step can refuse with the block allocated and
+  > not yet registered. That refusal used to be `copy-in!`'s raise, and
+  > nothing freed the block. Every write whose payload an engine's timer
+  > handler, or another thread, truncated in that window leaked it; the shape
+  > dates from v0.1.0. The step now answers the refusal as a status
+  > (`try-copy-in!`), and each verb frees its block before raising its own
+  > `span-out-of-range`. A `guard` around the copy would also free it, at
+  > ~300 B a write (#45). `tests/test-stream.sps`'s shrinking-payload sweep
+  > holds the refusal and the bytes sent, and Valgrind holds the free.
+  > `.plans/write-copy-leak-mutation-log.md` has the evidence.
+  >
   > **What pins all this:**
   >
   > - `tests/test-native.sps` holds each helper within 3x of libc's own

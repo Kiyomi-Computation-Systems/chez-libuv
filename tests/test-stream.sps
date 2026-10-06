@@ -26,12 +26,26 @@
         (only (libuv private native) live-counts)
         (uv-testing)
         (uv-bulk)
-        (only (uv-evidence) live-count)
-        (only (chezscheme) collect foreign-alloc foreign-free))
+        (only (uv-evidence) live-count describe)
+        ;; make-engine and bytevector-truncate! drive the shrinking-payload
+        ;; sweep.
+        (only (chezscheme) collect foreign-alloc foreign-free
+              make-engine bytevector-truncate!))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
 (define registry-count-at-start (registry-count))
+
+;; The simple runner prints only a failing row's title. The sweep rows
+;; return their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 (test-begin "stream")
 
@@ -110,6 +124,195 @@
 (test-equal "a uv-shutdown! libuv refuses raises its errno as uv-shutdown! and leaves no request"
   '((uv-shutdown! errno) 0 0)
   (refusal-and-residue (lambda () (uv-shutdown! pipe nop))))
+
+;; --- a payload that shrinks during the call -------------------------------
+;; A write verb checks each span against its bytevector, allocates the
+;; request block, and then copies the span in. The copy checks the span
+;; again, in one interrupt-free step with the memcpy. An engine's timer can
+;; expire between the two checks, and its handler can truncate the
+;; bytevector (so can another thread). The copy then finds the span past the
+;; new end while the block is allocated and not yet registered, and only the
+;; verb can free it.
+;;
+;; Each sweep runs a verb in an engine at rising fuel. At the first expiry it
+;; truncates the payload to 16 bytes, then resumes the verb. Fuel 1 expires
+;; before the verb's own check, and the sweep stops at the first run that
+;; finishes before any expiry, so between them every point in the verb is
+;; visited. Each run has one right answer:
+;;   'refused   the verb refused the span under its own name, with no
+;;              request left registered or counted;
+;;   'written   the copy came first, and the peer received exactly the bytes
+;;              the call was given;
+;;   'untouched the last run, which no expiry reached.
+;; A block a refusal fails to free is invisible here, because the live
+;; counters count a request from its registration on. Valgrind reports it
+;; definitely lost when `make test-memory` runs this suite on Linux.
+
+(define s-loop (make-uv-loop))
+(define s-server (make-uv-tcp s-loop))
+(define s-port (bind-loopback! s-server))
+(define s-received (make-byte-collector))   ; where the current run's bytes go
+(define s-peer #f)
+(uv-listen! s-server 1
+            (lambda (err)
+              (set! s-peer (uv-accept! s-server))
+              (uv-read-start! s-peer
+                              (lambda (bv start end)
+                                (collect-span! s-received bv start end))
+                              nop nop)))
+(define s-client (make-uv-tcp s-loop))
+(define s-connected #f)
+(connect-loopback! s-client s-port (lambda (err) (set! s-connected #t)))
+
+(test-equal "seed: the sweep's client connected and was accepted"
+  'satisfied
+  (run-until/ticking s-loop (lambda () (and s-connected s-peer)) 4000))
+
+(define sweep-len 3001)
+(define sweep-max-fuel 400)
+(define s-issued 0)
+(define s-completed 0)
+(define (on-swept err) (set! s-completed (+ s-completed 1)))
+
+;; A variant names its verb, writes BV (filled with FILL) through it, and
+;; says what the peer must receive and how the verb refuses a span.
+(define-record-type sweep-variant
+  (fields name write expected refusal))
+
+(define sweep-variants
+  (list
+   (make-sweep-variant
+    'uv-write!
+    (lambda (bv fill) (uv-write! s-client bv 0 sweep-len on-swept))
+    (lambda (fill) (make-bytevector sweep-len fill))
+    '(uv-write! span-out-of-range))
+   (make-sweep-variant
+    'uv-write*!
+    (lambda (bv fill) (uv-write*! s-client (list (list bv 0 sweep-len)) on-swept))
+    (lambda (fill) (make-bytevector sweep-len fill))
+    '(uv-write*! segment-span-out-of-range))
+   ;; The shrinking segment second, so its copy refuses after the first's.
+   (make-sweep-variant
+    'uv-write*!-second-segment
+    (lambda (bv fill)
+      (uv-write*! s-client (list (make-bytevector 7 (- 255 fill))
+                                 (list bv 0 sweep-len))
+                  on-swept))
+    (lambda (fill)
+      (let ((out (make-bytevector (+ 7 sweep-len) fill)))
+        (bytevector-fill-range! out 0 7 (- 255 fill))
+        out))
+    '(uv-write*! segment-span-out-of-range))))
+
+(define (bytevector-fill-range! bv start end byte)
+  (let fill ((i start))
+    (when (< i end) (bytevector-u8-set! bv i byte) (fill (+ i 1)))))
+
+;; shrink-verdict : sweep-variant exact-positive-integer -> verdict
+;; A verdict is one of the symbols above, or else the evidence, a list.
+;; FILL is unique to the run among its neighbours and never 0, so a run that
+;; sent a zeroed or a stale block cannot match the bytes it was given.
+(define (shrink-verdict variant fuel)
+  (let* ((fill (+ 1 (mod fuel 254)))
+         (bv (make-bytevector sweep-len fill))
+         (expired #f)
+         (registry-before (registry-count))
+         (requests-before (live-count 'write-req))
+         (outcome
+          (let run ((eng (make-engine
+                          (lambda ()
+                            (guard (e ((uv-invalid-argument? e)
+                                       (list 'refused
+                                             (uv-invalid-argument-who e)
+                                             (uv-invalid-argument-reason e)))
+                                      (#t (list 'raised (describe e))))
+                              ((sweep-variant-write variant) bv fill)
+                              '(written)))))
+                    (ticks fuel))
+            (eng ticks
+                 (lambda (left v) v)
+                 (lambda (next)
+                   (unless expired
+                     (set! expired #t)
+                     (bytevector-truncate! bv 16))
+                   (run next 100000)))))
+         (registry-after (registry-count))
+         (requests-after (live-count 'write-req)))
+    (case (car outcome)
+      ((refused)
+       (if (and (equal? (cdr outcome) (sweep-variant-refusal variant))
+                (= registry-after registry-before)
+                (= requests-after requests-before))
+           'refused
+           (list 'refused-as (cdr outcome)
+                 'registered (- registry-after registry-before)
+                 'counted (- requests-after requests-before))))
+      ((written)
+       (set! s-issued (+ s-issued 1))
+       (set! s-received (make-byte-collector))
+       (let* ((expected ((sweep-variant-expected variant) fill))
+              (drained (run-until/ticking
+                        s-loop
+                        (lambda ()
+                          (and (= s-completed s-issued)
+                               (>= (collector-count s-received)
+                                   (bytevector-length expected))))
+                        1000))
+              (sent (compare-bytes expected (collector-bytes s-received))))
+         (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
+                (list 'written-but-sent sent drained))
+               (expired 'written)
+               (else 'untouched))))
+      (else outcome))))
+
+;; shrink-sweep : sweep-variant -> (list-of (list fuel verdict))
+;; A raise between runs would abort the suite, so the whole sweep is caught
+;; and its evidence handed to the rows.
+(define (shrink-sweep variant)
+  (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
+    (let run ((fuel 1) (acc '()))
+      (let ((row (list fuel (shrink-verdict variant fuel))))
+        (if (or (eq? (cadr row) 'untouched) (= fuel sweep-max-fuel))
+            (reverse (cons row acc))
+            (run (+ fuel 1) (cons row acc)))))))
+
+(define shrink-sweeps
+  (map (lambda (v) (cons (sweep-variant-name v) (shrink-sweep v)))
+       sweep-variants))
+
+;; rows-where : (verdict -> boolean) -> (list-of (list name fuel verdict))
+(define (rows-where bad?)
+  (apply append
+         (map (lambda (sweep)
+                (map (lambda (row) (cons (car sweep) row))
+                     (filter (lambda (row) (bad? (cadr row))) (cdr sweep))))
+              shrink-sweeps)))
+
+(define (verdict-is? kind) (lambda (v) (and (pair? v) (eq? (car v) kind))))
+
+;; The rows below look for bad verdicts and must find none, which says
+;; nothing unless each sweep saw the span refused and ran its verb to the end.
+(test-equal "each sweep began before the verb's own check and ended in a run no expiry reached"
+  (map (lambda (v) (list (sweep-variant-name v) 'refused 'untouched))
+       sweep-variants)
+  (map (lambda (sweep)
+         (let ((rows (cdr sweep)))
+           (list (car sweep)
+                 (cadr (car rows))
+                 (cadr (list-ref rows (- (length rows) 1))))))
+       shrink-sweeps))
+
+(test-equal "a write whose payload shrank during the call is refused by the verb itself, leaving no request"
+  '()
+  (rows-where (lambda (v) (or ((verdict-is? 'refused-as) v)
+                              ((verdict-is? 'raised) v)
+                              ((verdict-is? 'sweep-raised) v)))))
+
+(test-equal "a write the sweep let through sent the peer exactly the bytes it was given"
+  '()
+  (rows-where (verdict-is? 'written-but-sent)))
+
+(uv-loop-teardown! s-loop)
 
 ;; --- the write verbs move their payload in bulk (issue #35) -------------
 ;; A write to the unconnected pipe runs the verb's whole synchronous prefix --

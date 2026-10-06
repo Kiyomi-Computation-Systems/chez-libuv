@@ -5,6 +5,12 @@
 ;;; checking the status rather than guarding the native call: the guard
 ;;; allocated ~300 B on every write (#45). So the stream's pointer, whose
 ;;; check can raise, is resolved before the request exists.
+;;;
+;;; One check can still fail once a write's block exists: the payload can
+;;; shrink between the verb's span check and the copy (an engine's timer
+;;; handler can truncate it, or another thread). The copy answers that as a
+;;; status, and the verb frees the block before it raises its own refusal
+;;; (test-stream.sps's shrinking-payload sweep).
 (library (libuv stream)
   (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -49,7 +55,9 @@
               ;; Empty writes still need an address inside the owned block.
               (block (alloc-zeroed (+ payload-offset (max len 1))))
               (payload (+ block payload-offset)))
-         (copy-in! payload bv start len)
+         (unless (eq? (try-copy-in! payload bv start len) 'copied)
+           (free! block)
+           (raise (make-uv-invalid-argument 'uv-write! 'span-out-of-range)))
          (uv-buf-set! (+ block buf-offset) payload len)
          (let ((req (%make-uv-req-record block 'write stream on-complete)))
            (registry-register! block 'write-req (handle-loop stream) req)
@@ -116,7 +124,11 @@
                  (bv (car spec)) (start (cadr spec)) (len (caddr spec))
                  (buf (+ block bufs-offset (* i (sizeof-uv-buf-t))))
                  (base (if (zero? len) payload-base (+ payload-base running))))
-            (when (positive? len) (copy-in! base bv start len))
+            (unless (or (zero? len)
+                        (eq? (try-copy-in! base bv start len) 'copied))
+              (free! block)
+              (raise (make-uv-invalid-argument 'uv-write*!
+                                               'segment-span-out-of-range)))
             (uv-buf-set! buf base len)
             (place (cdr specs) (+ i 1) (+ running len)))))
       (let ((req (%make-uv-req-record block 'write stream on-complete)))

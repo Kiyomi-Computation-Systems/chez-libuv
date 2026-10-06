@@ -958,6 +958,25 @@
         (copy-in! addr (u8-list->bytevector (list 1 2 3)) 1 3)))
     'no-raise))
 
+;; try-copy-in! is copy-in! for a caller that owns a block it must free when
+;; the span no longer fits (the write verbs): that refusal is its answer, not
+;; a raise, and nothing is written.
+(test-equal "try-copy-in! answers copied for a span that fits, and copies it"
+  (list 'copied (u8-list->bytevector (list 20 30 40 0)))
+  (let* ((addr (alloc-zeroed 4))
+         (answer (try-copy-in! addr (u8-list->bytevector (list 10 20 30 40)) 1 3))
+         (written (copy-out addr 4)))
+    (free! addr)
+    (list answer written)))
+
+(test-equal "try-copy-in! answers span-out-of-range for a span past the end, and writes nothing"
+  (list 'span-out-of-range (make-bytevector 4 0))
+  (let* ((addr (alloc-zeroed 4))
+         (answer (try-copy-in! addr (u8-list->bytevector (list 1 2 3)) 1 3))
+         (written (copy-out addr 4)))
+    (free! addr)
+    (list answer written)))
+
 (test-equal "copy-out rejects a null source"
   'uv-copy-out
   (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
