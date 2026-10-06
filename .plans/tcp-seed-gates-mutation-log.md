@@ -267,8 +267,10 @@ Rule 2 also holds the cancelled-write wait's tick, which q-norec held first
 - **Load flakes that now fail by name, not fixed here.** The reset section's
   abortive close sometimes sends FIN instead of RST, because the server's
   bytes have not reached the client when it closes: 5 or 6 of 32 runs at load
-  ~35, on main and here alike. The read path's and the transfer's EOF waits,
-  at 64 ticks, failed by name at heavier load.
+  ~35, on main and here alike. PR #50, open as this lands, makes the close
+  wait until those bytes are queued; the two PRs merge without conflict. The
+  read path's and the transfer's EOF waits, at 64 ticks, failed by name at
+  heavier load.
 - **Other suites start peers as placeholders too:** `test-stream` (`#f`),
   `test-flow` (`'not-accepted`), `test-facade` and `test-lifecycle`
   (`'never-accepted`), `test-callback-alloc` (`#f`). They were not audited,
