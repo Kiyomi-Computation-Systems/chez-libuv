@@ -14,13 +14,11 @@
   (define (make-uv-pipe loop)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-pipe)
-    (let* ((handle-size (uv-handle-size (uv-named-pipe-type)))
-           (ptr (alloc-zeroed (stream-block-size handle-size))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-pipe-init (loop-pointer loop 'make-uv-pipe) ptr 0)
-                  'make-uv-pipe))
-      (let ((pipe (%make-uv-pipe-record ptr loop handle-size)))
-        (registry-register! ptr 'pipe loop pipe)
-        (count-pipe-new!)
-        (attach-stream-descriptor! pipe)
-        pipe))))
+    (let ((handle-size (uv-handle-size (uv-named-pipe-type))))
+      (construct-handle 'make-uv-pipe loop (stream-block-size handle-size)
+                        init-pipe
+                        (lambda (ptr) (%make-uv-pipe-record ptr loop handle-size))
+                        count-pipe-new! #f)))
+
+  ;; No IPC: these pipes carry bytes, never handles.
+  (define (init-pipe loop-ptr ptr) (uv-pipe-init loop-ptr ptr 0)))

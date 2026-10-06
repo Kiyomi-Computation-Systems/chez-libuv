@@ -4,7 +4,7 @@
 ;;; before the shim so uv_* symbols are globally available on Linux.
 (library (libuv private native)
   (export ;; loading and the init gate
-          ensure-native-loaded! native-init-count native-initialized?
+          ensure-native-loaded! native-init-count native-initialized? init-mutex
           resolve-shim-path load-shim shim-file
           version-supported? version-compatible? check-version-compatible!
 
@@ -1065,12 +1065,23 @@
 
   ;; ensure-native-loaded! : -> unspecified
   ;; Idempotently validate versions, constants, and uv_buf_t layout.
+  ;;
+  ;; The lock is held only with interrupts disabled. with-mutex releases it
+  ;; in a dynamic-wind exit, after the winder is gone, where an engine could
+  ;; expire: every constructor starts here, and a dropped one left the lock
+  ;; held for good, so another thread's next constructor would wait on it
+  ;; forever (tests/test-constructors.sps). Disabled, no engine expires and
+  ;; no collection stops the thread between the take and the release, so a
+  ;; thread that waits on the lock, waiting with interrupts disabled too,
+  ;; waits only for a holder that is running. A raise inside, from a refused
+  ;; library, unwinds both forms.
   (define (ensure-native-loaded!)
-    (with-mutex init-mutex
-      (unless initialized?
-        (check-version-compatible! (shim-compiled-version) (uv-version))
-        (constants-init! lookup-constant raw-errno-count
-                         errno-name-at raw-errno-value)
-        (validate-uv-buf-layout!)
-        (set! init-count (+ init-count 1))
-        (set! initialized? #t)))))
+    (with-interrupts-disabled
+     (with-mutex init-mutex
+       (unless initialized?
+         (check-version-compatible! (shim-compiled-version) (uv-version))
+         (constants-init! lookup-constant raw-errno-count
+                          errno-name-at raw-errno-value)
+         (validate-uv-buf-layout!)
+         (set! init-count (+ init-count 1))
+         (set! initialized? #t))))))

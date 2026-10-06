@@ -107,11 +107,24 @@ call in one step that no engine timer interrupts. A verb resumed after its
 stream was closed raises `&uv-handle-closed` without touching it. A verb
 whose engine is never resumed leaves nothing behind: either it had not
 begun, or libuv holds its request and the request's completion frees it.
+
+The constructors (`make-uv-loop`, `make-uv-timer`, `make-uv-tcp`,
+`make-uv-pipe`, `make-uv-signal`, `make-uv-async`) and `uv-accept!` make
+the same promise. One resumed after its loop was torn down raises
+`&uv-handle-closed` for the loop; `uv-accept!` resumed after its server
+was closed raises it for the server. One whose engine is never resumed
+either had not begun or has registered its handle, which the loop's
+teardown closes. The loop `make-uv-loop` makes is the caller's to tear
+down from the moment it exists. `call-with-uv-loop` makes its loop inside
+its body, so an engine that expires anywhere from there on tears the loop
+down with it.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
-the task that is using it, and do not abandon an engine inside a
-constructor, `uv-tcp-connect!`, a DNS request or `uv-spawn!`.
+the task that is using it, and do not abandon an engine inside
+`uv-tcp-connect!`, a DNS request, `uv-spawn!`, or `call-with-uv-loop`'s
+teardown on the way out of its body.
 
 ## Flow control
 

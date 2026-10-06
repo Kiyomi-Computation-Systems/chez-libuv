@@ -18,14 +18,10 @@
   (define (make-uv-timer loop)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-timer)
-    (let ((ptr (alloc-zeroed (uv-handle-size (uv-timer-type)))))
-      (guard (e (#t (free! ptr) (raise e)))
-        (uv-check (uv-timer-init (loop-pointer loop 'make-uv-timer) ptr)
-                  'make-uv-timer))
-      (let ((timer (%make-uv-timer-record ptr loop)))
-        (registry-register! ptr 'timer loop timer)
-        (count-timer-new!)
-        timer)))
+    (construct-handle 'make-uv-timer loop (uv-handle-size (uv-timer-type))
+                      uv-timer-init
+                      (lambda (ptr) (%make-uv-timer-record ptr loop))
+                      count-timer-new! #f))
 
   ;; uv-timer-start! : uv-timer procedure exact-nonnegative-integer
   ;;                   exact-nonnegative-integer -> unspecified

@@ -10,7 +10,8 @@
           registry-add! registry-remove!
 
           ;; interrupt-free steps
-          one-step open-handle-ptr step-refusal
+          one-step open-handle-ptr open-loop-ptr step-refusal
+          try-construct-handle construct-handle try-construct-loop
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -34,7 +35,7 @@
           signal-mode set-signal-mode!
           %make-uv-async-record uv-async-record?
           async-on-wake set-async-on-wake!
-          async-fence with-send-fence valid-pointer?
+          async-fence make-send-fence with-send-fence valid-pointer?
           handle-ptr handle-kind handle-loop
           handle-state set-handle-state!
           handle-on-close set-handle-on-close!
@@ -44,7 +45,7 @@
           stream-on-eof set-stream-on-eof!
           stream-on-error set-stream-on-error!
           stream-read-buf stream-read-buf-len stream-descriptor
-          stream-block-size attach-stream-descriptor!
+          stream-block-size
           install-read-buffer! free-read-buffer!
           stream-reading? set-stream-reading!
           pipe-connected? set-pipe-connected!
@@ -63,7 +64,7 @@
           record-orphan-callback! orphan-callback-events
 
           ;; close and dispatcher installation
-          close-handle! install-close-handle! close-handle-installed?
+          close-handle! begin-close! install-close-handle! close-handle-installed?
           install-dispatch-procedure!
           discard-failed-handle!
 
@@ -84,7 +85,8 @@
                 count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
                 count-read-buffer-new! count-read-buffer-free!
-                alloc-block align-16 uv-buf-set! copy-out
+                count-loop-new! uv-loop-size
+                alloc-block free-block! align-16 uv-buf-set! copy-out
                 uv-handle-set-data
                 uv-errno-condition
                 uv-walk-native
@@ -225,15 +227,20 @@
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
   ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
-  ;; fence is the handle's send fence (#33); see with-send-fence.
+  ;; fence is the handle's send fence (#33); see with-send-fence. The caller
+  ;; makes it, with make-send-fence: make-uv-async makes the record inside an
+  ;; interrupt-free step, where nothing may raise, and making a mutex raises
+  ;; when it cannot be allocated.
   (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
     (parent uv-handle-record)
     (fields (mutable on-wake async-on-wake set-async-on-wake!)
             (immutable fence async-fence))
     (protocol
      (lambda (pargs->new)
-       (lambda (ptr loop on-wake)
-         ((pargs->new ptr 'async loop) on-wake (make-mutex))))))
+       (lambda (ptr loop on-wake fence)
+         ((pargs->new ptr 'async loop) on-wake fence)))))
+
+  (define (make-send-fence) (make-mutex))
 
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
@@ -357,16 +364,30 @@
             ((not (valid-pointer? ptr)) 'no-pointer)
             (else ptr))))
 
-  ;; step-refusal : (or symbol exact-integer) symbol uv-handle -> condition
+  ;; open-loop-ptr : uv-loop -> (or uptr 'loop-not-open 'no-loop-pointer)
+  ;; open-handle-ptr for a loop: a constructor's step checks again that the
+  ;; loop it was given is open, since a teardown can free the loop between
+  ;; the constructor's open check and its init.
+  (define (open-loop-ptr loop)
+    (let ((ptr (loop-ptr loop)))
+      (cond ((not (eq? (loop-state loop) 'open)) 'loop-not-open)
+            ((not (valid-pointer? ptr)) 'no-loop-pointer)
+            (else ptr))))
+
+  ;; step-refusal : (or symbol exact-integer) symbol (or uv-handle #f)
+  ;;                -> condition
   ;; What verb WHO raises, once its step is over, for a step on HANDLE that
-  ;; answered STATUS instead of starting. A closed handle and a missing
-  ;; pointer are the refusals the checked accessors raise outside a step; a
-  ;; refused registration is registry-register!'s; an integer is libuv's
-  ;; errno. Any other symbol is a refusal of WHO's own argument, and names it.
+  ;; answered STATUS instead of starting; a constructor has no handle to
+  ;; pass. A closed handle or loop and a missing pointer are the refusals
+  ;; the checked accessors raise outside a step; a refused registration is
+  ;; registry-register!'s; an integer is libuv's errno. Any other symbol is a
+  ;; refusal of WHO's own argument, and names it.
   (define (step-refusal status who handle)
     (case status
       ((not-open) (make-uv-handle-closed (handle-kind handle)))
       ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
+      ((loop-not-open) (make-uv-handle-closed 'loop))
+      ((no-loop-pointer) (make-uv-invalid-argument who 'null-loop-pointer))
       ((no-memory) (uv-errno-condition (errno-symbol->value 'ENOMEM) who))
       ((null-or-invalid-pointer loop-not-a-uv-loop pointer-already-registered)
        (make-uv-invalid-argument 'uv-registry-register! status))
@@ -552,14 +573,111 @@
   (define (stream-block-size handle-size)
     (+ (descriptor-offset handle-size) (sizeof-uv-buf-t)))
 
-  ;; attach-stream-descriptor! : uv-stream -> unspecified
-  ;; Points the handle's data at its descriptor, for the stream's whole life:
-  ;; the one write of data in src/ (tests/test-source-rules.sps). The block
-  ;; is zeroed, so until the first read start the descriptor is the empty
+  ;; attach-stream-descriptor! : uv-stream uptr -> unspecified
+  ;; Points the data of STREAM's handle, at PTR, at its descriptor, for the
+  ;; stream's whole life: the one write of data in src/
+  ;; (tests/test-source-rules.sps). try-construct-handle makes it inside its
+  ;; step, on the block it has just made, so it checks nothing. The block is
+  ;; zeroed, so until the first read start the descriptor is the empty
   ;; buffer, which libuv reports as UV_ENOBUFS.
-  (define (attach-stream-descriptor! stream)
-    (uv-handle-set-data (handle-pointer stream 'uv-attach-stream-descriptor!)
-                        (stream-descriptor stream)))
+  (define (attach-stream-descriptor! stream ptr)
+    (uv-handle-set-data ptr (stream-descriptor stream)))
+
+  ;; try-construct-handle : uv-loop exact-positive-integer procedure
+  ;;                        procedure procedure boolean
+  ;;                        -> (or uv-handle symbol exact-integer)
+  ;; Makes a handle on LOOP in one interrupt-free step: the loop's open check
+  ;; and pointer, a block of SIZE bytes, the record MAKE-RECORD makes of the
+  ;; block, its registration, libuv's init (INIT!, given the loop's pointer
+  ;; and the block), a stream's descriptor, and the count (COUNT-NEW!). With
+  ;; OWNED? the step also requires this thread to own the loop. It answers
+  ;; the handle, or what stood in the way: 'loop-not-open, 'no-loop-pointer,
+  ;; 'wrong-thread, 'no-memory, a refused registration, or INIT!'s errno, and
+  ;; a refused step leaves nothing behind. MAKE-RECORD, INIT! and COUNT-NEW!
+  ;; must be total, as a step's calls are (one-step).
+  ;; - Split by an engine, a constructor's open check stopped covering its
+  ;;   init: a teardown freed the loop in between, and the init linked the
+  ;;   handle into the freed uv_loop_t. A teardown between the init and the
+  ;;   registration could not close the handle, so uv_loop_close failed with
+  ;;   EBUSY for good.
+  ;; - Dropped, a constructor lost the block it had allocated, or left its
+  ;;   handle linked into the loop and unregistered: the same EBUSY, and for
+  ;;   an async, which keeps the loop alive, a teardown that never returned
+  ;;   (tests/test-constructors.sps).
+  (define (try-construct-handle loop size init! make-record count-new! owned?)
+    (one-step
+     (let ((loop-ptr (open-loop-ptr loop)))
+       (cond
+        ((symbol? loop-ptr) loop-ptr)
+        ((and owned? (not (eqv? (loop-owner-thread loop) (current-thread-id))))
+         'wrong-thread)
+        (else
+         (let ((ptr (alloc-block size)))
+           (if (zero? ptr)
+               'no-memory
+               (let* ((handle (make-record ptr))
+                      (status (register-then-init! ptr (handle-kind handle) loop handle
+                                                   (lambda () (init! loop-ptr ptr)))))
+                 (if (not (eq? status 'registered))
+                     status
+                     (begin (when (uv-stream-record? handle)
+                              (attach-stream-descriptor! handle ptr))
+                            (count-new!)
+                            handle))))))))))
+
+  ;; try-construct-loop : (uptr -> exact-integer) (uv-loop -> object)
+  ;;                      -> (or uv-loop symbol exact-integer)
+  ;; try-construct-handle for a loop: one interrupt-free step makes the
+  ;; block, the record, its registration, libuv's init (INIT!, given the
+  ;; block) and the count. It answers the loop, or 'no-memory, a refused
+  ;; registration, or INIT!'s errno, leaving nothing behind. An engine
+  ;; dropped make-uv-loop between these and lost the block, or the loop with
+  ;; its descriptors. KEEP!, which must be total, is handed the loop inside
+  ;; the step, so a caller that tears the loop down however it is left,
+  ;; call-with-uv-loop, holds it from the step on.
+  (define (try-construct-loop init! keep!)
+    (let ((size (uv-loop-size)))
+      (one-step
+       (let ((ptr (alloc-block size)))
+         (if (zero? ptr)
+             'no-memory
+             (let* ((loop (%make-uv-loop-record ptr))
+                    (status (register-then-init! ptr 'loop loop loop
+                                                 (lambda () (init! ptr)))))
+               (if (not (eq? status 'registered))
+                   status
+                   (begin (count-loop-new!)
+                          (keep! loop)
+                          loop))))))))
+
+  ;; register-then-init! : uptr symbol uv-loop object (-> exact-integer)
+  ;;                       -> (or 'registered symbol exact-integer)
+  ;; For a constructor's step: registers OBJECT under the block at PTR, then
+  ;; runs libuv's init (INIT). It answers 'registered, or what stood in the
+  ;; way, having freed the block: a refused registration, before libuv has
+  ;; seen the block, or the init's errno, after which the entry is removed.
+  ;; Registered first, a handle linked into its loop is always one the
+  ;; loop's teardown can find and close.
+  (define (register-then-init! ptr kind loop object init)
+    (let ((status (registry-add! ptr kind loop object)))
+      (if (not (eq? status 'registered))
+          (begin (free-block! ptr) status)
+          (let ((rc (init)))
+            (if (zero? rc)
+                'registered
+                (begin (registry-remove! ptr) (free-block! ptr) rc))))))
+
+  ;; construct-handle : symbol uv-loop exact-positive-integer procedure
+  ;;                    procedure procedure boolean -> uv-handle
+  ;; try-construct-handle for constructor WHO, raising what stood in the way
+  ;; once the step is over.
+  (define (construct-handle who loop size init! make-record count-new! owned?)
+    (let ((made (try-construct-handle loop size init! make-record count-new! owned?)))
+      (cond ((uv-handle? made) made)
+            ((eq? made 'wrong-thread)
+             (raise (make-uv-wrong-thread who (loop-owner-thread loop)
+                                          (current-thread-id))))
+            (else (raise (step-refusal made who #f))))))
 
   ;; install-read-buffer! : uv-stream object
   ;;                        -> (or 'installed 'not-open 'buffered 'no-memory)
