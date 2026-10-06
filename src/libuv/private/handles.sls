@@ -41,6 +41,7 @@
           stream-on-error set-stream-on-error!
           stream-read-buf set-stream-read-buf!
           stream-read-buf-len set-stream-read-buf-len!
+          install-read-buffer! stream-read-payload
           stream-reading? set-stream-reading!
           pipe-connected? set-pipe-connected!
           process-on-exit process-exited? set-process-exited!
@@ -78,13 +79,14 @@
                 count-pipe-free! count-process-free!
                 count-signal-free! count-async-free!
                 count-write-req-free! count-connect-req-free!
-                count-read-buffer-free!
-                uv-buf-set! copy-out
+                count-read-buffer-new! count-read-buffer-free!
+                alloc-zeroed align-16 uv-buf-set! copy-out
+                uv-handle-set-data
                 uv-errno-condition
                 uv-walk-native
                 current-thread-id
                 dispatcher-names install-callback-dispatchers!)
-          (only (libuv private constants) uv-eof))
+          (only (libuv private constants) uv-eof sizeof-uv-buf-t))
 
   ;; A unique sentinel is required because R6RS permits (raise #f).
   (define no-pending (list 'no-pending))
@@ -163,7 +165,9 @@
        (lambda (ptr loop) ((pargs->new ptr 'timer loop) #f)))))
 
   ;; The reusable read buffer belongs to the handle and is freed only at close.
-  ;; reading records caller intent; EOF and read errors do not clear it.
+  ;; read-buf is its whole block, a descriptor and then the payload
+  ;; (install-read-buffer!); read-buf-len is the payload's length. reading
+  ;; records caller intent; EOF and read errors do not clear it.
   (define-record-type (uv-stream-record %make-uv-stream-record uv-stream-record?)
     (parent uv-handle-record)
     (fields (mutable on-data      stream-on-data      set-stream-on-data!)
@@ -413,14 +417,6 @@
     (complete-request! 'shutdown 'uv-shutdown! no-request-counter
                        req req-ptr status))
 
-  ;; This dispatcher must remain infallible: it can only return the existing
-  ;; handle buffer or a zero-length buffer. libuv provides no alloc error path.
-  (define (alloc-dispatch handle handle-ptr suggested buf-ptr)
-    (if (and (uv-stream-record? handle)
-             (valid-pointer? (stream-read-buf handle)))
-        (uv-buf-set! buf-ptr (stream-read-buf handle) (stream-read-buf-len handle))
-        (uv-buf-set! buf-ptr 0 0)))
-
   ;; nread is signed so UV_EOF cannot masquerade as a huge positive read. The
   ;; buffer argument is ignored; the registered handle owns the trusted base.
   (define (read-dispatch handle stream-ptr nread buf-ptr)
@@ -434,7 +430,7 @@
   (define (deliver-read-data! handle nread)
     (let ((on-data (stream-on-data handle)))
       (when on-data
-        (on-data (copy-out (stream-read-buf handle) nread) 0 nread))))
+        (on-data (copy-out (stream-read-payload handle) nread) 0 nread))))
 
   (define (deliver-read-eof! handle)
     (let ((on-eof (stream-on-eof handle)))
@@ -459,6 +455,31 @@
           (let ((on-close (handle-on-close handle)))
             (when on-close (on-close))))
         (record-orphan-callback! 'close handle-ptr)))
+
+  ;; A read buffer is one block: a uv_buf_t descriptor of the payload, then the
+  ;; payload, from the first 16-byte boundary after it. The handle's data
+  ;; points at the descriptor, and the shim's alloc callback answers libuv
+  ;; with a copy of it before every read (#45). In one block, the descriptor
+  ;; lives exactly as long as the buffer it describes: from the first read
+  ;; start until the close dispatcher frees both, after libuv's last alloc
+  ;; callback for the handle.
+  (define (read-buffer-payload-offset) (align-16 (sizeof-uv-buf-t)))
+
+  ;; stream-read-payload : uv-stream -> uptr
+  ;; Where libuv reads into, and where a read's delivery copies from.
+  (define (stream-read-payload stream)
+    (+ (stream-read-buf stream) (read-buffer-payload-offset)))
+
+  ;; install-read-buffer! : uv-stream exact-positive-integer -> unspecified
+  ;; The handle owns the block before data points at it, so the close
+  ;; dispatcher frees it whatever happens after.
+  (define (install-read-buffer! stream size)
+    (let ((block (alloc-zeroed (+ (read-buffer-payload-offset) size))))
+      (uv-buf-set! block (+ block (read-buffer-payload-offset)) size)
+      (set-stream-read-buf! stream block)
+      (set-stream-read-buf-len! stream size)
+      (count-read-buffer-new!)
+      (uv-handle-set-data (handle-pointer stream 'uv-read-start!) block)))
 
   ;; A zero buffer means reading never started; free! deliberately rejects zero.
   (define (free-read-buffer! handle)
@@ -684,10 +705,9 @@
                       (cons 'write-done write-done-dispatch)
                       (cons 'shutdown   shutdown-dispatch)
                       (cons 'connect    connect-dispatch)
-                      (cons 'alloc      alloc-dispatch)
                       (cons 'read       read-dispatch)))
       (install-callback-dispatchers!
-       (seams alloc read connection write-done close timer shutdown connect
+       (seams read connection write-done close timer shutdown connect
               getaddrinfo getnameinfo exit walk signal async))
       (install-close-handle! real-close-handle!)
       'wired)))

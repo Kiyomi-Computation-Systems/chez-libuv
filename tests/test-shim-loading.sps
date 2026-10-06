@@ -30,7 +30,8 @@
 (import (rnrs)
         (srfi :64)
         (libuv private config)   ; shim-path: a known-good absolute path
-        (only (chezscheme) getenv system current-directory))
+        (only (chezscheme) getenv system current-directory
+              path-parent path-last load-shared-object foreign-entry?))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -138,6 +139,36 @@
 ;; assertion (review of #36); every shim binding now checks its entry first.
 (check-rejected "a loadable library without the shim's exports"
                 (car uv-library-paths))
+
+;; --- a shim built from older sources ---------------------------------------
+;; The library above lacks every export, so it is refused at the first. A
+;; consumer who upgrades without rebuilding has a shim that lacks only the
+;; newest, libuv's alloc callback (#45). The Makefile's STALE_SHIM is that
+;; shim: this one's source with chez_uv_alloc_cb renamed away.
+(define stale-shim
+  (string-append (path-parent (path-parent shim-path))
+                 "/stale-shim/" (path-last shim-path)))
+
+;; Control: the stale shim loads, and has the callback under another name
+;; only. A fixture that failed to load would be refused for that reason too,
+;; and would prove nothing about the missing entry.
+(test-equal "control: the stale shim loads, with the alloc callback renamed away"
+  '(loaded copy-in alloc-cb-absent alloc-cb-withheld)
+  (guard (e (#t (list 'raised (if (message-condition? e) (condition-message e) e))))
+    (for-each load-shared-object uv-library-paths)
+    (load-shared-object stale-shim)
+    (list 'loaded
+          (if (foreign-entry? "chez_uv_copy_in") 'copy-in 'no-copy-in)
+          (if (foreign-entry? "chez_uv_alloc_cb") 'alloc-cb-present 'alloc-cb-absent)
+          (if (foreign-entry? "chez_uv_alloc_cb_withheld")
+              'alloc-cb-withheld
+              'no-withheld-alloc-cb))))
+
+(check-rejected "a shim built before libuv's alloc callback was added" stale-shim)
+
+(let-values (((code out err) (run-probe stale-shim)))
+  (test-equal "...and the refusal names that shim"
+    #t (contains? err stale-shim)))
 
 ;; --- the libuv leg, distinguished from the shim leg ----------------------
 ;; A synthetic (libuv private config), resolved AHEAD of the generated one

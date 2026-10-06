@@ -387,6 +387,19 @@ relink-guard: ## Delete the shim when the build flavor or acquisition path chang
 	  rm -f $(SHIM); \
 	fi
 
+# A shim built from older sources, for tests/test-shim-loading.sps: this
+# shim's own source with its newest export, libuv's alloc callback (#45),
+# renamed away. So it loads cleanly and has every entry but that one, which
+# is what a consumer has after upgrading without `make build`, and the
+# import must refuse it with &uv-shim-unavailable naming the shim. The suite
+# finds it beside build/lib by this path.
+STALE_SHIM := $(BUILD_DIR)/stale-shim/libchezlibuv.$(SHLIB_EXT)
+
+$(STALE_SHIM): src/libuv-shim.c src/libuv-shim.h $(SHIM)
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_SHIM) -Dchez_uv_alloc_cb=chez_uv_alloc_cb_withheld \
+	      $(UV_CFLAGS) $(SHLIB_LDFLAGS) -o $@ src/libuv-shim.c $(UV_LIBS)
+
 # config.sls carries the shim's ABSOLUTE path so the loader never searches.
 # Kept as a canned recipe from when `prod` linked the shim itself and had to
 # generate this file without recursing via `$(MAKE) $(CONFIG_SLS)` -- that
@@ -444,7 +457,7 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 # $(TESTS) is a $(wildcard), so a later task's new tests/test-*.sps file is
 # picked up automatically -- no edit needed here, same reasoning as
 # PURE_TESTS above.
-test: build deps check-pins ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
+test: build deps check-pins $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
 	@test -n "$(TIMEOUT_BIN)" || echo "note: no timeout(1) on PATH; a hung suite will not be capped (brew install coreutils)"
 	@fail=0; \
 	for t in $(TESTS); do \
@@ -516,7 +529,7 @@ test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `ma
 # `make test-memory ASAN_DYLIB_PATTERN=/nonexistent/x.dylib` must fail loudly.
 ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
 
-test-memory: build deps check-pins ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
+test-memory: build deps check-pins $(STALE_SHIM) ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
 ifeq ($(UNAME_S),Linux)
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
 # seccomp profiles, containers that disallow the io_uring syscalls) reject

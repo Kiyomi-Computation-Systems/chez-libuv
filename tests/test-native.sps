@@ -1822,8 +1822,8 @@
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
-(test-equal "dispatcher-names names the fourteen callback types the design commits to"
-  '(alloc read connection write-done close timer shutdown connect
+(test-equal "dispatcher-names names the thirteen callback types that cross into Scheme"
+  '(read connection write-done close timer shutdown connect
     getaddrinfo getnameinfo exit walk signal async)
   dispatcher-names)
 
@@ -1879,7 +1879,7 @@
     ((dispatcher-ref 'async) 0)
     #f))
 
-(test-equal "dispatcher-ref rejects a name that is not one of the fourteen"
+(test-equal "dispatcher-ref rejects a name that is not one of the thirteen"
   '(uv-dispatcher-ref unknown-dispatcher)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -1890,7 +1890,7 @@
 ;; A partial install must be refused OUTRIGHT, leaving nothing installed --
 ;; a half-installed dispatcher table would hand libuv a trampoline that
 ;; raises from inside a C frame.
-(test-equal "an install missing one of the fourteen is refused, naming who and why"
+(test-equal "an install missing one of the thirteen is refused, naming who and why"
   '(uv-install-callback-dispatchers! incomplete-dispatcher-set)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))

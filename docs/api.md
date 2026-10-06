@@ -147,9 +147,10 @@ which regime you are in is backpressure discipline, not connection count —
 see `uv-read-stop!` and `uv-stream-write-queue-size` below.
 
 **The chez-libuv read buffer is the opposite shape**, and at rest it is the
-larger of the two by roughly 5×: 65536 bytes of resident foreign memory
-committed the moment `uv-read-start!` runs, whether or not a byte ever
-arrives, and not reclaimed until close.
+larger of the two by roughly 5×: 65536 bytes of resident foreign memory,
+plus a 16-byte header that libuv's alloc callback reads, committed the
+moment `uv-read-start!` runs, whether or not a byte ever arrives, and not
+reclaimed until close.
 
 `tcp_rmem[1]` was 131072 on the measured host. A commonly cited 87 KB is the
 older default; both are sysctl-tunable, so measure on the target kernel

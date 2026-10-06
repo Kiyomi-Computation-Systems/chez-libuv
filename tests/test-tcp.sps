@@ -43,13 +43,14 @@
         ;; group that looks inside a write block while it is still in flight
         ;; -- see "a written span" below for why that is the only place the
         ;; copied bytes are observable without a read on the other end.
-        ;; uv-buf-set! seeds a scratch uv_buf_t for the alloc-dispatcher rows,
-        ;; which is the only way to observe what alloc_cb hands libuv back.
+        ;; uv-buf-set! seeds a scratch uv_buf_t for the alloc-callback rows,
+        ;; which is the only way to observe what alloc_cb hands libuv back;
+        ;; copy-in! plants the bytes those rows read back through on-data.
         ;; shim-compiled-version tells the reuseport row which answer is right.
         (only (libuv private native)
               live-counts alloc-zeroed free! count-read-buffer-new!
               dispatcher-ref
-              uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-out
+              uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-in! copy-out
               shim-compiled-version)
         ;; uv-eof and errno-symbol->value are read from the SHIM's table, not
         ;; transcribed (ADR-0005): the read dispatcher's arms are driven with
@@ -58,7 +59,9 @@
               uv-write-req-type sizeof-uv-buf-t uv-eof errno-symbol->value)
         (uv-testing)
         (only (uv-evidence) live-count)
-        (only (chezscheme) collect))
+        ;; foreign-entry and foreign-procedure call the shim's alloc
+        ;; callback, and libuv's handle-data getter, as libuv would.
+        (only (chezscheme) collect foreign-entry? foreign-entry foreign-procedure))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -1519,43 +1522,74 @@
 
 (set-handle-state! s-peer 'open)
 
-;; --- the alloc dispatcher, reached directly ------------------------------
+;; --- libuv's alloc callback, called as libuv calls it ---------------------
 ;; The only way to see what alloc_cb hands libuv back is to call it with a
-;; uv_buf_t of one's own. The scratch is seeded with values no success path
-;; can leave behind (AGENTS.md), so "the dispatcher wrote nothing" is
-;; distinguishable from "the dispatcher wrote an empty buffer".
+;; uv_buf_t of one's own. Since #45 it is the shim's chez_uv_alloc_cb, not a
+;; Scheme dispatcher: it answers the uv_buf_t descriptor a reading handle's
+;; data field points at, and the empty buffer when data is NULL (ADR-0002,
+;; amended 2026-10-05). The scratch is seeded with values no success path
+;; can leave behind (AGENTS.md), so "the callback wrote nothing" is
+;; distinguishable from "the callback wrote an empty buffer". Against a shim
+;; without the callback, each row fails by name.
+(define shim-alloc-cb
+  (and (foreign-entry? "chez_uv_alloc_cb")
+       (foreign-procedure (foreign-entry "chez_uv_alloc_cb")
+                          (uptr size_t uptr) void)))
+
+(define handle-data (foreign-procedure "uv_handle_get_data" (uptr) uptr))
+
 (define s-scratch-buf (alloc-zeroed (sizeof-uv-buf-t)))
 
-(uv-buf-set! s-scratch-buf 999 999)
+;; alloc-answer : uptr exact-nonnegative-integer -> (list 'answered base len)
+;; What the callback leaves in a freshly seeded scratch uv_buf_t.
+(define (alloc-answer handle-ptr suggested)
+  (uv-buf-set! s-scratch-buf 999 999)
+  (if shim-alloc-cb
+      (begin (shim-alloc-cb handle-ptr suggested s-scratch-buf)
+             (list 'answered (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
+      'no-alloc-callback-in-this-shim))
 
-;; `suggested` is 1: libuv's hint is deliberately ignored, and a dispatcher
+;; One block holds the descriptor and the buffer it describes, so the
+;; descriptor lives exactly as long as the buffer: from the first read start
+;; until the close dispatcher frees the block, after libuv's last alloc
+;; callback for the handle.
+(test-equal "once a handle has started reading, its data points at the head of its own read buffer"
+  (stream-read-buf s-peer) (handle-data (handle-ptr s-peer)))
+
+;; `suggested` is 1: libuv's hint is deliberately ignored, and a callback
 ;; that answered the hint instead of the buffer's real length would put a 1
-;; here -- and then libuv would read one byte at a time forever.
-((dispatcher-ref 'alloc) (handle-ptr s-peer) 1 s-scratch-buf)
+;; here -- and then libuv would read one byte at a time forever. s-peer has
+;; been read into by now, so a payload that overlapped its own descriptor
+;; would have overwritten it already.
+(define s-alloc-answer (alloc-answer (handle-ptr s-peer) 1))
 
-(test-equal "the alloc dispatcher hands libuv the handle's own buffer, at its full length"
-  (list (stream-read-buf s-peer) (stream-read-buf-len s-peer))
-  (list (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
+(test-equal "libuv's alloc callback answers the handle's own buffer, at its full length"
+  (list 'answered (stream-read-buf-len s-peer))
+  (if (pair? s-alloc-answer)
+      (list (car s-alloc-answer) (caddr s-alloc-answer))
+      s-alloc-answer))
 
-(uv-buf-set! s-scratch-buf 999 999)
+;; What libuv reads into the answered buffer is what on-data must deliver.
+;; So a row-unique pattern planted at the answer's base has to come back
+;; through the read dispatcher, called as its trampoline calls it.
+(define s-planted (string->utf8 "alloc-answer-row"))
+(define s-delivered 'on-data-never-fired)
 
-(test-equal "the alloc dispatcher is infallible: a pointer it cannot resolve raises nothing"
-  'no-raise
-  (guard (e (#t (list 'raised e)))
-    ((dispatcher-ref 'alloc) 909090 65536 s-scratch-buf)
-    'no-raise))
-
-(test-equal "...and answers the EMPTY buffer libuv turns into UV_ENOBUFS"
-  '(0 0) (list (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
+(test-equal "...and on-data delivers the bytes read into that buffer"
+  s-planted
+  (if (pair? s-alloc-answer)
+      (let ((saved (stream-on-data s-peer)))
+        (copy-in! (cadr s-alloc-answer) s-planted 0 (bytevector-length s-planted))
+        (set-stream-on-data! s-peer (lambda (bv start end) (set! s-delivered bv)))
+        ((dispatcher-ref 'read) (handle-ptr s-peer) (bytevector-length s-planted) 0)
+        (set-stream-on-data! s-peer saved)
+        s-delivered)
+      s-alloc-answer))
 
 (define s-unread (make-uv-tcp sl))
 
-(uv-buf-set! s-scratch-buf 999 999)
-
-((dispatcher-ref 'alloc) (handle-ptr s-unread) 65536 s-scratch-buf)
-
-(test-equal "a tcp handle that never started reading gets the empty buffer too"
-  '(0 0) (list (uv-buf-base s-scratch-buf) (uv-buf-len s-scratch-buf)))
+(test-equal "a tcp handle that never started reading gets the EMPTY buffer libuv turns into UV_ENOBUFS"
+  '(answered 0 0) (alloc-answer (handle-ptr s-unread) 65536))
 
 (free! s-scratch-buf)
 
@@ -1953,10 +1987,11 @@
 (test-equal "the reset loop tore down cleanly"
   registry-count-at-start (registry-count))
 
-;; --- the six dispatchers Stages 4 and 5 installed through the seam -------
+;; --- the dispatchers Stages 4 and 5 installed through the seam -----------
 ;; Stage 3 left six raising stubs behind (tests/test-timer.sps); Stage 4
 ;; replaced four of them by name and Stage 5 the last two, with no second
-;; install-callback-dispatchers! call. Asking "is it still a stub?" on an
+;; install-callback-dispatchers! call. One of those two, alloc, has since
+;; left Scheme: the shim answers libuv's alloc callback (#45). Asking "is it still a stub?" on an
 ;; UNREGISTERED pointer cannot tell the two apart -- a stub's raise is
 ;; contained by the seam and recorded as an orphan, which is also what a real
 ;; dispatcher does with a pointer it cannot resolve. So the question is put
@@ -1965,31 +2000,27 @@
 ;; dispatcher leaves the error cell alone.
 (define dl (make-uv-loop))
 (define dtcp (make-uv-tcp dl))
-(define dbuf (alloc-zeroed (sizeof-uv-buf-t)))
 (define dispatch-orphans-before (length (orphan-callback-events)))
 
 ((dispatcher-ref 'connection) (handle-ptr dtcp) 0)
 ((dispatcher-ref 'write-done) (handle-ptr dtcp) 0)
 ((dispatcher-ref 'shutdown)   (handle-ptr dtcp) 0)
 ((dispatcher-ref 'connect)    (handle-ptr dtcp) 0)
-((dispatcher-ref 'alloc)      (handle-ptr dtcp) 65536 dbuf)
 ((dispatcher-ref 'read)       (handle-ptr dtcp) 0 0)
 
-(test-equal "the six dispatchers of Stages 4 and 5 are real, not Stage 3's raising stubs"
+(test-equal "the dispatchers Stages 4 and 5 installed are real, not Stage 3's raising stubs"
   'no-raise
   (guard (e (#t (list 'raised e)))
     (uv-run dl 'nowait)
     'no-raise))
 
-(free! dbuf)
-
-;; The connection, alloc and read dispatchers RESOLVED the pointer (it is a
-;; tcp record that was never listened on and never read from, so there is no
+;; The connection and read dispatchers RESOLVED the pointer (it is a tcp
+;; record that was never listened on and never read from, so there is no
 ;; callback to run and nothing to record); the three request dispatchers
 ;; could not, because a handle is not a request, so each records an orphan
 ;; naming its own callback type. Both halves are asserted at once: a
-;; connection, alloc or read dispatcher that fell through to the orphan arm
-;; would add a fourth pair here.
+;; connection or read dispatcher that fell through to the orphan arm would
+;; add a fourth pair here.
 (test-equal "the request dispatchers record an orphan for a pointer that is not a request"
   (list (cons 'write-done (handle-ptr dtcp))
         (cons 'shutdown (handle-ptr dtcp))

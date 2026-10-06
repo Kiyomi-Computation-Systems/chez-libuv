@@ -219,6 +219,28 @@ void chez_uv_zero(void *dst, size_t len) {
   memset(dst, 0, len);
 }
 
+/* The descriptor is written once, when the read buffer is allocated, and is
+ * freed with the buffer by the close callback, after libuv's last alloc
+ * callback for the handle. libuv itself never reads or writes a handle's
+ * data. */
+void chez_uv_alloc_cb(uv_handle_t *handle, size_t suggested_size,
+                      uv_buf_t *buf) {
+  const uv_buf_t *descriptor = (const uv_buf_t *)handle->data;
+  (void)suggested_size;
+  if (descriptor == NULL) {
+    buf->base = NULL;
+    buf->len = 0;
+  } else {
+    *buf = *descriptor;
+  }
+}
+
+/* Compiles only while chez_uv_alloc_cb has libuv's uv_alloc_cb type: Scheme
+ * hands libuv its address, so no call site would catch a mismatch. */
+typedef char chez_uv_alloc_cb_has_uv_alloc_cb_type
+  [sizeof(1 ? &chez_uv_alloc_cb : (uv_alloc_cb)0) == sizeof(uv_alloc_cb)
+   ? 1 : -1];
+
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
 static long live_loop            = 0;

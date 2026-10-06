@@ -11,6 +11,11 @@
 ;;; libuv refused it. Each row below holds a path to a bound it can meet only
 ;;; without the cost it is named for.
 ;;;
+;;; libuv's alloc callback no longer crosses at all. It crossed into Scheme
+;;; before every read, only to answer the stream's own read buffer, and the
+;;; shim answers it now (ADR-0002, amended 2026-10-05). The two read rows
+;;; through libuv hold that.
+;;;
 ;;; THE METER. (+ (bytes-allocated) (bytes-deallocated)) is the total ever
 ;;; allocated, so a collection cannot make it run backwards, and reading it
 ;;; allocates nothing. Each call is metered on its own, with the collector
@@ -34,8 +39,14 @@
 ;;; arm64, Linux aarch64 and x86_64 agree to the byte), and less than any
 ;;; undone change adds back: a second guard around the user's call, or one
 ;;; around a write's native start. The idle run's margin is half a
-;;; dynamic-wind instead, for the one uv-run held. The figures are in
-;;; .plans/callback-alloc-mutation-log.md.
+;;; dynamic-wind instead, for the one uv-run held.
+;;;
+;;; One row holds a difference instead. A read through libuv crosses into
+;;; Scheme once, as a timer does, so each costs over its delivery straight
+;;; through the slot what the other does. An alloc callback answered in
+;;; Scheme would add a crossing to every read, under half a guard when it
+;;; has no seam around it. The figures are in
+;;; .plans/callback-alloc-mutation-log.md and .plans/shim-alloc-mutation-log.md.
 ;;;
 ;;; NOT pure: (libuv) reaches (libuv private native). Never add this to the
 ;;; Makefile's PURE_TESTS.
@@ -182,6 +193,7 @@
     (getaddrinfo 656 2)
     (getnameinfo 384 1)
     (idle-run 16 0) (timer-through-libuv 400 1) (close-through-libuv 400 1)
+    (read-through-libuv 448 1)
     ;; the seam's guard and the callback's own
     (guarded-callback-through-libuv 787 2)
     (uv-write! 240 0) (uv-write*! 304 0) (uv-shutdown! 128 0)))
@@ -202,6 +214,8 @@
 ;; holds it to its bound: the row's value is 'within, or the measurement
 ;; beside the bound. A measurement that raises becomes the row's evidence,
 ;; so it cannot abort the rows after it.
+(define measured (make-eq-hashtable))
+
 (define-syntax row
   (syntax-rules ()
     ((_ name title measurement)
@@ -212,6 +226,7 @@
 
 (define (row-of name title measure)
   (let ((bytes (measure)) (limit (bound name)))
+    (hashtable-set! measured name bytes)
     (display "  [informational] ") (display name) (display ": ")
     (display bytes) (display " B (at most ") (display limit)
     (display ")") (newline)
@@ -242,7 +257,7 @@
 ;; type. A slot with a rest parameter gathers them into a fresh list on every
 ;; callback, and procedure-arity-mask is negative for exactly those.
 (define trampoline-arity
-  '((alloc . 3) (read . 3) (connection . 2) (write-done . 2) (close . 1)
+  '((read . 3) (connection . 2) (write-done . 2) (close . 1)
     (timer . 1) (shutdown . 2) (connect . 2) (getaddrinfo . 3)
     (getnameinfo . 4) (exit . 3) (walk . 2) (signal . 2) (async . 1)))
 
@@ -470,6 +485,85 @@
                      (lambda () (uv-run close-loop 'once))
                      (lambda () (= (closed-tally) (+ before 1))))))
 
+;; A read: libuv's alloc callback, the read itself, and the read callback,
+;; which copies the 16 bytes out and calls on-data. The reader has a loop of
+;; its own, so the metered run delivers that read and nothing else. Each
+;; call's 16 bytes are written, and the write completed, on the writer's
+;; loop, off the meter. Answered in Scheme instead, the alloc callback cost
+;; 416 B more a read (.plans/shim-alloc-mutation-log.md).
+(define rd-loop (make-uv-loop))
+(define wr-loop (make-uv-loop))
+(define rd-server (make-uv-tcp rd-loop))
+(define rd-port (bind-loopback! rd-server))
+(define rd-peer #f)
+(uv-listen! rd-server 8 (lambda (err) (set! rd-peer (uv-accept! rd-server))))
+(define wr-client (make-uv-tcp wr-loop))
+(define wr-connected #f)
+(connect-loopback! wr-client rd-port (lambda (err) (set! wr-connected #t)))
+
+;; The handshake needs both loops run, so neither step may block.
+(define (run-both-until pred cap)
+  (let step ((i 0))
+    (cond ((pred) 'satisfied)
+          ((>= i cap) 'iterations-exhausted)
+          (else (uv-run wr-loop 'nowait)
+                (uv-run rd-loop 'nowait)
+                (step (+ i 1))))))
+
+(test-equal "seed: the read pair connected across its two loops and was accepted"
+  'satisfied
+  (run-both-until (lambda () (and wr-connected rd-peer)) 100000))
+
+(define-tally read-tally read-tally!)
+(define read-span 0)
+(uv-read-start! rd-peer
+                (lambda (bv start end) (set! read-span (- end start)) (read-tally!))
+                (lambda () #f) (lambda (err) #f))
+(define rd-msg (make-bytevector 16 98))
+(define-tally rd-written-tally rd-written-tally!)
+(define (on-rd-written err) (rd-written-tally!))
+
+;; Should a read never arrive, the watchdog ends the run that waits for it,
+;; and that call does not count, rather than the suite hanging there.
+(define rd-watchdog (make-uv-timer rd-loop))
+(define (on-watchdog t) #f)
+
+(row 'read-through-libuv
+     "a uv-run that delivers a 16-byte read, its alloc callback answered in the shim"
+     (let ((before 0))
+       (fewest-bytes (lambda ()
+                       (set! before (read-tally))
+                       (uv-timer-start! rd-watchdog on-watchdog 1000 0)
+                       (let ((issued (rd-written-tally)))
+                         (uv-write! wr-client rd-msg on-rd-written)
+                         (run-until wr-loop (lambda () (> (rd-written-tally) issued)) 64)))
+                     (lambda () (uv-run rd-loop 'once))
+                     (lambda () (and (= (read-tally) (+ before 1)) (= read-span 16))))))
+
+;; What a delivery through libuv costs over the same delivery straight
+;; through its slot: one uv-run and one crossing into Scheme, for a timer.
+;; A read must cost no more, or something else crossed for it: an alloc
+;; callback answered in Scheme adds 64 B a read on Chez 10.4.1 with no seam
+;; at all, and 416 B through one. The margin is half the timer's increment.
+(define (through-libuv-increment through direct)
+  (let ((t (hashtable-ref measured through #f))
+        (d (hashtable-ref measured direct #f)))
+    (if (and (integer? t) (integer? d)) (- t d) (list through t direct d))))
+
+(let* ((timer (through-libuv-increment 'timer-through-libuv 'timer))
+       (read (through-libuv-increment 'read-through-libuv 'read-data))
+       (limit (and (integer? timer) (positive? timer) (+ timer (div timer 2)))))
+  (display "  [informational] over a direct delivery, a read through libuv costs ")
+  (display read) (display " B, a timer ") (display timer) (display " B") (newline)
+  (test-equal (string-append
+               "a read through libuv costs over its direct delivery what a timer"
+               " does, one crossing, at most "
+               (if limit (number->string limit) "?") " bytes")
+    'within
+    (if (and limit (integer? read) (<= read limit))
+        'within
+        (list 'read read 'timer timer 'at-most limit))))
+
 ;; --- the write verbs, the call alone -----------------------------------------
 ;; On a connected stream, with each call's completion drained before the
 ;; next. Nine clients: one for the write rows, and one for each call of the
@@ -543,7 +637,8 @@
 (drain-writes!)
 
 ;; --- balance ----------------------------------------------------------------
-(for-each uv-loop-teardown! (list r-loop idle-loop fire-loop close-loop w-loop))
+(for-each uv-loop-teardown!
+          (list r-loop idle-loop fire-loop close-loop rd-loop wr-loop w-loop))
 (collect)
 
 (test-equal "every allocation counter is back to zero"

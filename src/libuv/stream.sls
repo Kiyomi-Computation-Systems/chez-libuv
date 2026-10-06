@@ -191,10 +191,7 @@
   ;; restart without specifying a size, but may not resize the existing buffer.
   (define (ensure-read-buffer! stream buffer-size)
     (if (zero? (stream-read-buf stream))
-        (let ((size (or buffer-size default-read-buffer-size)))
-          (set-stream-read-buf! stream (alloc-zeroed size))
-          (set-stream-read-buf-len! stream size)
-          (count-read-buffer-new!))
+        (install-read-buffer! stream (or buffer-size default-read-buffer-size))
         (when (and buffer-size (not (= buffer-size (stream-read-buf-len stream))))
           (raise (make-uv-invalid-argument 'uv-read-start!
                                            'buffer-size-fixed)))))

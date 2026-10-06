@@ -1,6 +1,6 @@
 # ADR-0002: Bind libuv directly via FFI; keep the C shim to constants only
 
-- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline. Amended 2026-10-05 (issue #45): a sixth kind, libuv's alloc callback for reads — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0001](0001-hybrid-native-dependency-acquisition.md)
@@ -83,6 +83,54 @@ binding's behalf.
 >   already loaded by path. This is plausible but unverified, since Windows
 >   is deferred.
 
+> **Amended 2026-10-05 (issue #45, item 5).** A sixth kind of export, and
+> the first that libuv calls rather than Scheme: `chez_uv_alloc_cb`, the
+> alloc callback `uv-read-start-native` hands `uv_read_start` in place of a
+> Scheme trampoline ([ADR-0008](0008-static-trampolines-and-handle-registry.md),
+> amended the same day).
+>
+> libuv calls the alloc callback before every read, and the binding's answer
+> never varied: the stream's own read buffer, allocated at its first read
+> start and freed by its close dispatcher. Crossing into Scheme for it cost
+> a collect-safe reactivation of the loop thread and the seam's dispatch on
+> every read: 416 B a read through libuv (864 B against 448 B,
+> `tests/test-callback-alloc.sps`).
+>
+> Now the answer is in place before the first read. A handle that has
+> started reading has a `data` field pointing at a `uv_buf_t` descriptor at
+> the head of its read buffer, with the payload after it, and the callback
+> copies the descriptor into libuv's `uv_buf_t`. A handle whose `data` is
+> NULL gets the empty buffer, which libuv reports as `UV_ENOBUFS`, as the
+> Scheme dispatcher answered for a handle with no buffer.
+>
+> The line this ADR draws holds: the callback calls nothing, in libuv or in
+> Scheme. It reads one field of the handle libuv passes it and copies one
+> struct. What it relies on:
+>
+> - **`data` belongs to the read path.** libuv never reads or writes a
+>   handle's `data` (in `vendor/libuv/src`, only `uv_handle_get_data` and
+>   `uv_handle_set_data` touch it), and nothing else in the binding sets it.
+>   A feature that wants `data` for anything else has to move the
+>   descriptor first.
+> - **The descriptor lives exactly as long as the buffer, because it is
+>   part of the buffer's block.** It is written once, when the block is
+>   allocated, and freed with it by the close dispatcher, after libuv's last
+>   alloc callback for the handle. `tests/test-tcp.sps` holds that `data`
+>   points at the head of the read buffer, and the Linux Valgrind gate sees
+>   the callback's reads: a descriptor freed early reads as an invalid read
+>   in `chez_uv_alloc_cb` (`.plans/shim-alloc-mutation-log.md`).
+> - **It has libuv's `uv_alloc_cb` type**, checked when the shim compiles.
+>   Scheme passes only its address, so no call site would notice a drift.
+> - **A shim built from older sources is still refused by name.**
+>   `native.sls` fetches the address through `shim-entry`, which checks the
+>   entry as `shim-procedure` does, and `tests/test-shim-loading.sps` loads
+>   a shim built without the callback.
+>
+> Rejected: a block of its own for the descriptor, which would be a second
+> allocation with a second lifetime to keep in step with the buffer's; and
+> a table in C keyed by handle, which would be a lookup on every read for
+> what one field already holds.
+
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object
 `dlopen` namespacing means the shim would not otherwise see libuv's symbols
@@ -103,7 +151,9 @@ layers above this binding depend on.
   never-transcribe-constants policy
   ([ADR-0005](0005-constants-are-never-transcribed.md)) cheap to maintain.
   (Amended 2026-09-27 for #35: five kinds of export now. The fifth is three
-  one-line functions, and "four" always counted kinds, not symbols.)
+  one-line functions, and "four" always counted kinds, not symbols.
+  Amended 2026-10-05 for #45: six. The sixth is the one function libuv
+  calls, and it calls nothing back.)
 - The Linux load-order requirement becomes a hard invariant, enforced in
   `native.sls` and covered by `test-shim-loading`; getting it wrong fails at
   import time, not at first call.
