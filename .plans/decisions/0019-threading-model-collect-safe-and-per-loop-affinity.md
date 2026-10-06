@@ -237,6 +237,11 @@ drains a caller-side queue rather than assuming one item per send.
 >   - `uv-tcp-connect!`, `uv-getaddrinfo!` and `uv-getnameinfo!`: a block
 >     lost, or a request registered and never submitted.
 >   - `uv-spawn!`: one or two blocks lost, or `EBUSY`.
+>     - Later on 2026-10-06 its splits were closed, and the `EBUSY` with
+>       them: the step that spawns checks the stdio handles and the loop
+>       again, and marks the pipes, registers the process or cleans up
+>       inside it (ADR-0015, the amendment to decision 5). A drop between
+>       its allocations and that step still loses both blocks.
 >   - The scratch verbs (bind, the address and port queries, the buffer
 >     sizes): one or two blocks lost.
 >   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,

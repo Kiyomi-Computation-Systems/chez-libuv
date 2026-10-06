@@ -3,8 +3,10 @@
 - **Status:** Accepted (2026-08-21) — evidence: spike/process/FINDINGS.md SQ1
   (`spike/process/07-spawn-failure.ss`, both platforms, Linux leg under
   valgrind). Amended 2026-10-06: decision 1's block is sized and filled from
-  the caller's data as read once, never from the data itself — see the dated
-  note after decision 1.
+  the caller's data as read once, never from the data itself; and decision
+  5's state is foreclosed by checks made in the step that spawns, which also
+  holds decisions 2 and 3's cleanup and registration — see the dated notes
+  after decisions 1 and 5.
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.3
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.3-process-design.md) §4.3, §5.5, §5.6, §7 (V1, V3),
@@ -241,6 +243,46 @@ implementation stage may refine this symbol name; design spec §4.7 gains
 the row when it does) — with the handle **deliberately untouched**: a
 leaked 136-byte block is recoverable and diagnosable; queue corruption and
 use-after-free are neither.
+
+> **Amended 2026-10-06: the stdio handles and the loop are checked again in
+> the step that spawns.** "`'pipe-already-used` forecloses [the trigger]
+> before any allocation" held for a pipe consumed before the call, and
+> missed two ways to reach this state:
+> - **A pipe consumed during the call.** `uv-spawn!` checked its handles on
+>   entry, then allocated and built the options block, and an engine's timer
+>   handler could spawn on the same pipe in between. An engine sweep over
+>   55125e1 reached this state in 148 of 232 runs, and in 8 more it put the
+>   handler's own spawn here: the pipes were marked only after `uv_spawn`
+>   returned.
+> - **One pipe named twice in one spawn,** from a plain call: libuv opens
+>   the pipe once per spec after the fork, and the second open fails.
+>
+> Now one interrupt-free step checks the loop and every stdio handle again
+> (open, with a pointer, and a pipe not consumed), passes libuv the pointers
+> it has just checked, calls `uv_spawn`, frees the options block and marks
+> the pipes. No spawn on this thread can then consume a pipe between the
+> check and libuv's open. A pipe named twice is refused `'pipe-already-used`
+> before anything is allocated. The pid guard stays, for the `SO_OOBINLINE`
+> arm above.
+>
+> The same sweeps found three siblings of the window, each closed by the
+> same step. A pipe closed during the call was opened into its closing
+> handle, a descriptor nothing ever closed (8 open descriptors became 157).
+> A pipe closed and freed during the call, with a new pipe at its address,
+> connected the child to the new pipe. A loop torn down during the call
+> leaked the options block and the process handle, or reached `uv_spawn`
+> freed (an invalid memory reference, or an abort).
+>
+> Decision 2's cleanup and decision 3's registration run inside the step
+> too. Placed after it (mutations M5 and M8), a teardown between
+> `uv_spawn` and them left the process handle in the loop unregistered, and
+> the teardown raised `EBUSY`. The step raises nothing: it answers a
+> status, and `uv-spawn!` raises after it with what the entry checks raise
+> for the same state. A refusal in the step, made before `uv_spawn` is
+> called, frees the options block and the process handle before it answers,
+> as the build's own guard does when the build fails; on every other path
+> the block is still freed the moment `uv_spawn` returns. Evidence and the
+> mutations: `.plans/spawn-stdio-fence-mutation-log.md`.
 
 **6. The pipe contract, rewritten from measurement.** On a failed spawn every
 pipe named in a `(pipe …)` spec is **marked connected, left open, and closed
