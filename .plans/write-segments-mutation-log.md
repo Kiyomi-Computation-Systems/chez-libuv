@@ -190,7 +190,7 @@ the commit after 139ebe4 unless the list says otherwise.
   15-26% longer. A spec is now `(bv . len)` for a span from 0, else
   `(bv start . len)`. That brings one segment from 208 to 176 B, and 64
   segments from 5,248 to 3,200 B.
-- **Not fixed here: the follow-up issue has them.** Three older walks have
+- **Not fixed here: #66 has them.** Three older walks have
   the faults this PR removed from uv-write*!, and none of the three is in
   its diff:
   - addrinfo.sls's checked-flags hangs on circular flags at
@@ -200,6 +200,12 @@ the commit after 139ebe4 unless the list says otherwise.
   - process.sls's read-stdio-spec re-reads a checked cdr.
   Also deferred: one shared counted walk, and one shared engine-sweep
   driver for the suites.
+
+With the Brent count, a count of N pairs takes N + 1 engine ticks, so the
+sweeps' windows moved. On 3335c38 each reads refused, then written, then
+one untouched run: fuels 1–24, 25–59 and 60 for segments-cut,
+segments-made-circular and span-cut, and 1–33, 34–59 and 60 for
+segments-two-cycles.
 
 ### The rows the review added
 
@@ -270,3 +276,23 @@ On 680e0c3:
     117 and 131 B, as before, and 147 B in 69 of test-process's spawn
     children (5 more report none), a block `chez_uv_alloc` gave the parent
     before the fork, beside the usual 1,576 B possibly lost.
+
+On 3335c38, after the review:
+
+- `make test`: 24 suites pass. `make test-threading` passes. `make
+  check-purity` holds, and `make check-help` is silent.
+- macOS ASan: `check-memory-gate` printed MEMORY GATE CAN FAIL, then `make
+  test-memory` passed with no AddressSanitizer report. Both race rows ran
+  there: the count race's change reached 69,814 of 100,000 counts, and the
+  span race's 16,926 of 20,000 calls.
+- `make prod` passes check-prod, and `make test` passes again on the
+  rebuilt dev build.
+- `make test-memory-docker` (Linux Valgrind, aarch64, vendored libuv), from a
+  `--no-hardlinks` clone:
+  - `check-memory-gate` printed MEMORY GATE CAN FAIL;
+  - each of the 24 suites reports 0 errors and 0 B definitely lost
+    (test-stream at 6,063 allocations, test-callback-alloc at 5,671);
+  - both race rows skip under Valgrind, so test-native passes 305 rows and
+    test-stream 35, with no unexpected failure in any suite;
+  - forked children report the same fork artifacts as on 680e0c3: 117 and
+    131 B, 147 B in 69 spawn children, and none in 5.
