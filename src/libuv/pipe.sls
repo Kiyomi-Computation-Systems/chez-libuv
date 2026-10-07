@@ -18,7 +18,7 @@
       (construct-handle 'make-uv-pipe loop (stream-block-size handle-size)
                         init-pipe
                         (lambda (ptr) (%make-uv-pipe-record ptr loop handle-size))
-                        count-pipe-new! #f)))
+                        count-pipe-new!)))
 
   ;; No IPC: these pipes carry bytes, never handles.
   (define (init-pipe loop-ptr ptr) (uv-pipe-init loop-ptr ptr 0)))

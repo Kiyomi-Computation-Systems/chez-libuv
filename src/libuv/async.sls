@@ -28,7 +28,7 @@
       (construct-handle 'make-uv-async loop (uv-handle-size (uv-async-type))
                         uv-async-init-native
                         (lambda (ptr) (%make-uv-async-record ptr loop on-wake fence))
-                        count-async-new! #t)))
+                        count-async-new!)))
 
   ;; uv-async-send! : uv-async -> unspecified
   ;; The ONE verb exempt from the loop-thread affinity check (design §6.3):

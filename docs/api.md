@@ -31,11 +31,15 @@ libraries exist for narrower imports.
 A loop and its handles belong to one thread: the one that created the loop,
 then whichever thread most recently entered `uv-run` on it — so a loop can be
 built on one thread and handed to a dedicated loop thread, which keeps it
-after `uv-run` returns. Every verb that operates on an open handle, plus
-`make-uv-async` and `uv-update-time!`, raises `&uv-wrong-thread` from any
-other thread before it touches anything. Verbs outside that check — among
-them `uv-close!`, the other constructors, `uv-stop!`, and loop queries such
-as `uv-now` — are loop-thread-only all the same, just unchecked. The one
+after `uv-run` returns. Every verb that operates on an open handle, every
+verb that makes something on a loop (the handle constructors, `uv-accept!`,
+`uv-spawn!`, `uv-getaddrinfo!` and `uv-getnameinfo!`), and
+`uv-update-time!` raise `&uv-wrong-thread` from any other thread before
+they touch anything. The check cannot see a call that races the hand-off
+itself, made while the other thread is entering `uv-run`: hand a loop over
+once its builder is done with it. Verbs outside that check — among them
+`uv-close!`, `uv-stop!`, and loop queries such as `uv-now` — are
+loop-thread-only all the same, just unchecked. The one
 exemption is `uv-async-send!`, which is how another thread reaches the loop
 ([Async](#async--libuv-async)). While the loop thread waits in `uv-run`, other
 Scheme threads allocate and collect freely.
@@ -160,16 +164,18 @@ begun, or libuv holds its request and the request's completion frees it.
 The constructors (`make-uv-loop`, `make-uv-timer`, `make-uv-tcp`,
 `make-uv-pipe`, `make-uv-signal`, `make-uv-async`) and `uv-accept!` make
 the same promise. One resumed after its loop was torn down raises
-`&uv-handle-closed` for the loop; `uv-accept!` resumed after its server
-was closed raises it for the server. One whose engine is never resumed
-either had not begun or has registered its handle, which the loop's
-teardown closes. The loop `make-uv-loop` makes is the caller's to tear
+`&uv-handle-closed` for the loop, and one resumed after its loop was
+handed to another thread raises `&uv-wrong-thread`; `uv-accept!` resumed
+after its server was closed raises `&uv-handle-closed` for the server. One
+whose engine is never resumed either had not begun or has registered its
+handle, which the loop's teardown closes. The loop `make-uv-loop` makes is the caller's to tear
 down from the moment it exists. `call-with-uv-loop` makes its loop inside
 its body, so an engine that expires anywhere from there on tears the loop
 down with it.
 
 `uv-spawn!` makes both promises for the handles in its `stdio` and for its
-loop ([Child processes](#child-processes--libuv-process)). One whose engine
+loop, its owner included
+([Child processes](#child-processes--libuv-process)). One whose engine
 is never resumed either had not begun, or had finished: the loop holds its
 process, or a failed spawn has been cleaned up.
 

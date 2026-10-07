@@ -18,7 +18,7 @@
     (construct-handle 'make-uv-signal loop (uv-handle-size (uv-signal-type))
                       uv-signal-init
                       (lambda (ptr) (%make-uv-signal-record ptr loop))
-                      count-signal-new! #f))
+                      count-signal-new!))
 
   ;; watch-symbol->int : (or symbol 0) symbol -> exact-integer
   (define (watch-symbol->int sig who)

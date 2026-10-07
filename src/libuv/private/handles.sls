@@ -15,6 +15,7 @@
           ;; interrupt-free steps
           one-step open-handle-ptr open-loop-ptr step-refusal
           try-construct-handle construct-handle try-construct-loop
+          loop-owned-here? wrong-thread-refusal
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -687,18 +688,35 @@
   (define (attach-stream-descriptor! stream ptr)
     (uv-handle-set-data ptr (stream-descriptor stream)))
 
+  ;; loop-owned-here? : uv-loop -> boolean
+  ;; Whether this thread owns LOOP: require-loop-thread's test, for a step,
+  ;; where nothing may raise.
+  (define (loop-owned-here? loop)
+    (eqv? (loop-owner-thread loop) (current-thread-id)))
+
+  ;; wrong-thread-refusal : uv-loop symbol -> condition
+  ;; What WHO raises once its step has answered 'wrong-thread for LOOP.
+  (define (wrong-thread-refusal loop who)
+    (make-uv-wrong-thread who (loop-owner-thread loop) (current-thread-id)))
+
   ;; try-construct-handle : uv-loop exact-positive-integer procedure
-  ;;                        procedure procedure boolean
+  ;;                        procedure procedure
   ;;                        -> (or uv-handle symbol exact-integer)
-  ;; Makes a handle on LOOP in one interrupt-free step: the loop's open check
-  ;; and pointer, a block of SIZE bytes, the record MAKE-RECORD makes of the
-  ;; block, its registration, libuv's init (INIT!, given the loop's pointer
-  ;; and the block), a stream's descriptor, and the count (COUNT-NEW!). With
-  ;; OWNED? the step also requires this thread to own the loop. It answers
-  ;; the handle, or what stood in the way: 'loop-not-open, 'no-loop-pointer,
-  ;; 'wrong-thread, 'no-memory, a refused registration, or INIT!'s errno, and
-  ;; a refused step leaves nothing behind. MAKE-RECORD, INIT! and COUNT-NEW!
-  ;; must be total, as a step's calls are (one-step).
+  ;; Makes a handle on LOOP in one interrupt-free step: the loop's open and
+  ;; owner checks and pointer, a block of SIZE bytes, the record MAKE-RECORD
+  ;; makes of the block, its registration, libuv's init (INIT!, given the
+  ;; loop's pointer and the block), a stream's descriptor, and the count
+  ;; (COUNT-NEW!). It answers the handle, or what stood in the way:
+  ;; 'loop-not-open, 'no-loop-pointer, 'wrong-thread, 'no-memory, a refused
+  ;; registration, or INIT!'s errno, and a refused step leaves nothing
+  ;; behind. MAKE-RECORD, INIT! and COUNT-NEW! must be total, as a step's
+  ;; calls are (one-step).
+  ;; - libuv's init links the handle into the loop's handle queue, which the
+  ;;   loop's thread unlinks closed handles from as it runs. From any other
+  ;;   thread the two raced, and corrupted the queue with no error (#79). The
+  ;;   step is where the owner is checked, not the constructor's entry: an
+  ;;   engine can suspend a constructor while the loop is handed to another
+  ;;   thread (tests/test-constructors.sps's handoff sweeps).
   ;; - Split by an engine, a constructor's open check stopped covering its
   ;;   init: a teardown freed the loop in between, and the init linked the
   ;;   handle into the freed uv_loop_t. A teardown between the init and the
@@ -708,13 +726,12 @@
   ;;   handle linked into the loop and unregistered: the same EBUSY, and for
   ;;   an async, which keeps the loop alive, a teardown that never returned
   ;;   (tests/test-constructors.sps).
-  (define (try-construct-handle loop size init! make-record count-new! owned?)
+  (define (try-construct-handle loop size init! make-record count-new!)
     (one-step
      (let ((loop-ptr (open-loop-ptr loop)))
        (cond
         ((symbol? loop-ptr) loop-ptr)
-        ((and owned? (not (eqv? (loop-owner-thread loop) (current-thread-id))))
-         'wrong-thread)
+        ((not (loop-owned-here? loop)) 'wrong-thread)
         (else
          (let ((ptr (alloc-block size)))
            (if (zero? ptr)
@@ -772,15 +789,13 @@
                 (begin (registry-remove! ptr) (free-block! ptr) rc))))))
 
   ;; construct-handle : symbol uv-loop exact-positive-integer procedure
-  ;;                    procedure procedure boolean -> uv-handle
+  ;;                    procedure procedure -> uv-handle
   ;; try-construct-handle for constructor WHO, raising what stood in the way
   ;; once the step is over.
-  (define (construct-handle who loop size init! make-record count-new! owned?)
-    (let ((made (try-construct-handle loop size init! make-record count-new! owned?)))
+  (define (construct-handle who loop size init! make-record count-new!)
+    (let ((made (try-construct-handle loop size init! make-record count-new!)))
       (cond ((uv-handle? made) made)
-            ((eq? made 'wrong-thread)
-             (raise (make-uv-wrong-thread who (loop-owner-thread loop)
-                                          (current-thread-id))))
+            ((eq? made 'wrong-thread) (raise (wrong-thread-refusal loop who)))
             (else (raise (step-refusal made who #f))))))
 
   ;; install-read-buffer! : uv-stream object

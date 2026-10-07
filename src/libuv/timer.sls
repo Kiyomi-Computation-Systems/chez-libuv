@@ -21,7 +21,7 @@
     (construct-handle 'make-uv-timer loop (uv-handle-size (uv-timer-type))
                       uv-timer-init
                       (lambda (ptr) (%make-uv-timer-record ptr loop))
-                      count-timer-new! #f))
+                      count-timer-new!))
 
   ;; uv-timer-start! : uv-timer procedure exact-nonnegative-integer
   ;;                   exact-nonnegative-integer -> unspecified

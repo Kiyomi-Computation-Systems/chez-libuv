@@ -92,8 +92,12 @@
   ;; the hints as the ints the block receives. So nothing the caller can
   ;; still change reaches C, and nothing between the allocation and the
   ;; guard can raise (tests/test-dns.sps's sweeps; Valgrind holds the free).
+  ;; Loop-thread-only, checked on entry: libuv counts the request in the
+  ;; loop with a plain increment the loop's thread decrements, so from
+  ;; another thread the loop could exit early or never (#79).
   (define (start-getaddrinfo! loop node service hints on-complete)
     (require-open-loop loop 'uv-getaddrinfo!)
+    (require-loop-thread loop 'uv-getaddrinfo!)
     (let* ((strings (validate-node-and-service node service 'uv-getaddrinfo!))
            (writes (hint-writes (validate-hints hints 'uv-getaddrinfo!))))
       (unless (procedure? on-complete)
@@ -151,9 +155,11 @@
        (start-getnameinfo! loop ip port flags on-complete))))
 
   ;; The address is read once, by validate-address, and libuv parses that
-  ;; copy (tests/test-address.sps).
+  ;; copy (tests/test-address.sps). Loop-thread-only, checked on entry, as
+  ;; uv-getaddrinfo! is.
   (define (start-getnameinfo! loop ip port flags on-complete)
     (require-open-loop loop 'uv-getnameinfo!)
+    (require-loop-thread loop 'uv-getnameinfo!)
     (let ((ip-bytes (validate-address ip 'uv-getnameinfo!)))
       (require-port port 'uv-getnameinfo!)
       (let ((flags-int (nameinfo-flag-symbols->int flags)))

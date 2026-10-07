@@ -102,7 +102,8 @@
     ("tests/test-callback-alloc.sps" (named r-peer rd-peer) (rows row))
     ("tests/test-process.sps" (named accepted))
     ("tests/test-echo.sps")
-    ("tests/test-constructors.sps")))
+    ("tests/test-constructors.sps")
+    ("tests/test-constructor-owner.sps")))
 
 ;; calls? : datum symbol -> boolean
 ;; Whether X calls NAME anywhere outside quoted data.
@@ -365,8 +366,9 @@
 ;; The suites that call an address or DNS verb, which a row below holds this
 ;; list to, and the verbs.
 (define verb-suites
-  '("tests/test-address.sps" "tests/test-dns.sps" "tests/test-facade.sps"
-    "tests/test-flow.sps" "tests/test-native.sps" "tests/test-tcp.sps"))
+  '("tests/test-address.sps" "tests/test-constructor-owner.sps" "tests/test-dns.sps"
+    "tests/test-facade.sps" "tests/test-flow.sps" "tests/test-native.sps"
+    "tests/test-tcp.sps"))
 
 (define address-verbs
   '(uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-tcp-bind! uv-tcp-connect!
@@ -697,7 +699,8 @@
     ("tests/test-callback-alloc.sps" r-peer rd-peer)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps")
-    ("tests/test-constructors.sps")))
+    ("tests/test-constructors.sps")
+    ("tests/test-constructor-owner.sps")))
 
 (define expected-seeded
   '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
@@ -709,7 +712,8 @@
     ("tests/test-callback-alloc.sps" r-peer rd-peer w-peers)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps" accept-error peers)
-    ("tests/test-constructors.sps")))
+    ("tests/test-constructors.sps")
+    ("tests/test-constructor-owner.sps")))
 
 (for-each
  (lambda (suite)

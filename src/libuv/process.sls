@@ -455,7 +455,7 @@
                        (spawn-step! loop on-exit layout request options))))
           (if (uv-process-record? made)
               made
-              (raise (spawn-refusal made)))))))
+              (raise (spawn-refusal made loop)))))))
 
   ;; --- the step that spawns ---------------------------------------------------
   ;; The checks above see the loop and the stdio handles as they were on
@@ -466,18 +466,20 @@
   ;; pipe through an address another pipe could hold by then; forked, then
   ;; failed to open a consumed pipe (ADR-0015 decision 5's state); or spawned
   ;; on a freed loop. A teardown between uv_spawn and the registration left
-  ;; the process in the loop where the teardown could not close it.
+  ;; the process in the loop where the teardown could not close it. And the
+  ;; handler can hand the loop to another thread, whose uv_run then races
+  ;; uv_spawn on libuv's handle queue (#79).
   ;;
   ;; And an engine can be dropped, as a timeout drops a task, and never
   ;; resumed. Nothing after its expiry runs, so what the verb held then and
   ;; had not handed on was lost: the process handle and the options block,
   ;; allocated and built before the step (test-process.sps's drop sweeps).
   ;;
-  ;; So one interrupt-free step checks the loop and each handle again,
-  ;; allocates the process handle and the options block, fills the block,
-  ;; hands libuv the pointers it just checked, spawns, frees the options
-  ;; block, marks the pipes, and registers the process or cleans up after a
-  ;; failure. An engine that expires during uv-spawn! is suspended or dropped
+  ;; So one interrupt-free step checks the loop, its owner and each handle
+  ;; again, allocates the process handle and the options block, fills the
+  ;; block, hands libuv the pointers it just checked, spawns, frees the
+  ;; options block, marks the pipes, and registers the process or cleans up
+  ;; after a failure. An engine that expires during uv-spawn! is suspended or dropped
   ;; before the step, holding nothing, or after it, when the loop holds the
   ;; process or the failure is cleaned up (test-process.sps's state and drop
   ;; sweeps).
@@ -501,9 +503,9 @@
   (define (spawn-step! loop on-exit layout request options)
     (let* ((specs (spawn-options-stdio options))
            (loop-address (open-loop-ptr loop))
-           (refusal (if (symbol? loop-address)
-                        loop-address
-                        (stdio-refusal specs))))
+           (refusal (cond ((symbol? loop-address) loop-address)
+                          ((not (loop-owned-here? loop)) 'wrong-thread)
+                          (else (stdio-refusal specs)))))
       (if refusal
           refusal
           (let ((ptr (alloc-block (options-layout-handle-size layout)))
@@ -559,14 +561,15 @@
                              (else #f))))))
             specs))
 
-  ;; spawn-refusal : status -> condition
-  ;; What uv-spawn! raises for a status the step answered: what the checks
-  ;; on entry raise for the same state, ENOMEM, or libuv's errno. A handle's
+  ;; spawn-refusal : status uv-loop -> condition
+  ;; What uv-spawn! on LOOP raises for a status the step answered: what the
+  ;; checks on entry raise for the same state, ENOMEM, or libuv's errno. A handle's
   ;; refusal comes paired with the handle (stdio-refusal). Options the fill
   ;; could not write are the binding's own fault, not the caller's: the
   ;; checks accepted them.
-  (define (spawn-refusal status)
+  (define (spawn-refusal status loop)
     (cond ((pair? status) (step-refusal (car status) 'uv-spawn! (cdr status)))
+          ((eq? status 'wrong-thread) (wrong-thread-refusal loop 'uv-spawn!))
           ((eq? status 'options-not-written)
            (condition (make-uv-error)
                       (make-who-condition 'uv-spawn!)
