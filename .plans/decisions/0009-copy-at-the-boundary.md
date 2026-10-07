@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet. Amended 2026-10-06 (segment lists): `uv-write*!` reads its segment list once, each pair checked as it is read — see the same bullet.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet. Amended 2026-10-06 (segment lists): `uv-write*!` reads its segment list once, each pair checked as it is read — see the same bullet. Amended 2026-10-06 (hint flags): `uv-getaddrinfo!`'s flags are read the same way, by `(libuv private lists)`'s `read-proper-list` — see the same bullet.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -297,3 +297,17 @@ for that API when it is added.
   same way. `tests/test-stream.sps`'s segment-list sweeps and span race hold
   the verb, `tests/test-native.sps`'s sweeps, random trials and race hold
   the count, and `.plans/write-segments-mutation-log.md` has the evidence.
+
+  `uv-getaddrinfo!`'s hint flags were still measured with a guarded
+  `length` (#66, #64 item 3). The guard cost 272 B a call. And a library is
+  compiled at its program's optimize level, where at 3 Chez's `length`
+  checks nothing: a circular flag list hung the call, where no guard could
+  catch it and no engine could stop it. The reads now share one pure
+  library, `(libuv private lists)`, which holds `proper-length`, `fold-flags`
+  and `read-proper-list`. `read-proper-list` counts a list with
+  `proper-length`, walks at most that many pairs, checking each, and
+  requires the list's end after them, answering `#f` where the list is not
+  one proper list as it read it. The hint flags are read with it and then
+  checked on the copy. `tests/test-addrinfo.sps` holds the flags, at level 3
+  in a child process too, and `tests/test-native.sps` holds the read;
+  `.plans/hint-flags-count-mutation-log.md` has the evidence.

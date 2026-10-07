@@ -11,6 +11,7 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
+          (only (libuv private lists) fold-flags)
           (libuv private handles)
           (libuv private addrinfo))
 

@@ -12,7 +12,8 @@
           validate-hints validate-node-and-service)
   (import (rnrs)
           (libuv private conditions)
-          (only (libuv private c-string) c-string-bytes))
+          (only (libuv private c-string) c-string-bytes)
+          (only (libuv private lists) read-proper-list))
 
   ;; make-uv-addrinfo : symbol (or symbol exact-integer)
   ;;                    (or symbol exact-integer) (or string #f)
@@ -71,24 +72,21 @@
       (else (checked-flags value who))))
 
   ;; checked-flags : object symbol -> (list-of symbol)
-  ;; A fresh list of the flags, each read once and checked as it is copied.
-  ;; The walk takes at most as many steps as the list had when it was found
-  ;; proper, so a list changed during it is refused, never walked forever.
-  ;; The length comes from one call, whose raise for an improper or circular
-  ;; list is the refusal. Asking list? first leaves a gap an engine can
-  ;; expire in, and a list made circular there makes length raise a
-  ;; condition of its own (the flags-made-circular sweep).
+  ;; A fresh list of the flags: read once by read-proper-list, which ends
+  ;; and raises nothing whatever the list is or becomes, then checked on
+  ;; that copy, which nothing else reaches. A guarded length cost a guard a
+  ;; call, and at --optimize-level 3 Chez's length checks nothing, so a
+  ;; circular list hung the call where no engine could stop it (#66;
+  ;; tests/flags-level-3-child.sps).
   (define (checked-flags value who)
-    (let ((n (guard (e (#t #f)) (length value))))
-      (unless n (refuse who 'hint-flags-not-a-list))
-      (let copy ((rest value) (left n))
-        (cond
-          ((zero? left) '())
-          ((not (pair? rest)) (refuse who 'hint-flags-not-a-list))
-          (else
-           (let ((flag (car rest)))
-             (unless (memq flag hint-flag-set) (refuse who 'unknown-hint-flag))
-             (cons flag (copy (cdr rest) (- left 1)))))))))
+    (let ((flags (read-proper-list value (lambda (flag) flag))))
+      (unless flags (refuse who 'hint-flags-not-a-list))
+      (let check ((rest flags))
+        (unless (null? rest)
+          (unless (memq (car rest) hint-flag-set)
+            (refuse who 'unknown-hint-flag))
+          (check (cdr rest))))
+      flags))
 
   ;; validate-node-and-service : (or string #f) (or string #f) symbol
   ;;                             -> (pair (or bytevector #f) (or bytevector #f))
