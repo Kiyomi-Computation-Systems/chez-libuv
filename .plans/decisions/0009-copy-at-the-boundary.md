@@ -1,6 +1,6 @@
 # ADR-0009: Copy at the FFI boundary; defer zero-copy without foreclosing it
 
-- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet. Amended 2026-10-06 (segment lists): `uv-write*!` reads its segment list once, each pair checked as it is read — see the same bullet. Amended 2026-10-06 (hint flags): `uv-getaddrinfo!`'s flags are read the same way, by `(libuv private lists)`'s `read-proper-list` — see the same bullet.
+- **Status:** Accepted (2026-08-18) — no spike dependency; accepted at Stage 0 exit. Amended 2026-08-18 (Stage 4): the Writes paragraph's free-vs-callback ordering was corrected — see the dated note inline. Amended 2026-08-30 (v0.5): two read-buffer-ownership facts recorded, established while rejecting a shared per-loop buffer — see the dated note inline. Realized 2026-09-19 (issue #18): the reserved `uv-write*!` vectored-write name now exists — see the dated note inline. Amended 2026-09-27 (issue #35): the copies, and the zeroing of every write block, became bulk moves — see the dated note in Consequences. Amended 2026-10-06 (DNS arguments): what a call checks, it copies, and only the copy reaches C — see the last bullet of Consequences. Amended 2026-10-06 (address strings): the same rule for the address `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` hand libuv — see the same bullet. Amended 2026-10-06 (segment lists): `uv-write*!` reads its segment list once, each pair checked as it is read — see the same bullet. Amended 2026-10-06 (hint flags): `uv-getaddrinfo!`'s flags are read the same way, by `(libuv private lists)`'s `read-proper-list` — see the same bullet. Amended 2026-10-07 (spawn lists): `uv-spawn!`'s lists and `uv-getaddrinfo!`'s hints alist are read the same way, `fold-flags` requires its list's end, its strings and `c-string-bytes`'s share one copy and one NUL scan, and such a read is no snapshot under another thread — see the same bullet.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0002](0002-direct-ffi-with-constants-only-shim.md),
@@ -311,3 +311,27 @@ for that API when it is added.
   checked on the copy. `tests/test-addrinfo.sps` holds the flags, at level 3
   in a child process too, and `tests/test-native.sps` holds the read;
   `.plans/hint-flags-count-mutation-log.md` has the evidence.
+
+  `uv-spawn!`'s lists are read with `read-proper-list` too (#66 items 2
+  and 3; ADR-0015's note of the same date), and so is `uv-getaddrinfo!`'s
+  hints alist, which `validate-hints` measured with Chez's `list?`: two
+  self-loops made at one engine expiry left `list?`'s two walkers on
+  separate cycles, and the call never returned. `fold-flags` now requires
+  its list's end, as `read-proper-list` does: a flag list spliced longer
+  during its walk was folded as far as the stale count, into flags the
+  caller never held. `uv-spawn!`'s strings and `c-string-bytes`'s now share
+  one copy, `read-utf8`, and one NUL scan, `nul-free?`, both in
+  `(libuv private c-string)` (#64 item 4). The copy disables interrupts with
+  a bare pair, not `with-interrupts-disabled`, so `c-string-bytes` no longer
+  pays for a dynamic-wind: 112 B a call for `"127.0.0.1"`, where it was 176.
+
+  A `read-proper-list` read is not a snapshot, though. When its walk
+  contradicts its count, it counts and walks the list once more, so a list
+  another thread changes once during the read answers as it was before the
+  change or after it. A list changed more than once can be read as a mix of
+  its versions, as a string can: one made circular and whole again during
+  the count and the walk is read once around its cycle. It can also be
+  answered `#f` though every version was a proper list. No read that takes
+  no lock can rule either out. `tests/test-native.sps`'s one-change and
+  cycle races and `tests/test-process.sps`'s list races hold this;
+  `.plans/spawn-list-reads-mutation-log.md` has the evidence.

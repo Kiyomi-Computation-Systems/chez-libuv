@@ -38,26 +38,36 @@
 
   ;; validate-hints : (or #f alist) symbol -> (or 'absent alist)
   ;; Empty and false both mean absent; non-empty hints use closed symbol sets.
-  ;; Present hints answer a copy, made by the walk that checks them: each
-  ;; entry and value is read once, and the copy shares no pair with them.
+  ;; Present hints answer a copy that shares no pair with them. The alist is
+  ;; read once, by read-proper-list, into fresh entries, each entry's key and
+  ;; value read once; the checks then walk that copy, which nothing else
+  ;; reaches. Measured with Chez's list? first, as it was until #66, an alist
+  ;; changed twice at one engine expiry, a self-loop at each of its first two
+  ;; pairs, left list?'s two walkers on separate cycles, and the call never
+  ;; returned; one made circular after list? was refused as a duplicate key
+  ;; (tests/test-addrinfo.sps's spine sweeps).
   (define (validate-hints hints who)
-    (cond
-      ((or (eq? hints #f) (null? hints)) 'absent)
-      ((not (list? hints)) (refuse who 'hints-not-an-alist))
-      (else
-       (let walk ((rest hints) (seen '()))
-         (cond
-           ((null? rest) '())
-           ((not (pair? rest)) (refuse who 'hints-not-an-alist))
-           (else
-            (let ((entry (car rest)))
-              (unless (pair? entry) (refuse who 'hints-not-an-alist))
-              (let ((key (car entry)) (value (cdr entry)))
-                (unless (memq key hint-keys) (refuse who 'unknown-hint-key))
-                (when (memq key seen) (refuse who 'duplicate-hint-key))
-                (let ((checked (checked-hint-value key value who)))
-                  (cons (cons key checked)
-                        (walk (cdr rest) (cons key seen))))))))))))
+    (if (or (eq? hints #f) (null? hints))
+        'absent
+        (let ((entries (read-proper-list hints read-hint-entry)))
+          (unless entries (refuse who 'hints-not-an-alist))
+          (let check ((rest entries) (seen '()))
+            (if (null? rest)
+                '()
+                (let ((entry (car rest)))
+                  (unless entry (refuse who 'hints-not-an-alist))
+                  (let ((key (car entry)) (value (cdr entry)))
+                    (unless (memq key hint-keys) (refuse who 'unknown-hint-key))
+                    (when (memq key seen) (refuse who 'duplicate-hint-key))
+                    (let ((checked (checked-hint-value key value who)))
+                      (cons (cons key checked)
+                            (check (cdr rest) (cons key seen)))))))))))
+
+  ;; read-hint-entry : object -> (or pair #f)
+  ;; A fresh (key . value) for a caller's hints entry, its car and cdr each
+  ;; read once, or #f for anything but a pair.
+  (define (read-hint-entry entry)
+    (and (pair? entry) (cons (car entry) (cdr entry))))
 
   ;; checked-hint-value : symbol object symbol -> object
   ;; VALUE if it is in KEY's closed set; flags answer a fresh list.

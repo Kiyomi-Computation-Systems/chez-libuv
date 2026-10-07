@@ -29,6 +29,8 @@
         (uv-testing)
         (uv-bulk)
         (only (uv-evidence) live-count describe)
+        ;; The span race's liveness watch, shared and pure.
+        (only (uv-race) watch-flipper)
         ;; make-engine drives the engine sweeps, and bytevector-truncate!
         ;; the shrinking-payload one; the interrupt pair checks that no
         ;; refusal leaves interrupts disabled; foreign-procedure binds the
@@ -527,9 +529,9 @@
 ;; calls the flipper's change reached.
 ;;
 ;; A flipper that never ran, or stopped, would leave that row passing. So
-;; before the first call and after the last, the race waits up to
-;; race-wait-cap steps to see the flipper cut the span and make it whole
-;; again, and a precondition row holds both. The first wait also holds the
+;; before the first call and after the last, the race waits to see the
+;; flipper cut the span and make it whole again (tests/uv-race.sls), and a
+;; precondition row holds both. The first wait also holds the
 ;; race until the flipper is flipping. The race finds the pair it watches
 ;; through segs, the list each call is given, so a flipper changing any
 ;; other span fails that row too, and so does one that never makes the
@@ -537,17 +539,6 @@
 ;; flipper, so that no thread is left to make the suite's (collect) raise.
 ;; Not under Valgrind, which runs one thread at a time.
 (define span-race-calls 20000)
-(define race-wait-cap 100000000)
-
-;; watch-flipper : pair object object -> (or 'flipping 'not-flipping)
-;; Whether P's cdr was seen to be CUT and then WHOLE again within
-;; race-wait-cap steps.
-(define (watch-flipper p cut whole)
-  (let wait ((k 0) (seen-cut #f))
-    (cond ((= k race-wait-cap) 'not-flipping)
-          ((eq? (cdr p) cut) (wait (+ k 1) #t))
-          ((and seen-cut (eq? (cdr p) whole)) 'flipping)
-          (else (wait (+ k 1) seen-cut)))))
 
 ;; span-race : -> (list calls bad first-bad cut before after)
 ;; It stops the flipper, joins it, and closes what it made before it

@@ -28,6 +28,11 @@
         (only (libuv private constants) uv-process-type)
         (uv-testing)
         (only (uv-evidence) live-count describe)
+        ;; uv-spawn!'s list reads against another thread (#66), the
+        ;; meter its cost rows use, and the level-3 child's runner.
+        (spawn-list-races)
+        (only (uv-meter) fewest-bytes)
+        (uv-level-3)
         (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor
               ;; The changing-data sweeps drive a spawn in an engine, or race
@@ -290,6 +295,12 @@
      (reason-of (spawn-with "/bin/\x0;sh" ok-args #f)))
    (test-equal "a NUL inside an args string" 'embedded-nul
      (reason-of (spawn-with "/bin/sh" '("sh\x0;x") #f)))
+   ;; The scan reaches a string's first and last bytes, where C would read
+   ;; the string as empty or as one character short.
+   (test-equal "a NUL as the first or the last character of an args string"
+     '(embedded-nul embedded-nul)
+     (list (reason-of (spawn-with "/bin/sh" '("\x0;sh") #f))
+           (reason-of (spawn-with "/bin/sh" '("sh\x0;") #f))))
    (test-equal "an options key outside the closed set" 'option-unknown
      (reason-of (spawn-with "/bin/sh" ok-args '((bogus . 1)) #f)))
    (test-equal "a malformed options alist entry" 'option-unknown
@@ -2072,6 +2083,167 @@
       (test-equal "a spawn whose argument another thread narrows during the call ran its child on one reading of it"
         (list race-rounds '())
         (list (car race) (cadr race)))))
+
+;; --- a list another thread changes during the call --------------------------
+;; tests/spawn-list-races.sls has the races, and why each is shaped as it is
+;; (#66 items 2 and 3). Every call in them is refused before anything is
+;; allocated, so they leave no handle, block or registry entry behind, which
+;; the suite's last rows hold. The races skip under Valgrind, which runs one
+;; thread at a time.
+;;
+;; list-race-rows is the one list of the races, each with its row's name:
+;; the races run, and their rows are made, from it, so a race added to it
+;; is run and gets its row.
+(define list-race-rows
+  '((args . "uv-spawn! refuses a call whose args another thread cuts, for the whole list or the cut one, and for nothing else")
+    (args-circular . "uv-spawn! refuses a call whose args another thread makes circular, for the whole list or the circular one, and for nothing else")
+    (env . "uv-spawn! refuses a call whose env another thread cuts, for the whole list or the cut one, and for nothing else")
+    (options . "uv-spawn! refuses a call whose options another thread cuts, for the whole list or the cut one, and for nothing else")
+    (stdio . "uv-spawn! refuses a call whose stdio list another thread cuts, for the whole list or the cut one, and for nothing else")
+    (pipe-spec . "uv-spawn! refuses a call whose pipe spec another thread cuts, for the whole spec or the cut one, and for nothing else")
+    (pipe-spec-head . "uv-spawn! refuses a call whose pipe spec's first pair another thread cuts, for the whole spec or the cut one, and for nothing else")
+    (entry-key . "uv-spawn! refuses a call whose options entry's key another thread turns, for either key, and for nothing else")
+    (spec-kind . "uv-spawn! refuses a call whose stdio spec's kind another thread turns, for either kind, and for nothing else")))
+
+(define list-race-names (map car list-race-rows))
+
+;; And a race defined in the library but left out of list-race-rows would
+;; never run.
+(test-equal "every race tests/spawn-list-races.sls defines has its row here, in its order"
+  list-race-names
+  (defined-list-races))
+
+;; Each of uv-spawn!'s lists, improper or circular from the start, is
+;; refused for that list. No thread is needed for this, so it runs under
+;; Valgrind too; at --optimize-level 3 it runs in a child, below.
+(define malformed-reasons
+  '((improper-args . args-not-a-string-list) (circular-args . args-not-a-string-list)
+    (improper-env . env-not-a-string-list) (circular-env . env-not-a-string-list)
+    (improper-options . option-unknown) (circular-options . option-unknown)
+    (improper-stdio . stdio-not-a-list) (circular-stdio . stdio-not-a-list)))
+
+(test-equal "uv-spawn! refuses each of its lists improper or circular, for that list"
+  malformed-reasons
+  (guard (e (#t (list 'raised (describe e))))
+    (malformed-refusals)))
+
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (begin
+      (display "  [informational] spawn's list races: skipped under Valgrind,")
+      (display " which runs one thread at a time")
+      (newline))
+    (let ((races (guard (e (#t (list (list 'raised (describe e)))))
+                   (list-races list-race-names))))
+      (for-each
+       (lambda (race)
+         (when (and (list? race) (= (length race) 7))
+           (display "  [informational] spawn's ")
+           (display (car race))
+           (display " race: ")
+           (display (list-ref race 4))
+           (display " of ")
+           (display (list-ref race 1))
+           (display " calls were refused for the cut")
+           (newline)))
+       races)
+      (for-each
+       (lambda (row)
+         (test-equal (cdr row)
+           (list (list (car row) 0 #f))
+           (list-race-verdicts races (list (car row)))))
+       list-race-rows)
+      ;; The rows above say nothing unless each flipper was changing its
+      ;; list while the calls read it.
+      (test-equal "precondition: each list race's flipper was changing the list its calls were given before the first call and after the last, and a call was refused for the cut"
+        (map (lambda (name) (list name 'flipping 'flipping 'cut-seen)) list-race-names)
+        (list-race-liveness races list-race-names))))
+
+;; --- what a refused spawn allocates for its args -----------------------------
+;; Counting a list allocates nothing (proper-length), where a guarded length
+;; (#51's shape) allocates a guard on every call and a condition for every
+;; list it refuses, which no other row sees: a guarded count refuses the
+;; same lists for the same reasons. So args improper or circular must be
+;; refused at what args of () cost: each call is refused at the same check,
+;; for the same reason, with nothing read from its args. A difference, not
+;; a figure, so it is 0 on every platform. And args that are read cost
+;; their read and nothing more: a pair, a copy and its UTF-8 a string, made
+;; directly by the second row. That row holds the check's NUL scan
+;; (nul-free?), which allocates nothing; the scan it replaced cost a
+;; refused three-string spawn 64 B. tests/uv-meter.sls is the meter.
+
+;; refused-spawn-cost : uv-loop -> (object -> (list reason bytes))
+;; A meter of one refused spawn on LOOP given its args: the reason it was
+;; refused for, and the fewest bytes a call allocated. Every call is the one
+;; closure CALL, which reads its args from a variable the meter assigns, so
+;; that the row's own allocation is the same for each shape: a literal ()
+;; folded into a closure of its own made that closure 16 B smaller.
+(define (refused-spawn-cost loop)
+  (let* ((args 'unset)
+         (call (lambda ()
+                 (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e))
+                           (#t (list 'raised (describe e))))
+                   (uv-spawn! loop "/nonexistent/sh" args #f)
+                   'not-refused))))
+    (lambda (shape)
+      (set! args shape)
+      (list (call) (fewest-bytes call)))))
+
+(test-equal "a refused uv-spawn! costs as much with its args improper or circular as with args of (): counting them allocates nothing"
+  '((args-not-a-string-list 0) (args-not-a-string-list 0) meter-live)
+  (guard (e (#t (list 'raised (describe e))))
+    (call-with-uv-loop
+     (lambda (loop)
+       (let* ((cost (refused-spawn-cost loop))
+              (empty (cost '()))
+              (improper (cost (cons "sh" "x")))
+              (circular (cost (let ((l (list "sh" "x"))) (set-cdr! (cdr l) l) l))))
+         (list (list (car improper) (- (cadr improper) (cadr empty)))
+               (list (car circular) (- (cadr circular) (cadr empty)))
+               (if (positive? (cadr empty)) 'meter-live 'meter-blind)))))))
+
+(test-equal "a refused uv-spawn! allocates for its args their read and nothing more: a pair, a copy and its UTF-8 a string"
+  '(embedded-nul 0 meter-live)
+  (guard (e (#t (list 'raised (describe e))))
+    (call-with-uv-loop
+     (lambda (loop)
+       (let* ((cost (refused-spawn-cost loop))
+              (strings (list "sh" "-c" "x\x0;"))
+              (empty (cost '()))
+              (three (cost strings))
+              (made (fewest-bytes
+                     (lambda ()
+                       (map (lambda (s) (string->utf8 (string-copy s))) strings)))))
+         (list (car three) (- (cadr three) (cadr empty) made)
+               (if (positive? made) 'meter-live 'meter-blind)))))))
+
+;; --- the malformed lists at --optimize-level 3 -------------------------------
+;; A program compiled at --optimize-level 3 compiles these libraries from
+;; source at that level too, where Chez's length, car and cdr check nothing:
+;; a read that counted a list with length walked a circular one forever,
+;; with interrupts disabled, and read through an improper one.
+;; tests/spawn-level-3-child.sps runs the malformed lists at level 3 in a
+;; process of its own (tests/uv-level-3.sls kills it at its deadline, and
+;; its rows then fail with killed-at-cap). The cross-thread races run at the
+;; default level only; the child's header says why. The child runs
+;; natively under the memory gates too, since neither tool follows a child.
+(define level-3-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+(define level-3-report
+  (and level-3-chez (level-3-run level-3-chez "tests/spawn-level-3-child.sps" '())))
+
+(if (not level-3-chez)
+    (test-equal "level-3 malformed-list rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (begin
+      ;; The child must run at level 3, with the libraries under test
+      ;; compiled there from source: a library loaded from a .so beside its
+      ;; source keeps the level it was compiled at.
+      (test-equal "seed: the malformed lists' child ran at --optimize-level 3, with no library under test loaded from a compiled object"
+        '(3 (#f #f #f #f))
+        (list (level-3-entry level-3-report 'level)
+              (level-3-entry level-3-report 'objects)))
+      (test-equal "at --optimize-level 3, uv-spawn! refuses each of its lists improper or circular, for that list, and never walks one forever"
+        malformed-reasons
+        (level-3-entry level-3-report 'malformed))))
 
 (collect)
 (test-assert "counters all zero at suite end"
