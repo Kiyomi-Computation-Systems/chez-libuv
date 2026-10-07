@@ -36,8 +36,7 @@
               foreign-sizeof current-directory getenv
               make-engine bytevector-truncate! collect
               bytes-allocated bytes-deallocated collect-request-handler void
-              random random-seed fork-thread make-mutex make-condition
-              with-mutex condition-wait condition-broadcast)
+              random random-seed fork-thread thread-join)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1901,29 +1900,47 @@
 ;; vector the second: the shape #61's count had, which no engine sweep can
 ;; split. As in test-addrinfo's cross-thread row, the row asserts only what
 ;; no schedule can make fail on a right answer, and the informational line
-;; counts the counts the flipper's change reached. Not under Valgrind,
-;; which runs one thread at a time.
+;; counts the counts the flipper's change reached.
+;;
+;; A flipper that never ran, or stopped, would leave that row passing. So
+;; before the first count and after the last, the race waits up to
+;; race-wait-cap steps to see the flipper cut the list and make it whole
+;; again, and a precondition row holds both. The first wait also holds the
+;; race until the flipper is flipping. The race finds the pair it watches
+;; through l, the list each count is given, so a flipper changing any other
+;; list fails that row too, and so does one that never makes the list
+;; whole, which no count could tell from a cut. Not under Valgrind, which
+;; runs one thread at a time.
 (define count-race-rounds 100000)
+(define race-wait-cap 100000000)
 
-;; count-race : -> (list rounds bad first-bad cut)
-;; Every exit stops the flipper and waits for it.
+;; watch-flipper : pair object object -> (or 'flipping 'not-flipping)
+;; Whether P's cdr was seen to be CUT and then WHOLE again within
+;; race-wait-cap steps.
+(define (watch-flipper p cut whole)
+  (let wait ((k 0) (seen-cut #f))
+    (cond ((= k race-wait-cap) 'not-flipping)
+          ((eq? (cdr p) cut) (wait (+ k 1) #t))
+          ((and seen-cut (eq? (cdr p) whole)) 'flipping)
+          (else (wait (+ k 1) seen-cut)))))
+
+;; count-race : -> (list rounds bad first-bad cut before after)
+;; It stops the flipper and joins it before it answers.
 (define (count-race)
   (let* ((l (iota* 12))
          (p (list-tail l 2))
          (rest (cdr p))
          (v (vector 'not 'a 'pair))
          (stop #f)
-         (stopped #f)
-         (m (make-mutex))
-         (c (make-condition)))
-    (fork-thread
-     (lambda ()
-       (let flip ()
-         (unless stop
-           (set-cdr! p v)
-           (set-cdr! p rest)
-           (flip)))
-       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+         (flipper
+          (fork-thread
+           (lambda ()
+             (let flip ()
+               (unless stop
+                 (set-cdr! p v)
+                 (set-cdr! p rest)
+                 (flip))))))
+         (before (watch-flipper (list-tail l 2) v rest)))
     (let ((result
            (let round ((r 0) (bad 0) (first-bad #f) (cut 0))
              (if (= r count-race-rounds)
@@ -1934,9 +1951,10 @@
                          ((not answer) (round (+ r 1) bad first-bad (+ cut 1)))
                          (else (round (+ r 1) (+ bad 1)
                                       (or first-bad (list r answer)) cut))))))))
-      (set! stop #t)
-      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
-      result)))
+      (let ((after (watch-flipper (list-tail l 2) v rest)))
+        (set! stop #t)
+        (thread-join flipper)
+        (append result (list before after))))))
 
 (if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
     (begin
@@ -1952,7 +1970,11 @@
       (newline)
       (test-equal "proper-length answers #f or 12 for a list another thread changes, never raising"
         (list count-race-rounds 0 #f)
-        (list (car race) (cadr race) (caddr race)))))
+        (list (car race) (cadr race) (caddr race)))
+      ;; The row above says nothing unless the flipper was changing the list.
+      (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
+        '(flipping flipping)
+        (list-tail race 4))))
 
 
 ;; The flags were measured with a guarded length, and a guard costs a few
