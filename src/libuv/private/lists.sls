@@ -49,12 +49,18 @@
   ;; and X's end is required after them. READ sees each element once, in
   ;; order, as its pair stood when the walk reached it, and may raise.
   ;;
-  ;; A list changed during the read answers as the walk found it, or #f:
-  ;; never a list it never was. Without the end, a tail spliced in during
-  ;; the read would be read only as far as the stale count, and the answer
-  ;; would end where the list did not (tests/test-native.sps's
-  ;; spliced-longer sweep). Nothing is allocated but the answer, and what
-  ;; READ allocates.
+  ;; A list changed once during the read answers as it was before the change
+  ;; or after it, or #f. Without the end, a tail spliced in during the read
+  ;; would be read only as far as the stale count, and the answer would end
+  ;; where the list did not (tests/test-native.sps's spliced-longer sweep).
+  ;; A list changed more than once can answer a mix of its versions. One
+  ;; made circular and whole again during the count, and again during the
+  ;; walk, is counted and then walked once around its cycle: its elements in
+  ;; an order it never held them in (tests/test-native.sps's cycle race).
+  ;; No read that takes no lock can rule that out. A read inside one
+  ;; interrupt-free step, as uv-spawn!'s is, sees no engine's handler, so
+  ;; only another thread can do it. Nothing is allocated but the answer, and
+  ;; what READ allocates.
   (define (read-proper-list x read)
     (let ((n (proper-length x)))
       (and n

@@ -9,6 +9,8 @@
           (libuv private constants)
           (libuv private native)
           (libuv private handles)
+          (only (libuv private lists) read-proper-list)
+          (only (libuv private c-string) read-utf8 nul-free?)
           ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) with-interrupts-disabled))
@@ -32,18 +34,30 @@
   ;;   them, unchecked, in a second (s/prims.ss). A string that changes in
   ;;   between gets bytes it never held, or bytes written past the
   ;;   bytevector sized for it. So each string is copied and the copy
-  ;;   encoded: a copy is fixed-width, and nothing runs inside one with
-  ;;   interrupts disabled.
-  ;; - Chez's map walks a list it has measured without checking it again,
-  ;;   where list? and length check every pair they pass (s/4.ss, s/5_2.ss).
-  ;;   So a list is measured with those and walked a pair at a time.
-  ;; On data that keeps still the read raises nothing: what is malformed is
-  ;; kept as #f, and the checks refuse it afterwards in the order they have
-  ;; always run.
+  ;;   encoded (read-utf8, in (libuv private c-string)).
+  ;; - Each list is read with read-proper-list ((libuv private lists)):
+  ;;   counted without raising, walked at most that many pairs, each checked
+  ;;   before it is read through, and its end required after them. Measured
+  ;;   with list? and then length, a list another thread changed in between
+  ;;   made length raise its own condition, and one cut or made longer
+  ;;   during the walk was read as a list the caller never had: the part
+  ;;   before the cut, or the stale length's worth of the longer list. At
+  ;;   --optimize-level 3, where length checks nothing, a list made circular
+  ;;   there was walked forever with interrupts disabled (#66).
+  ;; - Each pair of a stdio spec is read once, after it is found to be a
+  ;;   pair (read-stdio-spec).
+  ;; So whatever another thread does, the read raises nothing, never reads
+  ;; through a non-pair, and ends. What it finds malformed is kept as #f, and
+  ;; the checks refuse it afterwards in the order they have always run. A
+  ;; list changed once during the read is read as it was before the change
+  ;; or after it, or found malformed; one changed several times can be read
+  ;; as a mix of its versions, as a string can (docs/api.md).
+  ;; test-process.sps's cross-thread list races hold this.
 
   ;; file is a bytevector, or #f for a non-string. args is a list of
-  ;; (bytevector or #f), or #f for anything but a proper list; options is a
-  ;; list of read entries (read-option), or #f likewise.
+  ;; (bytevector or #f), or #f for anything but a proper list as the read
+  ;; found it; options is a list of read entries (read-option), or #f
+  ;; likewise.
   (define-record-type spawn-request
     (fields file args options))
 
@@ -54,23 +68,9 @@
 
   ;; read-spawn-request : object object object -> spawn-request
   (define (read-spawn-request file args options)
-    (make-spawn-request (read-string file)
-                        (read-list args read-string)
-                        (read-list options read-option)))
-
-  (define (read-string s) (and (string? s) (string->utf8 (string-copy s))))
-
-  ;; At most as many steps as LST had pairs when it was measured, each pair
-  ;; checked, so a list another thread changes during the walk only ends it
-  ;; early, and is never walked forever.
-  (define (read-list lst read-element)
-    (and (list? lst)
-         (let walk ((p lst) (left (length lst)))
-           (cond ((zero? left) '())
-                 ((pair? p)
-                  (let ((element (read-element (car p))))
-                    (cons element (walk (cdr p) (- left 1)))))
-                 (else '())))))
+    (make-spawn-request (read-utf8 file)
+                        (read-proper-list args read-utf8)
+                        (read-proper-list options read-option)))
 
   ;; An options entry as (key . value), its value read as its key needs; #f
   ;; for anything but a pair.
@@ -78,13 +78,17 @@
     (and (pair? entry)
          (let ((key (car entry)) (value (cdr entry)))
            (cons key (case key
-                       ((env)   (read-list value read-string))
-                       ((cwd)   (read-string value))
-                       ((stdio) (read-list value read-stdio-spec))
+                       ((env)   (read-proper-list value read-utf8))
+                       ((cwd)   (read-utf8 value))
+                       ((stdio) (read-proper-list value read-stdio-spec))
                        (else    value))))))
 
   ;; stdio spec = ignore | (inherit-fd . integer) | (inherit-stream . stream)
   ;;              | (pipe uv-pipe direction)
+  ;; A pipe spec's second pair is read once: checked as (cdr rest) and then
+  ;; read again as (cddr rest) and (cadr rest), it could be a non-pair by
+  ;; the second read, and Chez's own cddr raised there, or at
+  ;; --optimize-level 3 read through it (#66).
   (define (read-stdio-spec spec)
     (cond
       ((eq? spec 'ignore) (make-stdio-spec 'ignore #f #f))
@@ -93,25 +97,22 @@
          (case kind
            ((inherit-fd inherit-stream) (make-stdio-spec kind rest #f))
            ((pipe)
-            (if (and (pair? rest) (pair? (cdr rest)) (null? (cddr rest)))
-                (make-stdio-spec 'pipe (car rest) (cadr rest))
-                (make-stdio-spec #f #f #f)))
+            (let ((tail (and (pair? rest) (cdr rest))))
+              (if (and (pair? tail) (null? (cdr tail)))
+                  (make-stdio-spec 'pipe (car rest) (car tail))
+                  (make-stdio-spec #f #f #f))))
            (else (make-stdio-spec #f #f #f)))))
       (else (make-stdio-spec #f #f #f))))
 
   ;; --- checking what was read -----------------------------------------------
   ;; Every check precedes the first allocation.
 
-  ;; An embedded NUL would cut the string short at the C boundary. UTF-8
-  ;; encodes NUL, and nothing else, as a zero byte.
+  ;; An embedded NUL would cut the string short at the C boundary.
   (define (check-string bv who type-reason)
     (unless bv
       (raise (make-uv-invalid-argument who type-reason)))
-    (let scan ((i 0))
-      (when (< i (bytevector-length bv))
-        (when (zero? (bytevector-u8-ref bv i))
-          (raise (make-uv-invalid-argument who 'embedded-nul)))
-        (scan (+ i 1)))))
+    (unless (nul-free? bv (bytevector-length bv))
+      (raise (make-uv-invalid-argument who 'embedded-nul))))
 
   (define (check-strings lst who reason)
     (unless lst

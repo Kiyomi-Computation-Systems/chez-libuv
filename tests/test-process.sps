@@ -28,6 +28,8 @@
         (only (libuv private constants) uv-process-type)
         (uv-testing)
         (only (uv-evidence) live-count describe)
+        ;; uv-spawn!'s list reads against another thread (#66).
+        (spawn-list-races)
         (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor
               ;; The changing-data sweeps drive a spawn in an engine, or race
@@ -38,7 +40,9 @@
               ;; The state sweeps count this process's open descriptors.
               directory-list
               ;; The drop sweeps check that no run leaves interrupts off.
-              disable-interrupts enable-interrupts))
+              disable-interrupts enable-interrupts
+              ;; The level-3 races run in a child process under a cap.
+              open-process-ports input-port-ready? system sleep make-time))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -290,6 +294,12 @@
      (reason-of (spawn-with "/bin/\x0;sh" ok-args #f)))
    (test-equal "a NUL inside an args string" 'embedded-nul
      (reason-of (spawn-with "/bin/sh" '("sh\x0;x") #f)))
+   ;; The scan reaches a string's first and last bytes, where C would read
+   ;; the string as empty or as one character short.
+   (test-equal "a NUL as the first or the last character of an args string"
+     '(embedded-nul embedded-nul)
+     (list (reason-of (spawn-with "/bin/sh" '("\x0;sh") #f))
+           (reason-of (spawn-with "/bin/sh" '("sh\x0;") #f))))
    (test-equal "an options key outside the closed set" 'option-unknown
      (reason-of (spawn-with "/bin/sh" ok-args '((bogus . 1)) #f)))
    (test-equal "a malformed options alist entry" 'option-unknown
@@ -2040,6 +2050,156 @@
       (test-equal "a spawn whose argument another thread narrows during the call ran its child on one reading of it"
         (list race-rounds '())
         (list (car race) (cadr race)))))
+
+;; --- a list another thread changes during the call --------------------------
+;; tests/spawn-list-races.sls has the races, and why each is shaped as it is
+;; (#66 items 2 and 3). Every call in them is refused before anything is
+;; allocated, so they leave no handle, block or registry entry behind, which
+;; the suite's last rows hold. The races skip under Valgrind, which runs one
+;; thread at a time.
+(define list-race-names '(args args-circular env options stdio pipe-spec))
+
+;; Each of uv-spawn!'s lists, improper or circular from the start, is
+;; refused for that list. No thread is needed for this, so it runs under
+;; Valgrind too; at --optimize-level 3 it runs in a child, below.
+(define malformed-reasons
+  '((improper-args . args-not-a-string-list) (circular-args . args-not-a-string-list)
+    (improper-env . env-not-a-string-list) (circular-env . env-not-a-string-list)
+    (improper-options . option-unknown) (circular-options . option-unknown)
+    (improper-stdio . stdio-not-a-list) (circular-stdio . stdio-not-a-list)))
+
+(test-equal "uv-spawn! refuses each of its lists improper or circular, for that list"
+  malformed-reasons
+  (guard (e (#t (list 'raised (describe e))))
+    (malformed-refusals)))
+
+(if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
+    (begin
+      (display "  [informational] spawn's list races: skipped under Valgrind,")
+      (display " which runs one thread at a time")
+      (newline))
+    (let ((races (guard (e (#t (list (list 'raised (describe e)))))
+                   (list-races list-race-names))))
+      (for-each
+       (lambda (race)
+         (when (and (list? race) (= (length race) 7))
+           (display "  [informational] spawn's ")
+           (display (car race))
+           (display " race: ")
+           (display (list-ref race 4))
+           (display " of ")
+           (display (list-ref race 1))
+           (display " calls were refused for the list cut")
+           (newline)))
+       races)
+      (test-equal "uv-spawn! refuses a call whose args another thread cuts, for the whole list or the cut one, and for nothing else"
+        (list (list 'args list-race-rounds 0 #f))
+        (list-race-verdicts races '(args)))
+      (test-equal "uv-spawn! refuses a call whose args another thread makes circular, for the whole list or the circular one, and for nothing else"
+        (list (list 'args-circular list-race-rounds 0 #f))
+        (list-race-verdicts races '(args-circular)))
+      (test-equal "uv-spawn! refuses a call whose env another thread cuts, for the whole list or the cut one, and for nothing else"
+        (list (list 'env list-race-rounds 0 #f))
+        (list-race-verdicts races '(env)))
+      (test-equal "uv-spawn! refuses a call whose options another thread cuts, for the whole list or the cut one, and for nothing else"
+        (list (list 'options list-race-rounds 0 #f))
+        (list-race-verdicts races '(options)))
+      (test-equal "uv-spawn! refuses a call whose stdio list another thread cuts, for the whole list or the cut one, and for nothing else"
+        (list (list 'stdio list-race-rounds 0 #f))
+        (list-race-verdicts races '(stdio)))
+      (test-equal "uv-spawn! refuses a call whose pipe spec another thread cuts, for the whole spec or the cut one, and for nothing else"
+        (list (list 'pipe-spec list-race-rounds 0 #f))
+        (list-race-verdicts races '(pipe-spec)))
+      ;; The rows above say nothing unless each flipper was changing a list.
+      (test-equal "precondition: each list race's flipper was changing the list its calls were given, before the first call and after the last"
+        (map (lambda (name) (list name 'flipping 'flipping)) list-race-names)
+        (list-race-liveness races list-race-names))))
+
+;; --- the same races at --optimize-level 3 ---------------------------------
+;; A program compiled at --optimize-level 3 compiles these libraries from
+;; source at that level too, where Chez's length, car and cdr check
+;; nothing. There a list another thread cut between list? and length was
+;; read through, one it made circular was walked forever with interrupts
+;; disabled, and a pipe spec's second pair was read through (#66).
+;; tests/spawn-level-3-child.sps runs the races at level 3 in a process of
+;; its own, in two children, so that a hang takes only its own rows: the
+;; cut races in one, and in the other the circular race and the lists
+;; malformed from the start, among them circular ones, which a read that
+;; counted with length would walk forever. A child still running after
+;; level-3-cap polls of 10 ms is killed, and its rows fail with
+;; killed-at-cap. The children run natively under the memory gates too,
+;; since neither tool follows a child.
+(define level-3-cap 6000)
+
+;; level-3-run : string string -> (or alist symbol list)
+;; The datum CHEZ printed running the child on the races RACES names, or
+;; why there is none. The command execs Chez, so the pid is Chez's own and
+;; the kill reaches the race.
+(define (level-3-run chez races)
+  (guard (e (#t (list 'spawn-failed (describe e))))
+    (let-values (((to-child from-child errors pid)
+                  (open-process-ports
+                   (string-append "exec " chez " --optimize-level 3"
+                                  " --program tests/spawn-level-3-child.sps "
+                                  races)
+                   (buffer-mode block) (native-transcoder))))
+      (close-port to-child)
+      (let wait ((polls 0))
+        (cond
+          ((input-port-ready? from-child)
+           (let* ((out (get-string-all from-child))
+                  (err (get-string-all errors)))
+             (close-port from-child)
+             (close-port errors)
+             (let ((datum (guard (e (#t #f))
+                            (read (open-string-input-port out)))))
+               (if (list? datum) datum (list 'unreadable out err)))))
+          ((= polls level-3-cap)
+           (system (string-append "kill -9 " (number->string pid)))
+           (close-port from-child)
+           (close-port errors)
+           'killed-at-cap)
+          (else
+           (sleep (make-time 'time-duration 10000000 0))
+           (wait (+ polls 1))))))))
+
+(define level-3-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+(define level-3-cut-names '(args env options stdio pipe-spec))
+(define level-3-cuts
+  (and level-3-chez (level-3-run level-3-chez "args env options stdio pipe-spec")))
+(define level-3-circular
+  (and level-3-chez (level-3-run level-3-chez "malformed args-circular")))
+
+;; level-3-entry : (or alist symbol list) symbol -> object
+;; The entry KEY of a child's REPORT, or what stood in its way.
+(define (level-3-entry report key)
+  (let ((entry (and (list? report) (for-all pair? report) (assq key report))))
+    (if entry (cdr entry) (list 'no-entry key report))))
+
+(if (not level-3-chez)
+    (test-equal "level-3 list race rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (begin
+      ;; The children must run at level 3, or the rows below test the
+      ;; default level, where length checks for itself.
+      (test-equal "seed: the list races' children ran at --optimize-level 3"
+        '(3 3)
+        (list (level-3-entry level-3-cuts 'level)
+              (level-3-entry level-3-circular 'level)))
+      (test-equal "at --optimize-level 3, uv-spawn! refuses a call whose list another thread cuts, for the whole list or the cut one, and for nothing else"
+        (map (lambda (name) (list name list-race-rounds 0 #f)) level-3-cut-names)
+        (list-race-verdicts level-3-cuts level-3-cut-names))
+      (test-equal "at --optimize-level 3, uv-spawn! refuses a call whose args another thread makes circular, and never walks them forever"
+        (list (list 'args-circular list-race-rounds 0 #f))
+        (list-race-verdicts level-3-circular '(args-circular)))
+      (test-equal "at --optimize-level 3, uv-spawn! refuses each of its lists improper or circular, for that list, and never walks one forever"
+        malformed-reasons
+        (level-3-entry level-3-circular 'malformed))
+      (test-equal "precondition: at --optimize-level 3 too, each list race's flipper was changing the list its calls were given, before the first call and after the last"
+        (map (lambda (name) (list name 'flipping 'flipping))
+             (append level-3-cut-names '(args-circular)))
+        (append (list-race-liveness level-3-cuts level-3-cut-names)
+                (list-race-liveness level-3-circular '(args-circular))))))
 
 (collect)
 (test-assert "counters all zero at suite end"

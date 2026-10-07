@@ -405,9 +405,12 @@ the design spec (§4–§6):
   they were before the change or as they were after it, never a mix. A NUL
   that appears in a string during the call is refused, or never reaches the
   child. Another thread changing them during the call races that read, which
-  no lock here can order: the child may get part of each version, or the
-  call may raise on a list that stopped being one, but the read never takes
-  bytes a string did not hold.
+  no lock here can order: the child may get part of each version, and a
+  list or stdio spec the read finds malformed is refused
+  (`&uv-invalid-argument`) with the reason a value of that shape gets on
+  entry. But the read never takes bytes a string did not hold, never reads
+  through a non-pair, and never walks a list without end, at any optimize
+  level.
 - **The handles are checked again where it spawns.** The handles named in
   `stdio`, and the loop, stay yours while `uv-spawn!` runs, so an engine's
   timer handler can close one, spawn on the same pipe, or tear the loop

@@ -2074,6 +2074,67 @@
         (thread-join flipper)
         (append result (list before after))))))
 
+;; A flipper that turns the third pair's cdr between the list's head and
+;; the rest of the list makes the list circular and whole again. A read the
+;; list changes in once answers the list or #f, as in the race above. One
+;; it changes in during the count and again during the walk can count a
+;; walk once around the cycle and then take it: (0 1 2 0 1 2 3 ... 11), the
+;; list's elements in an order the list never held (lists.sls). No read
+;; that takes no lock can rule that out, so the row holds what a read can:
+;; each answers #f, or a walk of the list to its end, around the cycle as
+;; many times as the walk found it there, and none raises or stops short of
+;; the end. A read that did not require the end would answer the count's
+;; worth of such a walk. The informational line counts the answers that
+;; went around the cycle.
+
+;; cycle-turns : object list -> (or exact-nonnegative-integer #f)
+;; How many times ANSWER went around the race list's cycle of three before
+;; it ended as WHOLE does, or #f when it is no such walk.
+(define (cycle-turns answer whole)
+  (let strip ((a answer) (turns 0))
+    (cond ((equal? a whole) turns)
+          ((and (pair? a) (pair? (cdr a)) (pair? (cddr a))
+                (equal? (list (car a) (cadr a) (caddr a)) '(0 1 2)))
+           (strip (cdddr a) (+ turns 1)))
+          (else #f))))
+
+;; cycle-race : -> (list rounds bad first-bad circular turned before after)
+;; read-proper-list's answers for a list another thread makes circular and
+;; whole again. It stops the flipper and joins it before it answers.
+(define (cycle-race)
+  (let* ((l (iota* 12))
+         (whole (iota* 12))
+         (p (list-tail l 2))
+         (rest (cdr p))
+         (stop #f)
+         (flipper
+          (fork-thread
+           (lambda ()
+             (let flip ()
+               (unless stop
+                 (set-cdr! p l)
+                 (set-cdr! p rest)
+                 (flip))))))
+         (before (watch-flipper (list-tail l 2) l rest)))
+    (let ((result
+           (let round ((r 0) (bad 0) (first-bad #f) (circular 0) (turned 0))
+             (if (= r list-race-rounds)
+                 (list r bad first-bad circular turned)
+                 (let* ((answer (guard (e (#t (list 'raised (describe e))))
+                                  (read-all l)))
+                        (turns (and answer (cycle-turns answer whole))))
+                   (cond ((not answer)
+                          (round (+ r 1) bad first-bad (+ circular 1) turned))
+                         ((eqv? turns 0) (round (+ r 1) bad first-bad circular turned))
+                         (turns (round (+ r 1) bad first-bad circular (+ turned 1)))
+                         (else (round (+ r 1) (+ bad 1)
+                                      (or first-bad (list r answer))
+                                      circular turned))))))))
+      (let ((after (watch-flipper (list-tail l 2) l rest)))
+        (set! stop #t)
+        (thread-join flipper)
+        (append result (list before after))))))
+
 (if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
     (begin
       (display "  [informational] proper-length and read-proper-list races:")
@@ -2105,7 +2166,22 @@
           (list (car race) (cadr race) (caddr race)))
         (test-equal "precondition: the read race's flipper was changing the read list before the first read and after the last"
           '(flipping flipping)
-          (list-tail race 4)))))
+          (list-tail race 4))
+        (let ((race (cycle-race)))
+          (display "  [informational] read-proper-list cycle race: ")
+          (display (cadddr race))
+          (display " of ")
+          (display (car race))
+          (display " reads found the list circular, and ")
+          (display (list-ref race 4))
+          (display " answered a walk around its cycle")
+          (newline)
+          (test-equal "read-proper-list answers #f or a walk of the list to its end for a list another thread makes circular, never raising"
+            (list list-race-rounds 0 #f)
+            (list (car race) (cadr race) (caddr race)))
+          (test-equal "precondition: the cycle race's flipper was making the read list circular and whole again before the first read and after the last"
+            '(flipping flipping)
+            (list-tail race 5))))))
 
 
 ;; The flags were measured with a guarded length, and a guard costs a few
