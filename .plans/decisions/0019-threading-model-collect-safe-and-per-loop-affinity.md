@@ -246,7 +246,7 @@ drains a caller-side queue rather than assuming one item per send.
 >       process handle and the options block, and builds the block, so
 >       `uv-spawn!` holds nothing before it (ADR-0015, the amendment to
 >       decision 1). `tests/test-process.sps`'s drop sweeps hold it.
->     - Found reviewing #63, still open: `uv-process-kill!` and
+>     - Found reviewing #63 (this split is fixed below): `uv-process-kill!` and
 >       `uv-process-pid` split between the pointer and the call, and a
 >       split kill signalled another process at the freed handle's address
 >       (#71). Separately, decision 4 holds per loop only: the registry is
@@ -333,6 +333,43 @@ drains a caller-side queue rather than assuming one item per send.
 >   - The stream verbs' steps (#53) re-check the handle but not the loop's
 >     owner. This change re-checks the owner for `make-uv-async` only, the
 >     one constructor inside the enforced surface.
+
+> **Amended 2026-10-07 (#71): `uv-process-kill!` and `uv-process-pid` are
+> one step.** Each checked that its process was open, read the handle's
+> pointer and called libuv in separate steps. Measured on main (bfd2bbe),
+> with the sweeps now in `tests/test-process-steps.sps`, on macOS and on
+> glibc 2.39:
+>
+> - **A new process at the freed address.** Suspended after the check while
+>   a close freed the handle and a new process's handle took its address,
+>   `uv-process-kill!` resumed, sent the NEW process its SIGTERM and
+>   returned normally, and `uv-process-pid` answered the new process's pid.
+>   With a signal name, the kill was refused at three fuels before that as
+>   `null-handle-pointer` rather than `&uv-handle-closed`.
+> - **A freed block.** Resumed on the freed block itself, each read it: the
+>   kill, sent signal 0 by the sweep, returned normally, and the pid read 0
+>   on macOS and the old pid on glibc. Whatever pid that block holds is
+>   what a stale kill signals, and 0 there is `kill(0, sig)`, the caller's
+>   own process group, so the sweeps send signal 0 wherever a stale call
+>   could reach a freed block.
+>
+> Each verb now checks its process again (`open-handle-ptr`), reads the
+> pointer and calls libuv in one `one-step`, and raises after the step
+> (`step-refusal`), as the stream verbs do. A process closed while the verb
+> is suspended is refused with `&uv-handle-closed`, unless the verb had
+> made its call before the suspension. Neither verb has a trap check after
+> its step, so in the sweeps no run was suspended there; a collection
+> another thread requests can still be taken where the step ends (#68).
+>
+> - **Measured after:** every suspended run is refused, the new process
+>   comes through untouched, and every dropped run leaves the counters as
+>   it found them. Neither verb allocates, before or after: 0 B a call.
+>   Evidence and mutations: `.plans/process-verb-steps-mutation-log.md`.
+> - **The new process's handle.** A spawn made after the close took the
+>   freed address by itself in 24 to 30 of 30 runs on macOS, and in none
+>   of 30 on glibc 2.36 or 2.39. So the reuse sweep places a copy of the
+>   new process's handle at the freed address, and resumes a run only once
+>   libuv reads the new process's pid there.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
