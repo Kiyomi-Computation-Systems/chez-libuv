@@ -51,10 +51,10 @@
 ;; handle's pointer, and called libuv, in separate steps. Another task could
 ;; close the process in between and run the loop, which freed the
 ;; uv_process_t, and the verb resumed with the stale pointer. When a new
-;; spawn had been given the freed address meanwhile, as it was on every
-;; macOS run, a resumed kill signalled the NEW process and returned
-;; normally, and a resumed pid answered the new process's pid (#71). Now
-;; each verb checks, reads and calls in one interrupt-free step (one-step).
+;; process's handle had been given the freed address meanwhile, a resumed
+;; kill signalled the NEW process and returned normally, and a resumed pid
+;; answered the new process's pid (#71). Now each verb checks, reads and
+;; calls in one interrupt-free step (one-step).
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
 ;; the verb's own open check, and the sweep stops at the first run no expiry
@@ -82,10 +82,8 @@
 ;; A kill resumed on a freed handle signals whatever pid it reads there, and
 ;; 0 there is kill(0, sig): this process's own group. So the split and drop
 ;; sweeps send signal 0, which reaches no one; the reuse sweep sends SIGTERM,
-;; and resumes only a run whose B took A's address, where a stale call can
-;; reach only B.
-
-(define (nop . args) #f)
+;; and resumes only a run whose block at A's address holds B's handle, where
+;; a stale call can reach only B.
 
 (define (interrupts-enabled?)
   (disable-interrupts)
@@ -283,7 +281,7 @@
 ;;
 ;; Seven blocks of that size are freed first, before A's close. The search
 ;; then found A's address at its first try in 60 of 60 runs on macOS and on
-;; both glibcs; without them it missed one run in 30 on each.
+;; both glibcs; without them it missed one run of 60 on each.
 (define handle-size (uv-handle-size (uv-process-type)))
 (define squat-fill 7)
 (define squat-tries 16)
