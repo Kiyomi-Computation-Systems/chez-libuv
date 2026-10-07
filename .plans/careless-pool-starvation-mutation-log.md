@@ -113,6 +113,7 @@ fence.
   close begins it makes at most one more send. So a round always ends once
   the loop thread closes, however long it is starved.
 - The failing-row hook, byte-identical to `tests/test-async-fence.sps`'s.
+  The review round moved it into `(uv-evidence)`.
 
 ## RED, then GREEN: a starved loop thread on demand
 
@@ -175,7 +176,9 @@ send that returns once the close has begun.
 T1 and T2 show that the order of the read and of the flag matters: either
 reversal fails the row on correct code. T3, T5 and T4 show that the flag is
 what ends a worker on a build that never refuses. Without it, the round
-waits for good.
+waits for good. These are 1547367's results: since the review round's
+bounded join, each of the three fails both rows by name instead ("The
+review's fixes", 2).
 
 ### Injected failures
 
@@ -367,3 +370,15 @@ cherry-pick. On that commit, macOS arm64, load under 3:
 
 The same gates passed on 5ac8469. The stress suite runs on no other gate:
 not CI, not the memory gate.
+
+After the review round, on e759c61, the branch merged with main at 30a7bd1
+(#75), macOS arm64:
+
+- `make test`: ALL SUITES PASSED, 25 suites.
+- `make test-threading`: 12 rows, in 3 of 3 runs, at load 61–102 from
+  other sessions' work.
+- `make check-purity` and `make check-help`: exit 0.
+- A frozen copy of the final suite, in three loops at once: 1,200 runs,
+  every row passing in each, at 1-minute loads of 8–162 (median 28). Other
+  sessions made that load; another session's 192 `yes` hogs were running
+  during the last few of them.
