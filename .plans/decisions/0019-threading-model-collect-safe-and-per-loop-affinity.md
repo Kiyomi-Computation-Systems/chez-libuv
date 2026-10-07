@@ -434,7 +434,7 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 > | One thread | +27 ns a constructor, +38 ns a callback, +70 ns a close (two uses); 0 B | within 12 ns of the unlocked registry |
 > | Four threads, only making, firing and closing timers | 381, 2,714 and 3,420 ns | 170, 1,651 and 1,608 ns |
 > | A loopback round trip | 75.7 µs at one thread (76.3 µs without a lock); 120.1 µs at four; 231 µs at eight, its runs 223–233 µs | 76.9, 120.1 and 216 µs, its runs at eight 213–232 µs |
-> | A teardown, or `uv-loop-live-handles`, with other loops' entries registered | copies every loop's entries, holding the lock for most of it: 0.66 ms at 100,000 entries, 13 ms at 1,000,000 | copies its own loop's |
+> | A teardown, or `uv-loop-live-handles`, with other loops' entries registered | copies every loop's entries while it holds the lock: 0.66 ms a call at 100,000 entries, 13 ms at 1,000,000, most of it the copy | copies its own loop's |
 > | Change | `handles.sls` alone: every registry signature and every suite as before | `handles`, `loop`, `stream`, `process`, `dns` and `tcp`; request records gain a loop; test helpers in about 8 suites |
 >
 > A table per loop needs no lock of its own, and a seam can reach its

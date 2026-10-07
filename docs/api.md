@@ -56,10 +56,10 @@ engine can be suspended holding it.
   waiting on the kernel. At eight threads it took 7% longer (231 µs against
   216 µs), within the runs' spread.
 - `uv-loop-teardown!` (and so every `call-with-uv-loop` exit) and
-  `uv-loop-live-handles` copy the whole table, every loop's entries, and
-  hold the lock for most of the copy: about 0.7 ms at 100,000 entries and
-  13 ms at 1,000,000 on macOS arm64. Every other loop's thread waits that
-  out at its next constructor, callback or close.
+  `uv-loop-live-handles` copy the whole table, every loop's entries, while
+  they hold the lock. A call took about 0.7 ms at 100,000 entries and 13 ms
+  at 1,000,000 on macOS arm64, most of it the copy. Every other loop's
+  thread waits that out at its next constructor, callback or close.
 
 ADR-0019's amendment to decision 4 weighs this lock against a table for each
 loop.

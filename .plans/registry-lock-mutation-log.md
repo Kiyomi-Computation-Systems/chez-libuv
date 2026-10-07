@@ -313,3 +313,289 @@ above passes it.
 and `e3d04f1`. `make test` on macOS passed 26 suites at load 68: the new
 suite 16 rows, #75's 12. Rule 6 also passes with #73's `src/`
 (`fix/spawn-list-reads`, `519924b`) merged in.
+
+## The review (2026-10-07)
+
+A max-effort `/code-review` of the first push ran ten finder angles, a
+verifier for each candidate, and a final pass for gaps. It reported 15
+findings, and refuted 3 more candidates. This round fixes the 15, except
+one that predates this PR, along with the cheaper ones cut from the report.
+Two predate this PR and are filed:
+- #78: two threads can both run one loop through `uv-run`;
+- #79: a constructor called from another thread corrupts libuv's handle
+  queue, while teardown answers ok.
+
+### The overlap preconditions could fail on a correct build
+
+Past its rounds, a race thread carried on up to 20 times them: a count of
+its own. Suppose one thread was stalled at the start for longer than the
+other thread's whole extended run. The counter race's took 21 to 52 ms
+here; with a 30 ms stall, the old harness failed 3 of 3. Then both threads reported `still`, and `make test` failed on
+correct code.
+
+#74's lesson is to bound a worker by the other thread's progress. So a
+thread now carries on until each thread has seen the other move or the
+other has finished. It gives up only at `race-time-cap` (10 s), which
+bounds how long a broken build takes to show itself.
+
+Measured with both harnesses copied into `r77/stall.sps`: the counter race,
+with thread 1 stalled right after it marks itself started. The stall is
+either a Chez `sleep`, which deactivates the thread, or a spin. Each cell
+gives 3 runs, 2 at 1 s and 5 s:
+
+| Stall | Old harness | New harness |
+|---|---|---|
+| none | `(moved moved)` 3/3 | `(moved moved)` 3/3 |
+| 30 ms, sleep or spin | `(still still)` 3/3 each | `(moved moved)` 3/3 each |
+| 200 ms, sleep or spin | `(still still)` 3/3 each | `(moved moved)` 3/3 each |
+| 1 s, sleep or spin | `(still still)` | `(moved moved)` |
+| 5 s, sleep | `(still still)` 2/2 | `(moved moved)` 2/2 |
+
+A thread that dies before its work makes the other wait out the cap.
+Then the row fails by name, `(still still)`, after 10 s, rather than
+hanging. My first 1 s sleep showed this by accident: `make-time` refused
+10^9 ns, and the stalled thread died.
+
+### The spawn race could not fail on its own
+
+A copy of the suite holding only the spawn race (`r77/test-spawn-only.sps`)
+was run 6 times against each of the first push's mutants on `bfd2bbe`'s
+fix. It passed every run under K1 (`registry-add!` unlocked), K3
+(`registry-deregister!` unlocked), K11 (no lock) and K13 (the walk cell
+shared). Its failures in the full suite came from the corruption the
+timer race left behind. Through `uv-spawn!`, the walk's window is too
+narrow to race, as #70 found. So the spawn race is gone, and the walk
+race asks `handle-in-loop-queue?` directly.
+
+### A teardown copied the whole registry twice
+
+`cancel-requests-for-loop!` and `registry-snapshot-for-loop` each copied
+every loop's entries under the lock. A teardown now takes one copy
+(`loop-entries`), which serves both: a cancellation completes in a later
+run, so the handles are the same after it.
+
+Measured on macOS arm64 at load 5, with N entries of another loop
+registered. The figure is the median of 11 calls (`r77/teardown-bench.sps`):
+
+| N | Teardown of an empty loop, before | After | `uv-loop-live-handles` |
+|---|---|---|---|
+| 0 | 8 µs | 9 µs | 0 µs |
+| 10,000 | 142 µs | 75 µs | 66 µs |
+| 100,000 | 1.42 ms | 0.66 ms | 0.65 ms |
+| 200,000 | 3.26 ms | 1.66 ms | 1.41 ms |
+| 1,000,000 | 24.3 ms | 13.3 ms | 11.3 ms |
+
+The copy still holds the lock for most of a call. The registry's comment,
+the ADR's trade-off table and docs/api.md now state this cost, where they
+had said a holder runs one table operation. The next step, should it
+show, is an index of each loop's entries, kept under the same lock.
+
+### Each finding, and what was done
+
+- **Nothing checked that a lock body cannot raise.** A raise inside
+  `with-registry-lock` would leave the lock held with interrupts
+  disabled, and hang every loop's thread.
+  - Rule 6 now holds every body in `src/` to table operations and `cons`:
+    a `lambda` only as `call-with-values`'s producer, and the registry
+    only as a table operation's table.
+  - Two rows in the new suite require a refused registration and a
+    refused deregistration to reach the caller's handler with the lock
+    free, as `test-async-fence.sps` does for the send fence.
+- **A body answering two values would have kept the lock.** The macro
+  bound its body's value with a one-value `let`.
+  - `with-step-lock`, now shared by the registry's lock and the send
+    fence, answers through `call-with-values`: every arity releases the
+    lock.
+  - `registry-entries`' body is now `(hashtable-entries registry)` itself.
+  - A row requires two values and none back, with the lock free.
+  - `tests/test-callback-alloc.sps` passed unchanged: 34 rows, with the
+    same bytes a callback.
+- **The suite took `registry-lock` with interrupts enabled, and nothing
+  checked where `src/` takes it.**
+  - The probe now tries any mutex it is asked about, with interrupts
+    disabled.
+  - The sanity row still holds the lock through `with-mutex`, because it
+    waits on the probe while it holds it. A wait with interrupts disabled
+    keeps a thread active, so a collection the probe asked for would wait
+    on it for good. The row's comment says why it is safe there: no loop
+    thread exists yet.
+  - A rule-6 row requires `registry-lock` to be named in `src/` only where
+    it is made and in `with-registry-lock`.
+- **Two of the four lock sweeps could not fail.** `registry-count` and
+  `record-orphan-callback!` cross no trap check between taking the lock and
+  releasing it, so no engine expires there whatever the macro does. They
+  are gone. The comment's claim that requests register inside a step was
+  also false for `uv-tcp-connect!`, `uv-getaddrinfo!` and
+  `uv-getnameinfo!`; the comment, the ADR and AGENTS.md now name the calls
+  the sweeps take, and why.
+- **The counter rows were unseeded, and nine counters were never called.**
+  - A seed row requires a timer counted on a forked, joined thread to move
+    this thread's count by exactly one, and its free to move it back.
+  - The counter race now calls all 13 pairs, and compares every count.
+  - Rule 6 reads the shim's statics, and requires each counter to change
+    only through `count_add` and be read only through `count_read`.
+- **Rule 6 missed shapes, and checked two of its words not at all.**
+  - The scan reads every top-level form, `begin`'s spliced in and
+    `define-values`.
+  - It lists a variable whose initializer makes something mutable in a
+    `let`, or a closure over a variable it assigns. It also lists one a
+    form changes in place: the first argument of a procedure whose name
+    ends in `!`, or a `fluid-let` binding.
+  - `library-init` is now checked: written only by an installer or a
+    top-level initializer, and each installer called only from one.
+  - So is `init-lock`: set only under `init-mutex` or by
+    `constants-init!`, which is called only under it.
+  - `thread-local` needs a constant initial value, since a thread inherits
+    its creator's value.
+  - The lock-use row reads every top-level form and looks inside
+    vectors, and a row requires no library to export the registry or the
+    orphan list.
+- **The ADR's case against a table per loop misstated its cost.** A seam
+  can reach its loop from its own pointer: a handle's `loop` field, a
+  request's handle or loop. The running-loop tracking was the prototype's
+  choice, not a cost of the design. The ADR and the registry's comment now
+  say so, and name the cost the pointer route does have: a table of loops
+  every thread shares and every callback reads.
+- **The ADR credited the lock for a wrong-thread constructor.** Neither
+  design makes one safe; the sentence now says so, and points to #79.
+- **The ADR's round-trip figures.**
+  - They came from three rounds, not five, and with no claim about
+    collections.
+  - The lock's range at eight threads was quoted as 213–233 µs, which
+    mixed both designs' ranges.
+  - The table now gives each design's medians and ranges.
+  - docs/api.md now says the lock's round trip was 7% longer at eight
+    threads, within the runs' spread.
+- **Smaller corrections.** The shim header no longer calls the counters
+  single-threaded. The "2–3x" spread above is now 6.7x and 3.1x, as its
+  own example shows. H1's four rows are noted as all the precondition rows
+  of the time.
+
+### Not taken
+
+- **Folding a close's deregistration into its seam's lookup.** It saves
+  about 33 ns a close at one thread. The DNS seams must keep two steps:
+  `getaddrinfo-dispatch` reads the loop while the request is still
+  registered.
+- **Passing the walk's target as `uv_walk`'s argument,** so that a walk
+  skips the seam's lookup. A failed spawn on a loop of 10,000 handles took
+  2.5 ms, against 1.9 ms on main. Only a failed spawn walks.
+- **A spinlock in place of the mutex** (refuted). It is about 20 ns cheaper
+  uncontended. But a spinner burns CPU behind a preempted holder or a
+  teardown's copy, and the contended runs did not favor it.
+- **Cleanups that reach other suites or files:**
+  - an X-macro for the shim's counters;
+  - one probe library for this suite and `test-async-fence.sps`;
+  - one fuel-sweep helper across suites;
+  - one quote-skipping walker for rules 1 to 6.
+
+  Rules 1 to 5's `mentions?` hides a name that follows a bare `quote` in
+  the same list. No form in `src/` hits it: 46,830 comparisons agreed.
+
+### Mutations
+
+Each mutation is an exact text replacement in a scratch copy of the fixed
+tree (`r77/mutate77.py` and `r77/mutations77.py`). A shim mutation builds
+the copy's own shim. Each race ran 5 times, and everything else once. Each
+cell counts the runs in which the row failed by name.
+
+| ID | Mutation | Failed by name | Runs |
+|---|---|---|---|
+| N1 | `with-step-lock` binds one value again | the two-values row | 1/1 |
+| N2 | `registry-deregister!` raises inside the lock | the refused-deregistration row; rule 6's lock-body row | 1/1; 1/1 |
+| N3 | `registry-add!` raises its refusal inside the lock | the refused-registration row; rule 6's lock-body row | 1/1; 1/1 |
+| N4 | `handles.sls` takes `registry-lock` with `with-mutex` | rule 6's `registry-lock` row | 1/1 |
+| N5 | `timer.sls` tries `registry-lock` | rule 6's `registry-lock` row | 1/1 |
+| N6 | the DNS cancellations call libuv under the lock | rule 6's lock-body row | 1/1 |
+| N7 | a procedure hands the table out of the lock | rule 6's lock-body row | 1/1 |
+| N8 | a new table made inside a `let` | rule 6's listing row | 1/1 |
+| N9 | an `init-lock` variable set outside the init mutex | rule 6's `init-lock` row | 1/1 |
+| N10 | an installer called from a constructor | rule 6's `library-init` row | 1/1 |
+| N11 | the walk cell made with `(list)` | rule 6's `thread-local` row | 1/1 |
+| N12 | a new static variable in the shim | rule 6's statics row | 1/1 |
+| N13 | the signal counter updated with `+=` | rule 6's counter-use row; the counter race; the balance row | 1/1; 1/5; 1/5 |
+| N14 | every counter kept per thread (`__thread`) | the counter seed | 3/3 |
+| N15 | the release shim's stubs | the counter seed | 1/1 |
+| H1 | a race's threads run one after the other | the four precondition rows | 1/1 each |
+| H2 | the overlap witness never notes a move | the four precondition rows | 1/1 each |
+| H3 | the probe always answers free | the probe row | 1/1 |
+| H5 | the sweeps start at fuel 1000 | the sweep precondition | 1/1 |
+| H6 | each suspended engine is dropped | the sweeps' teardown row | 1/1 |
+| K1 | `registry-add!` unlocked | rule 6's lock-use row; the timer race | 1/1; 5/5 (one run died of SIGABRT) |
+| K9 | `record-orphan-callback!` unlocked | rule 6's lock-use row; the orphan race | 1/1; 5/5 |
+| K11 | `with-registry-lock` takes no lock | rule 6's `registry-lock` row; the timer race; the orphan race | 1/1; 4/5; 5/5 |
+| K12 | `with-step-lock` never disables interrupts | the sweep row | 5/5 |
+| K13 | the walk cell shared again | rule 6's `thread-local` row; the walk race | 1/1; 5/5 |
+| K14 | `count_add` a plain `+=` | the counter race; the balance row | 5/5; 5/5 |
+| C1 | `all-forms-where` reads quoted data | the seeded listing row | 1/1 |
+| C2 | `eager-forms` reads `lambda` bodies | the seeded listing row | 1/1 |
+| C3 | `changed-in-place` sees no mutator | the seeded listing row | 1/1 |
+| C4 | `per-thread?` takes any initial value | the seeded `per-thread?` row | 1/1 |
+| C5 | `mentions-outside?` skips vectors | the seeded lock-use row | 1/1 |
+| C6 | `top-level-forms` splices no `begin` | the seeded listing and lock-use rows | 1/1 |
+| C7 | a lock body may call anything | the seeded lock-body row | 1/1 |
+| C8 | `unknown-classes` accepts every word | the seeded words row | 1/1 |
+| C9 | `sites` never sees `init-mutex` | the seeded `init-lock` row, and the real tree's | 1/1 |
+| C10 | `sites` counts every form as a top-level initializer | the seeded `library-init` row | 1/1 |
+| C11 | `static-objects` reads a `const` as a variable | the seeded statics row, and the real tree's | 1/1 |
+| C12 | `bare-counter-uses` accepts every use | the seeded counter-use row | 1/1 |
+| C13 | `made-by` ignores an assignment | the seeded maker row | 1/1 |
+| C14 | `holds-state?` ignores a closure's `set!` | the seeded listing row | 1/1 |
+
+What the table shows:
+
+- **Rule 6 now catches, by name and on every run, three mutants the races
+  caught only by chance.**
+  - The registry's macro without its lock (K11): it no longer names
+    `registry-lock`.
+  - One counter on `+=` (N13), which the counter race caught 1 run in 5:
+    the shim's counters may change only through `count_add`.
+  - A raise inside a lock body (N2, N3), which no row saw before.
+- **N1 failed its row, then hung the suite.** The sweeps' teardown raised
+  inside the lock, through the one-value macro, and kept it. `make test`
+  reports that as HUNG at 300 s, with the row failed by name first.
+- **The timer race caught K1 5 of 5** on the new harness, against 3 of 5
+  on the first.
+- **The counter seed is what catches counters kept per thread** (N14).
+  Every other row reads this thread's counts and stays balanced.
+
+Equivalent, or uncovered:
+
+- **The order of `with-step-lock`'s steps.** Taking the lock before
+  disabling interrupts, and enabling them before releasing it, passed 5
+  of 5. That is equivalent, as the note above says: no tick falls between
+  the two calls.
+- **`count_read`'s relaxed atomic load, against a plain read.** The two
+  compile byte for byte the same at -O2 on arm64 and x86_64; at -O0 a
+  stack spill wraps the same single load. No row can tell them apart. The
+  atomic load stays: a plain read racing an atomic add is a data race in
+  C's memory model.
+- **What rule 6 cannot see:**
+  - a structure changed only through a procedure that takes it as an
+    argument;
+  - a `set!` through a macro whose name does not end in `!`;
+  - a `lambda` an initializer stores and something calls later: an
+    installer called from it passes the `library-init` row.
+
+### Gates
+
+On `19610e1`, on main `1504309` (#74):
+
+- **macOS arm64:**
+  - `make test`, 26 suites;
+  - `make test-memory` (ASan: 26 suites; the new suite ran all 18 rows,
+    races included);
+  - `make check-memory-gate` (both planted defects caught);
+  - `make check-purity`; `make check-help`.
+- **Linux aarch64, Ubuntu 24.04** (the `chez-libuv-noble-scratch` image,
+  `CHEZ=scheme`): `make test` on both of CI's legs, apt libuv 1.48 and
+  vendored libuv 1.52.1, from a `--no-hardlinks` clone.
+- **`make test-memory-docker`** (Debian bookworm, Valgrind 3.19, vendored
+  libuv 1.52.1), from the same clone: every planted defect caught (5 modes); every suite's own process 0 errors
+  and 0 bytes definitely lost; the new suite ran its 10 rows that need no
+  race; the 74 reports from `test-process.sps`'s forked children are the
+  known non-gating artifacts (76 on the first push's run).
+
+The commit that carries this section differs from `19610e1` only in
+`.plans/` and in two sentences of docs/api.md and the ADR on what the
+teardown's copy costs.
