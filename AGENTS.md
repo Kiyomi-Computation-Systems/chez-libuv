@@ -237,8 +237,11 @@ None is obvious from reading the code.
   2026-10-06. The pool now has no cap. What ends a worker on a build that
   never refuses is the contract instead: a send made once the close has
   begun is refused. Bound a worker by the other thread's progress, never by
-  a count of its own. The discipline pool's 1,000,000-post cap has the same
-  shape, and hit it once at load 200
+  a count of its own. The discipline pool's 1,000,000-post cap had the same
+  shape and hit it once at load 200; its posts now wait for the loop
+  thread's drains. Any wait on another thread needs a bound of its own, or
+  a broken build hangs where it should fail a row: each pool's join, and the
+  discipline pool's wait for a drain, give up after 10 s and say so
   (`.plans/careless-pool-starvation-mutation-log.md`).
 * **Chez resolves its boot files by argv[0], not by the executable's path.**
   A Chez child spawned with `file` = the real binary but argv[0] hardcoded to

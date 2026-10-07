@@ -27,26 +27,18 @@
         (only (chezscheme)
               collect collect-trip-bytes foreign-alloc foreign-free
               fork-thread
-              make-mutex make-condition condition-wait condition-signal with-mutex
+              make-mutex make-condition condition-wait condition-signal
+              condition-broadcast with-mutex
               get-thread-id sleep make-time real-time
               make-list iota)
         ;; describe is total: a raise escaping a worker's handler would skip
         ;; its signal, and a worker that never signals hangs its join.
-        (only (uv-evidence) describe))
+        (only (uv-evidence) describe print-actual-on-failure!))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
-
-;; The simple runner prints only a failing row's title. Each row here
-;; returns its evidence when it fails, so print that too.
-(let ((simple-end (test-runner-on-test-end runner)))
-  (test-runner-on-test-end! runner
-    (lambda (r)
-      (simple-end r)
-      (when (eq? (test-result-kind r) 'fail)
-        (display "  actual: ")
-        (write (test-result-ref r 'actual-value))
-        (newline)))))
+;; Each row here returns its evidence when it fails.
+(print-actual-on-failure! runner)
 
 (test-begin "threading-stress")
 
@@ -219,6 +211,45 @@
   (test-equal "a loop run by a second thread is owned by that thread"
     #t b-owns))
 
+;; --- plumbing shared by the two worker pools below --------------------------
+;; A worker in either pool ends at its next send or post once its round has
+;; closed, so each round's join waits only for that. JOIN-WAITS bounds the
+;; wait anyway: without it, a worker that never ends hangs the suite with no
+;; row named. The bound caps only how long a broken round gets to show
+;; itself; no verdict on a correct build depends on it.
+(define join-waits 1000)               ; waits of 10 ms: 10 s for a broken round
+(define ten-ms (make-time 'time-duration 10000000 0))
+
+;; join-workers! : mutex condition (-> boolean) -> boolean
+;; With M held, waits on CV until (DONE?) holds, at most JOIN-WAITS waits.
+;; Answers whether it held.
+(define (join-workers! m cv done?)
+  (let wait ((n 0))
+    (cond ((done?) #t)
+          ((= n join-waits) #f)
+          (else (condition-wait cv m ten-ms) (wait (+ n 1))))))
+
+;; run-rounds : exact-nonnegative-integer (-> list) (list -> boolean) -> list
+;; Runs up to N rounds in order, and stops after the first that STUCK?
+;; names. Such a round spent a wait's whole bound, and every round after it
+;; would too, so the suite would hang after all; the rows fail on it anyway.
+(define (run-rounds n run-round stuck?)
+  (let more ((i 0) (acc '()))
+    (if (or (= i n) (and (pair? acc) (stuck? (car acc))))
+        (reverse acc)
+        (more (+ i 1) (cons (run-round) acc)))))
+
+;; ran-out? : (or symbol list) -> boolean
+;; Whether a round's outcomes name a worker that spent a wait's bound: one
+;; its join gave up on ('never-ended), or one that found no room in the
+;; discipline pool's queue through every wait for a drain ((no-room seq)).
+(define (ran-out? outcomes)
+  (and (pair? outcomes)
+       (exists (lambda (o)
+                 (or (eq? o 'never-ended)
+                     (and (pair? o) (eq? (car o) 'no-room))))
+               outcomes)))
+
 ;; --- worker pool posting work via uv-async-send! (design §6.1) ----------
 ;; K workers push items to a shared queue and wake the loop thread. The wake
 ;; callback drains the WHOLE queue each time, so coalescing (N sends -> 1
@@ -246,13 +277,24 @@
 ;; only 2 to 11 of 20 single-pool runs (measured; see
 ;; .plans/async-close-discipline-mutation-log.md). So the pool runs ROUNDS
 ;; times, fresh each time, and a row passes only if it held in every round.
+;;
+;; The loop thread's drains pace the posts: a worker that finds ROOM items
+;; queued waits for the next drain. A fixed cap alone let a starved loop
+;; thread fail a correct build: under CPU load the busiest worker posted up
+;; to 304,839 items before the close, and one reached the cap of 1,000,000
+;; at a load average of 200 (.plans/careless-pool-starvation-mutation-
+;; log.md). Paced, a worker reaches CAP only if the loop thread drains over
+;; and over without closing. The wait for a drain is bounded too, so a loop
+;; thread that stops draining without closing fails a row, where a worker
+;; waiting for good would hang the suite inside uv-run.
 (let ()
   (define rounds 30)
   (define k 4)
   (define close-after 400)             ; deliveries before the close begins
+  (define room 4096)                   ; items queued before a post waits
+  (define room-waits 1000)             ; waits of 10 ms for a drain: 10 s
   (define cap 1000000)                 ; a worker still unrefused after this many
                                        ; posts stops, and fails the refusal row
-                                       ; (the busiest measured: ~20000)
   ;; run-pool : -> (list closed refusals delivery drained)
   ;; One pool, from make-uv-loop to teardown. Each verdict is a sentinel
   ;; symbol when its property held, and otherwise the evidence.
@@ -260,8 +302,10 @@
     (let ()
       (define loop (make-uv-loop))
       (define qm (make-mutex))             ; guards open?, queue, every send
+      (define drained (make-condition))    ; broadcast, with QM, at each drain
       (define open? #t)
       (define queue '())                   ; (worker-id . seq), newest first
+      (define queued 0)                    ; QUEUE's length, kept with it
       (define async #f)
       (define delivered 0)
       (define seen (make-vector k '()))    ; per worker: every seq delivered
@@ -272,16 +316,28 @@
       (define dm (make-mutex))             ; guards results, for the join
       (define all-done (make-condition))
       (define results '())                 ; (worker-id . outcome), one each
-      ;; post! : pair -> boolean. #t: queued, and the loop woken. #f:
-      ;; refused -- the loop thread has begun closing; nothing was queued.
+      ;; post! : pair -> (or #t #f 'no-room). #t: queued, and the loop woken.
+      ;; #f: refused -- the loop thread has begun closing; nothing was
+      ;; queued. 'no-room: the queue stayed full through ROOM-WAITS waits for
+      ;; a drain, so the loop thread stopped draining without closing.
       (define (post! item)
         (with-mutex qm
-          (and open?
-               (begin (set! queue (cons item queue))
-                      (uv-async-send! async)
-                      #t))))
+          (let wait ((n 0))
+            (cond ((not open?) #f)
+                  ((< queued room)
+                   (set! queue (cons item queue))
+                   (set! queued (+ queued 1))
+                   (uv-async-send! async)
+                   #t)
+                  ((= n room-waits) 'no-room)
+                  (else (condition-wait drained qm ten-ms)
+                        (wait (+ n 1)))))))
       (define (take-queue!)                ; with qm held
-        (let ((b queue)) (set! queue '()) b))
+        (let ((b queue))
+          (set! queue '())
+          (set! queued 0)
+          (condition-broadcast drained)
+          b))
       (define (deliver! batch)
         (for-each (lambda (item)
                     (let ((id (car item)))
@@ -306,20 +362,23 @@
           (deliver! (with-mutex qm (take-queue!)))))
       ;; Any raise is a failure, recorded as evidence rather than left to kill
       ;; the thread: under this discipline the handle never refuses a send.
-      ;; A worker that stops unrefused (it raised, or reached CAP) wakes the
-      ;; loop thread, under the discipline, so the round closes and uv-run
-      ;; returns. That wake can itself raise only when the discipline is
-      ;; already broken -- the handle closing under an open flag -- and the
-      ;; outcome has already recorded the failure, so it is dropped.
+      ;; A worker that stops unrefused (it raised, found no room, or reached
+      ;; CAP) wakes the loop thread, under the discipline, so the round closes
+      ;; and uv-run returns. That wake can itself raise only when the
+      ;; discipline is already broken -- the handle closing under an open
+      ;; flag -- and the outcome has already recorded the failure, so it is
+      ;; dropped.
       (define (worker id)
         (let ((outcome
                (guard (e (#t (list 'raised (describe e))))
                  (let push ((seq 0))
-                   (cond ((= seq cap) (list 'never-refused seq))
-                         ((post! (cons id seq))
-                          (vector-set! accepted id (+ seq 1))
-                          (push (+ seq 1)))
-                         (else 'refused))))))
+                   (if (= seq cap)
+                       (list 'never-refused seq)
+                       (case (post! (cons id seq))
+                         ((#t) (vector-set! accepted id (+ seq 1))
+                               (push (+ seq 1)))
+                         ((no-room) (list 'no-room seq))
+                         (else 'refused)))))))
           (unless (eq? outcome 'refused)
             (guard (e (#t #f))
               (with-mutex qm
@@ -343,33 +402,36 @@
                    (uv-run loop 'default)  ; drains wakes until the close
                    'returned)))
         ;; Already clear if the closing wake ran. If uv-run raised first, this
-        ;; refuses the workers now, before the join and before teardown
-        ;; closes the async, instead of letting each post to CAP into a loop
-        ;; that no longer drains.
-        (with-mutex qm (set! open? #f))
-        (with-mutex dm                     ; join every worker before teardown
-          (let join ()
-            (unless (= (length results) k)
-              (condition-wait all-done dm)
-              (join))))
-        (uv-loop-teardown! loop)
-        (list
-         (cond ((not (eq? run 'returned)) (list 'uv-run run))
-               ((and queued-at-close (positive? queued-at-close))
-                'closed-with-posts-queued)
-               (else (list 'queued-at-close queued-at-close)))
-         (let ((outcomes (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
-                                             results))))
-           (if (equal? outcomes (make-list k 'refused))
-               'every-worker-refused
-               outcomes))
-         (let ((verdicts (map delivery-verdict (iota k))))
-           (if (equal? verdicts (make-list k 'exact)) 'exactly-once verdicts))
-         (if (null? queue) 'empty (list 'stranded (length queue)))))))
-  (let ((pools (let more ((i 0) (acc '()))
-                 (if (= i rounds)
-                     (reverse acc)
-                     (more (+ i 1) (cons (run-pool) acc))))))
+        ;; refuses the workers now, and wakes any waiting for a drain, before
+        ;; the join and before teardown closes the async.
+        (with-mutex qm
+          (set! open? #f)
+          (condition-broadcast drained))
+        (let* ((ended (with-mutex dm      ; join every worker before teardown
+                        (join-workers! dm all-done
+                                       (lambda () (= (length results) k)))
+                        results))
+               (torn (guard (e (#t (list 'raised (describe e))))
+                       (uv-loop-teardown! loop)
+                       'torn-down)))
+          (list
+           (cond ((not (eq? run 'returned)) (list 'uv-run run))
+                 ((not (eq? torn 'torn-down)) (list 'teardown torn))
+                 ((and queued-at-close (positive? queued-at-close))
+                  'closed-with-posts-queued)
+                 (else (list 'queued-at-close queued-at-close)))
+           (let ((outcomes (map (lambda (id)
+                                  (cond ((assv id ended) => cdr)
+                                        (else 'never-ended)))
+                                (iota k))))
+             (if (equal? outcomes (make-list k 'refused))
+                 'every-worker-refused
+                 outcomes))
+           (let ((verdicts (map delivery-verdict (iota k))))
+             (if (equal? verdicts (make-list k 'exact)) 'exactly-once verdicts))
+           (if (null? queue) 'empty (list 'stranded (length queue))))))))
+  (let ((pools (run-rounds rounds run-pool
+                           (lambda (pool) (ran-out? (cadr pool))))))
     (define (every-round n) (map (lambda (pool) (list-ref pool n)) pools))
     ;; The precondition the rows below depend on: each close met items still
     ;; queued, so the final drain had work and the queue was once non-empty.
@@ -396,14 +458,18 @@
 ;; before the 50th wake (.plans/careless-pool-starvation-mutation-log.md).
 ;; What ends a worker on a build that never refuses is the contract instead
 ;; (docs/api.md, Async): a send made once a close has begun is refused.
+;; Workers spin while the loop thread is stalled, and that spinning is what
+;; races the close: backing off in stalls cut the failing rounds of main's
+;; unfenced send from 150 to 35 in 40 runs (the same log).
 ;;
 ;; How often the refusal row catches main's unfenced send depends on load:
 ;; in 6 of 6 runs at a load average near 170, and in 44 of 80 near 10 (the
-;; same log). It always catches a wrong refusal, and a send that returns
-;; once the close has begun. It never sees the closer's half of the fence:
-;; the closer row in tests/test-async-fence.sps holds that, and holds both
-;; halves on the default gate. The first row is the precondition: the loop
-;; thread closed the async while the workers sent.
+;; same log). It catches a wrong refusal in every round, and a send that
+;; returns after its worker saw the close begin. It never sees the closer's
+;; half of the fence: the closer row in tests/test-async-fence.sps holds
+;; that, and holds both halves on the default gate. The first row is the
+;; precondition: the loop thread closed the async while the workers sent,
+;; and the round's own close and teardown raised nothing.
 (let ()
   (define rounds 30)
   (define k 4)
@@ -457,27 +523,34 @@
       (set! async (make-uv-async loop on-wake))
       (let spawn ((i 0))
         (when (< i k) (fork-thread worker) (spawn (+ i 1))))
-      (let ((run (guard (e (#t (list 'raised (describe e))))
-                   (uv-run loop 'default)  ; returns once the close completes
-                   'returned)))
-        ;; If uv-run returned early, close now, so the workers are refused
-        ;; instead of sending into a loop nothing runs. A handle already
-        ;; closing or closed makes this a no-op.
-        (close! async)
-        (with-mutex dm
-          (let join ()
-            (unless (= (length results) k)
-              (condition-wait all-done dm)
-              (join))))
-        (uv-loop-teardown! loop)
-        (list run
-              (if (equal? results (make-list k 'refused))
+      (let* ((run (guard (e (#t (list 'raised (describe e))))
+                    (uv-run loop 'default)  ; returns once the close completes
+                    'returned))
+             ;; If uv-run returned early, close now, so the workers are
+             ;; refused instead of sending into a loop nothing runs. A handle
+             ;; already closing or closed makes this a no-op. A raise here or
+             ;; in the teardown is the round's evidence, not the suite's end.
+             (closed (guard (e (#t (list 'raised (describe e))))
+                       (close! async)
+                       'closed))
+             (ended (with-mutex dm
+                      (join-workers! dm all-done
+                                     (lambda () (= (length results) k)))
+                      results))
+             (torn (guard (e (#t (list 'raised (describe e))))
+                     (uv-loop-teardown! loop)
+                     'torn-down))
+             (outcomes (append ended
+                               (make-list (- k (length ended)) 'never-ended))))
+        (list (if (and (eq? run 'returned) (eq? closed 'closed)
+                       (eq? torn 'torn-down))
+                  'returned
+                  (list run closed torn))
+              (if (equal? outcomes (make-list k 'refused))
                   'every-worker-refused
-                  results)))))
-  (let ((round-results (let more ((i 0) (acc '()))
-                         (if (= i rounds)
-                             (reverse acc)
-                             (more (+ i 1) (cons (run-careless-round) acc))))))
+                  outcomes)))))
+  (let ((round-results (run-rounds rounds run-careless-round
+                                   (lambda (r) (ran-out? (cadr r))))))
     (test-equal "a careless pool's loop closes its async while workers send"
       (make-list rounds 'returned) (map car round-results))
     (test-equal "every careless sender is refused with &uv-handle-closed, and nothing else raises"
