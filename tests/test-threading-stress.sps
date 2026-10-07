@@ -37,6 +37,17 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
+;; The simple runner prints only a failing row's title. Each row here
+;; returns its evidence when it fails, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
 (test-begin "threading-stress")
 
 (let ()
@@ -379,27 +390,40 @@
 ;; binding fenced its sends. Now every worker must end refused with
 ;; &uv-handle-closed, and nothing else may raise.
 ;;
-;; What the rows catch depends on load (.plans/async-send-fence-mutation-
-;; log.md). On a loaded machine the refusal row caught main's unfenced send
-;; in every run, and on an idle one in none. It always catches a wrong
-;; refusal. It never sees the closer's half of the fence: the closer row in
-;; tests/test-async-fence.sps holds that, and holds both halves on the
-;; default gate. The first row is the precondition: the loop thread closed
-;; the async while the workers sent.
+;; A worker has no cap on its sends: it sends for as long as the loop thread
+;; takes to close. A cap of 1,000,000 failed a correct build when a load
+;; average of 140 starved the loop thread, and one worker reached the cap
+;; before the 50th wake (.plans/careless-pool-starvation-mutation-log.md).
+;; What ends a worker on a build that never refuses is the contract instead
+;; (docs/api.md, Async): a send made once a close has begun is refused.
+;;
+;; How often the refusal row catches main's unfenced send depends on load:
+;; in 6 of 6 runs at a load average near 170, and in 44 of 80 near 10 (the
+;; same log). It always catches a wrong refusal, and a send that returns
+;; once the close has begun. It never sees the closer's half of the fence:
+;; the closer row in tests/test-async-fence.sps holds that, and holds both
+;; halves on the default gate. The first row is the precondition: the loop
+;; thread closed the async while the workers sent.
 (let ()
   (define rounds 30)
   (define k 4)
   (define close-at 50)                 ; the wake that closes the async
-  (define cap 1000000)                 ; sends before a worker stops unrefused
   ;; run-careless-round : -> (list run outcomes)
   (define (run-careless-round)
     (let ()
       (define loop (make-uv-loop))
       (define async #f)
       (define wakes 0)
+      (define close-begun #f)              ; #t once a close of ASYNC has begun
       (define dm (make-mutex))             ; guards results, for the join
       (define all-done (make-condition))
       (define results '())                 ; one outcome per worker
+      ;; Begins the close, then tells the workers it has begun. Told first,
+      ;; a worker could send before the close began and look as if it had
+      ;; sent after.
+      (define (close! h)
+        (uv-close! h)
+        (set! close-begun #t))
       ;; Closes at the CLOSE-AT'th wake, or at once if a worker has ended
       ;; unrefused: the round has failed, and the wakes it waits for may
       ;; never come, which would leave uv-run blocked.
@@ -408,17 +432,23 @@
         (when (or (= wakes close-at)
                   (with-mutex dm
                     (exists (lambda (o) (not (eq? o 'refused))) results)))
-          (uv-close! h)))
-      ;; A worker that ends unrefused sends one more wake so the loop thread
-      ;; sees it. The fence makes that safe even if the close has begun.
+          (close! h)))
+      ;; Reads CLOSE-BEGUN before each send; read after it, a send made
+      ;; before the close began could look as if it came after. A send made
+      ;; after the worker saw it set must be refused, so one that returns
+      ;; ends the worker unrefused, with its count of sends. A worker that
+      ;; ends unrefused sends one more wake so the loop thread sees it. The
+      ;; fence makes that safe even if the close has begun.
       (define (worker)
         (let ((outcome
                (guard (e ((uv-handle-closed? e) 'refused)
                          (#t (list 'raised (describe e))))
                  (let send ((n 0))
-                   (if (= n cap)
-                       (list 'never-refused n)
-                       (begin (uv-async-send! async) (send (+ n 1))))))))
+                   (let ((begun close-begun))
+                     (uv-async-send! async)
+                     (if begun
+                         (list 'sent-after-close n)
+                         (send (+ n 1))))))))
           (with-mutex dm
             (set! results (cons outcome results))
             (condition-signal all-done))
@@ -431,9 +461,9 @@
                    (uv-run loop 'default)  ; returns once the close completes
                    'returned)))
         ;; If uv-run returned early, close now, so the workers are refused
-        ;; instead of sending to CAP into a loop nothing runs. A handle
-        ;; already closing or closed makes this a no-op.
-        (uv-close! async)
+        ;; instead of sending into a loop nothing runs. A handle already
+        ;; closing or closed makes this a no-op.
+        (close! async)
         (with-mutex dm
           (let join ()
             (unless (= (length results) k)

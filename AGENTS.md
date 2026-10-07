@@ -227,6 +227,19 @@ None is obvious from reading the code.
   the peer's kernel state has to look at it: the section now waits on
   `recv(MSG_PEEK)` and asserts what it saw as a named precondition
   (`.plans/reset-precondition-mutation-log.md`).
+* **A worker thread's cap on its own work races the loop thread's
+  scheduling, and CPU load does test that.** Each worker in
+  test-threading-stress's careless pool sent until refused or until
+  1,000,000 sends, and the loop thread closed at its 50th wake. Idle, the
+  busiest worker sent at most 9,049 times. With CPU hogs at load 76–160 it
+  sent up to 774,427, and 3 of 170 suite runs at load 40–214 failed a
+  correct build with `(never-refused 1000000)`: the one-off failure of
+  2026-10-06. The pool now has no cap. What ends a worker on a build that
+  never refuses is the contract instead: a send made once the close has
+  begun is refused. Bound a worker by the other thread's progress, never by
+  a count of its own. The discipline pool's 1,000,000-post cap has the same
+  shape, and hit it once at load 200
+  (`.plans/careless-pool-starvation-mutation-log.md`).
 * **Chez resolves its boot files by argv[0], not by the executable's path.**
   A Chez child spawned with `file` = the real binary but argv[0] hardcoded to
   another name (e.g. `"chez"` against an install whose binary is `scheme`)
