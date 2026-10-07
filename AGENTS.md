@@ -103,7 +103,9 @@ None is obvious from reading the code.
   `call-with-uv-loop`, which runs at once. Loopback placeholders such as
   test-tcp.sps's `(define p 'never-accepted)` raised from all of these when a
   handshake missed its cap (2026-10-06). `tests/test-seed-gates.sps` now holds
-  every suite that waits for an accepted peer to this. A late handshake also
+  every suite that waits for an accepted peer to this. Its rule 4 holds the
+  suites that test the address and DNS verbs too: test-dns.sps died at its
+  first lookup when a verb raised, with no summary (#64). A late handshake also
   reaches teardown: a connect still pending there completes as `'ECANCELED`,
   and a callback that goes on from it raises `&uv-handle-closed` out of
   `uv-loop-teardown!` (test-tcp and test-facade), so a connect callback goes
@@ -171,6 +173,15 @@ None is obvious from reading the code.
   first use, so the error points nowhere near the mistake.
 * **A struct tag first named in a prototype's parameter list has prototype scope
   only** (C99 6.2.1p7). Forward-declare it at file scope before the prototype.
+* **Chez encodes a `string` argument during the foreign call, and takes a
+  `u8*` in a `__collect_safe` call without a word.** A caller's string
+  changed after it was checked reached C changed, and a NUL cut it short
+  (#51, #61). A `__collect_safe` copy out of a bytevector was corrupted by
+  another thread's collection (#35). `tests/test-source-rules.sps` holds
+  every foreign call in `src/` to both, each type family checked against
+  Chez's own expander: a string crosses only into `chez_uv_constant`, and no
+  `__collect_safe` call takes `u8*`, `u16*`, `u32*`, `scheme-object`, `ptr`
+  or `ftype-scheme-object-pointer`.
 * **A few bytes in front of a power-of-two allocation cost a whole macOS size
   class.** macOS malloc rounds 65,552 B (a 64 KiB read buffer behind a
   16-byte header) up to 81,920 B, and zeroing the request touches every

@@ -44,6 +44,15 @@
 ;;;    Rule 3 holds test-tcp.sps alone: only its ticking waits were measured
 ;;;    under a flood.
 ;;;
+;;; 4. A suite that tests the address and DNS verbs calls them only where a
+;;;    raise from one fails a row: in a row's tested expression, in a
+;;;    procedure body, or in the body of a guard with an else or #t clause.
+;;;    A verb that raises anywhere else ends the suite at that form, with no
+;;;    summary and none of the evidence after it: under #61's mutations MV1
+;;;    and MA8, test-dns.sps died at its first lookup and test-tcp.sps at its
+;;;    first bind (#64). A procedure of the suite's own that such a raise can
+;;;    leave counts as a verb.
+;;;
 ;;; Neither of the first two rules sees a callback that raises inside a later
 ;;; wait, which a late handshake can cause. That was checked by forcing each seed to fail, in a
 ;;; scratch clone (.plans/tcp-seed-gates-mutation-log.md and
@@ -332,6 +341,92 @@
                      (scan peers form)))
               (filter pair? forms))))
 
+;; --- rule 4 -------------------------------------------------------------------
+;; The suites that test the address and DNS verbs, and those verbs.
+(define verb-suites
+  '("tests/test-dns.sps" "tests/test-tcp.sps" "tests/test-address.sps"))
+
+(define address-verbs
+  '(uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-tcp-bind! uv-tcp-connect!
+    fill-sockaddr!))
+
+;; catch-all? : datum -> boolean
+;; A guard clause that catches every raise.
+(define (catch-all? clause)
+  (and (pair? clause) (memq (car clause) '(else #t)) #t))
+
+;; procedure-body : datum -> (list-of datum) or #f
+;; The body of the procedure FORM defines, as (define (f ...) ...) or
+;; (define f (lambda ...)), else #f.
+(define (procedure-body form)
+  (and (pair? form) (eq? (car form) 'define) (pair? (cdr form))
+       (cond ((pair? (cadr form)) (cddr form))
+             ((and (pair? (cddr form)) (pair? (caddr form))
+                   (memq (car (caddr form)) '(lambda case-lambda)))
+              (cdr (caddr form)))
+             (else #f))))
+
+;; escaping : (list-of symbol) datum -> (list-of symbol)
+;; Each call of NAMES in FORM that a raise would leave FORM from, once per
+;; call: one not in a row's tested expression, a lambda, a procedure
+;; definition, quoted data, or the body of a guard with a catch-all clause.
+(define (escaping names form)
+  (define (walk x)
+    (cond ((not (pair? x)) '())
+          ((memq (car x) '(quote quasiquote lambda case-lambda)) '())
+          ((procedure-body x) '())
+          ((and (memq (car x) row-heads) (list? (cdr x)))
+           (walk-each (all-but-last (cdr x))))
+          ((and (eq? (car x) 'guard) (pair? (cdr x)) (pair? (cadr x))
+                (list? (cdadr x)) (exists catch-all? (cdadr x)))
+           (walk-each (cdadr x)))
+          (else (append (if (memq (car x) names) (list (car x)) '())
+                        (walk-each x)))))
+  (define (walk-each xs)
+    (if (pair? xs) (append (walk (car xs)) (walk-each (cdr xs))) '()))
+  (walk form))
+
+;; procedure-definitions : (list-of datum) -> (list-of (symbol . body))
+;; Each procedure FORMS define, with its body.
+(define (procedure-definitions forms)
+  (filter pair?
+          (map (lambda (form)
+                 (let ((body (procedure-body form)))
+                   (and body
+                        (let ((head (cadr form)))
+                          (cons (if (pair? head) (car head) head) body)))))
+               forms)))
+
+;; raising-procedures : (list-of symbol) (list-of datum) -> (list-of symbol)
+;; The procedures FORMS define whose bodies a raise from one of VERBS, or
+;; from another such procedure, can leave, in the order found.
+(define (raising-procedures verbs forms)
+  (let ((defs (procedure-definitions forms)))
+    (let grow ((found '()))
+      (let ((more
+             (map car
+                  (filter (lambda (def)
+                            (and (not (memq (car def) found))
+                                 (exists (lambda (body-form)
+                                           (pair? (escaping (append verbs found)
+                                                            body-form)))
+                                         (cdr def))))
+                          defs))))
+        (if (null? more) found (grow (append found more)))))))
+
+;; uncaught : (list-of symbol) (list-of datum) -> (list-of list)
+;; Rule 4's findings in a suite's FORMS: each call of VERBS, or of a
+;; procedure raising-procedures finds, that a raise would leave the suite
+;; from, as (verb head first-argument) of its plumbing form.
+(define (uncaught verbs forms)
+  (let ((names (append verbs (raising-procedures verbs forms))))
+    (apply append
+           (map (lambda (form)
+                  (map (lambda (name)
+                         (list name (car form) (if (pair? (cdr form)) (cadr form) '())))
+                       (escaping names form)))
+                (filter pair? (plumbing forms))))))
+
 ;; scan : list (list-of datum) -> list
 ;; What the rows below hold for one suite, from its SPEC (its entry in
 ;; suites, less the path) and its FORMS: the placeholders found, what an
@@ -572,6 +667,75 @@
 
 (test-equal "no ticking wait in test-tcp.sps gives up sooner than a delivery took during a loopback flood"
   '() short-findings)
+
+;; Rule 4, first on seeded forms: what the scan must report, then what it
+;; must not.
+(test-equal "rule 4 flags a verb a raise would leave the suite from, and only that"
+  '((v) (v) (v) (v) (v) (v) (v) () () () () () () () ())
+  (map (lambda (form) (escaping '(v) form))
+       '((v 1)
+         (define x (v 1))
+         (let loop ((i 0)) (when (< i 2) (v i) (loop (+ i 1))))
+         (test-equal (v 1) 'expected (f))
+         (test-equal "row" (v 1) (f))
+         (guard (e ((symbol? e) 'caught)) (v 1))
+         (guard (e (#t (v 2))) (f))
+         (test-equal "row" 'started (v 1))
+         (test-assert "row" (v 1))
+         (define (f) (v 1))
+         (define f (lambda () (v 1)))
+         (g (lambda () (v 1)))
+         (guard (e (#t 'caught)) (v 1))
+         (guard (e (else 'caught)) (v 1))
+         (define x '(v 1)))))
+
+(test-equal "a procedure a raise from a verb can leave counts as one, through another too"
+  '(a b c)
+  (raising-procedures '(v)
+                      '((define (c) (b))
+                        (define (a) (v 1))
+                        (define b (lambda () (a)))
+                        (define (d) (guard (e (#t #f)) (v 1)))
+                        (define (e) (g (lambda () (v 1))))
+                        (define (f) (test-equal "row" 1 (v 1)))
+                        (define x (v 1)))))
+
+(test-equal "rule 4's findings name each call with its form's head and first argument, in a body that runs at once too"
+  '((a a ()) (v v 2) (a define x))
+  (uncaught '(v)
+            '((define (a) (v 1))
+              (a)
+              (with-loop (lambda (l) (v 2)))
+              (define x (a))
+              (test-equal "row" 1 (a)))))
+
+;; Live: a list naming a verb these suites never call, or a scan that read
+;; no file or no procedure, would pass the rows after it.
+(define verb-suite-forms (map read-forms verb-suites))
+
+(test-equal "rule 4's scan is live: it reads each suite, each verb is called there, and test-dns.sps's raising procedures are found"
+  'live
+  (let ((uncalled (filter (lambda (verb)
+                            (not (exists (lambda (forms)
+                                           (exists (lambda (f) (calls? f verb)) forms))
+                                         verb-suite-forms)))
+                          address-verbs))
+        (dns-procedures (raising-procedures address-verbs (car verb-suite-forms))))
+    (if (and (for-all pair? verb-suite-forms) (null? uncalled)
+             (memq 'h-submit! dns-procedures)
+             (memq 'make-synthetic-sockaddr dns-procedures))
+        'live
+        (list 'forms (map length verb-suite-forms) 'uncalled uncalled
+              'dns-procedures dns-procedures))))
+
+(for-each
+ (lambda (path forms)
+   (let ((found (uncaught address-verbs forms)))
+     (report path "uncaught" found)
+     (test-equal (string-append "no plumbing in " path
+                                " calls an address or DNS verb where a raise would end the suite")
+       '() found)))
+ verb-suites verb-suite-forms)
 
 (test-end "seed-gates")
 

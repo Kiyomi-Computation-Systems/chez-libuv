@@ -178,11 +178,15 @@
 ;; fire-and-forgotten: a comment-that-is-a-check.
 (define pin-err 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! pin-err (err->symbol err))))
+(test-equal "prologue: the pool-pinning lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! pin-err (err->symbol err))))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? pin-err 'callback-never-fired))) cap)
 
@@ -197,13 +201,17 @@
 (define a-err 'callback-never-fired)
 (define a-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream)
-                              '(protocol . tcp))
-                 (lambda (err results)
-                   (collect)
-                   (set! a-err (err->symbol err))
-                   (set! a-results results)))
+(test-equal "v4: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream)
+                                  '(protocol . tcp))
+                     (lambda (err results)
+                       (collect)
+                       (set! a-err (err->symbol err))
+                       (set! a-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? a-err 'callback-never-fired))) cap)
 
@@ -239,12 +247,16 @@
 (define a2-err 'callback-never-fired)
 (define a2-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" #f
-                 (suite-hints #f '(family . inet) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! a2-err (err->symbol err))
-                   (set! a2-results results)))
+(test-equal "absent service: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" #f
+                     (suite-hints #f '(family . inet) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! a2-err (err->symbol err))
+                       (set! a2-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? a2-err 'callback-never-fired))) cap)
 
@@ -261,12 +273,16 @@
 (define b-err 'callback-never-fired)
 (define b-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "::1" "80"
-                 (suite-hints #t '(family . inet6) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! b-err (err->symbol err))
-                   (set! b-results results)))
+(test-equal "v6: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "::1" "80"
+                     (suite-hints #t '(family . inet6) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! b-err (err->symbol err))
+                       (set! b-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? b-err 'callback-never-fired))) cap)
 
@@ -289,13 +305,17 @@
 (define b2-err 'callback-never-fired)
 (define b2-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "::1" "443"
-                 (suite-hints #t '(family . inet6) '(socktype . dgram)
-                              '(protocol . udp))
-                 (lambda (err results)
-                   (collect)
-                   (set! b2-err (err->symbol err))
-                   (set! b2-results results)))
+(test-equal "dgram/udp: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "::1" "443"
+                     (suite-hints #t '(family . inet6) '(socktype . dgram)
+                                  '(protocol . udp))
+                     (lambda (err results)
+                       (collect)
+                       (set! b2-err (err->symbol err))
+                       (set! b2-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? b2-err 'callback-never-fired))) cap)
 
@@ -316,12 +336,16 @@
 (define c-err 'callback-never-fired)
 (define c-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t)
-                 (lambda (err results)
-                   (collect)
-                   (set! c-err (err->symbol err))
-                   (set! c-results results)))
+(test-equal "unpinned socktype: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t)
+                     (lambda (err results)
+                       (collect)
+                       (set! c-err (err->symbol err))
+                       (set! c-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? c-err 'callback-never-fired))) cap)
 
@@ -358,12 +382,16 @@
 (define d-err 'callback-never-fired)
 (define d-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . unspec) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! d-err (err->symbol err))
-                   (set! d-results results)))
+(test-equal "unspec + v4 literal: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . unspec) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! d-err (err->symbol err))
+                       (set! d-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? d-err 'callback-never-fired))) cap)
 
@@ -384,12 +412,16 @@
 (define e-err 'callback-never-fired)
 (define e-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "chez-libuv-not-numeric.invalid" "80"
-                 (suite-hints #t '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! e-err (err->symbol err))
-                   (set! e-results results)))
+(test-equal "numeric-host + non-numeric name: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "chez-libuv-not-numeric.invalid" "80"
+                     (suite-hints #t '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! e-err (err->symbol err))
+                       (set! e-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? e-err 'callback-never-fired))) cap)
 
@@ -403,15 +435,23 @@
 (define f1-results 'callback-never-fired)
 (define f2-results 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream))
-                 (lambda (err results) (collect) (set! f1-results results)))
+(test-equal "two identical lookups: the first starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream))
+                     (lambda (err results) (collect) (set! f1-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? f1-results 'callback-never-fired))) cap)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream))
-                 (lambda (err results) (collect) (set! f2-results results)))
+(test-equal "two identical lookups: the second starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream))
+                     (lambda (err results) (collect) (set! f2-results results)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? f2-results 'callback-never-fired))) cap)
 
@@ -435,15 +475,22 @@
 (define g-registry-in-callback 'callback-never-fired)
 (define g-registry-before-submit (registry-count))
 
-(define g-req
-  (uv-getaddrinfo! l "127.0.0.1" "80"
-                   (suite-hints #t '(family . inet) '(socktype . stream)
-                                '(protocol . tcp))
-                   (lambda (err results)
-                     (collect)
-                     (set! g-live-in-callback (live-count 'getaddrinfo-req))
-                     (set! g-ptr-in-callback (req-ptr g-req))
-                     (set! g-registry-in-callback (registry-count)))))
+;; The request the start answers, once it has started.
+(define g-req 'never-started)
+
+(test-equal "in flight: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (set! g-req
+          (uv-getaddrinfo! l "127.0.0.1" "80"
+                           (suite-hints #t '(family . inet) '(socktype . stream)
+                                        '(protocol . tcp))
+                           (lambda (err results)
+                             (collect)
+                             (set! g-live-in-callback (live-count 'getaddrinfo-req))
+                             (set! g-ptr-in-callback (req-ptr g-req))
+                             (set! g-registry-in-callback (registry-count)))))
+    'started))
 
 ;; Between the submit and the first uv-run nothing can deliver (callbacks
 ;; run only inside uv-run, on the loop thread), so these two mid-flight
@@ -530,7 +577,11 @@
                                          h-order))
                      (when (< n 3) (h-submit! (+ n 1))))))
 
-(h-submit! 1)
+(test-equal "a chain of three resubmissions: the first lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (h-submit! 1)
+    'started))
 
 (run-until/ticking l (lambda () (= 3 (length h-order))) cap)
 
@@ -589,11 +640,15 @@
 ;; seam found through registry-loop-of before the dispatcher deregistered
 ;; the request (no handle-loop route exists for a handle-less request --
 ;; ADR-0011), then re-raised by uv-run.
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (raise 'dns-on-complete-sentinel-raise)))
+(test-equal "a raising on-complete: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (raise 'dns-on-complete-sentinel-raise)))
+    'started))
 
 (test-equal "a raising on-complete re-raises from uv-run as &uv-callback-error"
   '(callback-error dns-on-complete-sentinel-raise)
@@ -607,11 +662,15 @@
 ;; full lookup afterwards.
 (define j2-err 'callback-never-fired)
 
-(uv-getaddrinfo! l "127.0.0.1" "80"
-                 (suite-hints #t '(family . inet) '(socktype . stream))
-                 (lambda (err results)
-                   (collect)
-                   (set! j2-err (err->symbol err))))
+(test-equal "after the callback error: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! l "127.0.0.1" "80"
+                     (suite-hints #t '(family . inet) '(socktype . stream))
+                     (lambda (err results)
+                       (collect)
+                       (set! j2-err (err->symbol err))))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? j2-err 'callback-never-fired))) cap)
 
@@ -937,12 +996,22 @@
 ;; record has no honest representation for) is SKIPPED, and the walk
 ;; advances past it to the INET entry behind it. 203.0.113.9 is
 ;; TEST-NET-3: decode-only, never routed, and no lookup happens anyway.
-(define k-sockaddr (make-synthetic-sockaddr "203.0.113.9" 8080))
+;; fill-sockaddr! parses the address, so a parse that raises fails the
+;; first row here by name; the node then carries a NULL ai_addr, and the
+;; rows that decode it fail too.
+(define k-sockaddr
+  (guard (e (#t (list 'raised (describe e))))
+    (make-synthetic-sockaddr "203.0.113.9" 8080)))
+
+(test-equal "synthetic: the sockaddr is built"
+  'built (if (integer? k-sockaddr) 'built k-sockaddr))
+
 (define k-canon (make-c-string "synthetic-canon.example"))
 (define k-skip-node
   (make-synthetic-node (af-unspec) (sock-stream) 0 0 0))
 (define k-inet-node
-  (make-synthetic-node (af-inet) (sock-stream) 6151 k-sockaddr k-canon))
+  (make-synthetic-node (af-inet) (sock-stream) 6151
+                       (if (integer? k-sockaddr) k-sockaddr 0) k-canon))
 
 (test-equal "synthetic: a non-INET entry is skipped, the entry behind it decoded"
   '((inet "203.0.113.9" 8080))
@@ -998,8 +1067,9 @@
   '() (addrinfo-chain->list 0))
 
 ;; Synthetic memory is freed with free!, never uv_freeaddrinfo.
-(for-each free! (list k-skip-node k-inet-node k-lone-skip k-null-addr-node
-                      k-sockaddr k-canon))
+(for-each free! (filter integer?
+                        (list k-skip-node k-inet-node k-lone-skip
+                              k-null-addr-node k-sockaddr k-canon)))
 
 ;; --- the dispatcher's step-1 arms, driven directly (S5.4) ----------------
 ;; No public API can make libuv deliver a completion for an unregistered
@@ -1064,12 +1134,16 @@
 (define m-host 'callback-never-fired)
 (define m-serv 'callback-never-fired)
 
-(uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                 (lambda (err host service)
-                   (collect)
-                   (set! m-err (err->symbol err))
-                   (set! m-host host)
-                   (set! m-serv service)))
+(test-equal "reverse v4: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                     (lambda (err host service)
+                       (collect)
+                       (set! m-err (err->symbol err))
+                       (set! m-host host)
+                       (set! m-serv service)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? m-err 'callback-never-fired))) cap)
 
@@ -1088,12 +1162,16 @@
 (define m2-host 'callback-never-fired)
 (define m2-serv 'callback-never-fired)
 
-(uv-getnameinfo! l "::1" 8080 '(numeric-host numeric-serv)
-                 (lambda (err host service)
-                   (collect)
-                   (set! m2-err (err->symbol err))
-                   (set! m2-host host)
-                   (set! m2-serv service)))
+(test-equal "reverse v6: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getnameinfo! l "::1" 8080 '(numeric-host numeric-serv)
+                     (lambda (err host service)
+                       (collect)
+                       (set! m2-err (err->symbol err))
+                       (set! m2-host host)
+                       (set! m2-serv service)))
+    'started))
 
 (run-until/ticking l (lambda () (not (eq? m2-err 'callback-never-fired))) cap)
 
@@ -1117,13 +1195,20 @@
 (define n-registry-in-callback 'callback-never-fired)
 (define n-registry-before-submit (registry-count))
 
-(define n-req
-  (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                   (lambda (err host service)
-                     (collect)
-                     (set! n-live-in-callback (live-count 'getnameinfo-req))
-                     (set! n-ptr-in-callback (req-ptr n-req))
-                     (set! n-registry-in-callback (registry-count)))))
+;; The request the start answers, once it has started.
+(define n-req 'never-started)
+
+(test-equal "getnameinfo in flight: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (set! n-req
+          (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                           (lambda (err host service)
+                             (collect)
+                             (set! n-live-in-callback (live-count 'getnameinfo-req))
+                             (set! n-ptr-in-callback (req-ptr n-req))
+                             (set! n-registry-in-callback (registry-count)))))
+    'started))
 
 (test-equal "getnameinfo in flight: the live counter reads 1 after submit, before stepping"
   1 (live-count 'getnameinfo-req))
@@ -1203,28 +1288,43 @@
 (define tc-tail-err 'callback-never-fired)
 (define tc-tail-results 'callback-never-fired)
 
-(let submit ((i 0))
-  (when (< i 4)
-    (let ((idx i))
-      (uv-getaddrinfo! l "127.0.0.1" "80"
-                       (suite-hints #t '(family . inet) '(socktype . stream))
-                       (lambda (err results)
-                         (collect)
-                         (vector-set! tc-blocker-fires idx
-                                      (+ 1 (vector-ref tc-blocker-fires idx))))))
-    (submit (+ i 1))))
+(test-equal "tolerant cancel: the four blockers start"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (let submit ((i 0))
+      (when (< i 4)
+        (let ((idx i))
+          (uv-getaddrinfo! l "127.0.0.1" "80"
+                           (suite-hints #t '(family . inet) '(socktype . stream))
+                           (lambda (err results)
+                             (collect)
+                             (vector-set! tc-blocker-fires idx
+                                          (+ 1 (vector-ref tc-blocker-fires idx))))))
+        (submit (+ i 1))))
+    'started))
 
-(define tc-tail-req
-  (uv-getaddrinfo! l "127.0.0.1" "80"
-                   (suite-hints #t '(family . inet) '(socktype . stream))
-                   (lambda (err results)
-                     (collect)
-                     (set! tc-tail-fires (+ tc-tail-fires 1))
-                     (set! tc-tail-err (err->symbol err))
-                     (set! tc-tail-results results))))
+;; The tail the start answers, once it has started.
+(define tc-tail-req 'never-started)
 
-;; SAME TURN: nothing has stepped the loop since the five submits.
-(define tc-outcome (uv-cancel! tc-tail-req))
+(test-equal "tolerant cancel: the tail starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (set! tc-tail-req
+          (uv-getaddrinfo! l "127.0.0.1" "80"
+                           (suite-hints #t '(family . inet) '(socktype . stream))
+                           (lambda (err results)
+                             (collect)
+                             (set! tc-tail-fires (+ tc-tail-fires 1))
+                             (set! tc-tail-err (err->symbol err))
+                             (set! tc-tail-results results))))
+    'started))
+
+;; SAME TURN: nothing has stepped the loop since the five submits. A cancel
+;; that raises, of a tail that never started too, is the outcome the next
+;; row reports.
+(define tc-outcome
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-cancel! tc-tail-req)))
 
 (test-equal "tolerant cancel: the outcome is a boolean"
   'boolean-outcome
@@ -1338,12 +1438,19 @@
 
 (define dc-attempts '())   ; most recent first
 
+;; An attempt that raises is kept as (raised description), with the key the
+;; retry reads, and ends the retries; the row after the loop reports it.
 (let attempt ((n 1))
-  (let ((obs (double-cancel-attempt!)))
+  (let ((obs (guard (e (#t (list (list 'raised (describe e)) (cons 'first 'raised))))
+               (double-cancel-attempt!))))
     (set! dc-attempts (cons obs dc-attempts))
     (when (and (< n dc-max-attempts)
+               (not (assq 'raised obs))
                (not (eq? #t (cdr (assq 'first obs)))))
       (attempt (+ n 1)))))
+
+(test-equal "double-cancel: no attempt raised"
+  '() (filter (lambda (obs) (assq 'raised obs)) dc-attempts))
 
 ;; The wording branches on the OUTCOME: an exhausted retry bound must not
 ;; print "won" -- the catcher row below fails in that case, and the
@@ -1578,12 +1685,18 @@
 
 (define td-attempts '())   ; most recent first
 
+;; An attempt that raises is kept and ends the retries, as above.
 (let attempt ((n 1))
-  (let ((obs (teardown-attempt!)))
+  (let ((obs (guard (e (#t (list (list 'raised (describe e)) (cons 'tail-err 'raised))))
+               (teardown-attempt!))))
     (set! td-attempts (cons obs td-attempts))
     (when (and (< n td-max-attempts)
+               (not (assq 'raised obs))
                (not (eq? 'EAI_CANCELED (cdr (assq 'tail-err obs)))))
       (attempt (+ n 1)))))
+
+(test-equal "queued-tail teardown: no attempt raised"
+  '() (filter (lambda (obs) (assq 'raised obs)) td-attempts))
 
 ;; Branched on the outcome for the same reason as the double-cancel line:
 ;; exhaustion must not print "won" while the catcher row fails.
@@ -1641,11 +1754,15 @@
 (define eb-err 'callback-never-fired)
 (define eb-host 'callback-never-fired)
 
-(uv-getnameinfo! l3 "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                 (lambda (err host service)
-                   (collect)
-                   (set! eb-err (err->symbol err))
-                   (set! eb-host host)))
+(test-equal "close with in-flight request: the lookup starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getnameinfo! l3 "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                     (lambda (err host service)
+                       (collect)
+                       (set! eb-err (err->symbol err))
+                       (set! eb-host host)))
+    'started))
 
 (test-equal "close with in-flight request: EBUSY, as a symbol"
   'EBUSY
@@ -1657,8 +1774,11 @@
 (test-equal "close with in-flight request: the loop is untouched and still open"
   'still-open (if (uv-loop-open? l3) 'still-open 'closed))
 
-;; ... and still USABLE: the same loop drains the request normally.
-(run-until/ticking l3 (lambda () (not (eq? eb-err 'callback-never-fired))) cap)
+;; ... and still USABLE: the same loop drains the request normally. With no
+;; request in flight, the close above succeeded, and a closed loop takes no
+;; wait.
+(when (uv-loop-open? l3)
+  (run-until/ticking l3 (lambda () (not (eq? eb-err 'callback-never-fired))) cap))
 
 (test-equal "close with in-flight request: the drained lookup delivered normally"
   '(no-error "127.0.0.1") (list eb-err eb-host))

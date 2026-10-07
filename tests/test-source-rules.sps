@@ -18,8 +18,28 @@
 ;;;    fixtures in tests/test-shim-loading.sps can each reach one entry only:
 ;;;    with the other 46 resolved bare, every suite still passed.
 ;;;
+;;; 3. No caller's string crosses the FFI as a string argument. Chez encodes
+;;;    a string, wstring or utf-N argument during the foreign call: it
+;;;    counts, allocates and encodes, so a string changed after it was
+;;;    checked reaches C changed, and an embedded NUL cuts it short (#51,
+;;;    #61). A caller's string crosses as the NUL-terminated bytevector
+;;;    c-string-bytes answers, passed as u8*. The one string parameter is
+;;;    chez_uv_constant's, which receives only the binding's own constant
+;;;    names.
+;;;
+;;; 4. No __collect_safe foreign call takes an argument in Scheme memory:
+;;;    u8*, u16*, u32*, scheme-object or its alias ptr, or
+;;;    ftype-scheme-object-pointer. A collect-safe call deactivates its
+;;;    thread, so another thread's collection can move the object while C
+;;;    reads it, and copies made that way were corrupted under a concurrent
+;;;    collection (#35). Chez accepts these types there without a word. It
+;;;    refuses a string argument there itself.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
+;;; Rules 3 and 4 also ask Chez's expander about types, in forms it compiles
+;;; and never runs, so no entry is resolved.
 (import (rnrs)
+        (rnrs eval)
         (srfi :64)
         (uv-source))
 
@@ -75,6 +95,94 @@
            (if (pair? xs) (elements (cdr xs) (+ n (checked-entries (car xs)))) n)))
         (else 0)))
 
+;; --- foreign calls (rules 3 and 4) ----------------------------------------------
+;; A foreign call is a (foreign-procedure convention ... entry (type ...)
+;; result) form, or a shim-procedure form, which expands to one. A
+;; foreign-callable form is not a call: C passes its arguments to Scheme.
+
+;; Chez encodes these during the call. The suite checks the list against
+;; Chez below.
+(define string-types
+  '(string wstring utf-8 utf-16 utf-16le utf-16be utf-32 utf-32le utf-32be))
+
+;; These hand C the address of a Scheme object's own storage.
+(define address-types
+  '(u8* u16* u32* scheme-object ptr ftype-scheme-object-pointer))
+
+;; The foreign calls that may take a string type: entries, not bindings.
+(define string-allowlist '("chez_uv_constant"))
+
+;; foreign-calls : datum -> (list-of datum)
+;; Every foreign call within X.
+(define (foreign-calls x)
+  (cond ((not (pair? x)) '())
+        ((memq (car x) '(foreign-procedure shim-procedure)) (list x))
+        (else
+         (let elements ((xs x) (acc '()))
+           (if (pair? xs)
+               (elements (cdr xs) (append acc (foreign-calls (car xs))))
+               acc)))))
+
+;; call-parts : datum -> (list (list-of datum) datum (list-of datum))
+;; A call's conventions, entry and parameter types. The types are its
+;; next-to-last element, the entry the one before, and the conventions (such
+;; as __collect_safe) everything between the keyword and the entry. A form
+;; too short to have them has none.
+(define (call-parts call)
+  (let ((n (if (list? call) (length call) 0)))
+    (if (< n 4)
+        (list '() #f '())
+        (let split ((xs (cdr call)) (k (- n 4)) (conventions '()))
+          (if (zero? k)
+              (list (reverse conventions)
+                    (car xs)
+                    (if (list? (cadr xs)) (cadr xs) '()))
+              (split (cdr xs) (- k 1) (cons (car xs) conventions)))))))
+
+(define (call-conventions call) (car (call-parts call)))
+(define (call-entry call) (cadr (call-parts call)))
+(define (call-types call) (caddr (call-parts call)))
+
+;; types-in : (list-of symbol) datum -> (list-of symbol)
+;; The parameter types of CALL that are in TYPES.
+(define (types-in types call)
+  (filter (lambda (t) (memq t types)) (call-types call)))
+
+;; string-callers : (list-of datum) -> (list-of datum)
+;; The entry of each call that takes a string type.
+(define (string-callers calls)
+  (map call-entry
+       (filter (lambda (call) (pair? (types-in string-types call))) calls)))
+
+(define (collect-safe? call)
+  (and (memq '__collect_safe (call-conventions call)) #t))
+
+;; collect-safe-address-callers : (list-of datum) -> (list-of datum)
+;; (entry type ...) for each __collect_safe call that takes an address type,
+;; naming those types.
+(define (collect-safe-address-callers calls)
+  (map (lambda (call) (cons (call-entry call) (types-in address-types call)))
+       (filter (lambda (call)
+                 (and (collect-safe? call) (pair? (types-in address-types call))))
+               calls)))
+
+;; chez-verdict : (or symbol #f) symbol -> symbol
+;; What this Chez's expander makes of a foreign call taking TYPE, under
+;; CONVENTION or none: 'accepted; 'string-refused, its refusal of a string
+;; argument under __collect_safe; or 'invalid. The call sits in a lambda
+;; that never runs, so no entry is resolved.
+(define (chez-verdict convention type)
+  (guard (e ((and (message-condition? e)
+                  (string=? (condition-message e)
+                            "string argument not allowed with __collect_safe procedure"))
+             'string-refused)
+            (else 'invalid))
+    (eval `(lambda ()
+             (foreign-procedure ,@(if convention (list convention) '())
+                                "strlen" (,type) void))
+          (environment '(chezscheme)))
+    'accepted))
+
 (test-begin "source-rules")
 
 ;; --- the checkers, on seeded forms -------------------------------------------
@@ -97,6 +205,64 @@
   (let ((forms '((define z (shim-procedure "chez_uv_zero" (uptr size_t) void))
                  (define a (shim-entry "chez_uv_alloc_cb")))))
     (list (unchecked-entries forms) (checked-entries forms))))
+
+;; Each type is written out here rather than taken from string-types, so a
+;; type dropped from that list fails this row.
+(test-equal "the string rule finds each string type in either kind of call, and only as a parameter"
+  '("t_string" "t_wstring" "t_utf_8" "t_utf_16" "t_utf_16le" "t_utf_16be"
+    "t_utf_32" "t_utf_32le" "t_utf_32be" "chez_uv_t_shim")
+  (string-callers
+   (foreign-calls
+    '((define a (foreign-procedure "t_string" (uptr string) int))
+      (define b (foreign-procedure "t_wstring" (wstring) int))
+      (define c (foreign-procedure "t_utf_8" (utf-8) int))
+      (define d (foreign-procedure "t_utf_16" (utf-16) int))
+      (define e (foreign-procedure "t_utf_16le" (utf-16le) int))
+      (define f (foreign-procedure "t_utf_16be" (utf-16be) int))
+      (define g (foreign-procedure "t_utf_32" (utf-32) int))
+      (define h (foreign-procedure "t_utf_32le" (utf-32le) int))
+      (define i (foreign-procedure "t_utf_32be" (utf-32be int) int))
+      (define j (shim-procedure "chez_uv_t_shim" (string uptr) int))
+      ;; A string result comes from C, and a callable's arguments too.
+      (define k (foreign-procedure "t_result" (uptr) string))
+      (define l (foreign-callable (lambda (s) s) (string) void))
+      (define m (foreign-procedure "t_bytes" (uptr u8* int) int))))))
+
+(test-equal "the collect-safe rule finds each address type, after another convention too, and only in a __collect_safe call"
+  '(("t_u8" u8*) ("t_u16" u16*) ("t_u32" u32*) ("t_object" scheme-object)
+    ("t_ptr" ptr) ("t_sop" ftype-scheme-object-pointer) ("t_two" u8*))
+  (collect-safe-address-callers
+   (foreign-calls
+    '((define a (foreign-procedure __collect_safe "t_u8" (uptr u8*) int))
+      (define b (foreign-procedure __collect_safe "t_u16" (u16*) int))
+      (define c (foreign-procedure __collect_safe "t_u32" (u32*) int))
+      (define d (foreign-procedure __collect_safe "t_object" (scheme-object) int))
+      (define e (foreign-procedure __collect_safe "t_ptr" (ptr) int))
+      (define f (foreign-procedure __collect_safe "t_sop"
+                                   (ftype-scheme-object-pointer) int))
+      (define g (foreign-procedure (__varargs_after 1) __collect_safe "t_two"
+                                   (u8* int) int))
+      ;; A plain call keeps its thread active, scalars hold no address, and
+      ;; a callable's arguments come from C.
+      (define h (foreign-procedure "t_plain" (u8* scheme-object ptr) int))
+      (define i (foreign-procedure __collect_safe "t_scalars" (uptr int) int))
+      (define j (foreign-callable __collect_safe (lambda (p) p) (u8*) void))))))
+
+;; What Chez makes of a type decides which rule it needs, so the lists are
+;; checked against this Chez. A misspelt type is 'invalid here.
+(test-equal "the verdict tells Chez's answers apart: a scalar is accepted, an unknown type is invalid"
+  '(accepted accepted invalid)
+  (list (chez-verdict #f 'uptr) (chez-verdict '__collect_safe 'uptr)
+        (chez-verdict #f 'not-a-type)))
+
+(test-equal "Chez encodes each string type: it accepts each in a plain call, and refuses each under __collect_safe as a string"
+  (map (lambda (t) (list t 'accepted 'string-refused)) string-types)
+  (map (lambda (t) (list t (chez-verdict #f t) (chez-verdict '__collect_safe t)))
+       string-types))
+
+(test-equal "Chez accepts each address type under __collect_safe, so only rule 4 stops one there"
+  (map (lambda (t) (list t 'accepted)) address-types)
+  (map (lambda (t) (list t (chez-verdict '__collect_safe t))) address-types))
 
 ;; --- the real tree ------------------------------------------------------------
 ;; Run from the repo root, as `make test` does.
@@ -127,6 +293,30 @@
 
 (test-equal "every shim entry native.sls resolves is checked first"
   '() (if native-form (unchecked-entries native-form) '(no-native-form)))
+
+(define calls
+  (apply append (map (lambda (e) (foreign-calls (cdr e))) libraries)))
+
+;; Live: a scan that missed either kind of call, the convention or the
+;; types would pass rules 3 and 4 below with nothing found.
+(test-equal "the foreign-call scan is live: it reads native.sls's calls of both kinds, uv_run's __collect_safe and the u8* arguments"
+  'live
+  (let ((shim (filter (lambda (c) (eq? (car c) 'shim-procedure)) calls))
+        (collect-safe (map call-entry (filter collect-safe? calls)))
+        (u8 (map call-entry
+                 (filter (lambda (c) (memq 'u8* (call-types c))) calls))))
+    (if (and (> (length calls) 80) (> (length shim) 30)
+             (member "uv_run" collect-safe)
+             (member "chez_uv_copy_in" u8) (member "uv_getaddrinfo" u8))
+        'live
+        (list 'calls (length calls) 'shim (length shim)
+              'collect-safe collect-safe 'u8* u8))))
+
+(test-equal "a string crosses the FFI only into chez_uv_constant: no other foreign call in src/ takes a string type"
+  string-allowlist (string-callers calls))
+
+(test-equal "no __collect_safe foreign call in src/ takes an argument in Scheme memory"
+  '() (collect-safe-address-callers calls))
 
 (test-end "source-rules")
 
