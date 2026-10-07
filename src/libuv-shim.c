@@ -254,6 +254,24 @@ void chez_uv_alloc_cb(uv_handle_t *handle, size_t suggested_size,
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
+/* Each loop's thread updates these counters, and a program can run a loop
+ * on each of several threads (#70). So every update is one atomic add:
+ * with plain += and -=, two loop threads lost updates, and the counts no
+ * longer balanced (tests/test-loop-threads.sps's balance row). Relaxed
+ * order is enough, as a count orders nothing else. GCC and Clang have these
+ * builtins under -std=c99. */
+#if !defined(__GNUC__) && !defined(__clang__)
+#error "CHEZ_LIBUV_DEBUG_COUNTERS needs the __atomic builtins of GCC or Clang"
+#endif
+
+static void count_add(long *counter, long delta) {
+  (void)__atomic_fetch_add(counter, delta, __ATOMIC_RELAXED);
+}
+
+static long count_read(long *counter) {
+  return __atomic_load_n(counter, __ATOMIC_RELAXED);
+}
+
 static long live_loop            = 0;
 static long live_tcp             = 0;
 static long live_timer           = 0;
@@ -268,60 +286,60 @@ static long live_spawn_options   = 0;
 static long live_signal          = 0;
 static long live_async           = 0;
 
-void chez_uv_count_loop_new(void)  { live_loop += 1; }
-void chez_uv_count_loop_free(void) { live_loop -= 1; }
-long chez_uv_live_loop(void)       { return live_loop; }
+void chez_uv_count_loop_new(void)  { count_add(&live_loop, 1); }
+void chez_uv_count_loop_free(void) { count_add(&live_loop, -1); }
+long chez_uv_live_loop(void)       { return count_read(&live_loop); }
 
-void chez_uv_count_tcp_new(void)  { live_tcp += 1; }
-void chez_uv_count_tcp_free(void) { live_tcp -= 1; }
-long chez_uv_live_tcp(void)       { return live_tcp; }
+void chez_uv_count_tcp_new(void)  { count_add(&live_tcp, 1); }
+void chez_uv_count_tcp_free(void) { count_add(&live_tcp, -1); }
+long chez_uv_live_tcp(void)       { return count_read(&live_tcp); }
 
-void chez_uv_count_timer_new(void)  { live_timer += 1; }
-void chez_uv_count_timer_free(void) { live_timer -= 1; }
-long chez_uv_live_timer(void)       { return live_timer; }
+void chez_uv_count_timer_new(void)  { count_add(&live_timer, 1); }
+void chez_uv_count_timer_free(void) { count_add(&live_timer, -1); }
+long chez_uv_live_timer(void)       { return count_read(&live_timer); }
 
-void chez_uv_count_write_req_new(void)  { live_write_req += 1; }
-void chez_uv_count_write_req_free(void) { live_write_req -= 1; }
-long chez_uv_live_write_req(void)       { return live_write_req; }
+void chez_uv_count_write_req_new(void)  { count_add(&live_write_req, 1); }
+void chez_uv_count_write_req_free(void) { count_add(&live_write_req, -1); }
+long chez_uv_live_write_req(void)       { return count_read(&live_write_req); }
 
-void chez_uv_count_connect_req_new(void)  { live_connect_req += 1; }
-void chez_uv_count_connect_req_free(void) { live_connect_req -= 1; }
-long chez_uv_live_connect_req(void)       { return live_connect_req; }
+void chez_uv_count_connect_req_new(void)  { count_add(&live_connect_req, 1); }
+void chez_uv_count_connect_req_free(void) { count_add(&live_connect_req, -1); }
+long chez_uv_live_connect_req(void)       { return count_read(&live_connect_req); }
 
-void chez_uv_count_getaddrinfo_req_new(void)  { live_getaddrinfo_req += 1; }
-void chez_uv_count_getaddrinfo_req_free(void) { live_getaddrinfo_req -= 1; }
-long chez_uv_live_getaddrinfo_req(void)       { return live_getaddrinfo_req; }
+void chez_uv_count_getaddrinfo_req_new(void)  { count_add(&live_getaddrinfo_req, 1); }
+void chez_uv_count_getaddrinfo_req_free(void) { count_add(&live_getaddrinfo_req, -1); }
+long chez_uv_live_getaddrinfo_req(void)       { return count_read(&live_getaddrinfo_req); }
 
-void chez_uv_count_getnameinfo_req_new(void)  { live_getnameinfo_req += 1; }
-void chez_uv_count_getnameinfo_req_free(void) { live_getnameinfo_req -= 1; }
-long chez_uv_live_getnameinfo_req(void)       { return live_getnameinfo_req; }
+void chez_uv_count_getnameinfo_req_new(void)  { count_add(&live_getnameinfo_req, 1); }
+void chez_uv_count_getnameinfo_req_free(void) { count_add(&live_getnameinfo_req, -1); }
+long chez_uv_live_getnameinfo_req(void)       { return count_read(&live_getnameinfo_req); }
 
-void chez_uv_count_read_buffer_new(void)  { live_read_buffer += 1; }
-void chez_uv_count_read_buffer_free(void) { live_read_buffer -= 1; }
-long chez_uv_live_read_buffer(void)       { return live_read_buffer; }
+void chez_uv_count_read_buffer_new(void)  { count_add(&live_read_buffer, 1); }
+void chez_uv_count_read_buffer_free(void) { count_add(&live_read_buffer, -1); }
+long chez_uv_live_read_buffer(void)       { return count_read(&live_read_buffer); }
 
-void chez_uv_count_pipe_new(void)  { live_pipe += 1; }
-void chez_uv_count_pipe_free(void) { live_pipe -= 1; }
-long chez_uv_live_pipe(void)       { return live_pipe; }
+void chez_uv_count_pipe_new(void)  { count_add(&live_pipe, 1); }
+void chez_uv_count_pipe_free(void) { count_add(&live_pipe, -1); }
+long chez_uv_live_pipe(void)       { return count_read(&live_pipe); }
 
-void chez_uv_count_process_new(void)  { live_process += 1; }
-void chez_uv_count_process_free(void) { live_process -= 1; }
-long chez_uv_live_process(void)       { return live_process; }
+void chez_uv_count_process_new(void)  { count_add(&live_process, 1); }
+void chez_uv_count_process_free(void) { count_add(&live_process, -1); }
+long chez_uv_live_process(void)       { return count_read(&live_process); }
 
-void chez_uv_count_spawn_options_new(void)  { live_spawn_options += 1; }
-void chez_uv_count_spawn_options_free(void) { live_spawn_options -= 1; }
-long chez_uv_live_spawn_options(void)       { return live_spawn_options; }
+void chez_uv_count_spawn_options_new(void)  { count_add(&live_spawn_options, 1); }
+void chez_uv_count_spawn_options_free(void) { count_add(&live_spawn_options, -1); }
+long chez_uv_live_spawn_options(void)       { return count_read(&live_spawn_options); }
 
-void chez_uv_count_signal_new(void)  { live_signal += 1; }
-void chez_uv_count_signal_free(void) { live_signal -= 1; }
-long chez_uv_live_signal(void)       { return live_signal; }
+void chez_uv_count_signal_new(void)  { count_add(&live_signal, 1); }
+void chez_uv_count_signal_free(void) { count_add(&live_signal, -1); }
+long chez_uv_live_signal(void)       { return count_read(&live_signal); }
 
-void chez_uv_count_async_new(void)  { live_async += 1; }
-void chez_uv_count_async_free(void) { live_async -= 1; }
-long chez_uv_live_async(void)       { return live_async; }
+void chez_uv_count_async_new(void)  { count_add(&live_async, 1); }
+void chez_uv_count_async_free(void) { count_add(&live_async, -1); }
+long chez_uv_live_async(void)       { return count_read(&live_async); }
 
 static long live_block = 0;
-long chez_uv_live_block(void) { return live_block; }
+long chez_uv_live_block(void) { return count_read(&live_block); }
 
 #else
 
@@ -387,7 +405,7 @@ void *chez_uv_alloc(size_t n) {
   void *p = calloc(1, n);
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
   if (p != NULL) {
-    live_block += 1;
+    count_add(&live_block, 1);
   }
 #endif
   return p;
@@ -396,7 +414,7 @@ void *chez_uv_alloc(size_t n) {
 void chez_uv_free(void *p) {
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
   if (p != NULL) {
-    live_block -= 1;
+    count_add(&live_block, -1);
   }
 #endif
   free(p);

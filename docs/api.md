@@ -40,6 +40,30 @@ exemption is `uv-async-send!`, which is how another thread reaches the loop
 ([Async](#async--libuv-async)). While the loop thread waits in `uv-run`, other
 Scheme threads allocate and collect freely.
 
+Several threads can each run a loop of their own at the same time, a thread
+per core for instance. What the loops share is the binding's table from
+libuv's pointers back to handles and requests, which has one lock (#70; until
+then, two loops on two threads corrupted it). Every constructor, callback and
+close holds it for a table operation or two, with interrupts disabled, so no
+engine can be suspended holding it.
+
+- On one thread the lock costs about 30 ns each time and allocates nothing.
+- Threads that do nothing but make, fire and close handles contend for it:
+  at four threads, timers made and closed that way took 1.6 to 2.2 times as
+  long as with a table for each loop.
+- A loopback round trip took as long with the lock as with a table for each
+  loop up to four threads, since each loop thread spends most of its time
+  waiting on the kernel. At eight threads it took 7% longer (231 µs against
+  216 µs), within the runs' spread.
+- `uv-loop-teardown!` (and so every `call-with-uv-loop` exit) and
+  `uv-loop-live-handles` copy the whole table, every loop's entries, while
+  they hold the lock. A call took about 0.7 ms at 100,000 entries and 13 ms
+  at 1,000,000 on macOS arm64, most of it the copy. Every other loop's
+  thread waits that out at its next constructor, callback or close.
+
+ADR-0019's amendment to decision 4 weighs this lock against a table for each
+loop.
+
 **A callback ends only by returning.** To end a run early, call `uv-stop!` or
 raise. A continuation that escapes a callback leaves libuv in the middle of
 an iteration that nothing can finish, so the loop stays marked running:

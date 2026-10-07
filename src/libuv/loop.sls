@@ -147,8 +147,11 @@
     (when (loop-running? loop)
       (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
     (when (eq? (loop-state loop) 'open)
-      (cancel-requests-for-loop! loop)
-      (for-each close-handle! (registry-snapshot-for-loop loop))
+      ;; One copy of the registry serves both: a cancellation completes in a
+      ;; later run, so the loop's handles are the same after it.
+      (let-values (((handles requests) (loop-entries loop)))
+        (cancel-requests! requests)
+        (for-each close-handle! handles))
       (let drain ((i 0) (stored teardown-no-error))
         (let ((outcome (drain-step loop)))
           (cond ((eq? outcome 'drained)

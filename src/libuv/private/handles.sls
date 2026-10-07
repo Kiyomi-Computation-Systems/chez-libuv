@@ -8,6 +8,9 @@
           registry-register! registry-deregister! registry-ref
           registry-loop-of registry-count registry-snapshot-for-loop
           registry-add! registry-remove!
+          loop-entries cancel-requests!
+          ;; for the tests' probes only (tests/test-loop-threads.sps)
+          registry-lock with-step-lock
 
           ;; interrupt-free steps
           one-step open-handle-ptr open-loop-ptr step-refusal
@@ -75,7 +78,7 @@
           ;; threaded Chez (#41; tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) make-mutex mutex-acquire mutex-release
-                disable-interrupts enable-interrupts)
+                disable-interrupts enable-interrupts make-thread-parameter)
           (libuv private conditions)
           (only (libuv private native)
                 uv-cancel
@@ -286,7 +289,78 @@
       ptr))
 
   ;; Pointer values may be bignums, so registry identity uses eqv?, not eq?.
+  ;;
+  ;; The registry is one table for every loop, and each loop's thread uses
+  ;; it at once: a constructor or a request adds an entry, every callback's
+  ;; seam looks its pointer up, a close or a completion deletes one, and a
+  ;; teardown copies the whole table out to find its loop's entries. Chez's
+  ;; hashtables have no lock of their own, and two loops run on two threads
+  ;; at once corrupted this one in 4 of 4 runs (#70). So every access holds
+  ;; registry-lock, through with-registry-lock, and so does every access to
+  ;; the orphan list, which every loop's seams write too. Rule 6 of
+  ;; tests/test-source-rules.sps holds both to that.
+  ;;
+  ;; One lock, rather than a table per loop (ADR-0019, decision 4 as amended
+  ;; for #70). Uncontended, the lock costs about 30 ns an access on macOS
+  ;; arm64 and allocates nothing. Threads that only make, fire and close
+  ;; timers do contend for it: at 4 threads they ran 1.6 to 2.2 times slower
+  ;; than with a table per loop. And a teardown, or uv-loop-live-handles,
+  ;; holds it while it copies the whole table, every loop's entries: about
+  ;; 1.3 ms at 200,000 entries, which every other loop's thread waits out at
+  ;; its next registry use. A table per loop needs no lock of its own, and a
+  ;; seam could reach its loop from its own pointer (a handle's loop field,
+  ;; a request's handle or loop). But every seam would then read a table
+  ;; from loop pointers to loops that every thread shares, and the change
+  ;; reaches six libraries. Should contention ever show, the next step is
+  ;; several tables, chosen by pointer, each with a lock of its own; should
+  ;; the teardown's copy, an index of each loop's entries kept under the
+  ;; same lock.
   (define registry (make-eqv-hashtable))
+
+  (define registry-lock (make-mutex))
+
+  ;; (with-step-lock lock body ...) runs BODY holding LOCK and answers
+  ;; BODY's values, however many. LOCK is taken and released only with
+  ;; interrupts disabled, so no engine is suspended, and no collection stops
+  ;; a thread, while it holds the lock: an engine that a timeout drops can
+  ;; never keep it. A thread that finds the lock taken waits for it inside
+  ;; the same interrupt-free step, so it stays active, and a collection
+  ;; waits for it in turn; that is safe because every holder runs a BODY
+  ;; that waits on nothing. The send fence (#33) and the registry's lock
+  ;; (#70) take this shape.
+  ;; - BODY must not raise or wait: a raise would leave the lock held and
+  ;;   interrupts disabled.
+  ;; - LOCK is evaluated before interrupts are disabled, so an accessor that
+  ;;   refuses its argument raises with nothing held.
+  (define-syntax with-step-lock
+    (syntax-rules ()
+      ((_ lock-expr body1 body2 ...)
+       (let ((lock lock-expr))
+         (disable-interrupts)
+         (mutex-acquire lock)
+         (call-with-values
+           (lambda () body1 body2 ...)
+           (case-lambda
+             ((result)
+              (mutex-release lock)
+              (enable-interrupts)
+              result)
+             (results
+              (mutex-release lock)
+              (enable-interrupts)
+              (apply values results))))))))
+
+  ;; (with-registry-lock body ...) runs BODY holding registry-lock
+  ;; (with-step-lock). Each BODY is a table operation or two, a cons or a
+  ;; set!, none of which raises or waits for the pointers and entries the
+  ;; registry holds; the callers raise after. It nests inside an
+  ;; interrupt-free step (one-step), where constructors register. Rule 6 of
+  ;; tests/test-source-rules.sps holds every body to those operations, and
+  ;; registry-lock to this one use in src/.
+  (define-syntax with-registry-lock
+    (syntax-rules ()
+      ((_ body1 body2 ...)
+       (with-step-lock registry-lock body1 body2 ...))))
 
   (define-record-type (registry-entry %make-registry-entry registry-entry?)
     (fields kind loop object))
@@ -308,9 +382,13 @@
   (define (registry-add! ptr kind loop object)
     (cond ((not (valid-pointer? ptr)) 'null-or-invalid-pointer)
           ((not (uv-loop? loop)) 'loop-not-a-uv-loop)
-          ((hashtable-contains? registry ptr) 'pointer-already-registered)
-          (else (hashtable-set! registry ptr (%make-registry-entry kind loop object))
-                'registered)))
+          (else
+           (let ((entry (%make-registry-entry kind loop object)))
+             (with-registry-lock
+              (if (hashtable-contains? registry ptr)
+                  'pointer-already-registered
+                  (begin (hashtable-set! registry ptr entry)
+                         'registered)))))))
 
   ;; registry-register! : uptr symbol uv-loop object -> object
   ;; registry-add!, raising its refusal.
@@ -324,7 +402,7 @@
   ;; registry-deregister! for a step: removes PTR's entry if it has one, and
   ;; raises nothing.
   (define (registry-remove! ptr)
-    (hashtable-delete! registry ptr))
+    (with-registry-lock (hashtable-delete! registry ptr)))
 
   ;; (one-step body ...) runs BODY as one interrupt-free step and answers its
   ;; value. Neither an engine's timer nor a collect request is taken inside
@@ -344,8 +422,9 @@
   ;;   raises after the step (step-refusal). A fault in a native call inside
   ;;   it still leaves interrupts disabled; begin-close! has always accepted
   ;;   that.
-  ;; - BODY must not wait. This thread stays active throughout, so another
-  ;;   thread's collection waits for the step to end.
+  ;; - BODY must not wait, except for a with-step-lock's lock (the
+  ;;   registry's), whose holder waits on nothing. This thread stays active
+  ;;   throughout, so another thread's collection waits for the step to end.
   (define-syntax one-step
     (syntax-rules ()
       ((_ body1 body2 ...)
@@ -395,47 +474,68 @@
                 (make-uv-invalid-argument who status)
                 (uv-errno-condition status who)))))
 
+  ;; The lookup and the delete are one step under the lock; a missing entry
+  ;; is raised after it.
   (define (registry-deregister! ptr)
-    (let ((entry (hashtable-ref registry ptr #f)))
+    (let ((entry (with-registry-lock
+                  (let ((entry (hashtable-ref registry ptr #f)))
+                    (when entry (hashtable-delete! registry ptr))
+                    entry))))
       (unless entry
         (raise (make-uv-invalid-argument 'uv-registry-deregister!
                                          'pointer-not-registered)))
-      (hashtable-delete! registry ptr)
       (registry-entry-object entry)))
 
   (define (registry-ref ptr)
-    (let ((entry (hashtable-ref registry ptr #f)))
+    (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
       (and entry (registry-entry-object entry))))
 
   (define (registry-loop-of ptr)
-    (let ((entry (hashtable-ref registry ptr #f)))
+    (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
       (and entry (registry-entry-loop entry))))
 
-  (define (registry-count) (hashtable-size registry))
+  (define (registry-count) (with-registry-lock (hashtable-size registry)))
+
+  ;; registry-entries : -> (values (vector-of uptr) (vector-of registry-entry))
+  ;; Every entry as it stands, copied out under the lock, so that a caller
+  ;; walks them, and calls libuv, without holding it. The copy holds every
+  ;; loop's entries, so the lock is held for as long as the whole table
+  ;; takes to copy.
+  (define (registry-entries)
+    (with-registry-lock (hashtable-entries registry)))
+
+  ;; loop-entries : uv-loop -> (values (listof object) (listof uptr))
+  ;; LOOP's handles, and the pointers of its handle-less DNS requests, from
+  ;; one copy of the registry.
+  (define (loop-entries loop)
+    (let-values (((keys entries) (registry-entries)))
+      (let collect ((i 0) (handles '()) (requests '()))
+        (if (= i (vector-length entries))
+            (values handles requests)
+            (let ((entry (vector-ref entries i)))
+              (cond ((not (eq? (registry-entry-loop entry) loop))
+                     (collect (+ i 1) handles requests))
+                    ((memq (registry-entry-kind entry) handle-kinds)
+                     (collect (+ i 1)
+                              (cons (registry-entry-object entry) handles)
+                              requests))
+                    ((memq (registry-entry-kind entry) dns-request-kinds)
+                     (collect (+ i 1) handles (cons (vector-ref keys i) requests)))
+                    (else (collect (+ i 1) handles requests))))))))
 
   ;; Snapshot handles only. Requests stay out of the close sweep.
   (define (registry-snapshot-for-loop loop)
-    (let-values (((keys entries) (hashtable-entries registry)))
-      (let collect ((i 0) (acc '()))
-        (if (= i (vector-length entries))
-            acc
-            (let ((entry (vector-ref entries i)))
-              (collect (+ i 1)
-                       (if (and (eq? (registry-entry-loop entry) loop)
-                                (memq (registry-entry-kind entry) handle-kinds))
-                           (cons (registry-entry-object entry) acc)
-                           acc)))))))
+    (let-values (((handles requests) (loop-entries loop)))
+      handles))
 
   ;; Best-effort cancellation of handle-less DNS requests. Ignore return codes:
   ;; teardown drains either the cancellation or the real completion.
+  (define (cancel-requests! request-ptrs)
+    (for-each uv-cancel request-ptrs))
+
   (define (cancel-requests-for-loop! loop)
-    (let-values (((keys entries) (hashtable-entries registry)))
-      (do ((i 0 (+ i 1)))
-          ((= i (vector-length entries)))
-        (let ((entry (vector-ref entries i)))
-          (when (and (eq? (registry-entry-loop entry) loop)
-                     (memq (registry-entry-kind entry) dns-request-kinds))
-            (uv-cancel (vector-ref keys i)))))))
+    (let-values (((handles requests) (loop-entries loop)))
+      (cancel-requests! requests)))
 
   ;; Never raise through a C callback frame. Store the first object and stop the
   ;; loop; retain later objects for inspection.
@@ -450,13 +550,17 @@
                      (valid-pointer? (loop-ptr loop)))
             (uv-loop-stop (loop-ptr loop))))))
 
-  ;; An orphan callback has no owning loop on which to report an error.
+  ;; An orphan callback has no owning loop on which to report an error. Every
+  ;; loop's seams can record one, so the list is changed and read under the
+  ;; registry's lock: two threads recording at once lost 29 to 50 percent of
+  ;; their events without it (#70).
   (define orphan-events '())
 
   (define (record-orphan-callback! kind ptr)
-    (set! orphan-events (cons (cons kind ptr) orphan-events)))
+    (let ((event (cons kind ptr)))
+      (with-registry-lock (set! orphan-events (cons event orphan-events)))))
 
-  (define (orphan-callback-events) (reverse orphan-events))
+  (define (orphan-callback-events) (reverse (with-registry-lock orphan-events)))
 
   ;; Handle callbacks require open state; request callbacks remain deliverable
   ;; while their handle is closing.
@@ -744,16 +848,21 @@
       (set-handle-ptr! handle 0)
       (set-handle-state! handle 'closed)))
 
-  ;; uv_walk is synchronous, so one resettable cell can collect its pointers.
-  (define walk-query-cell '())
+  ;; uv_walk is synchronous: it calls walk-dispatch on the thread that walks,
+  ;; and returns when the walk is done. So a resettable cell can collect a
+  ;; walk's pointers, one cell for each thread: a thread parameter. With one
+  ;; cell for every thread, a thread's walk lost the pointers it had
+  ;; collected to another thread's reset, and a handle in its loop's queue
+  ;; was reported out of it (#70; tests/test-loop-threads.sps).
+  (define walk-query-cell (make-thread-parameter '()))
 
   (define (walk-dispatch walked walked-ptr arg)
-    (set! walk-query-cell (cons walked-ptr walk-query-cell)))
+    (walk-query-cell (cons walked-ptr (walk-query-cell))))
 
   (define (handle-in-loop-queue? loop handle)
-    (set! walk-query-cell '())
+    (walk-query-cell '())
     (uv-walk-native (loop-ptr loop) 0)
-    (and (memv (handle-ptr handle) walk-query-cell) #t))
+    (and (memv (handle-ptr handle) (walk-query-cell)) #t))
 
   ;; (with-send-fence async body ...) runs BODY holding ASYNC's send fence
   ;; (#33), the lock that orders uv-async-send! against uv-close!. The send's
@@ -761,31 +870,21 @@
   ;; step (begin-close!). So no close begins while a send is between its check
   ;; and its call, and no send gets past the check once a close has begun.
   ;;
-  ;; The fence is taken and released only with interrupts disabled, so no
-  ;; thread ever holds it where an engine can suspend it or a collection can
-  ;; stop it. Held across either, an abandoned engine would keep it for good,
-  ;; and a collection could wait for a thread that waits for the fence. That
-  ;; rules out with-mutex: it releases in a dynamic-wind exit thunk, after the
-  ;; winder is gone, at a point where an engine can be suspended (the review
-  ;; of #43). tests/test-async-fence.sps probes every such point from another
-  ;; thread.
-  ;; - A thread that finds the fence taken waits for it inside the same
-  ;;   interrupt-free step, so it stays active while it waits. The holder is
-  ;;   always running a BODY, which never waits on anything, so the wait is
-  ;;   short, and no collection can be waiting on the holder meanwhile.
+  ;; The fence is a with-step-lock: taken and released only with interrupts
+  ;; disabled, so no thread ever holds it where an engine can suspend it or a
+  ;; collection can stop it. Held across either, an abandoned engine would
+  ;; keep it for good, and a collection could wait for a thread that waits
+  ;; for the fence. That rules out with-mutex: it releases in a dynamic-wind
+  ;; exit thunk, after the winder is gone, at a point where an engine can be
+  ;; suspended (the review of #43). tests/test-async-fence.sps probes every
+  ;; such point from another thread.
   ;; - BODY must not raise or block: a raise would leave the fence held and
   ;;   interrupts disabled. The bodies check what could fault, the state and
   ;;   the pointer, and answer a status; their callers raise after.
   (define-syntax with-send-fence
     (syntax-rules ()
       ((_ async body1 body2 ...)
-       (let ((fence (async-fence async)))
-         (disable-interrupts)
-         (mutex-acquire fence)
-         (let ((result (begin body1 body2 ...)))
-           (mutex-release fence)
-           (enable-interrupts)
-           result)))))
+       (with-step-lock (async-fence async) body1 body2 ...))))
 
   ;; Starting close is idempotent and asynchronous. A repeated call cannot
   ;; replace the original on-close callback.
@@ -890,19 +989,20 @@
 
   ;; (seam-lambda name (ptr arg ...) ...) is a case-lambda with one clause
   ;; per argument list, so a callback's arguments are never gathered into a
-  ;; rest list. Each clause looks PTR up in the registry once, hands the
-  ;; dispatcher the registered object, and contains every raise with one
-  ;; guard; an else clause takes Chez's cheaper guard path. A one-shot
-  ;; continuation would allocate less for an empty callback, but a callback
-  ;; that captures a full continuation, as its own guard does, promotes it and
-  ;; copies the stack: about 4 KB a callback on the mean
+  ;; rest list. Each clause looks PTR up in the registry once, under its lock
+  ;; (another loop's thread may be changing it), hands the dispatcher the
+  ;; registered object, and contains every raise with one guard; an else
+  ;; clause takes Chez's cheaper guard path. A one-shot continuation would
+  ;; allocate less for an empty callback, but a callback that captures a
+  ;; full continuation, as its own guard does, promotes it and copies the
+  ;; stack: about 4 KB a callback on the mean
   ;; (tests/test-callback-alloc.sps holds both).
   (define-syntax seam-lambda
     (syntax-rules ()
       ((_ name (ptr arg ...) ...)
        (case-lambda
          ((ptr arg ...)
-          (let ((entry (hashtable-ref registry ptr #f)))
+          (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
             (guard (e (else (contain-dispatcher-raise! name ptr entry e)))
               ((dispatch-procedure name)
                (and entry (registry-entry-object entry)) ptr arg ...))))
