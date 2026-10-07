@@ -317,7 +317,23 @@ Left, as follow-ups:
 
 ## Gates
 
-On the reworked tree:
+On the branch head (7626c78, cut from a473313):
 
 - `make test`: 24 suites pass.
 - `make check-purity`: green.
+- `make check-memory-gate` + `make test-memory` (macOS ASan): green.
+
+#67 and #69 landed on main meanwhile (2511d17), and the branch merges with
+it cleanly. So every gate ran again on the planned merge, main plus this
+branch (tree a6f6e43), in `--no-hardlinks` scratch clones:
+
+- `make test`: 24 suites pass.
+- `make check-purity`: green.
+- `make check-memory-gate` + `make test-memory` (macOS ASan): green.
+- `make test-memory-docker` (Linux Valgrind): green. All 24 suites have 0
+  errors and 0 bytes definitely lost. The 76 forked children are the known
+  fork artifacts.
+
+The branch also merges cleanly with #68 (#63's open fix, which rewrites
+`process.sls`). That `process.sls` imports nothing from `(chezscheme)`
+renamed or prefixed and makes no foreign call, so rule 5 holds over it.
