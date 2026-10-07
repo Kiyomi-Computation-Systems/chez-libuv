@@ -60,7 +60,8 @@
   ;; holding-claim : uv-loop (-> object) -> object
   ;; (BODY)'s value, giving LOOP's claim back first if BODY raises. A body
   ;; left any other way, by a continuation or an engine, keeps the claim, as
-  ;; a run's frame left from a callback does.
+  ;; a run's frame left from a callback does. For a teardown, whose raises
+  ;; come from deep in its work; a run and a close answer theirs instead.
   (define (holding-claim loop body)
     (guard (e (#t (release-loop! loop) (raise e)))
       (body)))
@@ -160,22 +161,30 @@
     (require-loop loop 'uv-loop-close!)
     (let ((ptr (claim-or-raise! loop #f 'uv-loop-close!)))
       (when ptr
-        (let ((error (holding-claim loop (lambda () (close-claimed! loop ptr)))))
+        (let-values (((rc error) (close-claimed! loop ptr)))
           (release-loop! loop)
+          (uv-check rc 'uv-loop-close!)
           (raise-if-error! error)))))
 
-  ;; close-claimed! : uv-loop uptr -> (or condition #f)
-  ;; uv-loop-close!'s work on LOOP, whose claim this call holds: it raises
-  ;; libuv's refusal, and answers the pending callback error to raise once
-  ;; the claim is given back.
+  ;; close-claimed! : uv-loop uptr -> (values exact-integer (or condition #f))
+  ;; uv_loop_close on LOOP, whose claim this call holds, and once libuv has
+  ;; closed it, the record marked closed and the block freed. It answers
+  ;; libuv's return code and the pending callback error, for the caller to
+  ;; raise once the claim is given back: a close is refused 'EBUSY whenever a
+  ;; handle is open, and a guard around it, to give the claim back, cost
+  ;; 410 B a close. Only a loop missing from the registry raises here, with
+  ;; the claim held; the registry would then be corrupt.
   (define (close-claimed! loop ptr)
-    (uv-check (uv-loop-close ptr) 'uv-loop-close!)
-    (set-loop-state! loop 'closed)
-    (registry-deregister! ptr)
-    (free! ptr)
-    (set-loop-ptr! loop 0)
-    (count-loop-free!)
-    (take-pending-callback-error! loop))
+    (let ((rc (uv-loop-close ptr)))
+      (if (zero? rc)
+          (begin
+            (set-loop-state! loop 'closed)
+            (registry-deregister! ptr)
+            (free! ptr)
+            (set-loop-ptr! loop 0)
+            (count-loop-free!)
+            (values rc (take-pending-callback-error! loop)))
+          (values rc #f))))
 
   ;; Bound iterations, not wall time, so teardown is deterministic under load.
   (define max-drain-iterations 1024)
@@ -217,7 +226,8 @@
     (let drain ((i 0) (stored teardown-no-error))
       (let ((outcome (drain-step loop ptr)))
         (cond ((eq? outcome 'drained)
-               (let ((error (close-claimed! loop ptr)))
+               (let-values (((rc error) (close-claimed! loop ptr)))
+                 (uv-check rc 'uv-loop-close!)
                  (cond ((not (eq? stored teardown-no-error)) stored)
                        (error error)
                        (else teardown-no-error))))

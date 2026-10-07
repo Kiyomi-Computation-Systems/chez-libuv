@@ -214,6 +214,29 @@
     (let ((first (tear-down loop)))
       (list first (marked loop) (if (uv-loop-open? loop) 'open 'closed)))))
 
+;; A teardown whose drain never empties the loop gives up at its bound and
+;; raises from deep in its work. Here a close callback starts a timer the
+;; teardown never saw, which repeats every millisecond and stops each run,
+;; so every drain run ends with work left.
+(test-equal "a uv-loop-teardown! that gives up at its drain bound gives the claim back"
+  '(drain-bound not-running torn-down)
+  (let* ((loop (make-uv-loop))
+         (t (make-uv-timer loop))
+         (late #f))
+    (uv-close! t (lambda ()
+                   (set! late (make-uv-timer loop))
+                   (uv-timer-start! late (lambda (t) (uv-stop! loop)) 1 1)))
+    (let* ((first (guard (e ((and (uv-error? e) (message-condition? e)
+                                  (equal? (condition-message e)
+                                          "loop still had work after the drain bound"))
+                             'drain-bound)
+                            (#t (list 'raised (evidence e))))
+                    (uv-loop-teardown! loop)
+                    'torn-down))
+           (mark (marked loop)))
+      (when late (uv-close! late))
+      (list first mark (tear-down loop)))))
+
 (test-equal "a uv-loop-close! of a closed loop is still a quiet no-op, with no claim left"
   '(closed-again not-running)
   (let ((loop (make-uv-loop)))
