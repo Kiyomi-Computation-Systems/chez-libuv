@@ -22,11 +22,11 @@
         ;; run leaves interrupts disabled; foreign-procedure binds waitpid,
         ;; which reaps a child whose handle a run closed, and sleep paces
         ;; it; foreign-ref and foreign-set! copy a handle into the block a
-        ;; reuse run places at a freed address; getenv finds a memory tool,
-        ;; which never hands a freed block back.
+        ;; reuse run places at a freed address; getenv and foreign-entry?
+        ;; find a memory tool, which never hands a freed block back.
         (only (chezscheme) make-engine disable-interrupts enable-interrupts
-              collect foreign-procedure foreign-ref foreign-set! sleep make-time
-              getenv))
+              collect foreign-procedure foreign-entry? foreign-ref foreign-set!
+              sleep make-time getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -90,15 +90,38 @@
   (zero? (enable-interrupts)))
 
 ;; A memory tool never hands a freed block back: Memcheck's freelist and
-;; ASan's quarantine hold it. (getenv answers "" for a variable set empty.)
+;; ASan's quarantine hold it, and the reuse rows then ask less. The memory
+;; gates say so in the environment, but a plain run can inherit
+;; ASAN_OPTIONS from a shell, and would then ask less for nothing. So the
+;; allocator is asked as well: both tools report a block's size as
+;; requested, where a plain allocator rounds it up. A 288 B block from the
+;; shim read 288 under ASan and Valgrind, 320 on macOS and 296 on glibc
+;; 2.36 and 2.39. (getenv answers "" for a variable set empty.)
 (define (env-set? name)
   (let ((v (getenv name))) (and v (not (string=? v "")))))
-(define under-memory-tool?
-  (or (env-set? "CHEZ_LIBUV_UNDER_VALGRIND") (env-set? "ASAN_OPTIONS")))
 
 (define counts-at-start (live-counts))
 
 (define loop (make-uv-loop))
+
+;; The allocator's size of a block: malloc_size on macOS, malloc_usable_size
+;; on glibc, as test-tcp asks it. The loop above has loaded libc.
+(define allocation-size
+  (cond ((foreign-entry? "malloc_size")
+         (foreign-procedure "malloc_size" (uptr) size_t))
+        ((foreign-entry? "malloc_usable_size")
+         (foreign-procedure "malloc_usable_size" (uptr) size_t))
+        (else #f)))
+
+(define exact-block-sizes?
+  (let* ((block (alloc-block 288))
+         (size (and allocation-size (allocation-size block))))
+    (free-block! block)
+    (eqv? size 288)))
+
+(define under-memory-tool?
+  (and (or (env-set? "CHEZ_LIBUV_UNDER_VALGRIND") (env-set? "ASAN_OPTIONS"))
+       exact-block-sizes?))
 
 ;; waitpid reaps a child whose handle a run closed: libuv waits only for the
 ;; children of open process handles. WNOHANG is 1 on macOS and Linux. The
@@ -125,14 +148,19 @@
 (define-record-type child (fields proc pipe pid (mutable fate)))
 
 ;; spawn-child! : -> child
+;; A spawn that raises closes its pipe first: a failed uv-spawn! leaves its
+;; pipes for the caller to close.
 (define (spawn-child!)
   (let* ((pipe (make-uv-pipe loop))
          (c #f)
-         (proc (uv-spawn! loop "/bin/cat" '("cat")
-                          (list (cons 'stdio (list (list 'pipe pipe 'to-child))))
-                          (lambda (status sig)
-                            (collect)
-                            (child-fate-set! c (list status sig))))))
+         (proc (guard (e (#t (uv-close! pipe)
+                             (poll! (lambda () (closed? pipe)))
+                             (raise e)))
+                 (uv-spawn! loop "/bin/cat" '("cat")
+                            (list (cons 'stdio (list (list 'pipe pipe 'to-child))))
+                            (lambda (status sig)
+                              (collect)
+                              (child-fate-set! c (list status sig)))))))
     (set! c (make-child proc pipe (uv-process-pid proc) 'running))
     c))
 
@@ -316,7 +344,9 @@
 ;; MODE is 'free, or 'reuse to put B's handle at A's address after the free.
 ;; A reuse run counts its expiry, and whether its block landed there; a run
 ;; whose block did not is never resumed, since a stale call would read a
-;; pid from whatever holds A's address.
+;; pid from whatever holds A's address. What the expiry does to A and B is
+;; plumbing: a raise there is the run's verdict, and the run still reaps A,
+;; finishes B and frees the block, so nothing it made reaches the next run.
 (define reuse-expiries 0)
 (define reused-runs 0)
 
@@ -339,24 +369,27 @@
           (eng fuel
                (lambda (ticks o) (list 'no-expiry o))
                (lambda (resume)
-                 (let ((made returned))
-                   (when (eq? mode 'reuse) (fill-before-free!))
-                   (uv-close! (child-proc a))
-                   (poll! (lambda () (closed? (child-proc a))))
-                   (when (eq? mode 'reuse)
-                     (set! reuse-expiries (+ reuse-expiries 1))
-                     (set! squatter (squat! address))
-                     (set! b (spawn-child!))
-                     (when squatter
-                       (copy-handle! (handle-ptr (child-proc b)) squatter)
-                       (if (eqv? (uv-process-get-pid squatter) (child-pid b))
-                           (set! reused-runs (+ reused-runs 1))
-                           (begin (free-block! squatter) (set! squatter #f)))))
+                 (let ((made returned)
+                       (plumbing #f))
+                   (guard (e (#t (set! plumbing (describe e))))
+                     (when (eq? mode 'reuse) (fill-before-free!))
+                     (uv-close! (child-proc a))
+                     (poll! (lambda () (closed? (child-proc a))))
+                     (when (eq? mode 'reuse)
+                       (set! reuse-expiries (+ reuse-expiries 1))
+                       (set! squatter (squat! address))
+                       (set! b (spawn-child!))
+                       (when squatter
+                         (copy-handle! (handle-ptr (child-proc b)) squatter)
+                         (if (eqv? (uv-process-get-pid squatter) (child-pid b))
+                             (set! reused-runs (+ reused-runs 1))
+                             (begin (free-block! squatter) (set! squatter #f))))))
                    (list 'expired made
-                         (if (or (eq? mode 'free) squatter made)
-                             (resume 1000000 (lambda (ticks o) o)
-                                     (lambda (more) 'still-running))
-                             'not-resumed))))))
+                         (cond (plumbing (list 'plumbing-raised plumbing))
+                               ((or (eq? mode 'free) squatter made)
+                                (resume 1000000 (lambda (ticks o) o)
+                                        (lambda (more) 'still-running)))
+                               (else 'not-resumed)))))))
          (enabled (interrupts-enabled?)))
     (unless enabled (enable-interrupts))
     (when squatter (free-block! squatter))
@@ -545,7 +578,11 @@
 ;; never hands the block back.
 (display "  [informational] reuse: B's handle was at A's address in ")
 (display reused-runs) (display " of ") (display reuse-expiries)
-(display " expired runs\n")
+(display " expired runs; under a memory tool: ")
+(display (if under-memory-tool? "yes" "no"))
+(display " (exact block sizes: ")
+(display (if exact-block-sizes? "yes" "no"))
+(display ")\n")
 
 (if under-memory-tool?
     (test-equal "seed: the reuse sweeps ran (a memory tool: reuse unobservable by design)"

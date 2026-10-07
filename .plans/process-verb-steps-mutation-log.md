@@ -129,7 +129,9 @@ block it found. A stale call reads B's pid there. The run resumes only once
 make a stale kill `kill(0, sig)`. In every suite run since, the block
 landed in every expired reuse run (21 of 21 on macOS and on Ubuntu 24.04).
 Under a memory tool it never lands, by design, and the rows ask only that
-the sweep ran.
+the sweep ran. A memory tool is one the environment names and the
+allocator shows: it reports a block's size as requested (The review,
+finding 3).
 
 ## The tests
 
@@ -189,6 +191,7 @@ suite, which must match exactly once. The suite ran against each on macOS.
 | M9 | the pid takes a block before its checks, frees it after its step, and in a `guard` on a raise | drop (block +1 at 11–19); split and reuse (returned at 17–19 without having returned before: see below); the suite's closing counter row |
 | M9b | the pid takes a block before its checks and frees it before its step, and in a `guard` on a raise | drop (block +1 at 11–19); the closing counter row; nothing else |
 | M10 | the kill's step checks the pointer, not the open state | reuse (`null-handle-pointer` at 10–12) |
+| M10p | the pid's step checks the pointer, not the open state | equivalent: see below |
 | M11 | the kill's step split in two: the check, then the call | equivalent: see below |
 | M12 | the kill calls with a pointer read at entry, and checks after | reuse (refused, B `(0 sigterm)` at 10–12); the forced-state row |
 | M13 | the kill sends by a pid read before its step, and checks after | reuse (B `(0 sigterm)` at 10; A `(0 sigterm)` at 11–13); the forced-state row |
@@ -217,6 +220,16 @@ check in one step and the call in the next, leaves no point where an engine
 can suspend between them: nothing between the two has a trap check, as
 #53's W19 and W20 found. Their fuel maps match the fix's run for run.
 
+**M10p is equivalent, so the pid's in-step state check is uncovered.**
+Nothing between `uv-process-pid`'s entry check and its step has a trap
+check: every run of its sweeps expires at or before the entry check, which
+already refuses a closed process. So a step that checked only the pointer
+behaves the same in every run here, and its fuel maps match the fix's run
+for run. The check stays, so that the step is right by itself. It becomes
+observable the moment work is put between the entry check and the step,
+and the split sweep then reaches it: M10, the same mutation in the kill,
+is caught where converting a signal's name puts trap checks there.
+
 **M9 shows the oracle's premise.** Its free after the step adds trap checks
 there, so an engine can expire after the call and before the verb returns,
 and the split row then cannot tell the run from a stale call: the verb
@@ -227,7 +240,58 @@ revisited. M9b, which frees before the step, is caught by the drop row
 alone: the drop sweep is what holds a block held across the checks.
 
 **Uncovered.** The `(collect)` that starts each run guards against a false
-failure, a collection taken at the end of a step; no mutant shows it.
+failure, a collection taken at the end of a step; no mutant shows it. And
+the pid's in-step state check (M10p, above).
+
+## The review
+
+A `/code-review` at high effort (one pass, eight angles, no verifiers) gave
+seven findings on 0eaba43:
+
+1. **The pid's in-step state check is never exercised.** True: M10p is
+   equivalent. Recorded above as uncovered, with why.
+2. **A `waitpid` that answers -1 for EINTR fails a correct run.** Measured,
+   and it cannot: `waitpid` with WNOHANG never sleeps, so no signal can
+   interrupt it. 3,000,000 calls on a live child under a SIGUSR1 storm,
+   with the Scheme handler counting 30,935 signals on macOS and 399,905 on
+   glibc 2.39, answered 0 every time. No change: a retry branch for it
+   could never run.
+3. **Any `ASAN_OPTIONS` in the environment weakens the reuse rows.** Fixed.
+   The weak form now needs the memory tool to show in the allocator as
+   well: both tools report a block's size as requested, and plain
+   allocators round it up. A 288 B shim block read 288 under ASan and
+   Valgrind (3.19 and 3.22), 320 on macOS and 296 on glibc 2.36 and 2.39.
+   - Before: with `ASAN_OPTIONS=halt_on_error=1` set on a plain run, a
+     search that never finds A's address (T9) left the suite green, 12 of
+     12, the block landing in 0 of 21 runs.
+   - After: the same run fails the reuse reach row and the reuse seed by
+     name, `(0 of 21)`. A plain run with that variable set takes the
+     strong form and passes, 21 of 21.
+   - The witness caught a mistake of mine: a run with ASan's preload put on
+     `timeout` rather than on Chez (AGENTS.md's trap) set `ASAN_OPTIONS`
+     without loading ASan into Chez. The suite read plain sizes, took the
+     strong form, and the block landed 21 of 21. With the preload on Chez,
+     it read exact sizes and took the weak form.
+4. **A raise in the expiry's plumbing leaks A, B and the block.** Fixed.
+   `spawn-child!` closes its pipe when the spawn raises; a raise anywhere
+   in what the expiry does to A and B becomes the run's verdict,
+   `(plumbing-raised …)`; and the run still reaps A, finishes B and frees
+   the block.
+   - Before: with B's spawn made to fail (P2: `/nonexistent/cat`, which
+     uv-spawn! refuses with ENOENT), both reuse sweeps died at fuel 1
+     (`sweep-raised`). What they left surfaced in the drop sweep's first
+     run, charged as `process -1` and `block -1`, failing the drop rows
+     too, and the closing counter row found 2 blocks.
+   - After: only the three reuse rows fail, each run carrying `(plumbing-raised
+     "Exception in uv-spawn!: no such file or directory")` with A's and B's
+     fates; the drop rows and the closing counter row pass.
+5. **ADR-0019's "(fixed below)" also covers #70's open finding.** Fixed:
+   "(this split is fixed below)", on line 249 only.
+6. **The sweep helpers are a fourth copy of the other suites'.** Left for a
+   later change, with #66's shared sweep driver.
+7. **Each verb hand-writes the step and its refusal.** Left for a later
+   change: a macro in `(libuv private handles)` once more verb families
+   have their steps.
 
 ## Valgrind
 
@@ -262,8 +326,22 @@ On d4429b8, the fix with the suite as committed:
   (10,979 B among them, never gating); the new suite adds none, since its
   `cat` children exec.
 
-The suite's edits after d4429b8, its comments and an unused `nop`, change
-no behaviour; `make test` passed again on them (25 suites, macOS).
+The suite's edits in 0eaba43, its comments and an unused `nop`, change no
+behaviour; `make test` passed again on them (25 suites, macOS).
+
+After the review, only the suite changed in code: the memory-tool witness
+and the plumbing guards (The review, findings 3 and 4). On that commit:
+
+- `make test`, macOS: 25 suites passed.
+- The new suite plain and under the gate's Valgrind flags, vendored libuv
+  1.52.1, on Debian bookworm (glibc 2.36, Valgrind 3.19) and Ubuntu 24.04
+  (glibc 2.39, Valgrind 3.22): plain, 12 of 12 in the strong form, the
+  block landing 21 of 21; under Valgrind, 12 of 12 in the weak form, 0
+  errors and 0 bytes definitely lost.
+- The new suite under macOS ASan, preloaded on Chez as the recipe does:
+  12 of 12, in the weak form.
+- The new suite on a plain macOS run with `ASAN_OPTIONS` set: 12 of 12, in
+  the strong form.
 
 ## Not done
 

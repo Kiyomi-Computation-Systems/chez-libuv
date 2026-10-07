@@ -246,7 +246,7 @@ drains a caller-side queue rather than assuming one item per send.
 >       process handle and the options block, and builds the block, so
 >       `uv-spawn!` holds nothing before it (ADR-0015, the amendment to
 >       decision 1). `tests/test-process.sps`'s drop sweeps hold it.
->     - Found reviewing #63 (fixed below): `uv-process-kill!` and
+>     - Found reviewing #63 (this split is fixed below): `uv-process-kill!` and
 >       `uv-process-pid` split between the pointer and the call, and a
 >       split kill signalled another process at the freed handle's address
 >       (#71). Separately, decision 4 holds per loop only: the registry is
