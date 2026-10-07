@@ -149,6 +149,13 @@ loop ([Child processes](#child-processes--libuv-process)). One whose engine
 is never resumed either had not begun, or had finished: the loop holds its
 process, or a failed spawn has been cleaned up.
 
+`uv-process-kill!` and `uv-process-pid` make both promises too. One resumed
+after its process was closed raises `&uv-handle-closed` without touching
+it. Before, a kill resumed there signalled whatever process a later spawn
+had been given the closed handle's address, and returned normally, and
+`uv-process-pid` answered that process's pid. Neither verb allocates, so
+one whose engine is never resumed leaves nothing behind.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
