@@ -334,6 +334,14 @@ branch (tree a6f6e43), in `--no-hardlinks` scratch clones:
   errors and 0 bytes definitely lost. The 76 forked children are the known
   fork artifacts.
 
-The branch also merges cleanly with #68 (#63's open fix, which rewrites
-`process.sls`). That `process.sls` imports nothing from `(chezscheme)`
-renamed or prefixed and makes no foreign call, so rule 5 holds over it.
+#68 (#63's fix, which rewrites `process.sls`) landed next (5ac8469), and
+the branch merges with it cleanly. That `process.sls` imports nothing from
+`(chezscheme)` renamed or prefixed and makes no foreign call, so rule 5
+holds over it. The macOS gates ran again on that merge (tree 9f03976):
+
+- `make test`: 24 suites pass.
+- `make check-purity`: green.
+- `make check-memory-gate` + `make test-memory` (macOS ASan): green.
+
+Linux Valgrind on that merge is left to CI, which runs on the merge with
+main.
