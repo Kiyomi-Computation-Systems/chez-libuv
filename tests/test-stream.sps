@@ -37,8 +37,7 @@
         (only (chezscheme) collect foreign-alloc foreign-free foreign-procedure
               make-engine bytevector-truncate!
               disable-interrupts enable-interrupts
-              fork-thread make-mutex make-condition with-mutex
-              condition-wait condition-broadcast getenv))
+              fork-thread thread-join getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -525,12 +524,34 @@
 ;; condition the second, which no engine sweep can split. As in
 ;; test-addrinfo's cross-thread row, the row asserts only what no schedule
 ;; can make fail on a right answer, and the informational line counts the
-;; calls the flipper's change reached. Not under Valgrind, which runs one
-;; thread at a time.
+;; calls the flipper's change reached.
+;;
+;; A flipper that never ran, or stopped, would leave that row passing. So
+;; before the first call and after the last, the race waits up to
+;; race-wait-cap steps to see the flipper cut the span and make it whole
+;; again, and a precondition row holds both. The first wait also holds the
+;; race until the flipper is flipping. The race finds the pair it watches
+;; through segs, the list each call is given, so a flipper changing any
+;; other span fails that row too, and so does one that never makes the
+;; span whole, which the verb refuses as it refuses a cut. It joins the
+;; flipper, so that no thread is left to make the suite's (collect) raise.
+;; Not under Valgrind, which runs one thread at a time.
 (define span-race-calls 20000)
+(define race-wait-cap 100000000)
 
-;; span-race : -> (list calls bad first-bad cut)
-;; Every exit stops the flipper, waits for it, and closes what it made.
+;; watch-flipper : pair object object -> (or 'flipping 'not-flipping)
+;; Whether P's cdr was seen to be CUT and then WHOLE again within
+;; race-wait-cap steps.
+(define (watch-flipper p cut whole)
+  (let wait ((k 0) (seen-cut #f))
+    (cond ((= k race-wait-cap) 'not-flipping)
+          ((eq? (cdr p) cut) (wait (+ k 1) #t))
+          ((and seen-cut (eq? (cdr p) whole)) 'flipping)
+          (else (wait (+ k 1) seen-cut)))))
+
+;; span-race : -> (list calls bad first-bad cut before after)
+;; It stops the flipper, joins it, and closes what it made before it
+;; answers.
 (define (span-race)
   (let* ((l (make-uv-loop))
          (p (make-uv-pipe l))
@@ -539,17 +560,15 @@
          (tail (cdr second))
          (segs (list span))
          (stop #f)
-         (stopped #f)
-         (m (make-mutex))
-         (c (make-condition)))
-    (fork-thread
-     (lambda ()
-       (let flip ()
-         (unless stop
-           (set-cdr! second 'oops)
-           (set-cdr! second tail)
-           (flip)))
-       (with-mutex m (set! stopped #t) (condition-broadcast c))))
+         (flipper
+          (fork-thread
+           (lambda ()
+             (let flip ()
+               (unless stop
+                 (set-cdr! second 'oops)
+                 (set-cdr! second tail)
+                 (flip))))))
+         (before (watch-flipper (cdar segs) 'oops tail)))
     (let ((result
            (let call ((i 0) (bad 0) (first-bad #f) (cut 0))
              (if (= i span-race-calls)
@@ -568,11 +587,12 @@
                           (call (+ i 1) bad first-bad cut))
                          (else (call (+ i 1) (+ bad 1)
                                      (or first-bad (list i outcome)) cut))))))))
-      (set! stop #t)
-      (with-mutex m (let wait () (unless stopped (condition-wait c m) (wait))))
-      (uv-close! p)
-      (uv-loop-teardown! l)
-      result)))
+      (let ((after (watch-flipper (cdar segs) 'oops tail)))
+        (set! stop #t)
+        (thread-join flipper)
+        (uv-close! p)
+        (uv-loop-teardown! l)
+        (append result (list before after))))))
 
 (if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
     (begin
@@ -588,7 +608,11 @@
       (newline)
       (test-equal "a uv-write*! whose span another thread changes is refused by the verb, never by Chez"
         (list span-race-calls 0 #f)
-        (list (car race) (cadr race) (caddr race)))))
+        (list (car race) (cadr race) (caddr race)))
+      ;; The row above says nothing unless the flipper was changing the span.
+      (test-equal "precondition: the race's flipper was changing the written span before the first call and after the last"
+        '(flipping flipping)
+        (list-tail race 4))))
 
 (uv-loop-teardown! s-loop)
 
