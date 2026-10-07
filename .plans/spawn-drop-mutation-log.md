@@ -385,3 +385,63 @@ gate's own report of a drop depends on a stale pointer being gone; the
 suite's `'block` column does not.
 
 The first push's gates, on a473313, are superseded by these.
+
+## The squatter row on CI (2026-10-07)
+
+The row "a spawn whose handle block another entry holds is refused before it
+forks, leaving nothing behind" failed on CI's vendored pass in two runs:
+37611536379 (PR #73, 11:04 UTC) and 37613004038 (PR #74, 11:18 UTC). #74's
+`make test` ran main's `src/` and `test-process.sps` byte for byte. Both
+printed `(spawned marked torn-down (0 0 0 0 0))`: the spawn forked, so its
+handle block was not one the row had planted. Main's two runs since #68
+(09:32 and 09:50 UTC) and both runs' pkg-config passes passed the row.
+Neither the arm64 noble image nor the x86_64 Debian image (glibc 2.36,
+under emulation) failed it in a full `test-process.sps`.
+
+**Why.** The row freed 8 handle-size blocks in a row, entries left at
+them, and relied on the shim's `calloc` handing one back to the spawn's
+step. glibc's `calloc` skips the thread's cache, where the first 7 frees of
+each size go, and returns the oldest free block of an exact size first.
+So when earlier sections of the suite had left free blocks of a process
+handle's size, the step was given one of those, unregistered, and forked.
+That depends on the heap the earlier sections left, which is why two CI
+runs failed the row while main's two passed it.
+
+**Reproduced** by seeding the heap first: 16 unregistered handle-size blocks,
+each between kept spacers, freed, then one 176 B allocation so that glibc
+sorts them into its small bin, as earlier spawns can leave them. The
+scenario run 20 times on its own (a scratch probe), handle 136 B:
+
+| Layout | Clean heap, arm64 glibc 2.39 | Seeded, arm64 glibc 2.39 | Seeded, x86_64 glibc 2.36 |
+|---|---|---|---|
+| 8 blocks in a row (the row) | 20 of 20 squatted | 1 of 20 | 1 of 20 |
+| 16 blocks, each between kept spacers | 20 of 20 | 20 of 20 | 20 of 20 |
+| 64 blocks, each between kept spacers | 20 of 20 | 20 of 20 | 20 of 20 |
+
+The seeded result also tells how `calloc` chooses. Had it taken from the
+thread's cache, the old row would have squatted there: its 8 allocations
+took the seeded blocks, and its 8 frees went where `calloc` looks next.
+
+In the suite itself, with the same seeding placed just before the row, in
+the noble image (vendored libuv): the old row failed 3 of 3 runs with
+CI's exact `(spawned marked torn-down (0 0 0 0 0))`, and the new row passed
+3 of 3. Each seeded run also failed "counters all zero at suite end",
+because the scratch seeding never frees its spacers.
+
+**The fix** (test-only, `test/squatter-row`). The row plants 64 blocks,
+each allocated between two spacers that are kept until the spawn is over.
+The spacers stop glibc merging a freed planted block with a freed
+neighbour, and allocating 128 blocks takes up the older free blocks of that
+size first. A precondition row now names the seed: the next handle-size
+block the shim allocates must be one an entry still names. When the main
+row fails, a failed seed points at the allocator and a held seed points at
+the code. Under the memory tools the row keeps its weak form.
+
+**Watched fail:**
+
+- **The defect the row exists for.** M1 has `spawn-from-block!` ignore a
+  refused registration (`(if #f …`). The main row failed by name with
+  `(spawned marked (errno EBUSY) (0 1 1 2 3))`, and the precondition
+  passed. The suite's closing counter and registry rows failed too: the
+  forked process's handle was left unregistered.
+- **The CI failure.** The seeded suite, as above.
