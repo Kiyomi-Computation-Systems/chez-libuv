@@ -1,8 +1,9 @@
 #!r6rs
 ;;; SRFI-64 suite for the owner check on every verb that makes something on
 ;;; a loop: the handle constructors (make-uv-timer, -tcp, -pipe, -signal,
-;;; -async), uv-accept!, uv-spawn!, uv-getaddrinfo! and uv-getnameinfo!
-;;; (#79; ADR-0019's #79 amendment).
+;;; -async), uv-accept!, uv-spawn!, uv-getaddrinfo! and uv-getnameinfo!, and
+;;; on uv-cancel!, which a lookup's completion races (#79; ADR-0019's #79
+;;; amendment).
 ;;;
 ;;; A loop belongs to one thread: the one that made it, then whichever
 ;;; thread most recently entered uv-run on it (docs/api.md). Until #79 only
@@ -38,7 +39,7 @@
         (libuv signal)
         (libuv async)
         (only (libuv process) uv-spawn!)
-        (only (libuv dns) uv-getaddrinfo! uv-getnameinfo! uv-dns-request?)
+        (only (libuv dns) uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-dns-request?)
         (libuv private conditions)
         (only (libuv private handles) registry-count)
         (only (libuv private native) live-counts)
@@ -78,6 +79,8 @@
 ;; on-other-thread : (-> object) -> (or (list thread-id object) list)
 ;; Runs THUNK on a new thread and answers that thread's id with what THUNK
 ;; answered, or what it raised, or that no answer came within the cap.
+;; answered? tells the two apart: a row whose thread never answered must not
+;; tear its loop down, as the thread may still be using it.
 (define (on-other-thread thunk)
   (let ((m (make-mutex)) (c (make-condition)) (answer #f))
     (fork-thread
@@ -93,6 +96,8 @@
               ((= waits thread-wait-cap) (list 'no-answer-within-seconds thread-wait-cap))
               (else (condition-wait c m (make-time 'time-duration 0 1))
                     (wait (+ waits 1))))))))
+
+(define (answered? seen) (number? (car seen)))
 
 ;; --- what a row must leave as it found it ---------------------------------------
 
@@ -125,7 +130,8 @@
 ;; A verb prepares a fresh loop, answering a context its call needs, or #f
 ;; if the fixture could not be made, and calls the verb on it. Its context
 ;; is a cell holding 'pending until a spawn's child exits or a lookup
-;; completes; made? says whether the call made what it should.
+;; completes; made? says whether the call made what it should, or for
+;; uv-cancel!, answered as it should.
 (define-record-type verb (fields name prepare call made?))
 
 (define (pending-cell loop) (vector 'pending))
@@ -169,6 +175,20 @@
             (#t (list 'getnameinfo-raised (describe e))))
     (uv-getnameinfo! loop "127.0.0.1" 80 (lambda (err host service) (settle! cell)))))
 
+;; uv-cancel!'s context is the cell with a lookup started on the loop, which
+;; settles it when it completes, cancelled or not. No one runs the loop
+;; before the call, so the lookup is still the loop's when it is made.
+(define (lookup-prepare loop)
+  (let ((cell (vector 'pending #f)))
+    (vector-set! cell 1 (uv-getaddrinfo! loop "localhost" #f
+                                         (lambda (err results) (settle! cell))))
+    cell))
+
+(define (cancel-call loop cell)
+  (guard (e ((uv-wrong-thread? e) (raise e))
+            (#t (list 'cancel-raised (describe e))))
+    (uv-cancel! (vector-ref cell 1))))
+
 (define verbs
   (list (constructor 'make-uv-timer make-uv-timer uv-timer?)
         (constructor 'make-uv-tcp make-uv-tcp uv-tcp?)
@@ -179,7 +199,33 @@
                    (lambda (loop server) (uv-accept! server)) uv-tcp?)
         (make-verb 'uv-spawn! pending-cell spawn-call uv-process?)
         (make-verb 'uv-getaddrinfo! pending-cell getaddrinfo-call uv-dns-request?)
-        (make-verb 'uv-getnameinfo! pending-cell getnameinfo-call uv-dns-request?)))
+        (make-verb 'uv-getnameinfo! pending-cell getnameinfo-call uv-dns-request?)
+        (make-verb 'uv-cancel! lookup-prepare cancel-call boolean?)))
+
+;; The verbs that take arguments, called with arguments they refuse. From
+;; the wrong thread, each must say so before it reads them, as a handle verb
+;; does before it reads its handle's state (require-open-handle). Never made.
+(define (never-made? x) #f)
+
+(define (bad-spawn-call loop cell)
+  (guard (e ((uv-wrong-thread? e) (raise e))
+            (#t (list 'spawn-raised (describe e))))
+    (uv-spawn! loop "/bin/sh" '() #f)))
+
+(define (bad-getaddrinfo-call loop cell)
+  (guard (e ((uv-wrong-thread? e) (raise e))
+            (#t (list 'getaddrinfo-raised (describe e))))
+    (uv-getaddrinfo! loop 'not-a-node #f nop)))
+
+(define (bad-getnameinfo-call loop cell)
+  (guard (e ((uv-wrong-thread? e) (raise e))
+            (#t (list 'getnameinfo-raised (describe e))))
+    (uv-getnameinfo! loop 'not-an-address 80 nop)))
+
+(define bad-argument-verbs
+  (list (make-verb 'uv-spawn! pending-cell bad-spawn-call never-made?)
+        (make-verb 'uv-getaddrinfo! pending-cell bad-getaddrinfo-call never-made?)
+        (make-verb 'uv-getnameinfo! pending-cell bad-getnameinfo-call never-made?)))
 
 ;; attempt : verb uv-loop object -> list
 ;; Calls V, answering (made), (wrong-thread who expected actual), (returned
@@ -217,8 +263,8 @@
         (let* ((before (balance))
                (seen (on-other-thread (lambda () (attempt v loop ctx))))
                (left (residue before))
-               (torn (finish! loop ctx)))
-          (if (and (number? (car seen))
+               (torn (if (answered? seen) (finish! loop ctx) 'left-to-its-thread)))
+          (if (and (answered? seen)
                    (equal? (cadr seen) (list 'wrong-thread (verb-name v) me (car seen)))
                    (null? left)
                    (eq? torn 'torn-down))
@@ -232,6 +278,14 @@
      'refused-leaving-nothing
      (refusal-run v)))
  verbs)
+
+(for-each
+ (lambda (v)
+   (test-equal (string-append (symbol->string (verb-name v))
+                              " from a thread that does not own the loop is refused before its arguments are read")
+     'refused-leaving-nothing
+     (refusal-run v)))
+ bad-argument-verbs)
 
 ;; --- made by the owner ----------------------------------------------------------
 ;; The thread that made the loop owns it until another runs it.
@@ -272,9 +326,9 @@
                        (lambda ()
                          (uv-run loop 'nowait)
                          (attempt v loop ctx))))
-               (here (attempt v loop ctx))
-               (torn (finish! loop ctx)))
-          (if (and (number? (car there))
+               (here (if (answered? there) (attempt v loop ctx) 'not-tried))
+               (torn (if (answered? there) (finish! loop ctx) 'left-to-its-thread)))
+          (if (and (answered? there)
                    (equal? (cadr there) '(made))
                    (equal? here (list 'wrong-thread (verb-name v) (car there) me))
                    (eq? torn 'torn-down))

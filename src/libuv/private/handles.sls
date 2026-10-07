@@ -13,9 +13,9 @@
           registry-lock with-step-lock
 
           ;; interrupt-free steps
-          one-step open-handle-ptr open-loop-ptr step-refusal
+          one-step open-handle-ptr owned-loop-ptr step-refusal
           try-construct-handle construct-handle try-construct-loop
-          loop-owned-here? wrong-thread-refusal
+          wrong-thread-refusal
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -58,7 +58,7 @@
 
           ;; request records
           %make-uv-req-record uv-req?
-          req-ptr set-req-ptr! req-kind req-handle
+          req-ptr set-req-ptr! req-kind req-handle req-loop
           req-on-complete set-req-on-complete!
 
           ;; completion and callback policy
@@ -248,15 +248,22 @@
 
   ;; Requests are not handles: their one block lives until completion and has
   ;; no close state. DNS requests have no owning handle.
+  ;; A DNS request has no handle, and carries its loop instead, which
+  ;; uv-cancel! checks the owner of; a request made on a handle reaches its
+  ;; loop through the handle, and has no loop of its own.
   (define-record-type (uv-req-record %make-uv-req-record uv-req?)
     (fields (mutable ptr        req-ptr         set-req-ptr!)
             (immutable kind     req-kind)
             (immutable handle   req-handle)
-            (mutable on-complete req-on-complete set-req-on-complete!))
+            (mutable on-complete req-on-complete set-req-on-complete!)
+            (immutable loop     req-loop))
     (protocol
      (lambda (new)
-       (lambda (ptr kind handle on-complete)
-         (new ptr kind handle on-complete)))))
+       (case-lambda
+         ((ptr kind handle on-complete)
+          (new ptr kind handle on-complete #f))
+         ((ptr kind handle on-complete loop)
+          (new ptr kind handle on-complete loop))))))
 
   (define (require-handle handle who)
     (unless (uv-handle? handle)
@@ -444,14 +451,21 @@
             ((not (valid-pointer? ptr)) 'no-pointer)
             (else ptr))))
 
-  ;; open-loop-ptr : uv-loop -> (or uptr 'loop-not-open 'no-loop-pointer)
-  ;; open-handle-ptr for a loop: a constructor's step checks again that the
-  ;; loop it was given is open, since a teardown can free the loop between
-  ;; the constructor's open check and its init.
-  (define (open-loop-ptr loop)
+;; owned-loop-ptr : uv-loop
+  ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer 'wrong-thread)
+  ;; open-handle-ptr for a loop this thread owns: a step that makes something
+  ;; on the loop checks again that the loop it was given is open, since a
+  ;; teardown can free the loop between the verb's open check and its init,
+  ;; and that this thread owns it, since the loop can be handed to another
+  ;; thread there too. From another thread, libuv's init raced the loop's
+  ;; own thread on its handle queue, and corrupted it with no error (#79).
+  ;; Every step that calls libuv on a loop rather than a handle takes the
+  ;; loop's pointer here, so none can skip the owner check.
+  (define (owned-loop-ptr loop)
     (let ((ptr (loop-ptr loop)))
       (cond ((not (eq? (loop-state loop) 'open)) 'loop-not-open)
             ((not (valid-pointer? ptr)) 'no-loop-pointer)
+            ((not (eqv? (loop-owner-thread loop) (current-thread-id))) 'wrong-thread)
             (else ptr))))
 
   ;; step-refusal : (or symbol exact-integer) symbol (or uv-handle #f)
@@ -688,13 +702,7 @@
   (define (attach-stream-descriptor! stream ptr)
     (uv-handle-set-data ptr (stream-descriptor stream)))
 
-  ;; loop-owned-here? : uv-loop -> boolean
-  ;; Whether this thread owns LOOP: require-loop-thread's test, for a step,
-  ;; where nothing may raise.
-  (define (loop-owned-here? loop)
-    (eqv? (loop-owner-thread loop) (current-thread-id)))
-
-  ;; wrong-thread-refusal : uv-loop symbol -> condition
+    ;; wrong-thread-refusal : uv-loop symbol -> condition
   ;; What WHO raises once its step has answered 'wrong-thread for LOOP.
   (define (wrong-thread-refusal loop who)
     (make-uv-wrong-thread who (loop-owner-thread loop) (current-thread-id)))
@@ -703,7 +711,7 @@
   ;;                        procedure procedure
   ;;                        -> (or uv-handle symbol exact-integer)
   ;; Makes a handle on LOOP in one interrupt-free step: the loop's open and
-  ;; owner checks and pointer, a block of SIZE bytes, the record MAKE-RECORD
+  ;; owner checks and pointer (owned-loop-ptr), a block of SIZE bytes, the record MAKE-RECORD
   ;; makes of the block, its registration, libuv's init (INIT!, given the
   ;; loop's pointer and the block), a stream's descriptor, and the count
   ;; (COUNT-NEW!). It answers the handle, or what stood in the way:
@@ -711,12 +719,9 @@
   ;; registration, or INIT!'s errno, and a refused step leaves nothing
   ;; behind. MAKE-RECORD, INIT! and COUNT-NEW! must be total, as a step's
   ;; calls are (one-step).
-  ;; - libuv's init links the handle into the loop's handle queue, which the
-  ;;   loop's thread unlinks closed handles from as it runs. From any other
-  ;;   thread the two raced, and corrupted the queue with no error (#79). The
-  ;;   step is where the owner is checked, not the constructor's entry: an
-  ;;   engine can suspend a constructor while the loop is handed to another
-  ;;   thread (tests/test-constructors.sps's handoff sweeps).
+  ;; - The step is where the owner is checked, not the constructor's entry:
+  ;;   an engine can suspend a constructor while the loop is handed to
+  ;;   another thread (tests/test-constructors.sps's handoff sweeps).
   ;; - Split by an engine, a constructor's open check stopped covering its
   ;;   init: a teardown freed the loop in between, and the init linked the
   ;;   handle into the freed uv_loop_t. A teardown between the init and the
@@ -728,10 +733,9 @@
   ;;   (tests/test-constructors.sps).
   (define (try-construct-handle loop size init! make-record count-new!)
     (one-step
-     (let ((loop-ptr (open-loop-ptr loop)))
+     (let ((loop-ptr (owned-loop-ptr loop)))
        (cond
         ((symbol? loop-ptr) loop-ptr)
-        ((not (loop-owned-here? loop)) 'wrong-thread)
         (else
          (let ((ptr (alloc-block size)))
            (if (zero? ptr)

@@ -110,7 +110,7 @@
         ;; assign different defaults to those two forms.
         (unless (eq? writes 'absent)
           (write-hints! hints-tail writes))
-        (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete)))
+        (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete loop)))
           (registry-register! block 'getaddrinfo-req loop req)
           (count-getaddrinfo-req-new!)
           (guard (e (#t (abandon-request! req) (count-getaddrinfo-req-free!)
@@ -171,7 +171,7 @@
                (addr (+ block addr-offset)))
           (guard (e (#t (free! block) (raise e)))
             (fill-sockaddr! addr ip-bytes port 'uv-getnameinfo!))
-          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete)))
+          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete loop)))
             (registry-register! block 'getnameinfo-req loop req)
             (count-getnameinfo-req-new!)
             (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
@@ -185,10 +185,14 @@
   ;; uv-cancel! : uv-dns-request -> boolean
   ;; A true result means cancellation won, but the completion callback still
   ;; fires. False covers work already running or already completed.
+  ;; Loop-thread-only, checked: from another thread, the loop's thread could
+  ;; complete the request and free its block between the pointer's read and
+  ;; uv_cancel (#79).
   (define (uv-cancel! req)
     (unless (uv-dns-request? req)
       (raise (make-uv-invalid-argument 'uv-cancel!
                                        'not-a-cancellable-request)))
+    (require-loop-thread (req-loop req) 'uv-cancel!)
     (let ((ptr (req-ptr req)))
       (if (zero? ptr)
           #f

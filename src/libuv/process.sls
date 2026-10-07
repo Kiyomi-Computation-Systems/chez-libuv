@@ -438,6 +438,9 @@
   (define (start-spawn! loop file args options on-exit)
     (ensure-native-loaded!)
     (require-open-loop loop 'uv-spawn!)
+    ;; A caller on the wrong thread is told so before its arguments are
+    ;; read, as require-open-handle tells it before a handle's state.
+    (require-loop-thread loop 'uv-spawn!)
     (let ((request (with-interrupts-disabled
                      (read-spawn-request file args options))))
       (check-string (spawn-request-file request) 'uv-spawn! 'file-not-a-string)
@@ -502,10 +505,10 @@
   ;;               spawn-options -> (or uv-process status)
   (define (spawn-step! loop on-exit layout request options)
     (let* ((specs (spawn-options-stdio options))
-           (loop-address (open-loop-ptr loop))
-           (refusal (cond ((symbol? loop-address) loop-address)
-                          ((not (loop-owned-here? loop)) 'wrong-thread)
-                          (else (stdio-refusal specs)))))
+           (loop-address (owned-loop-ptr loop))
+           (refusal (if (symbol? loop-address)
+                        loop-address
+                        (stdio-refusal specs))))
       (if refusal
           refusal
           (let ((ptr (alloc-block (options-layout-handle-size layout)))
