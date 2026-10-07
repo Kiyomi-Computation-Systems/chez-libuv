@@ -472,3 +472,9 @@ At load averages near 6 to 13:
   row, #68's squatter row, which picks its expectation by that variable:
   with no real memory tool the allocator does reuse the freed blocks. main
   fails it the same way, run the same way. Valgrind itself is left to CI.
+- After main df2c041, which carries #76's squatter-row fix, was merged in
+  (7df4501): `make test` passes 26 suites, test-process at 157 rows (140 on
+  main). `make test-threading`, `make check-purity`, `make check-help`,
+  `make check-pins` and macOS ASan (26 suites, no report) pass. The skip
+  path still fails only the squatter row's memory-tool form, and main
+  df2c041 fails it the same way, run the same way.
