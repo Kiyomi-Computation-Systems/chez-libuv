@@ -32,12 +32,15 @@
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
         ;; bytes-allocated, bytes-deallocated and collect-request-handler
         ;; meter fold-flags. random draws proper-length's random trials, and
-        ;; the thread primitives run its cross-thread race.
+        ;; the thread primitives run its cross-thread races.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
               make-engine bytevector-truncate! collect
-              bytes-allocated bytes-deallocated collect-request-handler void
               random random-seed fork-thread thread-join)
+        ;; The races' liveness watch and the allocation meter, shared and
+        ;; pure.
+        (only (uv-race) watch-flipper)
+        (only (uv-meter) fewest-bytes)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -46,6 +49,17 @@
 ;; runner so its fail count can drive the exit status (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. The race and sweep
+;; rows return their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 ;; Captured BEFORE the first ensure-native-loaded! call anywhere in this
 ;; process, so the "has not run yet" assertions below are real observations
@@ -1927,6 +1941,44 @@
                    (if (caddr last-run) 'expired (cadr last-run))))))
        read-sweeps))
 
+;; --- fold-flags: a flag list spliced longer during the walk ---------------
+;; fold-flags walks no further than its count and requires the list's end
+;; after it, as read-proper-list does. Without the end, a tail spliced in
+;; during the walk was folded as far as the stale count, into flags the
+;; caller never held. The sweep splices splice-tail in at the first expiry,
+;; as the read sweeps do, and folds 2^e for each element e, so that each
+;; list's flags are its own: every run must answer the flags of the list as
+;; it was or as the splice left it, or refuse it.
+(define (flag-bit e) (expt 2 e))
+
+(define (bits-of l)
+  (fold-left (lambda (bits e) (bitwise-ior bits (flag-bit e))) 0 l))
+
+(define (fold-all l)
+  (guard (e ((uv-invalid-argument? e) (list 'refused (uv-invalid-argument-reason e))))
+    (fold-flags l 'test-flags 'flags-not-a-list flag-bit)))
+
+(define fold-splice-sweep
+  (list-sweep fold-all (lambda (l) (set-cdr! (cddr l) splice-tail))))
+
+(define spliced-bits (bits-of (append '(0 1 2) splice-tail)))
+
+(test-equal "fold-flags folds a flag list spliced longer during the walk as it was or as the splice left it, or refuses it"
+  '()
+  (filter (lambda (run)
+            (not (member (cadr run)
+                         (list (bits-of (iota* 12)) spliced-bits
+                               '(refused flags-not-a-list)))))
+          fold-splice-sweep))
+
+;; The row above finds no bad answer, which says nothing unless the sweep
+;; spliced the list before the walk began and ran the last walk whole.
+(test-equal "the fold-flags splice sweep spliced the list before the walk began and ended with a walk no expiry reached"
+  (list (list 1 spliced-bits #t) (bits-of (iota* 12)))
+  (list (car fold-splice-sweep)
+        (let ((last-run (list-ref fold-splice-sweep (- (length fold-splice-sweep) 1))))
+          (if (caddr last-run) 'expired (cadr last-run)))))
+
 ;; --- proper-length against changes nobody chose ---------------------------
 ;; The sweeps above make the changes a reader thought of; one reader thought
 ;; only of single changes, and the count above hung on two. These trials
@@ -2009,76 +2061,83 @@
 ;; --- proper-length and read-proper-list against another thread ----------
 ;; Another thread can change a list between any two instructions, where an
 ;; engine stops only at a trap check. A flipper turns the third pair's cdr
-;; between a vector and the rest of the list while this thread counts or
-;; reads the list. Every count must answer #f or 12, and every read #f or
-;; the list, without raising. A count or read that took a cdr twice,
-;; checking it the first time, would read through the vector the second:
-;; the shape #61's count had, which no engine sweep can split. As in
-;; test-addrinfo's cross-thread row, the rows assert only what no schedule
-;; can make fail on a right answer, and the informational lines count the
-;; counts and reads the flipper's change reached.
+;; between a cut and the rest of the list while this thread counts or reads
+;; the list. Cut to a vector, every count must answer #f or 12, and every
+;; read #f or the list, without raising. A count or read that took a cdr
+;; twice, checking it the first time, would read through the vector the
+;; second: the shape #61's count had, which no engine sweep can split. Cut
+;; to the list's head, which makes it circular, a read can go around the
+;; cycle, below. As in test-addrinfo's cross-thread row, the rows assert
+;; only what no schedule can make fail on a right answer, and the
+;; informational lines count the counts and reads the flipper's change
+;; reached.
 ;;
 ;; A flipper that never ran, or stopped, would leave those rows passing. So
-;; before the first count or read and after the last, each race waits up
-;; to race-wait-cap steps to see the flipper cut the list and make it whole
-;; again, and a precondition row holds both. The first wait also holds the
-;; race until the flipper is flipping. The race finds the pair it watches
+;; before the first count or read and after the last, each race waits to
+;; see the flipper cut the list and make it whole again (tests/uv-race.sls),
+;; and a precondition row holds both. The first wait also holds the race
+;; until the flipper is flipping. The race finds the pair it watches
 ;; through l, the list each call is given, so a flipper changing any other
 ;; list fails that row too, and so does one that never makes the list
 ;; whole, which no count could tell from a cut. Not under Valgrind, which
 ;; runs one thread at a time.
 (define list-race-rounds 100000)
-(define race-wait-cap 100000000)
 
-;; watch-flipper : pair object object -> (or 'flipping 'not-flipping)
-;; Whether P's cdr was seen to be CUT and then WHOLE again within
-;; race-wait-cap steps.
-(define (watch-flipper p cut whole)
-  (let wait ((k 0) (seen-cut #f))
-    (cond ((= k race-wait-cap) 'not-flipping)
-          ((eq? (cdr p) cut) (wait (+ k 1) #t))
-          ((and seen-cut (eq? (cdr p) whole)) 'flipping)
-          (else (wait (+ k 1) seen-cut)))))
-
-;; list-race : (list -> answer) answer -> (list rounds bad first-bad cut before after)
-;; OP's answers for a list another thread changes: WHOLE is its answer for
-;; the list as it began, and #f, counted as cut, its answer for the list
-;; cut. It stops the flipper and joins it before it answers.
-(define (list-race op whole)
+;; list-race : (list -> answer) (list -> object) (answer -> (or symbol #f))
+;;             -> (list rounds bad first-bad cut turned before after)
+;; OP's answers for a twelve-element list another thread changes, its third
+;; pair's cdr turned between (CUT-OF l) and the rest of the list. CLASSIFY
+;; names each answer 'whole, 'cut or 'turned (once around a cycle), or #f
+;; for one no right read gives, which is counted as bad. It stops the
+;; flipper and joins it before it answers.
+(define (list-race op cut-of classify)
   (let* ((l (iota* 12))
          (p (list-tail l 2))
          (rest (cdr p))
-         (v (vector 'not 'a 'pair))
+         (cut (cut-of l))
          (stop #f)
          (flipper
           (fork-thread
            (lambda ()
              (let flip ()
                (unless stop
-                 (set-cdr! p v)
+                 (set-cdr! p cut)
                  (set-cdr! p rest)
                  (flip))))))
-         (before (watch-flipper (list-tail l 2) v rest)))
+         (before (watch-flipper (list-tail l 2) cut rest)))
     (let ((result
-           (let round ((r 0) (bad 0) (first-bad #f) (cut 0))
+           (let round ((r 0) (bad 0) (first-bad #f) (cuts 0) (turned 0))
              (if (= r list-race-rounds)
-                 (list r bad first-bad cut)
+                 (list r bad first-bad cuts turned)
                  (let ((answer (guard (e (#t (list 'raised (describe e))))
                                  (op l))))
-                   (cond ((equal? answer whole) (round (+ r 1) bad first-bad cut))
-                         ((not answer) (round (+ r 1) bad first-bad (+ cut 1)))
-                         (else (round (+ r 1) (+ bad 1)
-                                      (or first-bad (list r answer)) cut))))))))
-      (let ((after (watch-flipper (list-tail l 2) v rest)))
+                   (case (classify answer)
+                     ((whole) (round (+ r 1) bad first-bad cuts turned))
+                     ((cut) (round (+ r 1) bad first-bad (+ cuts 1) turned))
+                     ((turned) (round (+ r 1) bad first-bad cuts (+ turned 1)))
+                     (else (round (+ r 1) (+ bad 1)
+                                  (or first-bad (list r answer))
+                                  cuts turned))))))))
+      (let ((after (watch-flipper (list-tail l 2) cut rest)))
         (set! stop #t)
         (thread-join flipper)
         (append result (list before after))))))
 
+(define (vector-cut l) (vector 'not 'a 'pair))
+(define (head-cut l) l)
+
+;; whole-or-cut : object -> (answer -> (or 'whole 'cut #f))
+(define (whole-or-cut whole)
+  (lambda (answer)
+    (cond ((equal? answer whole) 'whole)
+          ((not answer) 'cut)
+          (else #f))))
+
 ;; A flipper that turns the third pair's cdr between the list's head and
 ;; the rest of the list makes the list circular and whole again. A read the
-;; list changes in once answers the list or #f, as in the race above. One
-;; it changes in during the count and again during the walk can count a
-;; walk once around the cycle and then take it: (0 1 2 0 1 2 3 ... 11), the
+;; list changes in once answers the list or #f, as in the cut race. One it
+;; changes in during the count and again during the walk can count a walk
+;; once around the cycle and then take it: (0 1 2 0 1 2 3 ... 11), the
 ;; list's elements in an order the list never held (lists.sls). No read
 ;; that takes no lock can rule that out, so the row holds what a read can:
 ;; each answers #f, or a walk of the list to its end, around the cycle as
@@ -2098,63 +2157,103 @@
            (strip (cdddr a) (+ turns 1)))
           (else #f))))
 
-;; cycle-race : -> (list rounds bad first-bad circular turned before after)
-;; read-proper-list's answers for a list another thread makes circular and
-;; whole again. It stops the flipper and joins it before it answers.
-(define (cycle-race)
-  (let* ((l (iota* 12))
-         (whole (iota* 12))
-         (p (list-tail l 2))
-         (rest (cdr p))
+;; whole-cut-or-turned : answer -> (or 'whole 'cut 'turned #f)
+(define (whole-cut-or-turned answer)
+  (let ((turns (and answer (cycle-turns answer (iota* 12)))))
+    (cond ((not answer) 'cut)
+          ((eqv? turns 0) 'whole)
+          (turns 'turned)
+          (else #f))))
+
+;; --- read-proper-list: a list another thread changes exactly once -------
+;; Another thread turns the second pair's cdr between two proper tails, so
+;; that the list is a proper list at every instant and only its length
+;; changes, once a round, at a moment of its own while this thread reads
+;; the list; the round waits for that change before the next read, so no
+;; read sees two. A walk the change reaches contradicts its count, and
+;; read-proper-list then counts and walks the list once more, so every read
+;; must answer the list before the change or after it, never #f. With one
+;; count and one walk, a change between the two answered #f for a list that
+;; was proper before and after it, and uv-spawn! refused it as no list
+;; (#73's review: 20,246 of 100,000 spawns). A precondition row holds that
+;; the reads saw both lengths, so the other thread was changing the list.
+;; Not under Valgrind.
+(define one-change-rounds 20000)
+(define one-change-span 400)
+(define one-change-wait-cap 100000000)
+
+;; one-change-race : -> (list rounds bad first-bad short-reads long-reads)
+;; It stops the other thread and joins it on every exit, a raise included.
+(define (one-change-race)
+  (let* ((short-tail (list 'c 'd))
+         (long-tail (iota* 20))
+         (l (cons 'a (cons 'b short-tail)))
+         (p (cdr l))
+         (short (cons 'a (cons 'b (list 'c 'd))))
+         (long (cons 'a (cons 'b (iota* 20))))
+         (go 0)
+         (done 0)
          (stop #f)
-         (flipper
+         (changer
           (fork-thread
            (lambda ()
-             (let flip ()
-               (unless stop
-                 (set-cdr! p l)
-                 (set-cdr! p rest)
-                 (flip))))))
-         (before (watch-flipper (list-tail l 2) l rest)))
-    (let ((result
-           (let round ((r 0) (bad 0) (first-bad #f) (circular 0) (turned 0))
-             (if (= r list-race-rounds)
-                 (list r bad first-bad circular turned)
-                 (let* ((answer (guard (e (#t (list 'raised (describe e))))
-                                  (read-all l)))
-                        (turns (and answer (cycle-turns answer whole))))
-                   (cond ((not answer)
-                          (round (+ r 1) bad first-bad (+ circular 1) turned))
-                         ((eqv? turns 0) (round (+ r 1) bad first-bad circular turned))
-                         (turns (round (+ r 1) bad first-bad circular (+ turned 1)))
-                         (else (round (+ r 1) (+ bad 1)
-                                      (or first-bad (list r answer))
-                                      circular turned))))))))
-      (let ((after (watch-flipper (list-tail l 2) l rest)))
-        (set! stop #t)
-        (thread-join flipper)
-        (append result (list before after))))))
+             (let watch ((seen 0))
+               (cond (stop 'stopped)
+                     ((> go seen)
+                      (let ((this go))
+                        (let spin ((k (random one-change-span)))
+                          (unless (zero? k) (spin (- k 1))))
+                        (set-cdr! p (if (eq? (cdr p) short-tail) long-tail short-tail))
+                        (set! done this)
+                        (watch this)))
+                     (else (watch seen))))))))
+    (dynamic-wind
+     (lambda () #f)
+     (lambda ()
+       (let round ((r 1) (bad 0) (first-bad #f) (shorts 0) (longs 0))
+         (if (> r one-change-rounds)
+             (list one-change-rounds bad first-bad shorts longs)
+             (begin
+               (set! go r)
+               (let ((answer (guard (e (#t (list 'raised (describe e))))
+                               (read-all l))))
+                 (let wait ((k 0))
+                   (cond ((= done r) 'changed)
+                         ((= k one-change-wait-cap)
+                          (raise (list 'the-other-thread-never-changed-the-list 'round r)))
+                         (else (wait (+ k 1)))))
+                 (cond ((equal? answer short)
+                        (round (+ r 1) bad first-bad (+ shorts 1) longs))
+                       ((equal? answer long)
+                        (round (+ r 1) bad first-bad shorts (+ longs 1)))
+                       (else
+                        (round (+ r 1) (+ bad 1) (or first-bad (list r answer))
+                               shorts longs))))))))
+     (lambda ()
+       (set! stop #t)
+       (thread-join changer)))))
 
 (if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
     (begin
       (display "  [informational] proper-length and read-proper-list races:")
       (display " skipped under Valgrind, which runs one thread at a time")
       (newline))
-    (let ((race (list-race proper-length 12)))
-      (display "  [informational] proper-length race: ")
-      (display (cadddr race))
-      (display " of ")
-      (display (car race))
-      (display " counts found the list cut")
-      (newline)
-      (test-equal "proper-length answers #f or 12 for a list another thread changes, never raising"
-        (list list-race-rounds 0 #f)
-        (list (car race) (cadr race) (caddr race)))
-      ;; The row above says nothing unless the flipper was changing the list.
-      (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
-        '(flipping flipping)
-        (list-tail race 4))
-      (let ((race (list-race read-all (iota* 12))))
+    (begin
+      (let ((race (list-race proper-length vector-cut (whole-or-cut 12))))
+        (display "  [informational] proper-length race: ")
+        (display (cadddr race))
+        (display " of ")
+        (display (car race))
+        (display " counts found the list cut")
+        (newline)
+        (test-equal "proper-length answers #f or 12 for a list another thread changes, never raising"
+          (list list-race-rounds 0 #f)
+          (list (car race) (cadr race) (caddr race)))
+        ;; The row above says nothing unless the flipper was changing the list.
+        (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
+          '(flipping flipping)
+          (list-tail race 5)))
+      (let ((race (list-race read-all vector-cut (whole-or-cut (iota* 12)))))
         (display "  [informational] read-proper-list race: ")
         (display (cadddr race))
         (display " of ")
@@ -2166,45 +2265,44 @@
           (list (car race) (cadr race) (caddr race)))
         (test-equal "precondition: the read race's flipper was changing the read list before the first read and after the last"
           '(flipping flipping)
-          (list-tail race 4))
-        (let ((race (cycle-race)))
-          (display "  [informational] read-proper-list cycle race: ")
-          (display (cadddr race))
-          (display " of ")
-          (display (car race))
-          (display " reads found the list circular, and ")
-          (display (list-ref race 4))
-          (display " answered a walk around its cycle")
-          (newline)
-          (test-equal "read-proper-list answers #f or a walk of the list to its end for a list another thread makes circular, never raising"
-            (list list-race-rounds 0 #f)
-            (list (car race) (cadr race) (caddr race)))
-          (test-equal "precondition: the cycle race's flipper was making the read list circular and whole again before the first read and after the last"
-            '(flipping flipping)
-            (list-tail race 5))))))
+          (list-tail race 5)))
+      (let ((race (list-race read-all head-cut whole-cut-or-turned)))
+        (display "  [informational] read-proper-list cycle race: ")
+        (display (cadddr race))
+        (display " of ")
+        (display (car race))
+        (display " reads found the list circular, and ")
+        (display (list-ref race 4))
+        (display " answered a walk around its cycle")
+        (newline)
+        (test-equal "read-proper-list answers #f or a walk of the list to its end for a list another thread makes circular, never raising"
+          (list list-race-rounds 0 #f)
+          (list (car race) (cadr race) (caddr race)))
+        (test-equal "precondition: the cycle race's flipper was making the read list circular and whole again before the first read and after the last"
+          '(flipping flipping)
+          (list-tail race 5)))
+      (let ((race (guard (e (#t (list 0 1 (list 'raised (describe e)) 0 0)))
+                    (one-change-race))))
+        (display "  [informational] read-proper-list one-change race: ")
+        (display (list-ref race 3))
+        (display " reads answered the shorter list and ")
+        (display (list-ref race 4))
+        (display " the longer")
+        (newline)
+        (test-equal "read-proper-list answers a list another thread changes once during the read as it was before the change or after it, never #f"
+          (list one-change-rounds 0 #f)
+          (list (car race) (cadr race) (caddr race)))
+        (test-equal "precondition: the one-change race's reads answered both the shorter list and the longer"
+          'both
+          (if (and (positive? (list-ref race 3)) (positive? (list-ref race 4)))
+              'both
+              (list 'shorter (list-ref race 3) 'longer (list-ref race 4)))))))
 
 
 ;; The flags were measured with a guarded length, and a guard costs a few
 ;; hundred bytes a call even when nothing raises; the walk that replaced it
-;; allocates nothing. The meter reads (+ (bytes-allocated)
-;; (bytes-deallocated)) around each call with the collector held off, and
-;; takes the fewest bytes of 64 calls (tests/test-callback-alloc.sps's
-;; meter); its second element shows the meter sees an allocation.
-(define (fewest-bytes call)
-  (let ((saved (collect-request-handler)))
-    (dynamic-wind
-     (lambda () (collect-request-handler void))
-     (lambda ()
-       (let run ((i 0) (fewest #f))
-         (if (= i 64)
-             fewest
-             (let* ((before (+ (bytes-allocated) (bytes-deallocated)))
-                    (ignored (call))
-                    (after (+ (bytes-allocated) (bytes-deallocated))))
-               (run (+ i 1) (let ((b (- after before)))
-                              (if fewest (min fewest b) b)))))))
-     (lambda () (collect-request-handler saved)))))
-
+;; allocates nothing. tests/uv-meter.sls has the meter; the row's second
+;; element shows it sees an allocation.
 (test-equal "fold-flags allocates nothing, where the meter sees a 64-byte allocation"
   '(0 meter-live)
   (let ((flags (list 'a 'b 'c))

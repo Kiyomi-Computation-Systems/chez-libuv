@@ -8,22 +8,34 @@
 ;;;
 ;;; Pure: the library loads no native code, and make check-purity runs this
 ;;; suite with the shim poisoned (PURE_TESTS). So a change that breaks these
-;;; procedures fails rows here by name, where every suite that loads
-;;; native.sls fails at import: its constant table checks each name with
-;;; c-string?.
+;;; procedures fails rows here by name even when it stops native.sls
+;;; working: a c-string? that refuses well-formed names makes every constant
+;;; unavailable at the first ensure-native-loaded!, before most of the native
+;;; suites' rows run (#72's lookup-constant checks each name with it).
 (import (rnrs)
         (srfi :64)
         (libuv private c-string)
         (libuv private conditions)
         ;; The interrupt pair checks that read-utf8 leaves interrupts
-        ;; enabled; the rest meters what c-string-bytes allocates.
-        (only (chezscheme) disable-interrupts enable-interrupts display-condition
-              bytes-allocated bytes-deallocated collect-request-handler void))
+        ;; enabled; the meter is pure.
+        (only (chezscheme) disable-interrupts enable-interrupts display-condition)
+        (uv-meter))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. The rows return
+;; their evidence when they fail, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 (test-begin "c-string")
 
@@ -102,30 +114,32 @@
            (c-string-bytes s 'test-who 'test-reason)))
        (list "x\x3bb;" "" "a\x0;b" "ab\x0;")))
 
+;; Its callers refuse a non-string themselves, each for its own reason, so
+;; one reaching c-string-bytes is the binding's own fault: refused under
+;; c-string-bytes's name, never its caller's, and never read through as a
+;; bytevector, as #f was at --optimize-level 3.
+(test-equal "c-string-bytes refuses anything but a string under its own name, not its caller's"
+  '((refused c-string-bytes not-a-string)
+    (refused c-string-bytes not-a-string)
+    (refused c-string-bytes not-a-string))
+  (map (lambda (x)
+         (guard (e ((uv-invalid-argument? e)
+                    (list 'refused (uv-invalid-argument-who e)
+                          (uv-invalid-argument-reason e)))
+                   (#t (list 'raised (describe e))))
+           (c-string-bytes x 'test-who 'test-reason)
+           'not-refused))
+       (list 'x #f (u8-list->bytevector '(120)))))
+
 ;; c-string-bytes took its copy inside with-interrupts-disabled, a
 ;; dynamic-wind, and paid 64 B a call for it: 176 B for "127.0.0.1". Its
 ;; copy now takes a bare interrupt pair (read-utf8), so it allocates what
 ;; the same three objects cost made directly: the copy, the copy's UTF-8
 ;; and the answer. uv-spawn! reads each of its strings with read-utf8 too,
-;; inside its own interrupt-free step, where the dynamic-wind cost the
-;; same 64 B a string. The meter reads (+ (bytes-allocated)
-;; (bytes-deallocated)) around each call with the collector held off, and
-;; takes the fewest bytes of 64 calls (tests/test-native.sps's meter); the
-;; second element shows it sees an allocation.
-(define (fewest-bytes call)
-  (let ((saved (collect-request-handler)))
-    (dynamic-wind
-     (lambda () (collect-request-handler void))
-     (lambda ()
-       (let run ((i 0) (fewest #f))
-         (if (= i 64)
-             fewest
-             (let* ((before (+ (bytes-allocated) (bytes-deallocated)))
-                    (ignored (call))
-                    (after (+ (bytes-allocated) (bytes-deallocated))))
-               (run (+ i 1) (let ((b (- after before)))
-                              (if fewest (min fewest b) b)))))))
-     (lambda () (collect-request-handler saved)))))
+;; inside its own interrupt-free step, where a dynamic-wind nested there
+;; would cost the same 64 B a string; main's read-string took no fence of
+;; its own. tests/uv-meter.sls has the meter; the second element shows it
+;; sees an allocation.
 
 (test-equal "c-string-bytes allocates its copy, the copy's UTF-8 and its answer, and nothing more"
   '(0 meter-live)

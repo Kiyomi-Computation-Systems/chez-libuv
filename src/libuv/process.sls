@@ -37,22 +37,33 @@
   ;;   encoded (read-utf8, in (libuv private c-string)).
   ;; - Each list is read with read-proper-list ((libuv private lists)):
   ;;   counted without raising, walked at most that many pairs, each checked
-  ;;   before it is read through, and its end required after them. Measured
+  ;;   before it is read through, and its end required after them, counted
+  ;;   and walked once more when the walk contradicts the count. Measured
   ;;   with list? and then length, a list another thread changed in between
   ;;   made length raise its own condition, and one cut or made longer
   ;;   during the walk was read as a list the caller never had: the part
   ;;   before the cut, or the stale length's worth of the longer list. At
-  ;;   --optimize-level 3, where length checks nothing, a list made circular
-  ;;   there was walked forever with interrupts disabled (#66).
-  ;; - Each pair of a stdio spec is read once, after it is found to be a
-  ;;   pair (read-stdio-spec).
+  ;;   --optimize-level 3, where length checks nothing, it read through the
+  ;;   cut, and a list made circular for good during length was walked
+  ;;   forever with interrupts disabled (#66).
+  ;; - Each field of a stdio spec and of an options entry is read once,
+  ;;   after its pair is found to be one (read-stdio-spec, read-option).
   ;; So whatever another thread does, the read raises nothing, never reads
-  ;; through a non-pair, and ends. What it finds malformed is kept as #f, and
-  ;; the checks refuse it afterwards in the order they have always run. A
-  ;; list changed once during the read is read as it was before the change
-  ;; or after it, or found malformed; one changed several times can be read
-  ;; as a mix of its versions, as a string can (docs/api.md).
-  ;; test-process.sps's cross-thread list races hold this.
+  ;; through a non-pair, and ends once the changes stop. A list it finds
+  ;; malformed is kept as #f, a stdio spec of no known shape as a spec of
+  ;; kind #f, and the checks refuse them afterwards in the order they have
+  ;; always run. A list changed once during the read is read as it was
+  ;; before the change or after it; one changed several times can be read as
+  ;; a mix of its versions, as a string can, or found malformed though every
+  ;; version was a list (docs/api.md). test-process.sps's cross-thread list
+  ;; races and test-native.sps's one-change race hold this.
+  ;;
+  ;; The read raises nothing, so a bare interrupt pair, such as read-utf8
+  ;; takes, would do, and save the dynamic-wind's 80 B a spawn. The step
+  ;; keeps with-interrupts-disabled all the same: should an edit make the
+  ;; read raise, that unwinds the step and the change fails its rows by
+  ;; name, where a bare pair would leave interrupts off for good and
+  ;; test-process would hang (#73's review).
 
   ;; file is a bytevector, or #f for a non-string. args is a list of
   ;; (bytevector or #f), or #f for anything but a proper list as the read
@@ -85,10 +96,10 @@
 
   ;; stdio spec = ignore | (inherit-fd . integer) | (inherit-stream . stream)
   ;;              | (pipe uv-pipe direction)
-  ;; A pipe spec's second pair is read once: checked as (cdr rest) and then
-  ;; read again as (cddr rest) and (cadr rest), it could be a non-pair by
-  ;; the second read, and Chez's own cddr raised there, or at
-  ;; --optimize-level 3 read through it (#66).
+  ;; Each pair of a spec is read once. A pipe spec's (cdr rest), checked as
+  ;; a pair and then read again as (cddr rest) and (cadr rest), could be a
+  ;; non-pair by the second read: Chez's own cddr or cadr raised there, and
+  ;; at --optimize-level 3 the read went through it (#66).
   (define (read-stdio-spec spec)
     (cond
       ((eq? spec 'ignore) (make-stdio-spec 'ignore #f #f))

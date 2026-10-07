@@ -5,15 +5,21 @@
 ;;; validator that leaves a malformed list to one of them reads through a
 ;;; non-pair, or walks a circular list forever where no engine can stop it
 ;;; (#66). So this runs in a process of its own, which the suite kills if it
-;;; outlasts its cap. It runs the flag lists its arguments name, and prints
-;;; what it saw as one datum, an alist, for the suite to check row by row.
+;;; outlasts its deadline (tests/uv-level-3.sls). It runs the flag lists its
+;;; arguments name, and prints what it saw as one datum, an alist, for the
+;;; suite to check row by row: its optimize level, and the object file each
+;;; library under test came from, #f for one compiled here from source.
 ;;;
 ;;; Pure, as the suite is: it needs no shim.
 (import (rnrs)
         (rnrs mutable-pairs)
         (libuv private addrinfo)
         (libuv private conditions)
-        (only (chezscheme) optimize-level))
+        ;; Each library the report names, imported for its own sake, so that
+        ;; naming it cannot raise (tests/spawn-level-3-child.sps).
+        (only (libuv private lists))
+        (only (libuv private c-string))
+        (only (chezscheme) optimize-level library-object-filename))
 
 ;; outcome : object -> list
 ;; What validate-hints did with FLAGS as a hints flags entry.
@@ -32,9 +38,13 @@
                             (set-cdr! (cdr l) l)
                             l)))))
 
-(write (cons (cons 'level (optimize-level))
-             (map (lambda (arg)
-                    (let ((name (string->symbol arg)))
-                      (cons name (outcome ((cdr (assq name flag-lists)))))))
-                  (cdr (command-line)))))
+(write (cons* (cons 'level (optimize-level))
+              (cons 'objects
+                    (map library-object-filename
+                         '((libuv private addrinfo) (libuv private lists)
+                           (libuv private c-string))))
+              (map (lambda (arg)
+                     (let ((name (string->symbol arg)))
+                       (cons name (outcome ((cdr (assq name flag-lists)))))))
+                   (cdr (command-line)))))
 (newline)

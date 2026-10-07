@@ -59,15 +59,20 @@
   ;; c-string-bytes : string symbol symbol -> bytevector
   ;; S's UTF-8 and a terminating NUL, read once (read-utf8), or a refusal
   ;; naming WHO with REASON when S holds a NUL of its own, which C would read
-  ;; as the end of the string.
+  ;; as the end of the string. Its callers refuse a non-string themselves,
+  ;; each with its own reason; one that reaches here is the binding's own
+  ;; fault, refused under this procedure's name, where it was read through
+  ;; as a bytevector at --optimize-level 3 (tests/test-c-string.sps).
   (define (c-string-bytes s who reason)
-    (let* ((utf8 (read-utf8 s))
-           (n (bytevector-length utf8)))
-      (unless (nul-free? utf8 n)
-        (raise (make-uv-invalid-argument who reason)))
-      (let ((bytes (make-bytevector (+ n 1) 0)))
-        (bytevector-copy! utf8 0 bytes 0 n)
-        bytes)))
+    (let ((utf8 (read-utf8 s)))
+      (unless utf8
+        (raise (make-uv-invalid-argument 'c-string-bytes 'not-a-string)))
+      (let ((n (bytevector-length utf8)))
+        (unless (nul-free? utf8 n)
+          (raise (make-uv-invalid-argument who reason)))
+        (let ((bytes (make-bytevector (+ n 1) 0)))
+          (bytevector-copy! utf8 0 bytes 0 n)
+          bytes))))
 
   ;; c-string? : object -> boolean
   ;; Whether X is one C string: a bytevector whose only NUL is its last byte.

@@ -22,14 +22,13 @@
         (libuv private addrinfo)
         ;; The sweeps below run the validators in engines and change their
         ;; arguments mid-call, from a timer handler and from another thread.
-        ;; open-process-ports, input-port-ready?, sleep, make-time and system
-        ;; run tests/flags-level-3-child.sps under a cap, and bytes-allocated,
-        ;; bytes-deallocated and collect-request-handler meter the flags.
         (only (chezscheme) make-engine string-truncate! collect
               fork-thread make-mutex make-condition with-mutex
-              condition-wait condition-broadcast display-condition getenv
-              open-process-ports input-port-ready? sleep make-time system
-              bytes-allocated bytes-deallocated collect-request-handler void))
+              condition-wait condition-broadcast display-condition getenv)
+        ;; The flags' cost, and tests/flags-level-3-child.sps under a
+        ;; deadline. Both are pure.
+        (uv-meter)
+        (uv-level-3))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -203,23 +202,7 @@
 ;; length, and a guard allocates a few hundred bytes a call even when
 ;; nothing raises (#64 item 3): a flags entry cost 272 B more than a family
 ;; entry. Read with read-proper-list, it costs what a family entry does,
-;; plus one pair a flag. The meter reads (+ (bytes-allocated)
-;; (bytes-deallocated)) around each call with the collector held off, and
-;; takes the fewest bytes of 64 calls (tests/test-native.sps's meter).
-(define (fewest-bytes call)
-  (let ((saved (collect-request-handler)))
-    (dynamic-wind
-     (lambda () (collect-request-handler void))
-     (lambda ()
-       (let run ((i 0) (fewest #f))
-         (if (= i 64)
-             fewest
-             (let* ((before (+ (bytes-allocated) (bytes-deallocated)))
-                    (ignored (call))
-                    (after (+ (bytes-allocated) (bytes-deallocated))))
-               (run (+ i 1) (let ((b (- after before)))
-                              (if fewest (min fewest b) b)))))))
-     (lambda () (collect-request-handler saved)))))
+;; plus one pair a flag. tests/uv-meter.sls has the meter.
 
 (define (hints-bytes hints)
   (fewest-bytes (lambda () (validate-hints hints 'test-who))))
@@ -440,6 +423,20 @@
    ;; refused where the walk meets it.
    (list 'spine-made-improper 'hints-not-an-alist '(hints-not-an-alist)
          (lambda (hints) (set-cdr! (cdr hints) 'tail)))
+   ;; The spine again: read by read-proper-list, whose one walk finds a
+   ;; cycle however the list is cut. Chez's list?, which the validator asked
+   ;; first until #66, walks two pointers, and a self-loop made at each of
+   ;; the first two pairs at one expiry could leave them on separate cycles,
+   ;; where the call never returned: (stuck).
+   (list 'spine-split-in-two 'hints-not-an-alist '(hints-not-an-alist)
+         (lambda (hints)
+           (let ((first hints) (second (cdr hints)))
+             (set-cdr! first first)
+             (set-cdr! second second))))
+   ;; A spine made circular once list? had answered was walked to its first
+   ;; repeated key and refused as a duplicate, a reason no version earns.
+   (list 'spine-made-circular 'hints-not-an-alist '(hints-not-an-alist)
+         (lambda (hints) (set-cdr! (cddr hints) hints)))
    ;; The flags: walked no further than the list was long when found
    ;; proper, so a list made circular is not walked forever.
    (list 'flags-made-circular 'hint-flags-not-a-list '(hint-flags-not-a-list)
@@ -703,69 +700,35 @@
 ;; walked a circular flag list forever: no guard could catch that, and no
 ;; engine could stop it. tests/flags-level-3-child.sps runs validate-hints
 ;; at level 3 in a process of its own and prints what it answered, in two
-;; children so a hang takes only its own rows. A child still running after
-;; level-3-cap polls of 10 ms is killed, and its rows fail with
-;; killed-at-cap. Each runs in under a second.
-(define level-3-cap 6000)
-
-;; level-3-run : string string -> (or alist symbol list)
-;; The datum CHEZ printed running the child on the flag lists FLAG-LISTS
-;; names, or why there is none. The command execs Chez, so the pid is Chez's own and the
-;; kill reaches the walk.
-(define (level-3-run chez flag-lists)
-  (guard (e (#t (list 'spawn-failed (describe e))))
-    (let-values (((to-child from-child errors pid)
-                  (open-process-ports
-                   (string-append "exec " chez " --optimize-level 3"
-                                  " --program tests/flags-level-3-child.sps "
-                                  flag-lists)
-                   (buffer-mode block) (native-transcoder))))
-      (close-port to-child)
-      (let wait ((polls 0))
-        (cond
-          ((input-port-ready? from-child)
-           (let* ((out (get-string-all from-child))
-                  (err (get-string-all errors)))
-             (close-port from-child)
-             (close-port errors)
-             (let ((datum (guard (e (#t #f))
-                            (read (open-string-input-port out)))))
-               (if (list? datum) datum (list 'unreadable out err)))))
-          ((= polls level-3-cap)
-           (system (string-append "kill -9 " (number->string pid)))
-           (close-port from-child)
-           (close-port errors)
-           'killed-at-cap)
-          (else
-           (sleep (make-time 'time-duration 10000000 0))
-           (wait (+ polls 1))))))))
-
+;; children so a hang takes only its own rows (tests/uv-level-3.sls runs
+;; each under a deadline; its rows then fail with killed-at-cap). Each runs
+;; in under a second.
 (define level-3-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+(define level-3-program "tests/flags-level-3-child.sps")
 (define level-3-lists
-  (and level-3-chez (level-3-run level-3-chez "proper improper")))
+  (and level-3-chez (level-3-run level-3-chez level-3-program '(proper improper))))
 (define level-3-circular
-  (and level-3-chez (level-3-run level-3-chez "circular")))
-
-;; level-3 : (or alist symbol list) symbol -> object
-;; One entry of a child's REPORT.
-(define (level-3 report key)
-  (let ((entry (and (list? report) (assq key report))))
-    (if entry (cdr entry) (list 'no-entry key report))))
+  (and level-3-chez (level-3-run level-3-chez level-3-program '(circular))))
 
 (if (not level-3-chez)
     (test-equal "level-3 rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
-      ;; The children must run at level 3, or the rows below test the
-      ;; default level, where length checks for itself.
-      (test-equal "seed: the child ran at --optimize-level 3"
-        3 (level-3 level-3-lists 'level))
+      ;; The children must run at level 3, with the libraries under test
+      ;; compiled there from source, or the rows below test the default
+      ;; level, where length checks for itself: a library loaded from a .so
+      ;; beside its source keeps the level it was compiled at.
+      (test-equal "seed: both children ran at --optimize-level 3, with no library under test loaded from a compiled object"
+        '((3 (#f #f #f)) (3 (#f #f #f)))
+        (map (lambda (report)
+               (list (level-3-entry report 'level) (level-3-entry report 'objects)))
+             (list level-3-lists level-3-circular)))
       (test-equal "at --optimize-level 3, a proper flag list is answered as given"
-        '(answered ((flags passive canonname))) (level-3 level-3-lists 'proper))
+        '(answered ((flags passive canonname))) (level-3-entry level-3-lists 'proper))
       (test-equal "at --optimize-level 3, an improper flag list is refused"
-        '(refused hint-flags-not-a-list) (level-3 level-3-lists 'improper))
+        '(refused hint-flags-not-a-list) (level-3-entry level-3-lists 'improper))
       (test-equal "at --optimize-level 3, a circular flag list is refused, not walked forever"
-        '(refused hint-flags-not-a-list) (level-3 level-3-circular 'circular))))
+        '(refused hint-flags-not-a-list) (level-3-entry level-3-circular 'circular))))
 
 ;; --- who passthrough -----------------------------------------------------
 ;; The pure validators are shared vocabulary: the boundary passes its own

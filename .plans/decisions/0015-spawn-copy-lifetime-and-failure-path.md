@@ -11,7 +11,7 @@
   and 5. Amended 2026-10-07 (#66): that read takes each list with
   `read-proper-list`, so a list another thread changes mid-call is read or
   refused by name, never raised on by Chez, read through or walked without
-  end — see the last dated note after decision 1.
+  end once the changes stop — see the last dated note after decision 1.
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.3
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.3-process-design.md) §4.3, §5.5, §5.6, §7 (V1, V3),
@@ -154,31 +154,45 @@ to a struct instead of a payload.
 > **Amended 2026-10-07 (#66): each list is read with `read-proper-list`.**
 > The read step above measured each list with `list?` and then `length`,
 > walked that many pairs without requiring the end, and read a pipe spec's
-> second pair twice. The step holds an engine off but not another thread,
+> `(cdr rest)` twice. The step holds an engine off but not another thread,
 > and a thread changing a list during the call made each of these go
 > wrong. In `tests/test-process.sps`'s cross-thread races, where every call
-> is refused before anything is allocated, 1,709 to 24,418 of 100,000 calls
-> a race on main (bfd2bbe) were refused for neither the whole list nor the
-> cut one. `length` raised its own condition for a list cut after `list?`
-> (not `&uv-invalid-argument`), and so did `cddr` for a pipe spec. A list
-> cut during the walk, or made circular, was read short, so the call was
-> refused for the next thing it checked. At `--optimize-level 3`, where
-> `length` checks nothing, `length` and the pipe spec's second read went
-> through the cut (`invalid memory reference`), and a list made circular
-> for good during `length` hung it, interrupts disabled. Now each list is
-> read with
-> `(libuv private lists)`'s `read-proper-list`: counted without raising,
-> walked at most that many pairs, each checked before it is read through,
-> and its end required after them. A pipe spec's pairs are each read once.
-> Each string is read with `(libuv private c-string)`'s `read-utf8`, the
-> copy-then-encode `c-string-bytes` uses too (#64 item 4), and scanned for a
-> NUL with its `nul-free?`. A list another thread changes once during the
-> read is read as before the change or after it, or refused for its shape.
-> One changed several times can still be read as a mix of its versions, as
-> decision 1's strings can, but the read never raises, never reads through
-> a non-pair and always ends. The races hold that at both optimize levels,
-> level 3 in a child process. A spawn allocates slightly less (argv of 3:
-> 1,040 → 1,008 B). Evidence and the mutations:
+> is refused before anything is allocated, 6,246 to 27,102 of 100,000 calls
+> a race on main's code (1504309) were refused for neither the whole list
+> nor the cut one. `length` raised its own condition for a list cut after `list?`
+> (not `&uv-invalid-argument`), and so did `cddr` or `cadr` for a pipe
+> spec. A list cut during the walk, or made circular, was read short, so
+> the call was refused for the next thing it checked. At
+> `--optimize-level 3`, where `length` checks nothing, `length` and the
+> pipe spec's second read went through the cut (`invalid memory
+> reference`), and a list made circular for good during `length` hung it,
+> interrupts disabled.
+>
+> Now each list is read with `(libuv private lists)`'s `read-proper-list`:
+> counted without raising, walked at most that many pairs, each checked
+> before it is read through, and its end required after them; when the
+> walk contradicts the count, the list is counted and walked once more.
+> Each field of a stdio spec and of an options entry is read once. Each
+> string is read with `(libuv private c-string)`'s `read-utf8`, the
+> copy-then-encode `c-string-bytes` uses too (#64 item 4), and scanned for
+> a NUL with its `nul-free?`. A list another thread changes once during the
+> read is read as before the change or after it: without the second count
+> and walk, one change between the two refused a list that was a list both
+> before and after it as no list. One changed several times can still be
+> read as a mix of its versions, as decision 1's strings can, or refused as
+> no list though every version was one. Either way the read raises nothing,
+> never reads through a non-pair, and ends once the changes stop. The
+> races hold that at the default level, where a read through a non-pair
+> raises Chez's own condition. At level 3 a guarded read hides what it
+> reads through just as it hides that raise, so racing there caught nothing
+> more; a child process instead runs each list improper and circular from
+> the start at level 3, which hangs a read that counts with `length`. The
+> step keeps `with-interrupts-disabled`, a dynamic-wind, though the read
+> raises nothing: a bare interrupt pair would save 80 B a spawn, but should
+> an edit make the read raise, it would leave interrupts off for good.
+> A spawn allocates slightly less (argv of 3: 1,040 → 1,008 B), from the
+> NUL check's scan, which no longer allocates; the list reads cost what
+> they did. Evidence and the mutations:
 > `.plans/spawn-list-reads-mutation-log.md`.
 
 **2. Cleanup after a nonzero rc is class-dependent, and the class is decided

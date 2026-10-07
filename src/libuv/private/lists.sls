@@ -6,9 +6,10 @@
 ;;; between any two instructions. Chez's own list procedures assume nothing
 ;;; changes. map measures a list and then walks it unchecked, and at
 ;;; --optimize-level 3 length walks it with no check at all, so a list made
-;;; circular is walked forever (#64, #66). These read a caller's list once,
-;;; check each pair before reading through it, and always end. Pure: no
-;;; native code (tests/test-addrinfo.sps, under make check-purity).
+;;; circular is walked forever (#64, #66). These count a caller's list and
+;;; then read it, check each pair before reading through it, and end once
+;;; the list stops changing. Pure: no native code (tests/test-addrinfo.sps,
+;;; under make check-purity).
 (library (libuv private lists)
   (export proper-length read-proper-list fold-flags)
   (import (rnrs)
@@ -46,49 +47,73 @@
   ;; A fresh list of (READ e) for each element e of X, or #f when X is not a
   ;; proper list as this read finds it. X is counted with proper-length, at
   ;; most that many pairs are walked, each checked before it is read through,
-  ;; and X's end is required after them. READ sees each element once, in
-  ;; order, as its pair stood when the walk reached it, and may raise.
+  ;; and X's end is required after them. READ sees the elements in order, as
+  ;; each pair stood when the walk reached it, and may raise.
   ;;
-  ;; A list changed once during the read answers as it was before the change
-  ;; or after it, or #f. Without the end, a tail spliced in during the read
-  ;; would be read only as far as the stale count, and the answer would end
-  ;; where the list did not (tests/test-native.sps's spliced-longer sweep).
-  ;; A list changed more than once can answer a mix of its versions. One
-  ;; made circular and whole again during the count, and again during the
-  ;; walk, is counted and then walked once around its cycle: its elements in
-  ;; an order it never held them in (tests/test-native.sps's cycle race).
-  ;; No read that takes no lock can rule that out. A read inside one
-  ;; interrupt-free step, as uv-spawn!'s is, sees no engine's handler, so
-  ;; only another thread can do it. Nothing is allocated but the answer, and
-  ;; what READ allocates.
+  ;; A walk that contradicts its count, meeting a non-pair before the count
+  ;; runs out or no end after it, means the list changed after it was
+  ;; counted, and the read counts and walks it once more; READ then sees the
+  ;; elements of the abandoned walk again. So a list changed once during the
+  ;; read answers as it was before the change or after it, or #f when that
+  ;; version is no proper list. Without the second read, one change between
+  ;; the count and the walk made a list that was proper before and after it
+  ;; answer #f (tests/test-native.sps's one-change race). Without the end, a
+  ;; tail spliced in during the read would be read only as far as the stale
+  ;; count, and the answer would end where the list did not (the
+  ;; spliced-longer sweep there).
+  ;;
+  ;; A list changed more than once can answer a mix of its versions, or #f
+  ;; though every version was a proper list. One made circular and whole
+  ;; again during the count, and again during the walk, is counted and then
+  ;; walked once around its cycle: its elements in an order it never held
+  ;; them in (tests/test-native.sps's cycle race). No read that takes no lock
+  ;; can rule that out. A read inside one interrupt-free step, as uv-spawn!'s
+  ;; is, sees no engine's handler, so only another thread can do it. Nothing
+  ;; is allocated but the answer, and what READ allocates.
   (define (read-proper-list x read)
     (let ((n (proper-length x)))
       (and n
-           (let walk ((p x) (left n))
-             (cond ((zero? left) (and (null? p) '()))
-                   ((pair? p)
-                    (let* ((element (read (car p)))
-                           (rest (walk (cdr p) (- left 1))))
-                      (and rest (cons element rest))))
-                   (else #f))))))
+           (or (read-counted x n read)
+               (let ((n (proper-length x)))
+                 (and n (read-counted x n read)))))))
+
+  ;; read-counted : object exact-nonnegative-integer (object -> object)
+  ;;                -> (or list #f)
+  ;; The fresh list of (READ e) for the first N pairs of X, each checked
+  ;; before it is read through, when X's end follows them; #f otherwise.
+  (define (read-counted x n read)
+    (let walk ((p x) (left n))
+      (cond ((zero? left) (and (null? p) '()))
+            ((pair? p)
+             (let* ((element (read (car p)))
+                    (rest (walk (cdr p) (- left 1))))
+               (and rest (cons element rest))))
+            (else #f))))
 
   ;; fold-flags : object symbol symbol (object -> exact-integer)
   ;;              -> exact-integer
   ;; The bitwise-ior of (BIT flag) over a caller's flag list, which is read
   ;; once: its length from proper-length, #f for an improper or circular list
   ;; and then the refusal (WHO, REASON), then at most that many pairs, each
-  ;; checked as it is read. A list changed during the walk is refused, or
-  ;; read as each pair stood when the walk reached it, and never walked
-  ;; forever. Asking list? first would leave a gap an engine's handler can
-  ;; change the list in, and fold-left walks a list made circular there
-  ;; forever (tests/test-address.sps's flags sweeps). Nothing here
-  ;; allocates (tests/test-native.sps).
+  ;; checked as it is read, and the list's end after them. A list changed
+  ;; during the walk is refused, or read as each pair stood when the walk
+  ;; reached it, and never walked forever. Without the end, a tail spliced
+  ;; in during the walk was folded as far as the stale count, into flags the
+  ;; caller never held: (a b) made (a c d) folded a and c
+  ;; (tests/test-native.sps's fold-flags splice sweep). Asking list? first
+  ;; would leave a gap an engine's handler can change the list in, and
+  ;; fold-left walks a list made circular there forever
+  ;; (tests/test-address.sps's flags sweeps). Nothing here allocates
+  ;; (tests/test-native.sps).
   (define (fold-flags flags who reason bit)
     (let ((n (proper-length flags)))
       (unless n
         (raise (make-uv-invalid-argument who reason)))
       (let walk ((rest flags) (left n) (bits 0))
-        (cond ((zero? left) bits)
+        (cond ((zero? left)
+               (unless (null? rest)
+                 (raise (make-uv-invalid-argument who reason)))
+               bits)
               ((not (pair? rest))
                (raise (make-uv-invalid-argument who reason)))
               (else
