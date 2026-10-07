@@ -2,6 +2,12 @@
 ;;; Sole FFI layer. Shared objects must load before any foreign-procedure form
 ;;; is evaluated because Chez resolves symbols at definition time. Load libuv
 ;;; before the shim so uv_* symbols are globally available on Linux.
+;;;
+;;; tests/test-source-rules.sps holds the foreign calls below to its rules 3
+;;; to 5. A string crosses as its C string's bytes (u8*), never as a string
+;;; argument. No __collect_safe call takes an argument in Scheme memory, such
+;;; as a u8*. And every call is a foreign-procedure or shim-procedure form,
+;;; with its types spelt out where the rules can read them.
 (library (libuv private native)
   (export ;; loading and the init gate
           ensure-native-loaded! native-init-count native-initialized? init-mutex
@@ -176,19 +182,21 @@
   (define shim-compiled-version
     (shim-procedure "chez_uv_shim_compiled_version" () int))
 
-  ;; chez_uv_constant writes a C long through an out-parameter.
+  ;; chez_uv_constant writes a C long through an out-parameter. The name
+  ;; crosses as its C string's bytes, as every string does here.
   (define raw-constant
-    (shim-procedure "chez_uv_constant" (string uptr) int))
+    (shim-procedure "chez_uv_constant" (u8* uptr) int))
 
   (define raw-errno-count (shim-procedure "chez_uv_errno_count" () int))
   (define raw-errno-name  (shim-procedure "chez_uv_errno_name" (int) uptr))
   (define raw-errno-value (shim-procedure "chez_uv_errno_value" (int) int))
 
-  ;; Bulk byte moves (issue #35). Plain, not __collect_safe: a u8* argument
-  ;; is the bytevector's own storage, and a plain call keeps this thread
-  ;; active, so no collection can move that storage before the call returns
-  ;; (test-threading-stress.sps pins this). The price is that other threads'
-  ;; collections wait for the whole move (ADR-0009's #35 note).
+  ;; Bulk byte moves (issue #35). Plain, not __collect_safe
+  ;; (test-source-rules.sps): a u8* argument is the bytevector's own storage,
+  ;; and a plain call keeps this thread active, so no collection can move
+  ;; that storage before the call returns (test-threading-stress.sps pins
+  ;; this). The price is that other threads' collections wait for the whole
+  ;; move (ADR-0009's #35 note).
   (define raw-copy-in
     (shim-procedure "chez_uv_copy_in" (uptr u8* size_t size_t) void))
   (define raw-copy-out
@@ -358,10 +366,8 @@
     (foreign-procedure "uv_tcp_keepalive" (uptr int unsigned-int) int))
   (define uv-accept
     (foreign-procedure "uv_accept" (uptr uptr) int))
-  ;; The address is u8*, not string: Chez's string argument encodes the
-  ;; caller's string during the call, and an engine's handler or another
-  ;; thread can change it after validation (tests/test-address.sps). Plain,
-  ;; not __collect_safe, so no collection moves the bytes during the call.
+  ;; The address is u8*, not string, and the calls are plain
+  ;; (test-source-rules.sps; tests/test-address.sps).
   (define raw-ip4-addr
     (foreign-procedure "uv_ip4_addr" (u8* int uptr) int))
   (define raw-ip6-addr
@@ -393,10 +399,8 @@
     (foreign-procedure "uv_stream_get_write_queue_size" (uptr) size_t))
 
   ;; libuv copies node, service, and sockaddr inputs before these calls return.
-  ;; Node and service are u8*, not string: Chez's string argument encodes
-  ;; the caller's string during the call, and an engine's handler or another
-  ;; thread can change it after validation (tests/test-dns.sps). Plain, not
-  ;; __collect_safe, so no collection moves the bytes during the call.
+  ;; Node and service are u8*, not string, and the call is plain
+  ;; (test-source-rules.sps; tests/test-dns.sps).
   (define raw-getaddrinfo
     (foreign-procedure "uv_getaddrinfo"
                        (uptr uptr uptr u8* u8* uptr) int))
@@ -1037,14 +1041,18 @@
         (raise (make-uv-version-incompatible compiled runtime))))
 
   ;; lookup-constant : string -> (or exact-integer #f)
-  ;; Size the out-parameter as C long rather than assuming pointer width.
+  ;; Size the out-parameter as C long rather than assuming pointer width. A
+  ;; name holding a NUL names no constant, where the shim would read only
+  ;; up to the NUL (tests/test-native.sps).
   (define (lookup-constant name)
-    (let* ((out (foreign-alloc (foreign-sizeof 'long)))
-           (found (guard (e (#t (foreign-free out) (raise e)))
-                    (raw-constant name out)))
-           (value (if (zero? found) #f (foreign-ref 'long out 0))))
-      (foreign-free out)
-      value))
+    (let ((bytes (string->utf8 (string-append name "\x0;"))))
+      (and (c-string? bytes)
+           (let* ((out (foreign-alloc (foreign-sizeof 'long)))
+                  (found (guard (e (#t (foreign-free out) (raise e)))
+                           (raw-constant bytes out)))
+                  (value (if (zero? found) #f (foreign-ref 'long out 0))))
+             (foreign-free out)
+             value))))
 
   (define (errno-name-at i) (c-string->string (raw-errno-name i)))
 

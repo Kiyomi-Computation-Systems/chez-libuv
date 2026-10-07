@@ -74,6 +74,17 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
+;; The simple runner prints only a failing row's title. A row that catches a
+;; raise answers the condition as its actual value, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
 ;; Captured before this suite allocates anything.
 (define registry-count-at-start (registry-count))
 
@@ -175,9 +186,18 @@
     'no-raise))
 
 ;; --- bind and getsockname ------------------------------------------------
-(uv-tcp-bind! t0 "127.0.0.1" 0)
+;; A bind that raises fails this row by name, where at top level it would
+;; end the suite (tests/test-seed-gates.sps, rule 4). An unbound handle has
+;; no socket to name, so the port is read only after a bind.
+(define t0-bind
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! t0 "127.0.0.1" 0)
+    'bound))
 
-(define bound-port (uv-tcp-getsockname-port t0))
+(test-equal "uv-tcp-bind! binds a handle to 127.0.0.1, port 0" 'bound t0-bind)
+
+(define bound-port
+  (if (eq? t0-bind 'bound) (uv-tcp-getsockname-port t0) 'never-bound))
 
 (test-equal "binding to port 0 yields a real ephemeral port"
   'ephemeral
@@ -194,10 +214,13 @@
     (uv-tcp-bind! (make-uv-tcp l) "999.1.1.1" 0)
     'no-raise))
 
+;; The IPv6 handle the namelen row below reads.
+(define v6 (make-uv-tcp l))
+
 (test-equal "uv-tcp-bind! accepts an IPv6 address literal"
   'bound
-  (guard (e (#t (list 'raised (err->symbol e))))
-    (uv-tcp-bind! (make-uv-tcp l) "::1" 0)
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! v6 "::1" 0)
     'bound))
 
 ;; --- the namelen libuv writes back ---------------------------------------
@@ -211,10 +234,6 @@
 ;; the discriminating case, because its sockaddr_in6 is a DIFFERENT size from
 ;; the sockaddr_in every other row here produces -- a check spelled
 ;; `(= namelen (sizeof-sockaddr-in))` passes the whole suite except this row.
-(define v6 (make-uv-tcp l))
-
-(uv-tcp-bind! v6 "::1" 0)
-
 (test-equal "uv-tcp-getsockname-port answers for an IPv6 handle too, whose namelen differs"
   'ephemeral
   (guard (e ((uv-invalid-argument? e)
@@ -2029,12 +2048,13 @@
   (run-until/ticking ml (lambda () (>= (collector-count m-in) m-total))
                      delivery-cap))
 
-;; UNCONDITIONAL, not failure-gated: SRFI-64's simple runner prints only row
-;; NAMES, never expected-vs-actual, so a red row here says "the megabyte did
-;; not arrive" and nothing whatever about why. This line exists because that
-;; happened -- an intermittent failure of these three rows on CI's Linux
-;; Valgrind leg (never reproduced on macOS, nor in 5/5 aarch64 Valgrind runs)
-;; could not be diagnosed from the log at all.
+;; UNCONDITIONAL, not failure-gated. A red row here prints its actual value
+;; (the hook at the top of this suite), but no row carries the byte count
+;; or the reader's on-error as the drain ended, and a passing run gets a
+;; baseline to compare with. The line exists because an intermittent
+;; failure of these three rows on CI's Linux Valgrind leg (never reproduced
+;; on macOS, nor in 5/5 aarch64 Valgrind runs) could not be diagnosed from
+;; the log at all, when the rows printed only their names.
 ;;
 ;; The three rows fail TOGETHER whenever the transfer falls short, so the
 ;; discriminating question is which of the two causes did it: the drain ran

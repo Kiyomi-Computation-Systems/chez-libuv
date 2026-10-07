@@ -44,6 +44,24 @@
 ;;;    Rule 3 holds test-tcp.sps alone: only its ticking waits were measured
 ;;;    under a flood.
 ;;;
+;;; 4. A suite that calls an address or DNS verb calls it only where a raise
+;;;    from it fails a row: in a row's tested expression, in a procedure the
+;;;    suite defines (whose calls are then held to this rule), or in the body
+;;;    of a guard with an else or #t clause that raises nothing again. A
+;;;    verb that raises anywhere else ends the suite at that form, with no
+;;;    summary and none of the evidence after it. Under #61's mutation MA8,
+;;;    test-dns.sps died at its first lookup and test-tcp.sps at its first
+;;;    bind; under MV1, test-dns.sps died at its synthetic sockaddr (#64).
+;;;    The rule reads what runs at once: the top-level forms, the body of
+;;;    every lambda that is not a callback, a quasiquote's unquoted parts,
+;;;    and a verb passed as a value. It reads each callback's body too,
+;;;    wherever the callback was registered, because a raise there surfaces
+;;;    from the wait that runs it. It does not follow procedures a suite
+;;;    imports: tests/uv-testing.sls's bind-loopback! and connect-loopback!
+;;;    call uv-tcp-bind! and uv-tcp-connect!, and test-tcp.sps still dies at
+;;;    its first loopback fixture when every address is refused
+;;;    (.plans/ffi-and-plumbing-rules-mutation-log.md).
+;;;
 ;;; Neither of the first two rules sees a callback that raises inside a later
 ;;; wait, which a late handshake can cause. That was checked by forcing each seed to fail, in a
 ;;; scratch clone (.plans/tcp-seed-gates-mutation-log.md and
@@ -57,6 +75,17 @@
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. A row that answers
+;; what it found as its actual value fails carrying it, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 ;; The suites the scan reads. Each says how it spells a peer not yet accepted
 ;; (spelt, quoted), and names the peers no spelling finds (named): #f starts
@@ -332,6 +361,158 @@
                      (scan peers form)))
               (filter pair? forms))))
 
+;; --- rule 4 -------------------------------------------------------------------
+;; The suites that call an address or DNS verb, which a row below holds this
+;; list to, and the verbs.
+(define verb-suites
+  '("tests/test-address.sps" "tests/test-dns.sps" "tests/test-facade.sps"
+    "tests/test-flow.sps" "tests/test-native.sps" "tests/test-tcp.sps"))
+
+(define address-verbs
+  '(uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-tcp-bind! uv-tcp-connect!
+    fill-sockaddr!))
+
+;; The calls that keep a lambda argument to run later, inside uv-run: their
+;; callbacks. A raise in a callback surfaces from whichever wait runs the
+;; loop next, wherever the callback was registered.
+(define registering
+  '(uv-getaddrinfo! uv-getnameinfo! uv-tcp-connect! connect-loopback!
+    uv-listen! uv-read-start! uv-write! uv-write*! uv-shutdown! uv-close!
+    uv-timer-start! uv-signal-start! uv-signal-start-oneshot! make-uv-async
+    uv-spawn!))
+
+;; A guard clause that calls one of these raises again.
+(define raising-again
+  '(raise raise-continuable error assertion-violation syntax-violation))
+
+;; catch-all? : datum -> boolean
+;; A guard clause that catches every raise.
+(define (catch-all? clause)
+  (and (pair? clause) (memq (car clause) '(else #t)) #t))
+
+;; containing-guard? : datum -> boolean
+;; A guard with a catch-all clause, none of whose clauses raises again.
+(define (containing-guard? x)
+  (and (eq? (car x) 'guard) (pair? (cdr x)) (pair? (cadr x))
+       (list? (cdadr x)) (exists catch-all? (cdadr x))
+       (not (exists (lambda (clause)
+                      (exists (lambda (r) (calls? clause r)) raising-again))
+                    (cdadr x)))))
+
+;; procedure-body : datum -> (list-of datum) or #f
+;; The body of the procedure FORM defines, as (define (f ...) ...) or
+;; (define f (lambda ...)) or (define f (case-lambda ...)), else #f.
+(define (procedure-body form)
+  (and (pair? form) (eq? (car form) 'define) (pair? (cdr form))
+       (cond ((pair? (cadr form)) (cddr form))
+             ((and (pair? (cddr form)) (pair? (caddr form))
+                   (memq (car (caddr form)) '(lambda case-lambda)))
+              (cdr (caddr form)))
+             (else #f))))
+
+;; lambda-body : datum -> (list-of datum) or #f
+;; The body forms of a lambda or case-lambda form, else #f.
+(define (lambda-body x)
+  (cond ((not (pair? x)) #f)
+        ((and (eq? (car x) 'lambda) (pair? (cdr x))) (cddr x))
+        ((eq? (car x) 'case-lambda)
+         (apply append (map (lambda (clause) (if (pair? clause) (cdr clause) '()))
+                            (filter pair? (proper-part (cdr x))))))
+        (else #f)))
+
+;; proper-part : datum -> list
+;; The elements of X up to its first non-pair tail.
+(define (proper-part x)
+  (if (pair? x) (cons (car x) (proper-part (cdr x))) '()))
+
+;; escaping : (list-of symbol) (list-of symbol) datum -> (list-of symbol)
+;; Each call of NAMES in FORM that a raise would leave FORM from, and each of
+;; VERBS FORM passes as a value, which whatever receives it may call at once,
+;; once per occurrence. Contained: a row's tested expression, a procedure
+;; definition (raising-procedures checks it), a callback (callbacks hands its
+;; body to this walk separately), quoted data, an import, and the body of a
+;; guard with a catch-all clause that raises nothing again. Any other lambda
+;; may run at once, so its body counts, and so do a quasiquote's unquoted
+;; parts.
+(define (escaping names verbs form)
+  (define (walk x)
+    (cond ((symbol? x) (if (memq x verbs) (list x) '()))
+          ((not (pair? x)) '())
+          ((memq (car x) '(quote import)) '())
+          ((eq? (car x) 'quasiquote) (unquoted (cdr x)))
+          ((procedure-body x) '())
+          ((lambda-body x) => walk-each)
+          ((and (memq (car x) row-heads) (list? (cdr x)))
+           (walk-each (all-but-last (cdr x))))
+          ((containing-guard? x) (walk-each (cdadr x)))
+          ((symbol? (car x))
+           (append (if (memq (car x) names) (list (car x)) '())
+                   (walk-each (if (memq (car x) registering)
+                                  (filter (lambda (arg) (not (lambda-body arg)))
+                                          (proper-part (cdr x)))
+                                  (cdr x)))))
+          (else (walk-each x))))
+  (define (walk-each xs)
+    (if (pair? xs) (append (walk (car xs)) (walk-each (cdr xs))) '()))
+  (define (unquoted x)
+    (cond ((not (pair? x)) '())
+          ((memq (car x) '(unquote unquote-splicing)) (walk-each (cdr x)))
+          (else (append (unquoted (car x)) (unquoted (cdr x))))))
+  (walk form))
+
+;; callbacks : datum -> (list-of datum)
+;; The body forms of every lambda passed to a registering call within X,
+;; outside quoted data: in plumbing, procedure bodies, rows and other
+;; callbacks alike.
+(define (callbacks x)
+  (cond ((not (pair? x)) '())
+        ((eq? (car x) 'quote) '())
+        (else
+         (append (if (memq (car x) registering)
+                     (apply append (filter list? (map lambda-body (proper-part (cdr x)))))
+                     '())
+                 (apply append (map callbacks (proper-part x)))))))
+
+;; procedure-definitions : datum -> (list-of (symbol . body))
+;; Each procedure defined within X, at any depth outside quoted data, with
+;; its body.
+(define (procedure-definitions x)
+  (cond ((not (pair? x)) '())
+        ((eq? (car x) 'quote) '())
+        ((procedure-body x)
+         => (lambda (body)
+              (cons (cons (let ((head (cadr x))) (if (pair? head) (car head) head))
+                          body)
+                    (apply append (map procedure-definitions body)))))
+        (else (apply append (map procedure-definitions (proper-part x))))))
+
+;; raising-procedures : (list-of symbol) (list-of datum) -> (list-of symbol)
+;; The procedures FORMS define whose bodies a raise from one of VERBS, or
+;; from another such procedure, can leave, in the order found.
+(define (raising-procedures verbs forms)
+  (let ((defs (apply append (map procedure-definitions forms))))
+    (let grow ((found '()))
+      (let ((more
+             (map car
+                  (filter (lambda (def)
+                            (and (not (memq (car def) found))
+                                 (exists (lambda (body-form)
+                                           (pair? (escaping (append verbs found)
+                                                            verbs body-form)))
+                                         (cdr def))))
+                          defs))))
+        (if (null? more) found (grow (append found more)))))))
+
+;; uncaught : (list-of symbol) (list-of datum) -> (list-of list)
+;; Rule 4's findings in a suite's FORMS: each call of VERBS, or of a
+;; procedure raising-procedures finds, that a raise would leave the suite
+;; from, in its plumbing or in a callback's body, and each verb passed as a
+;; value there, as (name head first-argument) of the form it is in.
+(define (uncaught verbs forms)
+  (findings (lambda (names form) (escaping names verbs form))
+            (append verbs (raising-procedures verbs forms))
+            (append (plumbing forms) (apply append (map callbacks forms)))))
+
 ;; scan : list (list-of datum) -> list
 ;; What the rows below hold for one suite, from its SPEC (its entry in
 ;; suites, less the path) and its FORMS: the placeholders found, what an
@@ -572,6 +753,120 @@
 
 (test-equal "no ticking wait in test-tcp.sps gives up sooner than a delivery took during a loopback flood"
   '() short-findings)
+
+;; Rule 4, first on seeded forms: what the scan must report, then what it
+;; must not. uv-cancel! stands in for a verb passed as a value.
+(test-equal "rule 4 flags a verb a raise would leave the suite from, and only that"
+  '((v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (v) (uv-cancel!) (uv-cancel!)
+    () () () () () () () () () () () ())
+  (map (lambda (form) (escaping '(v) '(v uv-cancel!) form))
+       '((v 1)
+         (define x (v 1))
+         (let loop ((i 0)) (when (< i 2) (v i) (loop (+ i 1))))
+         (test-equal (v 1) 'expected (f))
+         (test-equal "row" (v 1) (f))
+         (guard (e ((symbol? e) 'caught)) (v 1))
+         (guard (e (#t (v 2))) (f))
+         (guard (e (#t (display "cleanup") (raise e))) (v 1))
+         (guard (e (else (error 'start "failed" e))) (v 1))
+         (guard (e (#t (raise-continuable e))) (v 1))
+         (define x `(a ,(v 1)))
+         (f `(a ,@(v 1)))
+         (for-each (lambda (i) (v i)) '(1 2))
+         ((lambda () (v 1)))
+         (g (case-lambda (() (v 1))))
+         (for-each uv-cancel! reqs)
+         (define cancel uv-cancel!)
+         (test-equal "row" 'started (v 1))
+         (test-assert "row" (v 1))
+         (define (f) (v 1))
+         (define f (lambda () (v 1)))
+         (define f (case-lambda (() (v 1))))
+         (uv-getaddrinfo! l "127.0.0.1" "80" (lambda (err results) (v 1)))
+         (uv-getaddrinfo! l "127.0.0.1" "80" (case-lambda ((err results) (v 1))))
+         (guard (e (#t 'caught)) (v 1))
+         (guard (e (else 'caught)) (v 1))
+         (define x '(v 1))
+         (define x `(v 1))
+         (import (only (lib) uv-cancel!)))))
+
+(test-equal "rule 4 reads each callback's body, wherever it was registered, and only callbacks"
+  '((v n) (v 2) (uv-read-start! p (lambda (bv start end) (v 3))) (v 3))
+  (apply append
+         (map callbacks
+              '((define (h n) (uv-getaddrinfo! l "x" "80" (lambda (err results) (v n))))
+                (test-equal "row" 'started
+                  (uv-tcp-connect! c "127.0.0.1" 80 (lambda (err) (v 2))))
+                (uv-listen! s 1 (lambda (err)
+                                  (uv-read-start! p (lambda (bv start end) (v 3)))))
+                (other (lambda () (v 4)))
+                (define x '(uv-close! h (lambda () (v 5))))))))
+
+;; Found a round at a time: those that call a verb, then their callers.
+(test-equal "a procedure a raise from a verb can leave counts as one, through another too"
+  '(a d g i b c)
+  (raising-procedures '(v)
+                      '((define (c) (b))
+                        (define (a) (v 1))
+                        (define b (lambda () (a)))
+                        (define d (case-lambda (() (v 1))))
+                        (define (e) (guard (e (#t #f)) (v 1)))
+                        (define (f) (test-equal "row" 1 (v 1)))
+                        (define (g) (for-each (lambda (x) (v x)) '(1)))
+                        (define (h) (uv-getaddrinfo! l "x" "80" (lambda (err r) (v 1))))
+                        (with-loop (lambda (loop) (define (i) (v 1)) (i)))
+                        (define x (v 1)))))
+
+(test-equal "rule 4's findings name each call with its form's head and first argument, in a body that runs at once and in a callback"
+  '((a a ()) (v v 2) (a define x) (v v n))
+  (uncaught '(v)
+            '((define (a) (v 1))
+              (a)
+              (with-loop (lambda (l) (v 2)))
+              (define x (a))
+              (test-equal "row" 1 (a))
+              (define (h n) (uv-getaddrinfo! l "x" "80" (lambda (err r) (v n)))))))
+
+;; Live: a list naming a verb these suites never call, or a scan that read
+;; no file or no procedure, would pass the rows after it.
+(define verb-suite-forms (map read-forms verb-suites))
+
+(test-equal "rule 4's scan is live: it reads each suite, each verb is called there, and test-dns.sps's raising procedures are found"
+  'live
+  (let ((uncalled (filter (lambda (verb)
+                            (not (exists (lambda (forms)
+                                           (exists (lambda (f) (calls? f verb)) forms))
+                                         verb-suite-forms)))
+                          address-verbs))
+        (dns-procedures (raising-procedures address-verbs
+                                            (cadr (assoc "tests/test-dns.sps"
+                                                         (map list verb-suites
+                                                              verb-suite-forms))))))
+    (if (and (for-all pair? verb-suite-forms) (null? uncalled)
+             (memq 'h-submit! dns-procedures)
+             (memq 'make-synthetic-sockaddr dns-procedures))
+        'live
+        (list 'forms (map length verb-suite-forms) 'uncalled uncalled
+              'dns-procedures dns-procedures))))
+
+;; The list holds every suite that calls a verb: a new one joins it by
+;; failing this row.
+(test-equal "rule 4 reads exactly the suites that call an address or DNS verb"
+  verb-suites
+  (filter (lambda (path)
+            (let ((forms (read-forms path)))
+              (exists (lambda (verb) (exists (lambda (f) (calls? f verb)) forms))
+                      address-verbs)))
+          (suite-files)))
+
+(for-each
+ (lambda (path forms)
+   (let ((found (uncaught address-verbs forms)))
+     (report path "uncaught" found)
+     (test-equal (string-append "no plumbing or callback in " path
+                                " calls an address or DNS verb where a raise would end the suite")
+       '() found)))
+ verb-suites verb-suite-forms)
 
 (test-end "seed-gates")
 

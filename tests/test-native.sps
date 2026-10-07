@@ -544,6 +544,18 @@
   (uv-eof)
   (constant-ref 'UV_EOF))
 
+;; A name holding a NUL names no constant. The shim reads a name as a C
+;; string, up to its first NUL, so this one resolved to UV_EOF's value
+;; while names crossed as Chez strings (#64).
+(define nul-name (string->symbol "UV_EOF\x0;junk"))
+
+(test-equal "a constant name holding a NUL names no constant, not the one before its NUL"
+  (list 'unavailable nul-name)
+  (guard (e ((uv-constant-unavailable? e)
+             (list 'unavailable (uv-constant-unavailable-name e)))
+            (#t (list 'wrong-condition (describe e))))
+    (list 'answered (constant-ref nul-name))))
+
 ;; --- errno enumeration (ADR-0006) ---------------------------------------
 (test-equal "the errno enumeration is non-empty"
   #t (positive? (errno-count)))
