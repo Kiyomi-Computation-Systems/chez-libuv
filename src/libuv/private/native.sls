@@ -51,7 +51,7 @@
 
           ;; shared validators and boundary helpers
           fill-sockaddr! align-16
-          validate-address require-port fold-flags proper-length
+          validate-address require-port
           require-callback
           signal-symbol->int term-signal->value
 
@@ -678,56 +678,6 @@
   (define (require-port port who)
     (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
       (raise (make-uv-invalid-argument who 'port-out-of-range))))
-
-  ;; fold-flags : object symbol symbol (object -> exact-integer)
-  ;;              -> exact-integer
-  ;; The bitwise-ior of (BIT flag) over a caller's flag list, which is read
-  ;; once: its length from proper-length, #f for an improper or circular list
-  ;; and then the refusal (WHO, REASON), then at most that many pairs, each
-  ;; checked as it is read. A list changed during the walk is refused, or
-  ;; read as each pair stood when the walk reached it, and never walked
-  ;; forever. Asking list? first would leave a gap an engine's handler can
-  ;; change the list in, and fold-left walks a list made circular there
-  ;; forever (tests/test-address.sps's flags sweeps). Nothing here
-  ;; allocates (tests/test-native.sps).
-  (define (fold-flags flags who reason bit)
-    (let ((n (proper-length flags)))
-      (unless n
-        (raise (make-uv-invalid-argument who reason)))
-      (let walk ((rest flags) (left n) (bits 0))
-        (cond ((zero? left) bits)
-              ((not (pair? rest))
-               (raise (make-uv-invalid-argument who reason)))
-              (else
-               (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest)))))))))
-
-  ;; proper-length : object -> (or exact-nonnegative-integer #f)
-  ;; X's length when it is a proper list, else #f. One walk, which ends at
-  ;; the list's end, at a non-pair, or back at the pair it last marked. The
-  ;; mark moves to the pair the walk stands on each time the count reaches a
-  ;; power of two (Brent's check), so a cycle of any length is found within
-  ;; twice its length. It raises nothing and allocates nothing, where length
-  ;; raises and a guard around it allocates.
-  ;;
-  ;; The list can change during the count, from an engine's handler or
-  ;; another thread. The walk takes each cdr once, of a value it has just
-  ;; found to be a pair, and only compares the mark with eq?, so no change
-  ;; makes it read through a non-pair, and once the changes stop it ends.
-  ;; #61's count walked a tortoise behind its hare along the list's links:
-  ;; one change could cut the tortoise's way, and two could leave the two on
-  ;; separate cycles, where the count never ended (#64 and its review).
-  ;;
-  ;; A count can be stale all the same: by the time it returns, the list may
-  ;; be improper, circular or of another length. So a caller walks at most
-  ;; that many pairs, checking each one, as fold-flags does, and where a
-  ;; list read twice would matter requires the list's end after them, as
-  ;; read-segments does.
-  (define (proper-length x)
-    (let walk ((p x) (n 0) (mark #f) (lap 1))
-      (cond ((null? p) n)
-            ((or (not (pair? p)) (eq? p mark)) #f)
-            ((= n lap) (walk (cdr p) (+ n 1) p (* 2 lap)))
-            (else (walk (cdr p) (+ n 1) mark lap)))))
 
   (define (require-callback proc who reason)
     (unless (procedure? proc)

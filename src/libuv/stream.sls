@@ -17,6 +17,7 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
+          (only (libuv private lists) proper-length)
           (libuv private handles))
 
   ;; Passing a non-stream handle to libuv stream functions is undefined.

@@ -18,6 +18,7 @@
         (rnrs mutable-pairs)
         (srfi :64)
         (libuv private native)
+        (libuv private lists)
         (libuv private constants)
         (libuv private conditions)
         (libuv private config)
@@ -1749,7 +1750,12 @@
 ;; list began with, without raising; a count it answers can be stale, which
 ;; is why uv-write*! walks to the end it counted. Each sweep stops at the
 ;; first run no expiry reached, or a run whose resumes ran out.
-(define (length-sweep change!)
+(define (length-sweep change!) (list-sweep proper-length change!))
+
+;; list-sweep : (list -> answer) (list -> any) -> (list-of (fuel answer expired?))
+;; OP on a fresh twelve-element list in an engine at rising fuel, with
+;; CHANGE! made to the list at the first expiry.
+(define (list-sweep op change!)
   (let next ((fuel 1) (acc '()))
     (let* ((l (iota* 12))
            (expired #f)
@@ -1757,7 +1763,7 @@
             (let run ((eng (make-engine
                             (lambda ()
                               (guard (e (#t (list 'raised (describe e))))
-                                (proper-length l)))))
+                                (op l)))))
                       (ticks fuel)
                       (resumes 0))
               (eng ticks
@@ -1811,6 +1817,103 @@
                  (let ((last-run (list-ref runs (- (length runs) 1))))
                    (if (caddr last-run) 'expired (cadr last-run))))))
        length-sweeps))
+
+;; --- read-proper-list: a caller's list, read once (#66) -------------------
+;; read-proper-list counts with proper-length, walks at most that many
+;; pairs, checking each, and requires the list's end after them. Its READ
+;; sees each element once, in order, and its answer is a fresh list or #f.
+
+;; read-trace : object -> (list answer elements-read)
+;; What read-proper-list answered for X, 'refused for #f, with the elements
+;; its READ saw, in the order it saw them. It reads in an engine, and a
+;; read still running after 100 resumes of 100000 ticks answers 'stuck, so
+;; a read that never ends fails its row instead of hanging the suite.
+(define (read-trace x)
+  (let* ((seen '())
+         (answer
+          (let run ((eng (make-engine
+                          (lambda ()
+                            (guard (e (#t (list 'raised (describe e))))
+                              (or (read-proper-list
+                                   x (lambda (element)
+                                       (set! seen (cons element seen))
+                                       (list 'read element)))
+                                  'refused)))))
+                    (resumes 0))
+            (eng 100000
+                 (lambda (left v) v)
+                 (lambda (more)
+                   (if (= resumes 100) 'stuck (run more (+ resumes 1))))))))
+    (list answer (reverse seen))))
+
+(define (read-all l) (read-proper-list l (lambda (e) e)))
+
+(test-equal "read-proper-list reads each element once, in order, into a fresh list"
+  '((((read a) (read b) (read c)) (a b c)) equal unshared)
+  (let* ((l (list 'a 'b 'c))
+         (copy (read-all l)))
+    (list (read-trace l)
+          (if (equal? copy l) 'equal (list 'copy-was copy))
+          (if (and (pair? copy)
+                   (exists (lambda (p) (memq p (list l (cdr l) (cddr l))))
+                           (list copy (cdr copy) (cddr copy))))
+              'shared
+              'unshared))))
+
+(test-equal "read-proper-list reads () as (), and refuses a non-list, an improper list or a circular one, reading none of it"
+  '((() ()) (refused ()) (refused ()) (refused ()) (refused ()))
+  (map read-trace
+       (list '()
+             42
+             (cons 'a 'b)
+             (cons 'a (cons 'b 'c))
+             (let ((l (list 'a 'b 'c)))
+               (set-cdr! (cddr l) l)
+               l))))
+
+;; The read sweeps change the list at the first expiry, as the count's do,
+;; and add a splice: the third pair's cdr becomes a longer list. A read the
+;; splice reaches has a stale count, and stops short of the list's end; a
+;; read that did not require the end would answer the twelve elements it
+;; walked, a list the caller never had. A run must answer the list as it
+;; was, the list as the change left it, or #f.
+(define splice-tail (map (lambda (i) (+ 100 i)) (iota* 20)))
+
+;; (name change! the-list-as-changed-or-#f)
+(define read-variants
+  (list (list 'cut (lambda (l) (set-cdr! (cddr l) (vector 'not 'a 'pair))) #f)
+        (list 'made-circular (lambda (l) (set-cdr! (cddr l) l)) #f)
+        (list 'two-cycles two-cycles! #f)
+        (list 'spliced-longer (lambda (l) (set-cdr! (cddr l) splice-tail))
+              (append '(0 1 2) splice-tail))))
+
+(define read-sweeps
+  (map (lambda (v) (cons (car v) (list-sweep read-all (cadr v)))) read-variants))
+
+(test-equal "read-proper-list answers a list changed during the read as it was, as the change left it, or #f, never raising"
+  '()
+  (apply append
+         (map (lambda (v s)
+                (map (lambda (run) (cons (car s) run))
+                     (filter (lambda (run)
+                               (let ((answer (cadr run)))
+                                 (not (or (not answer)
+                                          (equal? answer (iota* 12))
+                                          (and (caddr v) (equal? answer (caddr v)))))))
+                             (cdr s))))
+              read-variants read-sweeps)))
+
+;; The row above finds no bad answer, which says nothing unless each sweep
+;; changed the list before the read began and ran the last read whole.
+(test-equal "each read-proper-list sweep changed the list before the read began and ended with a read no expiry reached"
+  (map (lambda (v) (list (car v) (list 1 (caddr v) #t) (iota* 12))) read-variants)
+  (map (lambda (s)
+         (let ((runs (cdr s)))
+           (list (car s)
+                 (car runs)
+                 (let ((last-run (list-ref runs (- (length runs) 1))))
+                   (if (caddr last-run) 'expired (cadr last-run))))))
+       read-sweeps))
 
 ;; --- proper-length against changes nobody chose ---------------------------
 ;; The sweeps above make the changes a reader thought of; one reader thought
@@ -1891,27 +1994,28 @@
       'changed-mid-count
       (list 'changed trials-changed)))
 
-;; --- proper-length against a list another thread changes ------------------
+;; --- proper-length and read-proper-list against another thread ----------
 ;; Another thread can change a list between any two instructions, where an
 ;; engine stops only at a trap check. A flipper turns the third pair's cdr
-;; between a vector and the rest of the list while this thread counts the
-;; list, and every count must answer #f or 12 without raising. A count that
-;; read a cdr twice, checking it the first time, would take the cdr of the
-;; vector the second: the shape #61's count had, which no engine sweep can
-;; split. As in test-addrinfo's cross-thread row, the row asserts only what
-;; no schedule can make fail on a right answer, and the informational line
-;; counts the counts the flipper's change reached.
+;; between a vector and the rest of the list while this thread counts or
+;; reads the list. Every count must answer #f or 12, and every read #f or
+;; the list, without raising. A count or read that took a cdr twice,
+;; checking it the first time, would read through the vector the second:
+;; the shape #61's count had, which no engine sweep can split. As in
+;; test-addrinfo's cross-thread row, the rows assert only what no schedule
+;; can make fail on a right answer, and the informational lines count the
+;; counts and reads the flipper's change reached.
 ;;
-;; A flipper that never ran, or stopped, would leave that row passing. So
-;; before the first count and after the last, the race waits up to
-;; race-wait-cap steps to see the flipper cut the list and make it whole
+;; A flipper that never ran, or stopped, would leave those rows passing. So
+;; before the first count or read and after the last, each race waits up
+;; to race-wait-cap steps to see the flipper cut the list and make it whole
 ;; again, and a precondition row holds both. The first wait also holds the
 ;; race until the flipper is flipping. The race finds the pair it watches
-;; through l, the list each count is given, so a flipper changing any other
+;; through l, the list each call is given, so a flipper changing any other
 ;; list fails that row too, and so does one that never makes the list
 ;; whole, which no count could tell from a cut. Not under Valgrind, which
 ;; runs one thread at a time.
-(define count-race-rounds 100000)
+(define list-race-rounds 100000)
 (define race-wait-cap 100000000)
 
 ;; watch-flipper : pair object object -> (or 'flipping 'not-flipping)
@@ -1924,9 +2028,11 @@
           ((and seen-cut (eq? (cdr p) whole)) 'flipping)
           (else (wait (+ k 1) seen-cut)))))
 
-;; count-race : -> (list rounds bad first-bad cut before after)
-;; It stops the flipper and joins it before it answers.
-(define (count-race)
+;; list-race : (list -> answer) answer -> (list rounds bad first-bad cut before after)
+;; OP's answers for a list another thread changes: WHOLE is its answer for
+;; the list as it began, and #f, counted as cut, its answer for the list
+;; cut. It stops the flipper and joins it before it answers.
+(define (list-race op whole)
   (let* ((l (iota* 12))
          (p (list-tail l 2))
          (rest (cdr p))
@@ -1943,11 +2049,11 @@
          (before (watch-flipper (list-tail l 2) v rest)))
     (let ((result
            (let round ((r 0) (bad 0) (first-bad #f) (cut 0))
-             (if (= r count-race-rounds)
+             (if (= r list-race-rounds)
                  (list r bad first-bad cut)
                  (let ((answer (guard (e (#t (list 'raised (describe e))))
-                                 (proper-length l))))
-                   (cond ((eqv? answer 12) (round (+ r 1) bad first-bad cut))
+                                 (op l))))
+                   (cond ((equal? answer whole) (round (+ r 1) bad first-bad cut))
                          ((not answer) (round (+ r 1) bad first-bad (+ cut 1)))
                          (else (round (+ r 1) (+ bad 1)
                                       (or first-bad (list r answer)) cut))))))))
@@ -1958,10 +2064,10 @@
 
 (if (getenv "CHEZ_LIBUV_UNDER_VALGRIND")
     (begin
-      (display "  [informational] proper-length race: skipped under Valgrind,")
-      (display " which runs one thread at a time")
+      (display "  [informational] proper-length and read-proper-list races:")
+      (display " skipped under Valgrind, which runs one thread at a time")
       (newline))
-    (let ((race (count-race)))
+    (let ((race (list-race proper-length 12)))
       (display "  [informational] proper-length race: ")
       (display (cadddr race))
       (display " of ")
@@ -1969,12 +2075,25 @@
       (display " counts found the list cut")
       (newline)
       (test-equal "proper-length answers #f or 12 for a list another thread changes, never raising"
-        (list count-race-rounds 0 #f)
+        (list list-race-rounds 0 #f)
         (list (car race) (cadr race) (caddr race)))
       ;; The row above says nothing unless the flipper was changing the list.
       (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
         '(flipping flipping)
-        (list-tail race 4))))
+        (list-tail race 4))
+      (let ((race (list-race read-all (iota* 12))))
+        (display "  [informational] read-proper-list race: ")
+        (display (cadddr race))
+        (display " of ")
+        (display (car race))
+        (display " reads found the list cut")
+        (newline)
+        (test-equal "read-proper-list answers #f or the list for a list another thread changes, never raising"
+          (list list-race-rounds 0 #f)
+          (list (car race) (cadr race) (caddr race)))
+        (test-equal "precondition: the read race's flipper was changing the read list before the first read and after the last"
+          '(flipping flipping)
+          (list-tail race 4)))))
 
 
 ;; The flags were measured with a guarded length, and a guard costs a few
