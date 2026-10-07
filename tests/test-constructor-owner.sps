@@ -182,12 +182,14 @@
         (make-verb 'uv-getnameinfo! pending-cell getnameinfo-call uv-dns-request?)))
 
 ;; attempt : verb uv-loop object -> list
-;; Calls V, answering (made), (wrong-thread who expected actual), or
-;; (returned x) for anything else it answered.
+;; Calls V, answering (made), (wrong-thread who expected actual), (returned
+;; x) for anything else it answered, or (raised ...) for anything else it
+;; raised. It raises nothing, so a row always reaches its loop's teardown.
 (define (attempt v loop ctx)
   (guard (e ((uv-wrong-thread? e)
              (list 'wrong-thread (uv-wrong-thread-who e)
-                   (uv-wrong-thread-expected e) (uv-wrong-thread-actual e))))
+                   (uv-wrong-thread-expected e) (uv-wrong-thread-actual e)))
+            (#t (list 'raised (describe e))))
     (let ((x ((verb-call v) loop ctx)))
       (if ((verb-made? v) x) '(made) (list 'returned x)))))
 
