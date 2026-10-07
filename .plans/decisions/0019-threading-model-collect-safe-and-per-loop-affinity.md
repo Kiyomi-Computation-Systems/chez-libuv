@@ -242,6 +242,10 @@ drains a caller-side queue rather than assuming one item per send.
 >       again, and marks the pipes, registers the process or cleans up
 >       inside it (ADR-0015, the amendment to decision 5). A drop between
 >       its allocations and that step still loses both blocks.
+>     - Its drops were closed the same day (#63): the step allocates the
+>       process handle and the options block, and builds the block, so
+>       `uv-spawn!` holds nothing before it (ADR-0015, the amendment to
+>       decision 1). `tests/test-process.sps`'s drop sweeps hold it.
 >   - The scratch verbs (bind, the address and port queries, the buffer
 >     sizes): one or two blocks lost.
 >   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,

@@ -5,8 +5,10 @@
   valgrind). Amended 2026-10-06: decision 1's block is sized and filled from
   the caller's data as read once, never from the data itself; and decision
   5's state is foreclosed by checks made in the step that spawns, which also
-  holds decisions 2 and 3's cleanup and registration — see the dated notes
-  after decisions 1 and 5.
+  holds decisions 2 and 3's cleanup and registration; and (#63) that step
+  also allocates the process handle and makes decision 1's block, so a
+  dropped engine strands neither — see the dated notes after decisions 1
+  and 5.
 - **Date:** 2026-08-21
 - **Scope:** chez-libuv v0.3
 - **Related:** [design spec](../2026-08-21-chez-libuv-v0.3-process-design.md) §4.3, §5.5, §5.6, §7 (V1, V3),
@@ -122,6 +124,24 @@ to a struct instead of a payload.
 > again, so lists are walked a checked pair at a time. The fill refuses a
 > string that would not fit in the block, a bound `copy-in!` does not have.
 > Evidence and the mutations: `.plans/spawn-read-once-mutation-log.md`.
+
+> **Amended 2026-10-06 (#63): the block is made in the step that spawns.**
+> `uv-spawn!` allocated the process handle, then allocated and built this
+> block, and only then entered the interrupt-free step that calls
+> `uv_spawn` (the amendment to decision 5). An engine dropped in between,
+> as a scheduler's timeout drops a task, runs nothing more, so it lost the
+> handle, or the handle and the block: 124 of 190 dropped runs on main
+> (a473313). Now the block's layout (its size and offsets) is worked out
+> from the request before the step, and the step allocates the handle and
+> the block, builds the block, spawns and frees it. Before the step the
+> verb holds nothing, so a drop strands nothing; after it the loop holds
+> the process. The block is still freed the moment `uv_spawn` returns.
+> Inside the step nothing raises: the allocations answer 0 rather than
+> raise, a string that would not fit is answered as a status that the verb
+> raises after the step, and the strings are copied without the
+> per-string interrupt bracket `copy-in!` adds. A spawn allocates 992 B
+> less for argv of 3 and 4,832 B less with a 40-string env. Evidence and
+> the mutations: `.plans/spawn-drop-mutation-log.md`.
 
 **2. Cleanup after a nonzero rc is class-dependent, and the class is decided
 by whether the loop still owns the handle — never by the errno.** Both

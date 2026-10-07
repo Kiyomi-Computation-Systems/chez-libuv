@@ -1353,7 +1353,7 @@
 ;; the registry's size and the options blocks held once the run's handles
 ;; exist. found is what the change found: the step 'run or 'not-run, or
 ;; 'no-expiry. built says whether the change found the run's options block
-;; allocated, which it is only just before the step.
+;; allocated, which it never does: the step makes it and frees it.
 (define-record-type state-run
   (fields fuel loop setup registered-before blocks-before
           (mutable found state-run-found set-state-run-found!)
@@ -1595,11 +1595,13 @@
 
 ;; The rows above look for wrong verdicts and must find none, which says
 ;; nothing unless each sweep saw its change land from the start of the call
-;; right up to the step, where the options block is built, and ran the spawn
-;; to its end. Nothing after the step can expire, so on this code no change
-;; lands after it: every run before the last is refused.
-(test-equal "each state sweep saw its change land from the start of the call up to the spawn's step, and ended in a run no expiry reached"
-  (map (lambda (v) (list (state-variant-name v) 'before #t 'untouched)) state-variants)
+;; and ran the spawn to its end. The step makes the options block and frees
+;; it, so no change finds it built: one that did would have landed after an
+;; allocation the step had not made, which a dropped engine strands (the
+;; drop sweeps below). Nothing after the step can expire, so on this code
+;; no change lands after it: every run before the last is refused.
+(test-equal "each state sweep saw its change land from the start of the call, never with the options block built, and ended in a run no expiry reached"
+  (map (lambda (v) (list (state-variant-name v) 'before #f 'untouched)) state-variants)
   (map (lambda (sweep)
          (let ((rows (cdr sweep)))
            (list (car sweep)
@@ -1607,6 +1609,152 @@
                  (and (exists caddr rows) #t)
                  (cadr (list-ref rows (- (length rows) 1))))))
        state-sweeps))
+
+;; --- an engine dropped during the call -------------------------------------
+;; A scheduler can drop a task at its engine's expiry, as a timeout does,
+;; and never resume it. Nothing after the expiry then runs: no guard, and no
+;; dynamic-wind exit but the one taken at the suspension itself. Whatever
+;; uv-spawn! holds at that moment and has not handed to libuv or the loop is
+;; lost. It allocated the process handle, then built the options block, and
+;; only then entered the step that spawns, so a drop in between lost the
+;; handle, or the handle and the options block: 124 of 190 dropped runs on
+;; a473313. Now the step allocates both, builds the options block, spawns
+;; and frees it. Before the step the verb holds nothing a drop can strand,
+;; and after it the loop holds the process.
+;;
+;; Each sweep runs a spawn in an engine at rising fuel, each run on a loop
+;; of its own, and drops the engine at its first expiry, noting whether the
+;; step had run: the step marks the run's pipe consumed. The run then closes
+;; the pipe, waits for any child the spawn started, and tears its loop down,
+;; which must finish. It must leave the options blocks, processes, registry
+;; entries, the binding's blocks and the open descriptors as it found them.
+;; The second sweep's spawn is one libuv refuses before it forks, given an
+;; inherited stream that was never opened, so the verb still has a refusal
+;; to raise after its step, and some drops land there: the failure's
+;; cleanup must be over when the step ends. A sweep stops at its first run
+;; no expiry reached, at the fuel cap, or after its first wrong run.
+
+;; A drop variant's spawn takes the run's loop and pipe and an on-exit.
+;; UNTOUCHED is what a run no expiry reached comes to: the spawn's outcome
+;; and its child's exit.
+(define-record-type drop-variant
+  (fields name spawn untouched))
+
+(define drop-variants
+  (list
+   (make-drop-variant
+    'spawn
+    (lambda (loop pipe on-exit)
+      (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 7")
+                 (list (cons 'stdio (stdout-to pipe)))
+                 on-exit))
+    '(spawned (7 #f)))
+   (make-drop-variant
+    'refused-by-libuv
+    (lambda (loop pipe on-exit)
+      (uv-spawn! loop "/bin/cat" '("cat")
+                 (list (cons 'stdio (list (cons 'inherit-stream pipe))))
+                 on-exit))
+    '((errno EINVAL) not-yet))))
+
+;; drop-run : drop-variant exact-positive-integer -> (list fuel found verdict)
+;; FOUND is 'run or 'not-run, whether the step had run at the expiry, or
+;; 'no-expiry. The verdict is 'dropped or 'untouched, or else the evidence.
+(define (drop-run variant fuel)
+  (let* ((before (held))
+         (loop (make-uv-loop))
+         (pipe (make-uv-pipe loop))
+         (status 'not-yet)
+         (found 'no-expiry)
+         (outcome
+          ((make-engine
+            (lambda ()
+              (spawn-outcome
+               (lambda ()
+                 ((drop-variant-spawn variant)
+                  loop pipe
+                  (lambda (s g) (collect) (set! status (list s g))))))))
+           fuel
+           (lambda (ticks v) v)
+           (lambda (resume)
+             (set! found (if (pipe-connected? pipe) 'run 'not-run))
+             'dropped))))
+    (when (uv-process? outcome)
+      (run-until/ticking loop (lambda () (pair? status)) 20000))
+    (when (uv-handle-open? pipe) (uv-close! pipe))
+    (let* ((torn (spawn-outcome (lambda () (uv-loop-teardown! loop) 'torn-down)))
+           (residue (state-residue before))
+           (seen (list (if (uv-process? outcome) 'spawned outcome) status)))
+      (list fuel found
+            (cond ((not (eq? torn 'torn-down)) (list 'teardown torn seen residue))
+                  ((not (equal? residue '(0 0 0 0 0))) (list 'residue residue seen))
+                  ((eq? outcome 'dropped) 'dropped)
+                  ((equal? seen (drop-variant-untouched variant)) 'untouched)
+                  (else (list 'untouched-but seen)))))))
+
+;; drop-sweep : drop-variant -> (list-of (list fuel found verdict))
+;; A raise between runs would abort the suite, so the whole sweep is caught
+;; and its evidence handed to the rows.
+(define (drop-sweep variant)
+  (guard (e (#t (list (list 0 'no-expiry (list 'sweep-raised (describe e))))))
+    (let next ((fuel 1) (rows '()))
+      (let* ((row (drop-run variant fuel))
+             (rows (cons row rows)))
+        (if (or (eq? (cadr row) 'no-expiry)
+                (= fuel spawn-max-fuel)
+                (not (memq (caddr row) '(dropped untouched))))
+            (reverse rows)
+            (next (+ fuel 1) rows))))))
+
+(define drop-row-titles
+  '((spawn
+     . "a spawn whose engine was dropped during the call left no block, process, registry entry or descriptor behind, and its loop tore down")
+    (refused-by-libuv
+     . "a spawn libuv refused, its engine dropped during the call, left no block, process, registry entry or descriptor behind, and its loop tore down")))
+
+;; drop-sweeps : (list-of (cons name rows)), in the order the sweeps ran.
+;; Each sweep's row runs as soon as the sweep ends, as the state sweeps' do.
+(define drop-sweeps '())
+
+(for-each
+ (lambda (variant)
+   (let* ((name (drop-variant-name variant))
+          (rows (drop-sweep variant)))
+     (set! drop-sweeps (append drop-sweeps (list (cons name rows))))
+     (test-equal (cdr (assq name drop-row-titles))
+       '() (filter (lambda (row) (not (memq (caddr row) '(dropped untouched)))) rows))))
+ drop-variants)
+
+(for-each
+ (lambda (sweep)
+   (let ((dropped (lambda (found)
+                    (length (filter (lambda (row) (and (eq? (cadr row) found)
+                                                       (eq? (caddr row) 'dropped)))
+                                    (cdr sweep))))))
+     (display "  [informational] drop sweep ")
+     (display (car sweep))
+     (display ": ")
+     (display (length (cdr sweep)))
+     (display " runs, ")
+     (display (dropped 'not-run))
+     (display " dropped before the spawn's step, ")
+     (display (dropped 'run))
+     (display " after it\n")))
+ drop-sweeps)
+
+;; The rows above must find no wrong run, which says nothing unless each
+;; sweep dropped its spawn from the first expiry on and ran it to its end.
+;; A spawn that succeeds has nothing after its step that can expire, so only
+;; the refused spawn is dropped after its step, and it must be.
+(test-equal "each drop sweep dropped its spawn from fuel 1 on, after the step only where a refusal is left to raise, and ended in a run no expiry reached"
+  '((spawn dropped #f untouched) (refused-by-libuv dropped #t untouched))
+  (map (lambda (sweep)
+         (let ((rows (cdr sweep)))
+           (list (car sweep)
+                 (caddr (car rows))
+                 (and (exists (lambda (row) (eq? (cadr row) 'run)) rows) #t)
+                 (caddr (list-ref rows (- (length rows) 1))))))
+       drop-sweeps))
 
 ;; --- one pipe named twice in one spawn -------------------------------------
 ;; libuv opens each (pipe p dir) spec's end into p after it forks, so a pipe
