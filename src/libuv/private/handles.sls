@@ -20,7 +20,7 @@
           %make-uv-loop-record uv-loop?
           loop-ptr set-loop-ptr!
           loop-state set-loop-state!
-          loop-running? set-loop-running!
+          loop-running? set-loop-running! claim-loop! release-loop!
           loop-pending-error
           loop-has-pending-error? clear-loop-pending-error!
           loop-deferred-error-list set-loop-deferred-error-list!
@@ -78,7 +78,9 @@
           ;; threaded Chez (#41; tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) make-mutex mutex-acquire mutex-release
-                disable-interrupts enable-interrupts make-thread-parameter)
+                disable-interrupts enable-interrupts make-thread-parameter
+                box unbox box-cas! set-box!
+                memory-order-acquire memory-order-release)
           (libuv private conditions)
           (only (libuv private native)
                 uv-cancel
@@ -104,19 +106,82 @@
   ;; newest first and reversed at the public boundary.
   ;; owner-thread is the id of the only thread allowed to run this loop's verbs
   ;; (#20). It is set to the creating thread here and transferred to the caller
-  ;; at uv-run entry (loop.sls), so a loop may be created on one thread and run
-  ;; on another. eqv? against current-thread-id gates every handle verb.
+  ;; when uv-run claims the loop (claim-loop!), so a loop may be created on one
+  ;; thread and run on another. eqv? against current-thread-id gates every
+  ;; handle verb.
+  ;; run-mark is a box holding #t while some call holds the loop's claim
+  ;; (claim-loop!), and #f otherwise.
   (define-record-type (uv-loop-record %make-uv-loop-record uv-loop?)
     (fields (mutable ptr             loop-ptr             set-loop-ptr!)
             (mutable state           loop-state           set-loop-state!)
-            (mutable running         loop-running?        set-loop-running!)
+            (immutable run-mark      loop-run-mark)
             (mutable pending-error   loop-pending-error   set-loop-pending-error!)
             (mutable deferred-errors loop-deferred-error-list
                                      set-loop-deferred-error-list!)
             (mutable owner-thread    loop-owner-thread    set-loop-owner-thread!))
     (protocol
      (lambda (new)
-       (lambda (ptr) (new ptr 'open #f no-pending '() (current-thread-id))))))
+       (lambda (ptr) (new ptr 'open (box #f) no-pending '() (current-thread-id))))))
+
+  ;; loop-running? : uv-loop -> boolean
+  ;; Whether some call holds LOOP's claim: a run, or a close or teardown in
+  ;; progress, or a run whose frame a callback left (#45).
+  (define (loop-running? loop) (unbox (loop-run-mark loop)))
+
+  ;; set-loop-running! : uv-loop boolean -> unspecified
+  ;; Sets the mark outright, for the one caller that knows no other thread
+  ;; can hold the claim (call-with-uv-loop's exit, on a run its own thread
+  ;; left) and for the tests' forgeries. Everything else claims and releases.
+  (define (set-loop-running! loop running?)
+    (memory-order-release)
+    (set-box! (loop-run-mark loop) running?))
+
+  ;; claim-loop! : uv-loop boolean
+  ;;               -> (or uptr 'loop-running 'loop-not-open 'no-loop-pointer)
+  ;; Takes LOOP's claim and answers its pointer, or what stood in the way.
+  ;; A run, a close and a teardown each claim the loop before they touch it,
+  ;; and release it (release-loop!) when they are done, so at most one call
+  ;; on any thread is ever inside: until #78 the mark was checked and then
+  ;; set as two steps, and two threads that both passed the check ran uv_run
+  ;; on one loop at once (two callbacks at once, invalid memory references, a
+  ;; hang), or freed it under each other.
+  ;; - The mark is taken by compare-and-set, so two threads cannot both take
+  ;;   it, and in one interrupt-free step (one-step), so no engine of this
+  ;;   thread comes between the take and the owner.
+  ;; - The loop's state is read only once the claim is held. A close sets
+  ;;   it while holding the claim, so a run that claims after the close
+  ;;   finds the loop closed, never a freed pointer.
+  ;; - With TAKE-OWNER?, a successful claim also makes this thread the
+  ;;   loop's owner, in the same step (uv-run's hand-off, docs/api.md).
+  ;;   A refused claim changes nothing.
+  ;; - The acquire after the take and the release before the clear order
+  ;;   the loop's memory between the threads that hold it in turn: libuv's
+  ;;   own state, written by uv_run on one thread, is read by the next.
+  ;; box-cas! may fail with the box unchanged on some platforms, so a
+  ;; failure is a refusal only when the mark is really set.
+  (define (claim-loop! loop take-owner?)
+    (let ((mark (loop-run-mark loop)))
+      (one-step
+       (let take ()
+         (cond
+          ((box-cas! mark #f #t)
+           (memory-order-acquire)
+           (let ((ptr (open-loop-ptr loop)))
+             (if (symbol? ptr)
+                 (begin (release-mark! mark) ptr)
+                 (begin (when take-owner?
+                          (set-loop-owner-thread! loop (current-thread-id)))
+                        ptr))))
+          ((unbox mark) 'loop-running)
+          (else (take)))))))
+
+  ;; release-loop! : uv-loop -> unspecified
+  ;; Gives back the claim claim-loop! took. Only the call that holds it may.
+  (define (release-loop! loop) (release-mark! (loop-run-mark loop)))
+
+  (define (release-mark! mark)
+    (memory-order-release)
+    (set-box! mark #f))
 
   ;; require-loop-thread : uv-loop symbol -> unspecified
   ;; The single affinity predicate. Raised BEFORE any registry mutation, so a

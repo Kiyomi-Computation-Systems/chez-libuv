@@ -30,27 +30,72 @@
       ((nowait)  (uv-run-nowait))
       (else (raise (make-uv-invalid-argument who 'unknown-run-mode)))))
 
-  ;; Consume before raising so one callback failure cannot be delivered twice.
-  (define (deliver-pending-callback-error! loop)
-    (when (loop-has-pending-error? loop)
-      (let ((pending (loop-pending-error loop)))
-        (clear-loop-pending-error! loop)
-        (raise (if (condition? pending)
-                   (condition (make-uv-callback-error pending) pending)
-                   (make-uv-callback-error pending))))))
+  ;; take-pending-callback-error! : uv-loop -> (or condition #f)
+  ;; The condition to raise for LOOP's pending callback error, consumed so
+  ;; that one callback failure cannot be delivered twice, or #f. Called
+  ;; while the claim is held: once it is released, another thread's run can
+  ;; set a pending error of its own.
+  (define (take-pending-callback-error! loop)
+    (and (loop-has-pending-error? loop)
+         (let ((pending (loop-pending-error loop)))
+           (clear-loop-pending-error! loop)
+           (if (condition? pending)
+               (condition (make-uv-callback-error pending) pending)
+               (make-uv-callback-error pending)))))
+
+  (define (raise-if-error! error)
+    (when error (raise error)))
+
+  ;; claim-or-raise! : uv-loop boolean symbol -> (or uptr #f)
+  ;; claim-loop!, raising its refusal as WHO's; #f for a closed loop, which
+  ;; each caller answers in its own way.
+  (define (claim-or-raise! loop take-owner? who)
+    (let ((claimed (claim-loop! loop take-owner?)))
+      (cond ((not (symbol? claimed)) claimed)
+            ((eq? claimed 'loop-running)
+             (raise (make-uv-invalid-argument who 'loop-running)))
+            ((eq? claimed 'loop-not-open) #f)
+            (else (raise (step-refusal claimed who #f))))))
+
+  ;; holding-claim : uv-loop (-> object) -> object
+  ;; (BODY)'s value, giving LOOP's claim back first if BODY raises. A body
+  ;; left any other way, by a continuation or an engine, keeps the claim, as
+  ;; a run's frame left from a callback does.
+  (define (holding-claim loop body)
+    (guard (e (#t (release-loop! loop) (raise e)))
+      (body)))
+
+  ;; run-claimed! : uv-loop uptr exact-integer
+  ;;                -> (values exact-integer (or condition #f))
+  ;; One uv_run of LOOP, whose claim this call holds: libuv's return code,
+  ;; and the pending callback error to raise once the claim is released.
+  (define (run-claimed! loop ptr mode-int)
+    (set-loop-deferred-error-list! loop '())
+    (let ((rc (uv-loop-run ptr mode-int)))
+      (values rc (take-pending-callback-error! loop))))
 
   ;; uv-run : uv-loop [symbol] -> boolean
   ;; The boolean says whether work remains; libuv's raw integer would invert
   ;; ordinary Scheme truth tests because zero is true.
   ;;
-  ;; The loop is marked running for as long as uv_run's frame is on the
-  ;; stack, and that can outlast the call: an engine that runs out of fuel in
-  ;; a callback suspends the frame, and a continuation that escapes a
-  ;; callback abandons it, both in the middle of an iteration only a return
-  ;; into the frame can finish. So the mark is cleared when uv_run returns
-  ;; and not on the way out of the call (#45), and every verb that would run,
-  ;; close or tear the loop down meanwhile refuses it. No raise needs
-  ;; unwinding here: the seams contain every raise, and uv_run returns.
+  ;; The run holds the loop's claim (claim-loop!) for as long as uv_run's
+  ;; frame is on the stack, and that can outlast the call: an engine that
+  ;; runs out of fuel in a callback suspends the frame, and a continuation
+  ;; that escapes a callback abandons it, both in the middle of an iteration
+  ;; only a return into the frame can finish. So the claim is given back
+  ;; when uv_run returns and not on the way out of the call (#45), and every
+  ;; verb that would run, close or tear the loop down meanwhile is refused
+  ;; it. No raise needs unwinding here: the seams contain every raise, and
+  ;; uv_run returns.
+  ;;
+  ;; The claim also hands the loop to the calling thread: a loop created on
+  ;; one thread and run on another (the worker-pool handoff) becomes owned by
+  ;; whichever thread runs it. A call on another thread cannot take the
+  ;; claim while this one holds it (#78), so at most one thread runs the loop
+  ;; at a time and the transfer is unambiguous (design §6.2).
+  ;;
+  ;; The first check of the mark only keeps the order of uv-run's refusals,
+  ;; 'loop-running before an unknown mode; the claim is what refuses.
   (define uv-run
     (case-lambda
       ((loop) (uv-run loop 'default))
@@ -58,19 +103,12 @@
        (require-open-loop loop 'uv-run)
        (when (loop-running? loop)
          (raise (make-uv-invalid-argument 'uv-run 'loop-running)))
-       (let ((mode-int (run-mode->int mode 'uv-run))
-             (ptr (loop-pointer loop 'uv-run)))
-         (set-loop-deferred-error-list! loop '())
-         ;; Transfer ownership to the calling thread: a loop created on one
-         ;; thread and run on another (the worker-pool handoff) becomes owned by
-         ;; whichever thread runs it. Concurrent uv-run is already refused above,
-         ;; so at most one thread runs the loop at a time and the transfer is
-         ;; unambiguous (design §6.2).
-         (set-loop-owner-thread! loop (current-thread-id))
-         (set-loop-running! loop #t)
-         (let ((rc (uv-loop-run ptr mode-int)))
-           (set-loop-running! loop #f)
-           (deliver-pending-callback-error! loop)
+       (let* ((mode-int (run-mode->int mode 'uv-run))
+              (ptr (or (claim-or-raise! loop #t 'uv-run)
+                       (raise (make-uv-handle-closed 'loop)))))
+         (let-values (((rc error) (run-claimed! loop ptr mode-int)))
+           (release-loop! loop)
+           (raise-if-error! error)
            (not (zero? rc)))))))
 
   ;; uv-stop! : uv-loop -> unspecified
@@ -116,59 +154,85 @@
   ;; uv-loop-close! : uv-loop -> unspecified
   ;; Idempotent, but raises EBUSY while handles remain. Native state is marked
   ;; closed before freeing, then any pending callback error is delivered.
+  ;; The close holds the loop's claim, without taking the loop over, so no
+  ;; run on any thread can enter the loop it frees (#78).
   (define (uv-loop-close! loop)
     (require-loop loop 'uv-loop-close!)
-    (when (loop-running? loop)
-      (raise (make-uv-invalid-argument 'uv-loop-close! 'loop-running)))
-    (when (eq? (loop-state loop) 'open)
-      (let ((ptr (loop-pointer loop 'uv-loop-close!)))
-        (uv-check (uv-loop-close ptr) 'uv-loop-close!)
-        (set-loop-state! loop 'closed)
-        (registry-deregister! ptr)
-        (free! ptr)
-        (set-loop-ptr! loop 0)
-        (count-loop-free!)
-        (deliver-pending-callback-error! loop))))
+    (let ((ptr (claim-or-raise! loop #f 'uv-loop-close!)))
+      (when ptr
+        (let ((error (holding-claim loop (lambda () (close-claimed! loop ptr)))))
+          (release-loop! loop)
+          (raise-if-error! error)))))
+
+  ;; close-claimed! : uv-loop uptr -> (or condition #f)
+  ;; uv-loop-close!'s work on LOOP, whose claim this call holds: it raises
+  ;; libuv's refusal, and answers the pending callback error to raise once
+  ;; the claim is given back.
+  (define (close-claimed! loop ptr)
+    (uv-check (uv-loop-close ptr) 'uv-loop-close!)
+    (set-loop-state! loop 'closed)
+    (registry-deregister! ptr)
+    (free! ptr)
+    (set-loop-ptr! loop 0)
+    (count-loop-free!)
+    (take-pending-callback-error! loop))
 
   ;; Bound iterations, not wall time, so teardown is deterministic under load.
   (define max-drain-iterations 1024)
 
   (define teardown-no-error (list 'no-error))
 
-  (define (drain-step loop)
-    (guard (e ((uv-callback-error? e) e))
-      (if (uv-run loop 'default) 'work 'drained)))
+  ;; drain-step : uv-loop uptr -> (or 'work 'drained condition)
+  ;; One uv_run 'default of LOOP, whose claim this call holds.
+  (define (drain-step loop ptr)
+    (let-values (((rc error) (run-claimed! loop ptr (uv-run-default))))
+      (cond (error error)
+            ((zero? rc) 'drained)
+            (else 'work))))
 
   ;; uv-loop-teardown! : uv-loop -> unspecified
   ;; Cancel handle-less requests, close handles, drain completions, then close.
   ;; A callback failure is retained until cleanup finishes and then re-raised.
+  ;; The teardown holds the loop's claim throughout, as a run does, so no run
+  ;; on any thread can enter the loop it closes (#78), and it takes the loop
+  ;; over as a run does, since its drain runs the loop.
   (define (uv-loop-teardown! loop)
     (require-loop loop 'uv-loop-teardown!)
-    (when (loop-running? loop)
-      (raise (make-uv-invalid-argument 'uv-loop-teardown! 'loop-running)))
-    (when (eq? (loop-state loop) 'open)
-      ;; One copy of the registry serves both: a cancellation completes in a
-      ;; later run, so the loop's handles are the same after it.
-      (let-values (((handles requests) (loop-entries loop)))
-        (cancel-requests! requests)
-        (for-each close-handle! handles))
-      (let drain ((i 0) (stored teardown-no-error))
-        (let ((outcome (drain-step loop)))
-          (cond ((eq? outcome 'drained)
-                 (uv-loop-close! loop)
-                 (unless (eq? stored teardown-no-error) (raise stored)))
-                ((< i max-drain-iterations)
-                 (drain (+ i 1)
-                        (if (and (eq? stored teardown-no-error)
-                                 (not (eq? outcome 'work)))
-                            outcome
-                            stored)))
-                (else
-                 (raise (condition
-                         (make-uv-error)
-                         (make-who-condition 'uv-loop-teardown!)
-                         (make-message-condition
-                          "loop still had work after the drain bound")))))))))
+    (let ((ptr (claim-or-raise! loop #t 'uv-loop-teardown!)))
+      (when ptr
+        (let ((stored (holding-claim loop (lambda () (teardown-claimed! loop ptr)))))
+          (release-loop! loop)
+          (unless (eq? stored teardown-no-error) (raise stored))))))
+
+  ;; teardown-claimed! : uv-loop uptr -> object
+  ;; uv-loop-teardown!'s work on LOOP, whose claim this call holds. It raises
+  ;; what the drain bound or libuv's close refused, and answers the callback
+  ;; failure to raise once the claim is given back, or teardown-no-error.
+  (define (teardown-claimed! loop ptr)
+    ;; One copy of the registry serves both: a cancellation completes in a
+    ;; later run, so the loop's handles are the same after it.
+    (let-values (((handles requests) (loop-entries loop)))
+      (cancel-requests! requests)
+      (for-each close-handle! handles))
+    (let drain ((i 0) (stored teardown-no-error))
+      (let ((outcome (drain-step loop ptr)))
+        (cond ((eq? outcome 'drained)
+               (let ((error (close-claimed! loop ptr)))
+                 (cond ((not (eq? stored teardown-no-error)) stored)
+                       (error error)
+                       (else teardown-no-error))))
+              ((< i max-drain-iterations)
+               (drain (+ i 1)
+                      (if (and (eq? stored teardown-no-error)
+                               (not (eq? outcome 'work)))
+                          outcome
+                          stored)))
+              (else
+               (raise (condition
+                       (make-uv-error)
+                       (make-who-condition 'uv-loop-teardown!)
+                       (make-message-condition
+                        "loop still had work after the drain bound"))))))))
 
   ;; call-with-uv-loop : (uv-loop -> object) -> object
   ;; The body runs once: the before thunk refuses every return into it after

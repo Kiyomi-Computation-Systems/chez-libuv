@@ -64,6 +64,17 @@ engine can be suspended holding it.
 ADR-0019's amendment to decision 4 weighs this lock against a table for each
 loop.
 
+**One call inside a loop at a time.** `uv-run`, `uv-loop-close!` and
+`uv-loop-teardown!` each claim the loop, atomically, before they touch it,
+and give the claim back when they are done. While one call holds it, the
+others are refused `'loop-running`, from any thread. Running one loop from
+two threads is still a caller bug, since the loop belongs to one thread, but
+the second call is refused by name and changes nothing, not even the loop's
+owner. Until #78 both calls could get in: two of the loop's callbacks ran at
+once on two threads, `invalid memory reference` was raised out of `uv-run`,
+or both threads hung inside libuv. A run and a teardown take the loop over;
+a close does not, so a close refused `'EBUSY` leaves the loop with its owner.
+
 **A callback ends only by returning.** To end a run early, call `uv-stop!` or
 raise. A continuation that escapes a callback leaves libuv in the middle of
 an iteration that nothing can finish, so the loop stays marked running:
