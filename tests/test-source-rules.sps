@@ -42,6 +42,16 @@
 ;;;    are complete for this Chez: every parameter type its expander accepts
 ;;;    is a string type, an address type, or a scalar this suite lists.
 ;;;
+;;; 6. Process-wide state is shared by every loop's thread. ADR-0019 kept
+;;;    the handle registry unlocked because only a loop's own thread uses
+;;;    that loop's handles, but the registry is one table for every loop,
+;;;    and two loops run on two threads at once corrupted it (#70). So each
+;;;    variable a library in src/ defines at its top level and then sets,
+;;;    or binds to a table, a box, a vector, a parameter or a lock, is one
+;;;    this suite lists, saying how threads share it. A new one fails here
+;;;    until it is listed. And the variables listed as under the registry's
+;;;    lock are used only inside with-registry-lock.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -274,6 +284,132 @@
   (list-sort symbols<?
              (filter (lambda (s) (eq? (chez-verdict #f s) 'accepted)) (oblist))))
 
+;; --- process-wide state (rule 6) ------------------------------------------------
+;; A library's process-wide state is what its top-level definitions bind
+;; and something later changes: a variable a form in the library sets, or
+;; anything made by a call whose result changes in place.
+
+(define mutable-makers
+  '(make-eq-hashtable make-eqv-hashtable make-hashtable
+    make-weak-eq-hashtable make-weak-eqv-hashtable
+    make-ephemeron-eq-hashtable make-ephemeron-eqv-hashtable
+    box make-vector vector make-bytevector make-string
+    make-thread-parameter make-parameter make-mutex make-condition))
+
+;; library-body : datum -> (list-of datum)
+;; The forms after a library form's name, export and import.
+(define (library-body lib)
+  (if (and (list? lib) (>= (length lib) 4)) (cddddr lib) '()))
+
+;; defined-name : datum -> (or symbol #f)
+;; What a top-level (define x ...) or (define (f ...) ...) names.
+(define (defined-name form)
+  (and (pair? form) (eq? (car form) 'define) (pair? (cdr form))
+       (let ((target (cadr form)))
+         (cond ((symbol? target) target)
+               ((and (pair? target) (symbol? (car target))) (car target))
+               (else #f)))))
+
+;; all-forms-headed : (list-of symbol) datum -> (list-of datum)
+;; forms-headed, but looking inside each form it finds as well.
+(define (all-forms-headed heads x)
+  (cond ((not (pair? x)) '())
+        ((eq? (car x) 'quote) '())
+        (else
+         (append (if (memq (car x) heads) (list x) '())
+                 (let elements ((xs x) (acc '()))
+                   (if (pair? xs)
+                       (elements (cdr xs) (append acc (all-forms-headed heads (car xs))))
+                       acc))))))
+
+;; process-wide-state : datum -> (list-of symbol)
+;; Each name a top-level definition of the library form LIB binds, when a
+;; set! anywhere in LIB names it, or when the definition is (define x (maker
+;; ...)) for a maker in mutable-makers. A local variable that shares a
+;; top-level name counts too, which errs only toward listing.
+(define (process-wide-state lib)
+  (let* ((body (library-body lib))
+         (targets (map (lambda (form) (and (pair? (cdr form)) (cadr form)))
+                       (all-forms-headed '(set!) body))))
+    (filter symbol?
+            (map (lambda (form)
+                   (let ((name (defined-name form)))
+                     (and name
+                          (or (memq name targets)
+                              (and (symbol? (cadr form))
+                                   (pair? (cddr form))
+                                   (pair? (caddr form))
+                                   (memq (car (caddr form)) mutable-makers)))
+                          name)))
+                 body))))
+
+;; made-by : symbol datum -> (or symbol #f)
+;; The maker NAME's top-level definition in the library form LIB calls, when
+;; it is (define NAME (maker ...)) for a maker in mutable-makers and no set!
+;; in LIB names NAME; else #f.
+(define (made-by name lib)
+  (let* ((body (library-body lib))
+         (form (find (lambda (f) (and (eq? (defined-name f) name) (symbol? (cadr f))))
+                     body)))
+    (and form
+         (pair? (cddr form))
+         (pair? (caddr form))
+         (memq (car (caddr form)) mutable-makers)
+         (not (exists (lambda (s) (and (pair? (cdr s)) (eq? (cadr s) name)))
+                      (all-forms-headed '(set!) body)))
+         (car (caddr form)))))
+
+;; unlocked-mention? : (list-of symbol) datum -> boolean
+;; Whether the form X names one of NAMES outside quoted data and outside
+;; every with-registry-lock form. Only a form's head makes it one of those:
+;; the keyword quoted among a call's arguments does not.
+(define (unlocked-mention? names x)
+  (cond ((symbol? x) (and (memq x names) #t))
+        ((pair? x)
+         (and (not (memq (car x) '(quote with-registry-lock)))
+              (let elements ((xs x))
+                (cond ((pair? xs)
+                       (or (unlocked-mention? names (car xs)) (elements (cdr xs))))
+                      (else (unlocked-mention? names xs))))))
+        (else #f)))
+
+;; unlocked-uses : (list-of symbol) datum -> (list-of symbol)
+;; The name of each top-level define or define-syntax in the library form
+;; LIB that names one of NAMES outside with-registry-lock. Each is read past
+;; the name it defines, so the definition of one of NAMES is not a use.
+(define (unlocked-uses names lib)
+  (let ((forms (filter (lambda (f)
+                         (and (pair? f) (memq (car f) '(define define-syntax))
+                              (pair? (cdr f))))
+                       (library-body lib))))
+    (map (lambda (f) (let ((target (cadr f))) (if (pair? target) (car target) target)))
+         (filter (lambda (f) (unlocked-mention? names (cddr f))) forms))))
+
+;; How each piece of process-wide state in src/ is shared by threads:
+;; - library-init: set or filled while its library's body runs, which a
+;;   program's imports run before its own code, and only read after;
+;; - init-lock: set only while native.sls's init-mutex is held, by
+;;   ensure-native-loaded!, which every constructor calls first;
+;; - registry-lock: used only inside with-registry-lock, which the last row
+;;   checks;
+;; - thread-local: a thread parameter, with a value for each thread;
+;; - lock: a mutex.
+(define state-classes '(library-init init-lock registry-lock thread-local lock))
+
+(define shared-state
+  '(("src/libuv/private/constants.sls"
+     (snapshot init-lock) (lookup init-lock) (init-count init-lock)
+     (errno-value-table init-lock) (errno-symbol-table init-lock)
+     (errno-name-list init-lock))
+    ("src/libuv/private/handles.sls"
+     (registry registry-lock) (registry-lock lock)
+     (orphan-events registry-lock) (walk-query-cell thread-local)
+     (close-handle-proc library-init) (close-handle-installed library-init)
+     (dispatch-table library-init) (installed-dispatch-names library-init))
+    ("src/libuv/private/native.sls"
+     (dispatchers library-init) (dispatchers-installed library-init)
+     (init-mutex lock) (initialized? init-lock) (init-count init-lock))))
+
 (test-begin "source-rules")
 
 ;; --- the checkers, on seeded forms -------------------------------------------
@@ -382,6 +518,66 @@
               (prefix (rnrs) r:))
       (define rename 1))))
 
+(test-equal "rule 6 finds each top-level variable its library sets, or binds to a table, a box, a parameter or a lock, and only those"
+  '(counter table cell param lock flag)
+  (process-wide-state
+   '(library (seeded)
+      (export)
+      (import (rnrs))
+      (define counter 0)
+      (define table (make-eqv-hashtable))
+      (define cell (box 0))
+      (define param (make-thread-parameter #f))
+      (define lock (make-mutex))
+      (define flag #f)
+      (define constant 1)
+      (define quoted '(set! constant 2))
+      (define (bump!) (set! counter (+ counter 1)))
+      (define (local) (let ((n 0)) (set! n 1) n))
+      (define (raise-flag!) (set! flag #t)))))
+
+(test-equal "rule 6 sees a set! inside another set!'s value"
+  '(outer inner)
+  (process-wide-state
+   '(library (seeded)
+      (export)
+      (import (rnrs))
+      (define outer #f)
+      (define inner #f)
+      (define (f) (set! outer (begin (set! inner 1) 2))))))
+
+(test-equal "rule 6 reads a variable's maker only when it is made once and never set"
+  '(make-thread-parameter make-mutex #f #f #f)
+  (let ((lib '(library (seeded)
+                (export)
+                (import (rnrs))
+                (define cell (make-thread-parameter '()))
+                (define lock (make-mutex))
+                (define reset (make-thread-parameter '()))
+                (define plain '())
+                (define (f) (set! reset (make-thread-parameter 1))))))
+    (map (lambda (name) (made-by name lib)) '(cell lock reset plain missing))))
+
+(test-equal "rule 6 finds a use of a locked variable outside with-registry-lock, in a procedure or a macro, and only those"
+  '(bare in-macro after-lock mentions-the-keyword)
+  (unlocked-uses
+   '(registry orphans)
+   '(library (seeded)
+      (export)
+      (import (rnrs))
+      (define registry (make-eqv-hashtable))
+      (define orphans '())
+      (define (locked p) (with-registry-lock (hashtable-ref registry p #f)))
+      (define (bare p) (hashtable-ref registry p #f))
+      (define-syntax in-macro
+        (syntax-rules () ((_ p) (hashtable-ref registry p #f))))
+      (define (after-lock e)
+        (with-registry-lock 1)
+        (set! orphans (cons e orphans)))
+      (define (quoted) '(registry orphans))
+      (define (mentions-the-keyword p)
+        (list 'with-registry-lock (hashtable-ref registry p #f))))))
+
 ;; What Chez makes of a type decides which rule it needs, so the lists are
 ;; checked against this Chez. A misspelt type is 'invalid here.
 (test-equal "the verdict tells Chez's answers apart: a scalar is accepted, an unknown type is invalid"
@@ -480,6 +676,65 @@
 
 (test-equal "no library in src/ imports from (chezscheme) renamed or prefixed"
   '() (apply append (map (lambda (e) (renamed-chez-imports (cdr e))) libraries)))
+
+;; Each listed variable as (path name).
+(define listed-state
+  (apply append
+         (map (lambda (lib) (map (lambda (v) (list (car lib) (car v))) (cdr lib)))
+              shared-state)))
+
+;; Each found as (path name). The scan is live while anything is listed: a
+;; scan that found nothing would report every listed variable gone.
+(define found-state
+  (apply append
+         (map (lambda (e) (map (lambda (name) (list (car e) name))
+                               (process-wide-state (cdr e))))
+              libraries)))
+
+(test-equal "every process-wide variable in src/ is listed with how threads share it, and every listed one is still there"
+  '(unlisted () gone ())
+  (list 'unlisted (filter (lambda (v) (not (member v listed-state))) found-state)
+        'gone (filter (lambda (v) (not (member v found-state))) listed-state)))
+
+(test-equal "every listed variable says how threads share it in one of the suite's words"
+  '()
+  (filter (lambda (v) (not (and (pair? (cdr v)) (memq (cadr v) state-classes))))
+          (apply append (map cdr shared-state))))
+
+;; Two of the words can be read off the definition: a thread-local variable
+;; is a thread parameter, and a lock a mutex, each made once and never set.
+(test-equal "each variable listed as thread-local is a thread parameter, and each lock a mutex, made once and never set"
+  '()
+  (apply append
+         (map (lambda (lib)
+                (let ((form (cond ((assoc (car lib) libraries) => cdr) (else #f))))
+                  (filter (lambda (x) x)
+                          (map (lambda (v)
+                                 (let ((want (case (cadr v)
+                                               ((thread-local) 'make-thread-parameter)
+                                               ((lock) 'make-mutex)
+                                               (else #f))))
+                                   (and want
+                                        (not (eq? (and form (made-by (car v) form)) want))
+                                        (list (car lib) (car v) (cadr v)))))
+                               (cdr lib)))))
+              shared-state)))
+
+;; The variables listed as under the registry's lock, which the row below
+;; holds to it. Pinned, so that the row cannot pass by checking nothing.
+(define registry-locked
+  (let ((handles (assoc "src/libuv/private/handles.sls" shared-state)))
+    (if handles
+        (map car (filter (lambda (v) (eq? (cadr v) 'registry-lock)) (cdr handles)))
+        '())))
+
+(test-equal "the registry and the orphan list are used only inside with-registry-lock"
+  '((registry orphan-events) ())
+  (let ((handles (assoc "src/libuv/private/handles.sls" libraries)))
+    (list registry-locked
+          (if handles
+              (unlocked-uses registry-locked (cdr handles))
+              '(no-handles-form)))))
 
 (test-end "source-rules")
 

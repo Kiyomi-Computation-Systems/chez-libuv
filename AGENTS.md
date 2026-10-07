@@ -166,6 +166,22 @@ None is obvious from reading the code.
   - The other verb families are still exposed (ADR-0019's decision 3
     amendments list them). A new verb, or a change to one, takes the same
     shape and the same three sweeps.
+* **Affinity keeps each loop to one thread, not the process.** ADR-0019
+  left the handle registry unlocked because only a loop's own thread uses
+  that loop's handles. But the registry was one table for every loop, and
+  from v0.6.0 on two loops run on two threads at once corrupted it in 4 of
+  4 runs (#70). The walk cell, the orphan list and the debug shim's
+  counters were shared the same way, losing pointers, events and updates.
+  - The registry and the orphan list now hold one lock, taken only with
+    interrupts disabled (`with-registry-lock`).
+  - The walk cell is a thread parameter, and the counters are atomic.
+  - `tests/test-loop-threads.sps` races each on two loops' threads, and
+    sweeps engines over every call that takes the lock.
+  - Rule 6 of `tests/test-source-rules.sps` lists every process-wide
+    variable in `src/` with how threads share it. A new one fails there
+    until it is listed, and the registry's uses must sit inside the lock.
+    Before adding state that more than one loop can reach, decide which of
+    its words it is.
 
 ### C and the FFI
 
