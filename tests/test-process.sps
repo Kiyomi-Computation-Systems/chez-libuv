@@ -1819,48 +1819,80 @@
 ;; A fresh block is never registered already, so the row makes one that is:
 ;; it allocates blocks of a process handle's size through the shim, leaves an
 ;; entry at each, and frees them, so that the shim's allocator hands one back
-;; to the spawn's step (test-native.sps's seed). Neither memory tool hands a
-;; freed block back, Memcheck's freelist and ASan's quarantine both hold it,
-;; so under either the row asks only that the spawn ran and left nothing.
-(define squatted-blocks 8)
+;; to the spawn's step (test-native.sps's seed).
+;;
+;; How many, and where, is glibc's doing. Its calloc hands out the oldest
+;; free block of a size first, and skips the thread's cache, where the first
+;; 7 frees of each size go. With 8 blocks freed in a row, a free block of a
+;; process handle's size left by the suite's earlier spawns came first, and
+;; CI's vendored pass spawned (2026-10-07: two runs, one on main's own code).
+;; A heap seeded with 16 such blocks spawned 19 times in 20 that way. So each
+;; planted block now lies between two spacers, kept until the spawn is
+;; over, which stop glibc merging it with a freed neighbour, and allocating
+;; squatted-blocks of these pairs takes up the older free blocks first: the
+;; seeded heap spawned 0 times in 20 (.plans/spawn-drop-mutation-log.md).
+;;
+;; Neither memory tool hands a freed block back, Memcheck's freelist and
+;; ASan's quarantine both hold it, so under either the row asks only that
+;; the spawn ran and left nothing.
+(define squatted-blocks 64)
 
 ;; squatted-spawn : -> list
-;; A spawn made just after SQUATTED-BLOCKS handle-size blocks were freed
-;; with entries left at them: what came of it, the pipe's mark, the
-;; teardown, and what the run left.
+;; A spawn made just after SQUATTED-BLOCKS handle-size blocks, each between
+;; two spacers, were freed with entries left at them: whether the next
+;; handle-size block the shim allocated was one of them, what came of the
+;; spawn, the pipe's mark, the teardown, and what the run left.
 (define (squatted-spawn)
   (let* ((before (held))
          (loop (make-uv-loop))
          (pipe (make-uv-pipe loop))
-         (blocks (let make ((i 0) (acc '()))
-                   (if (= i squatted-blocks)
-                       acc
-                       (make (+ i 1)
-                             (cons (alloc-block (uv-handle-size (uv-process-type))) acc))))))
+         (size (uv-handle-size (uv-process-type)))
+         (pairs (let make ((i 0) (acc '()))
+                  (if (= i squatted-blocks)
+                      acc
+                      (let* ((spacer (alloc-block size))
+                             (planted (alloc-block size)))
+                        (make (+ i 1) (cons (cons planted spacer) acc))))))
+         (blocks (map car pairs))
+         (spacers (map cdr pairs)))
     (for-each (lambda (b) (registry-add! b 'process loop 'squatter)) blocks)
     (for-each free-block! blocks)
-    (let* ((status 'not-yet)
+    ;; The seed's check takes a planted block and frees it again, still
+    ;; named by its entry.
+    (let* ((seed (let ((next (alloc-block size)))
+                   (free-block! next)
+                   (if (memv next blocks) 'planted 'not-planted)))
+           (status 'not-yet)
            (outcome (spawn-outcome
                      (lambda ()
                        (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 7")
                                   (list (cons 'stdio (stdout-to pipe)))
                                   (lambda (s g) (collect) (set! status (list s g))))))))
       (for-each registry-remove! blocks)
+      (for-each free-block! spacers)
       (when (uv-process? outcome)
         (run-until/ticking loop (lambda () (pair? status)) 20000))
       (let* ((marked (mark pipe))
              (torn (begin (when (uv-handle-open? pipe) (uv-close! pipe))
                           (spawn-outcome (lambda () (uv-loop-teardown! loop) 'torn-down)))))
-        (list (if (uv-process? outcome) 'spawned outcome) marked torn
+        (list seed (if (uv-process? outcome) 'spawned outcome) marked torn
               (state-residue before))))))
 
 (if (or (getenv "CHEZ_LIBUV_UNDER_VALGRIND") (getenv "ASAN_OPTIONS"))
     (test-equal "a spawn made among freed blocks that entries still name left nothing behind (a memory tool: reuse unobservable by design)"
       '(spawned marked torn-down (0 0 0 0 0))
-      (squatted-spawn))
-    (test-equal "a spawn whose handle block another entry holds is refused before it forks, leaving nothing behind"
-      '((refused uv-registry-register! pointer-already-registered) unmarked torn-down (0 0 0 0 0))
-      (squatted-spawn)))
+      (cdr (squatted-spawn)))
+    ;; Run outside a row, so caught here: a raise would end the suite.
+    (let ((squatted (guard (e (#t (list 'raised (describe e))))
+                      (squatted-spawn))))
+      ;; Without its seed the row below says nothing about the code: a spawn
+      ;; given a fresh block forks. This row tells the two apart.
+      (test-equal "precondition: the next block of a process handle's size the shim allocated was one an entry still names"
+        'planted
+        (car squatted))
+      (test-equal "a spawn whose handle block another entry holds is refused before it forks, leaving nothing behind"
+        '((refused uv-registry-register! pointer-already-registered) unmarked torn-down (0 0 0 0 0))
+        (cdr squatted))))
 
 ;; --- one pipe named twice in one spawn -------------------------------------
 ;; libuv opens each (pipe p dir) spec's end into p after it forks, so a pipe
