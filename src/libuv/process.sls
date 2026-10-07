@@ -585,14 +585,25 @@
              (discard-failed-handle! proc)
              rc))))
 
+  ;; uv-process-kill! and uv-process-pid check the process again, read its
+  ;; pointer and call libuv in one interrupt-free step (one-step), as the
+  ;; stream verbs do. Split by an engine between the open check and the
+  ;; call, each reached a handle a close had freed meanwhile, and a spawn
+  ;; given the freed address was signalled in the process's place, or had
+  ;; its pid answered (#71; tests/test-process-steps.sps). The step answers
+  ;; a status, and the verb raises after it (step-refusal): a process closed
+  ;; meanwhile is refused with &uv-handle-closed.
+
   ;; uv-process-kill! : uv-process (or symbol 0) -> unspecified
   ;; Sending a signal after exit can race operating-system pid reuse.
   (define (uv-process-kill! proc sig)
     (require-open-process proc 'uv-process-kill!)
-    (let ((signum (signal-symbol->int sig 'uv-process-kill!)))
-      (uv-check (uv-process-kill (handle-pointer proc 'uv-process-kill!)
-                                 signum)
-                'uv-process-kill!)))
+    (let* ((signum (signal-symbol->int sig 'uv-process-kill!))
+           (sent (one-step
+                  (let ((ptr (open-handle-ptr proc)))
+                    (if (symbol? ptr) ptr (uv-process-kill ptr signum))))))
+      (unless (eqv? sent 0)
+        (raise (step-refusal sent 'uv-process-kill! proc)))))
 
   ;; uv-kill! : exact-integer (or symbol 0) -> unspecified
   ;; Negative pids retain kill(2)'s process-group meaning.
@@ -605,7 +616,12 @@
   ;; uv-process-pid : uv-process -> exact-integer
   (define (uv-process-pid proc)
     (require-open-process proc 'uv-process-pid)
-    (uv-process-get-pid (handle-pointer proc 'uv-process-pid)))
+    (let ((pid (one-step
+                (let ((ptr (open-handle-ptr proc)))
+                  (if (symbol? ptr) ptr (uv-process-get-pid ptr))))))
+      (if (symbol? pid)
+          (raise (step-refusal pid 'uv-process-pid proc))
+          pid)))
 
   ;; uv-os-getpid : -> exact-integer
   (define (uv-os-getpid)
