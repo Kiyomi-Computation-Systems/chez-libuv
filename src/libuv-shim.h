@@ -51,8 +51,10 @@ void chez_uv_alloc_cb(struct uv_handle_s *handle, size_t suggested_size,
 void *chez_uv_alloc(size_t n);
 void chez_uv_free(void *p);
 
-/* Counters are single-threaded diagnostics. Without CHEZ_LIBUV_DEBUG_COUNTERS,
- * updates are no-ops and live queries return zero. */
+/* Counters are diagnostics that every loop's thread may update at once, so
+ * each update is atomic (count_add in libuv-shim.c). Without
+ * CHEZ_LIBUV_DEBUG_COUNTERS, updates are no-ops and live queries return
+ * zero. */
 void chez_uv_count_loop_new(void);
 void chez_uv_count_loop_free(void);
 long chez_uv_live_loop(void);

@@ -91,9 +91,10 @@ With the release shim and collections held off
 So the lock costs 27 ns a constructor, 38 ns a callback and 70 ns a close
 (two uses) on one thread, and allocates nothing (`tests/test-callback-alloc.sps`
 passed L unchanged). P is within 12 ns of main. Past one thread both designs
-slow down, P too: something else shared, collections and the allocator
-among them, dominates at 4 and 8 threads, where single runs scattered by
-2–3x (fire at 8 threads: L 1,024–6,888, P 1,734–5,292). With the debug shim
+slow down, P too: something else shared dominates at 4 and 8 threads,
+where single runs scattered widely (fire at 8 threads: L 1,024–6,888, a
+spread of 6.7x; P 1,734–5,292, 3.1x). Collections were held off, not
+ruled out, so they are among the candidates, with the allocator. With the debug shim
 the figures were close to these at one thread (L 156/390/370, P 121/355/306,
 main 125/349/302).
 
@@ -153,6 +154,10 @@ The user chose L, on these trade-offs (ADR-0019, decision 4's amendment):
 
 ## Tests
 
+As first pushed. The review changed several of these (the review, below):
+the overlap's bound, the spawn race, the sweeps, the counter race, and
+most of rule 6.
+
 `tests/test-loop-threads.sps` (new, default gate):
 
 - **The lock's probe:** one long-lived thread tries the lock without
@@ -208,7 +213,9 @@ keyword as a quoted argument.
   shim): 8, 8 and 5 rows failed in 3 runs, every race, the orphan row, the
   counters and the registry's balance; the precondition rows too where a
   thread raised before the other moved. The lock rows pass there: nothing
-  takes the lock.
+  takes the lock. Races run one after another in one process, so a later
+  race's row can fail on what an earlier race corrupted: the spawn race
+  alone passed under every mutant (the review, below).
 - Rule 6 against main's `handles.sls`: 3 rows failed by name. `registry-lock`
   listed but gone; `registry-lock` and the walk cell not made as listed; and
   the lock-use row named all 11 unlocked definitions, `seam-lambda` among
@@ -239,7 +246,7 @@ in which the row failed by name.
 | K12 | `with-registry-lock` takes the lock with interrupts enabled | the lock sweep row | 5/5 |
 | K13 | the walk cell one variable for every thread again | rule 6's thread-local row; the walk race | 1/1; 5/5 |
 | K14 | the shim's counters updated with plain `+=` again | the counter race; the balance row | 5/5; 5/5 (the balance row alone, before the counter race was added: 4/5) |
-| H1 | a race's threads run one after the other | the four precondition rows | 5/5 |
+| H1 | a race's threads run one after the other | the four precondition rows (all there were: H1–H3 ran before the counter race was added) | 5/5 |
 | H2 | the overlap witness never counts a move | the precondition rows | 5/5 |
 | H3 | the lock's probe always answers free | the probe row | 5/5 |
 

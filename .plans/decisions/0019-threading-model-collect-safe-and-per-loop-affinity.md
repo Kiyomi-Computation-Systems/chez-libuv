@@ -142,9 +142,9 @@ drains a caller-side queue rather than assuming one item per send.
 > suspended, and other rows make a real sender and a real closer wait on a
 > held fence, and check its release on every way out. The mutations, the
 > deadlock reproducers and the widened-window runs are in
-> `.plans/async-send-fence-mutation-log.md`. Decision 4 stands: this lock
-> guards one handle's lifetime across the one call libuv makes thread-safe,
-> not the registry. The cost, on libuv's no-syscall fast path: about 30 ns a
+> `.plans/async-send-fence-mutation-log.md`. Decision 4 stands (until #70;
+> see its amendment): this lock guards one handle's lifetime across the one
+> call libuv makes thread-safe, not the registry. The cost, on libuv's no-syscall fast path: about 30 ns a
 > send on macOS arm64, up from 8, with no allocation. Senders sharing one
 > handle take turns: about 90 ns a send with four.
 
@@ -249,7 +249,7 @@ drains a caller-side queue rather than assuming one item per send.
 >     - Found reviewing #63 (this split is fixed below): `uv-process-kill!` and
 >       `uv-process-pid` split between the pointer and the call, and a
 >       split kill signalled another process at the freed handle's address
->       (#71). Separately, decision 4 held per loop only: the registry was
+>       (#71). Separately, decision 4 held per loop only: the registry is
 >       one table for every loop, and two loops run on two threads
 >       corrupted it (#70, decision 4's amendment).
 >   - The scratch verbs (bind, the address and port queries, the buffer
@@ -378,7 +378,7 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 
 > **Amended 2026-10-07 (issue #70): the registry has one lock after all.**
 > Decision 4 held per loop only. Affinity keeps each loop's handles on one
-> thread, but the registry was one table for every loop. So two loops run
+> thread, but the registry is one table for every loop. So two loops run
 > on two threads at once, the thread-per-core design this ADR names as its
 > driver, wrote it from both threads, and Chez's hashtables have no lock of
 > their own. Two threads making and closing timers on loops of their own
@@ -401,14 +401,18 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 >   `registry-lock`, through `with-registry-lock` in
 >   `(libuv private handles)`. That covers the constructors' and requests'
 >   registrations, every callback seam's lookup, the close dispatcher's and
->   the completions' deregistrations, a teardown's snapshot and its DNS
->   cancellations, and the readers.
-> - The lock has the send fence's shape (decision 3's amendment for #33).
->   It is taken and released only with interrupts disabled, so no engine
->   is suspended, and no collection stops a thread, while it holds the
->   lock. A thread that finds it taken waits inside the same interrupt-free
->   step, for a holder running one table operation, which waits on
->   nothing. The bodies raise nothing; their callers raise after.
+>   the completions' deregistrations, a teardown's snapshot, which also
+>   finds its DNS requests to cancel, and the readers.
+> - The lock has the send fence's shape (decision 3's amendment for #33),
+>   and both now use one macro, `with-step-lock`. It is taken and released
+>   only with interrupts disabled, so no engine is suspended, and no
+>   collection stops a thread, while it holds the lock. A thread that finds
+>   it taken waits inside the same interrupt-free step, for a holder
+>   running a table operation or two, which wait on nothing, or a copy of
+>   the whole table (the trade-off below). The bodies raise nothing, and
+>   their callers raise after; rule 6 holds every body to table operations
+>   and `cons`. `with-step-lock` hands back however many values its body
+>   answers.
 > - The walk cell is a thread parameter: `uv_walk` calls back on the thread
 >   that walks, before it returns.
 > - The debug shim's counters are updated with atomic adds, in relaxed
@@ -420,44 +424,67 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 > handles. The lock guards only the state every loop shares.
 >
 > **The trade-off: one lock, or a table per loop.** Both fixed every race
-> above. The figures are macOS arm64, Chez 10.4.1, the release shim, with
-> collections held off: the medians of five alternated rounds.
+> above. The figures are macOS arm64 and Chez 10.4.1. The timer rows use
+> the release shim with collections held off, and are the medians of five
+> alternated rounds. The round trip is the median of three rounds of each
+> thread's best of five, and the teardown the median of eleven.
 >
 > | | One lock (chosen) | A table per loop |
 > |---|---|---|
 > | One thread | +27 ns a constructor, +38 ns a callback, +70 ns a close (two uses); 0 B | within 12 ns of the unlocked registry |
 > | Four threads, only making, firing and closing timers | 381, 2,714 and 3,420 ns | 170, 1,651 and 1,608 ns |
-> | A loopback round trip, 1 to 8 threads | the same as without a lock: 71–79 µs at one thread, 213–233 µs at eight | the same |
+> | A loopback round trip | 75.7 µs at one thread (76.3 µs without a lock); 120.1 µs at four; 231 µs at eight, its runs 223–233 µs | 76.9, 120.1 and 216 µs, its runs at eight 213–232 µs |
+> | A teardown, or `uv-loop-live-handles`, with other loops' entries registered | copies every loop's entries, holding the lock for most of it: 0.66 ms at 100,000 entries, 13 ms at 1,000,000 | copies its own loop's |
 > | Change | `handles.sls` alone: every registry signature and every suite as before | `handles`, `loop`, `stream`, `process`, `dns` and `tcp`; request records gain a loop; test helpers in about 8 suites |
 >
-> A table per loop needs no lock, but a callback's seam gets only a raw
-> pointer, so it must first find the loop: the one its thread is running.
-> `uv-run` would have to track that by hand. It has no `dynamic-wind`
-> (#45's amendment to decision 2), and an engine suspended in one loop's
-> callback, while the scheduler runs another loop on the same thread, must
-> still find the first loop when it resumes. Process-wide views such as
-> `registry-count` would need a shared list of live loops anyway. And a
-> constructor called from the wrong thread, which only `make-uv-async`
-> checks for, would corrupt its loop's table, where the lock keeps the
-> table whole.
+> A table per loop needs no lock of its own, and a seam can reach its
+> loop's table from its own pointer: a handle's `loop` field, a write's,
+> connect's or shutdown's handle, a DNS request's `loop`. But the seam
+> then needs the binding's loop for that `uv_loop_t`, from a table of every
+> loop that every thread shares and every callback reads, and that
+> `make-uv-loop` and `uv-loop-close!` change from any thread: a lock again,
+> or a lock-free publication of it. The prototype measured here found the
+> loop another way, through the loop its thread was running, which
+> `uv-run` tracked by hand across engine suspensions with no
+> `dynamic-wind` (#45's amendment to decision 2). Process-wide views such
+> as `registry-count` would need a shared list of live loops anyway, and
+> the change reaches six libraries. Neither design makes a constructor
+> called from the wrong thread safe: its libuv init races the loop's own
+> thread whatever guards the table (decision 4). An owner check in every
+> constructor would (#79).
 >
 > The lock shows only where several threads use the registry without
-> pause. In a loopback round trip each thread spends most of its time
-> waiting on the kernel, and the lock never queued. Should a workload show
+> pause, or where a teardown copies a large table. In a loopback round
+> trip each thread spends most of its time waiting on the kernel, and the
+> lock never queued; at eight threads the round trip took 7% longer than
+> with a table per loop, within the runs' spread. Should a workload show
 > contention, the next step keeps every lookup free of the running loop:
-> several tables, chosen by pointer, each with a lock of its own.
+> several tables, chosen by pointer, each with a lock of its own. Should
+> a teardown's copy show, an index of each loop's entries, kept under the
+> same lock, lets it copy its own.
 >
 > **Held by** `tests/test-loop-threads.sps`, whose rows:
 >
-> - race two loops' threads over timers, walks, failed spawns and orphan
->   events, with a precondition that each thread saw the other move;
-> - sweep engines over every call that takes the lock with interrupts
->   enabled, asking another thread at each expiry whether the lock is free.
+> - race two loops' threads over timers, walks, orphan events and every
+>   debug counter, with a precondition that each thread saw the other
+>   move. A thread past its rounds waits on the other's progress, never on
+>   a count of its own, so no schedule fails a correct build;
+> - sweep engines over the calls whose way to the lock crosses a trap
+>   check, a timer's firing and a close, asking another thread at each
+>   expiry whether the lock is free;
+> - require a refused registration or deregistration to reach the caller's
+>   handler with the lock free, and `with-step-lock` to hand back two
+>   values or none with its lock free.
 >
-> And by rule 6 of `tests/test-source-rules.sps`. It lists every
-> process-wide variable in `src/` with how threads share it, so a new one
-> fails until it is listed, and requires every use of the registry and the
-> orphan list to sit inside `with-registry-lock`. Evidence and mutations:
+> And by rule 6 of `tests/test-source-rules.sps`. It lists each
+> process-wide variable in `src/` with how threads share it: what a
+> library's top level defines and then assigns, changes in place, or makes
+> mutable, and each static in the C shim. A new one fails until it is
+> listed, and each word is checked against the source. Every use of the
+> registry and the orphan list must sit inside `with-registry-lock`, every
+> body there may call only table operations and `cons`, `registry-lock` is
+> named nowhere else in `src/`, and the shim's counters change only
+> through `count_add`. Evidence and mutations:
 > `.plans/registry-lock-mutation-log.md`.
 
 **5. Opt-in, and free on a non-threaded Chez.** Identity uses `get-thread-id`
