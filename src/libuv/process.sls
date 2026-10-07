@@ -118,8 +118,15 @@
       (raise (make-uv-invalid-argument who reason)))
     (for-each (lambda (bv) (check-string bv who reason)) lst))
 
+  ;; The C types the options block holds a caller's number in: an fd is a C
+  ;; int, a uid or gid an unsigned 32-bit int. The checks refuse a number
+  ;; outside its type before anything is allocated, and the fill, inside the
+  ;; step that spawns, writes none (fill-options-block!).
+  (define (c-int-fd? x) (and (integer? x) (exact? x) (<= 0 x 2147483647)))
+  (define (u32? x) (and (integer? x) (exact? x) (<= 0 x 4294967295)))
+
   (define (require-u32 n who reason)
-    (unless (and (integer? n) (exact? n) (>= n 0) (< n 4294967296))
+    (unless (u32? n)
       (raise (make-uv-invalid-argument who reason))))
 
   (define (require-open-process proc who)
@@ -180,8 +187,7 @@
       ((ignore) #t)
       ((inherit-fd)
        (let ((fd (stdio-spec-value spec)))
-         (unless (and (integer? fd) (exact? fd) (>= fd 0)
-                      (< fd 2147483648))
+         (unless (c-int-fd? fd)
            (raise (make-uv-invalid-argument who 'stdio-fd-not-an-fd)))))
       ((inherit-stream)
        (let ((h (stdio-spec-value spec)))
@@ -189,13 +195,13 @@
            (raise (make-uv-invalid-argument who 'stdio-spec-unknown)))
          (require-open-handle h who)))
       ((pipe)
-       (let ((p (stdio-spec-value spec)) (dir (stdio-spec-direction spec)))
+       (let ((p (stdio-spec-value spec)))
          (unless (uv-pipe-record? p)
            (raise (make-uv-invalid-argument who 'stdio-spec-unknown)))
          (require-open-handle p who)
          (when (pipe-connected? p)
            (raise (make-uv-invalid-argument who 'pipe-already-used)))
-         (unless (memq dir '(to-child from-child duplex))
+         (unless (stdio-spec-flags spec)
            (raise (make-uv-invalid-argument who 'stdio-spec-unknown)))))
       (else (raise (make-uv-invalid-argument who 'stdio-spec-unknown)))))
 
@@ -238,139 +244,174 @@
 
   ;; --- the options block ------------------------------------------------------
 
+  ;; stdio-spec-flags : stdio-spec -> (or exact-integer #f)
+  ;; A container's flags for SPEC, or #f for a kind or direction there are
+  ;; no flags for: the checks refuse that spec, and the fill writes none.
   (define (stdio-spec-flags spec)
     (case (stdio-spec-kind spec)
       ((ignore)         (uv-stdio-ignore))
       ((inherit-fd)     (uv-stdio-inherit-fd))
       ((inherit-stream) (uv-stdio-inherit-stream))
-      (else ;; pipe
-       (bitwise-ior (uv-stdio-create-pipe)
-                    (case (stdio-spec-direction spec)
-                      ((to-child)   (uv-stdio-readable-pipe))
-                      ((from-child) (uv-stdio-writable-pipe))
-                      ((duplex)     (bitwise-ior (uv-stdio-readable-pipe)
-                                                 (uv-stdio-writable-pipe)))
-                      (else (raise (make-uv-invalid-argument
-                                    'uv-spawn! 'stdio-spec-unknown))))))))
+      ((pipe)
+       (let ((direction (case (stdio-spec-direction spec)
+                          ((to-child)   (uv-stdio-readable-pipe))
+                          ((from-child) (uv-stdio-writable-pipe))
+                          ((duplex)     (bitwise-ior (uv-stdio-readable-pipe)
+                                                     (uv-stdio-writable-pipe)))
+                          (else #f))))
+         (and direction (bitwise-ior (uv-stdio-create-pipe) direction))))
+      (else #f)))
 
   ;; The stdio containers' offset in the options block.
   (define (stdio-offset) (align-16 (sizeof-uv-process-options-t)))
 
-  ;; One zeroed allocation contains options, stdio, pointer arrays, and UTF-8
-  ;; strings. libuv consumes it synchronously during uv_spawn.
-  (define (build-options-block file args options)
-    (let* ((env         (spawn-options-env options))
+  ;; One zeroed block holds the options, the stdio containers, the argv and
+  ;; env pointer arrays, and the UTF-8 strings; libuv reads it only during
+  ;; uv_spawn. Its layout is worked out from the request before the step that
+  ;; spawns, and the step allocates the block, fills it, spawns and frees it,
+  ;; so no engine can strand it (the step's comment below).
+
+  ;; The process handle's size, and the options block's: its size and where
+  ;; its argv and env arrays and its strings begin, as offsets from its
+  ;; start.
+  (define-record-type options-layout
+    (fields handle-size size argv-off env-off strings-off))
+
+  ;; layout-options-block : spawn-request spawn-options -> options-layout
+  (define (layout-options-block request options)
+    (let* ((args        (spawn-request-args request))
+           (env         (spawn-options-env options))
            (cwd         (spawn-options-cwd options))
-           (specs       (spawn-options-stdio options))
            (ptr-size    (c-uptr-size))
-           (n-stdio     (length specs))
-           (stdio-off   (stdio-offset))
-           (argv-off    (align-16 (+ stdio-off
+           (n-stdio     (length (spawn-options-stdio options)))
+           (argv-off    (align-16 (+ (stdio-offset)
                                      (* n-stdio (sizeof-uv-stdio-container-t)))))
            (env-off     (align-16 (+ argv-off (* (+ 1 (length args)) ptr-size))))
            (strings-off (align-16 (+ env-off
                                      (if env (* (+ 1 (length env)) ptr-size) 0))))
            ;; Each string and its terminating NUL.
-           (size        (fold-left (lambda (at bv) (+ at (bytevector-length bv) 1))
-                                   strings-off
-                                   (cons file (append (if cwd (list cwd) '())
-                                                      args
-                                                      (or env '())))))
-           (block (alloc-zeroed size)))
-      (count-spawn-options-new!)
-      (guard (e (#t (free-options-block! block) (raise e)))
-        (fill-strings-and-arrays! block size file args options
-                                  argv-off env-off strings-off ptr-size)
-        (fill-stdio-containers! block specs stdio-off)
-        (fill-scalars! block options n-stdio stdio-off)
-        block)))
+           (add         (lambda (at bv) (+ at (bytevector-length bv) 1)))
+           (at          (add strings-off (spawn-request-file request)))
+           (at          (if cwd (add at cwd) at))
+           (at          (fold-left add at args)))
+      (make-options-layout (uv-handle-size (uv-process-type))
+                           (fold-left add at (or env '()))
+                           argv-off env-off strings-off)))
 
-  (define (fill-strings-and-arrays! block size file args options
-                                    argv-off env-off strings-off ptr-size)
-    (let ((env (spawn-options-env options))
-          (cwd (spawn-options-cwd options))
-          (cursor strings-off))
-      ;; The block is zeroed, so the byte after each string is its NUL. A
-      ;; string that would not fit, with that byte, is refused, never written:
-      ;; copy-in! bounds a copy by its source, not by the block it writes to.
-      (define (put-bytes! bv)
-        (let ((at cursor) (len (bytevector-length bv)))
-          (unless (<= (+ at len 1) size)
-            (raise (condition
-                    (make-uv-error)
-                    (make-who-condition 'uv-spawn!)
-                    (make-message-condition
-                     "the options block is too small for its strings"))))
-          (copy-in! (+ block at) bv 0 len)
-          (set! cursor (+ at len 1))
-          (+ block at)))
-      (c-uptr-set! (+ block (offsetof-uv-process-options-t-file))
-                   (put-bytes! file))
-      (when cwd
-        (c-uptr-set! (+ block (offsetof-uv-process-options-t-cwd))
-                     (put-bytes! cwd)))
-      (let arg-loop ((as args) (i 0))
-        (unless (null? as)
-          (c-uptr-set! (+ block argv-off (* i ptr-size)) (put-bytes! (car as)))
-          (arg-loop (cdr as) (+ i 1))))
-      ;; Zeroed slots terminate argv and env with NULL.
-      (c-uptr-set! (+ block (offsetof-uv-process-options-t-args))
-                   (+ block argv-off))
+  ;; fill-options-block! : uptr options-layout spawn-request spawn-options
+  ;;                       -> boolean
+  ;; Inside the step: writes the options into BLOCK, zeroed and LAYOUT's
+  ;; size, and answers #t. It raises nothing: a string that would not fit, or
+  ;; a number its C type cannot hold, is not written, and it answers #f. The
+  ;; checks refuse both before the step, so only a check that has drifted
+  ;; from the fill comes here, and the step then frees both blocks.
+  (define (fill-options-block! block layout request options)
+    (let ((specs (spawn-options-stdio options)))
+      (and (fill-strings-and-arrays! block layout request options)
+           (fill-stdio-containers! block specs)
+           (fill-scalars! block options (length specs)))))
+
+  ;; fill-strings-and-arrays! : uptr options-layout spawn-request
+  ;;                            spawn-options -> boolean
+  ;; Each string after the last, in the order the layout summed them, its
+  ;; slot pointed at it. The block is zeroed, so the byte after each string
+  ;; is its NUL, and zeroed slots end argv and env with NULL. A copy is
+  ;; bounded by its source, not by the block, so a string that would not
+  ;; fit, with its NUL, is not copied, and the fill answers #f.
+  (define (fill-strings-and-arrays! block layout request options)
+    (let ((size     (options-layout-size layout))
+          (argv-off (options-layout-argv-off layout))
+          (env-off  (options-layout-env-off layout))
+          (ptr-size (c-uptr-size))
+          (env      (spawn-options-env options))
+          (cwd      (spawn-options-cwd options)))
+      ;; put! : offset bytevector offset -> (or offset #f)
+      ;; Copies BV in at offset AT and points the slot at offset SLOT at it;
+      ;; answers the offset after its NUL.
+      (define (put! slot bv at)
+        (let ((next (+ at (bytevector-length bv) 1)))
+          (and (<= next size)
+               (begin (copy-in-unchecked! (+ block at) bv 0 (bytevector-length bv))
+                      (c-uptr-set! (+ block slot) (+ block at))
+                      next))))
+      ;; put-array! : offset (listof bytevector) offset -> (or offset #f)
+      ;; Each of BVS, its pointer in the array at offset OFF.
+      (define (put-array! off bvs at)
+        (let next ((bvs bvs) (slot off) (at at))
+          (if (null? bvs)
+              at
+              (let ((at (put! slot (car bvs) at)))
+                (and at (next (cdr bvs) (+ slot ptr-size) at))))))
+      (c-uptr-set! (+ block (offsetof-uv-process-options-t-args)) (+ block argv-off))
       (when env
-        (let env-loop ((es env) (i 0))
-          (unless (null? es)
-            (c-uptr-set! (+ block env-off (* i ptr-size)) (put-bytes! (car es)))
-            (env-loop (cdr es) (+ i 1))))
-        (c-uptr-set! (+ block (offsetof-uv-process-options-t-env))
-                     (+ block env-off)))))
+        (c-uptr-set! (+ block (offsetof-uv-process-options-t-env)) (+ block env-off)))
+      (let* ((at (put! (offsetof-uv-process-options-t-file)
+                       (spawn-request-file request)
+                       (options-layout-strings-off layout)))
+             (at (and at (if cwd (put! (offsetof-uv-process-options-t-cwd) cwd at) at)))
+             (at (and at (put-array! argv-off (spawn-request-args request) at))))
+        (and at (or (not env) (put-array! env-off env at)) #t))))
 
-  ;; Write the stdio union at the width of the active member: int for an fd,
-  ;; pointer width for a stream. A stream's pointer is left to the step that
-  ;; checks its handle (fill-stream-pointers!).
-  (define (fill-stdio-containers! block specs stdio-off)
-    (let stdio-loop ((ss specs) (i 0))
-      (unless (null? ss)
-        (let ((c (+ block stdio-off (* i (sizeof-uv-stdio-container-t))))
-              (spec (car ss)))
-          (c-int-set! (+ c (offsetof-uv-stdio-container-t-flags))
-                      (stdio-spec-flags spec))
-          (when (eq? (stdio-spec-kind spec) 'inherit-fd)
-            (c-int-set! (+ c (offsetof-uv-stdio-container-t-data))
-                        (stdio-spec-value spec))))
-        (stdio-loop (cdr ss) (+ i 1)))))
+  ;; fill-stdio-containers! : uptr (listof stdio-spec) -> boolean
+  ;; Each spec's container: its flags, and its data at the width of the
+  ;; active member, an int for an inherited fd, or the stream's pointer, read
+  ;; from the handle the step has just checked (stdio-refusal). Answers #f,
+  ;; writing nothing, when a spec has no flags or its fd is no C int.
+  (define (fill-stdio-containers! block specs)
+    (and (for-all (lambda (spec)
+                    (and (stdio-spec-flags spec)
+                         (or (not (eq? (stdio-spec-kind spec) 'inherit-fd))
+                             (c-int-fd? (stdio-spec-value spec)))))
+                  specs)
+         (let fill ((ss specs) (c (+ block (stdio-offset))))
+           (if (null? ss)
+               #t
+               (let ((spec (car ss))
+                     (data (+ c (offsetof-uv-stdio-container-t-data))))
+                 (c-int-set! (+ c (offsetof-uv-stdio-container-t-flags))
+                             (stdio-spec-flags spec))
+                 (case (stdio-spec-kind spec)
+                   ((inherit-fd) (c-int-set! data (stdio-spec-value spec)))
+                   ((inherit-stream pipe)
+                    (c-uptr-set! data (handle-ptr (stdio-spec-value spec)))))
+                 (fill (cdr ss) (+ c (sizeof-uv-stdio-container-t))))))))
 
-  ;; The step's half of the fill: each stream spec's handle pointer, read
-  ;; from the handle the step has just checked.
-  (define (fill-stream-pointers! block specs)
-    (let fill ((ss specs) (i 0))
-      (unless (null? ss)
-        (let ((h (stdio-spec-handle (car ss))))
-          (when h
-            (c-uptr-set! (+ block (stdio-offset)
-                            (* i (sizeof-uv-stdio-container-t))
-                            (offsetof-uv-stdio-container-t-data))
-                         (handle-ptr h))))
-        (fill (cdr ss) (+ i 1)))))
-
-  ;; Setting uid or gid must also set the corresponding libuv flag.
-  (define (fill-scalars! block options n-stdio stdio-off)
+  ;; fill-scalars! : uptr spawn-options exact-nonnegative-integer -> boolean
+  ;; Setting uid or gid must also set the corresponding libuv flag. Answers
+  ;; #f, writing nothing, for a uid or gid that is no unsigned 32-bit int.
+  (define (fill-scalars! block options n-stdio)
     (let ((uid (spawn-options-uid options))
           (gid (spawn-options-gid options)))
-      (c-int-set! (+ block (offsetof-uv-process-options-t-stdio-count)) n-stdio)
-      (when (positive? n-stdio)
-        (c-uptr-set! (+ block (offsetof-uv-process-options-t-stdio))
-                     (+ block stdio-off)))
-      (c-int-set! (+ block (offsetof-uv-process-options-t-flags))
-                  (bitwise-ior
-                   (if (spawn-options-detached? options) (uv-process-detached-flag) 0)
-                   (if uid (uv-process-setuid-flag) 0)
-                   (if gid (uv-process-setgid-flag) 0)))
-      (when uid (c-u32-set! (+ block (offsetof-uv-process-options-t-uid)) uid))
-      (when gid (c-u32-set! (+ block (offsetof-uv-process-options-t-gid)) gid))))
+      (and (or (not uid) (u32? uid))
+           (or (not gid) (u32? gid))
+           (begin
+             (c-int-set! (+ block (offsetof-uv-process-options-t-stdio-count)) n-stdio)
+             (when (positive? n-stdio)
+               (c-uptr-set! (+ block (offsetof-uv-process-options-t-stdio))
+                            (+ block (stdio-offset))))
+             (c-int-set! (+ block (offsetof-uv-process-options-t-flags))
+                         (bitwise-ior
+                          (if (spawn-options-detached? options) (uv-process-detached-flag) 0)
+                          (if uid (uv-process-setuid-flag) 0)
+                          (if gid (uv-process-setgid-flag) 0)))
+             (when uid (c-u32-set! (+ block (offsetof-uv-process-options-t-uid)) uid))
+             (when gid (c-u32-set! (+ block (offsetof-uv-process-options-t-gid)) gid))
+             #t))))
 
+  ;; alloc-options-block : exact-positive-integer -> uptr
+  ;; A zeroed options block of SIZE bytes, counted, or 0, uncounted, when it
+  ;; cannot be had (alloc-block).
+  (define (alloc-options-block size)
+    (let ((block (alloc-block size)))
+      (unless (zero? block) (count-spawn-options-new!))
+      block))
+
+  ;; free-options-block! : uptr -> unspecified
+  ;; Frees and uncounts what alloc-options-block answered; ignores 0.
   (define (free-options-block! block)
-    (free! block)
-    (count-spawn-options-free!))
+    (unless (zero? block)
+      (free-block! block)
+      (count-spawn-options-free!)))
 
   ;; uv-spawn! : uv-loop string (listof string) (or procedure #f) -> uv-process
   ;; uv-spawn! : uv-loop string (listof string) (or alist #f) (or procedure #f)
@@ -397,18 +438,12 @@
       (let ((options (check-options (spawn-request-options request) 'uv-spawn!)))
         (require-same-loop-stdio! (spawn-options-stdio options) loop 'uv-spawn!)
         (require-distinct-pipes! (spawn-options-stdio options) 'uv-spawn!)
-        (let* ((ptr (alloc-zeroed (uv-handle-size (uv-process-type))))
-               (proc (%make-uv-process-record ptr loop on-exit))
-               (block (guard (e (#t (free! ptr) (raise e)))
-                        (build-options-block (spawn-request-file request)
-                                             (spawn-request-args request)
-                                             options)))
-               (status (with-interrupts-disabled
-                         (spawn-step! loop proc block
-                                      (spawn-options-stdio options)))))
-          (unless (eq? status 'spawned)
-            (raise (spawn-refusal status)))
-          proc))))
+        (let* ((layout (layout-options-block request options))
+               (made (with-interrupts-disabled
+                       (spawn-step! loop on-exit layout request options))))
+          (if (uv-process-record? made)
+              made
+              (raise (spawn-refusal made)))))))
 
   ;; --- the step that spawns ---------------------------------------------------
   ;; The checks above see the loop and the stdio handles as they were on
@@ -421,42 +456,81 @@
   ;; on a freed loop. A teardown between uv_spawn and the registration left
   ;; the process in the loop where the teardown could not close it.
   ;;
-  ;; So once the options block is built, one interrupt-free step checks the
-  ;; loop and each handle again, hands libuv the pointers it just checked,
-  ;; spawns, frees the options block, marks the pipes, and registers the
-  ;; process or cleans up after a failure. An engine that expires during
-  ;; uv-spawn! is suspended before the step or after it (test-process.sps's
-  ;; state sweeps). One suspended between the allocations and the step and
-  ;; never resumed still strands the process handle and the options block.
+  ;; And an engine can be dropped, as a timeout drops a task, and never
+  ;; resumed. Nothing after its expiry runs, so what the verb held then and
+  ;; had not handed on was lost: the process handle and the options block,
+  ;; allocated and built before the step (test-process.sps's drop sweeps).
   ;;
-  ;; The step raises nothing. It answers 'spawned or a status, and the verb
-  ;; raises after it (spawn-refusal). It frees what a refusal leaves, so a
-  ;; refused spawn holds nothing. with-interrupts-disabled, a dynamic-wind,
-  ;; costs 32 B a spawn over one-step, a bare interrupt pair, and keeps
-  ;; interrupts from staying off should anything in the step raise after all:
-  ;; a fault in uv_spawn arrives as a Scheme condition.
+  ;; So one interrupt-free step checks the loop and each handle again,
+  ;; allocates the process handle and the options block, fills the block,
+  ;; hands libuv the pointers it just checked, spawns, frees the options
+  ;; block, marks the pipes, and registers the process or cleans up after a
+  ;; failure. An engine that expires during uv-spawn! is suspended or dropped
+  ;; before the step, holding nothing, or after it, when the loop holds the
+  ;; process or the failure is cleaned up (test-process.sps's state and drop
+  ;; sweeps).
+  ;;
+  ;; The step answers the process or a status, and the verb raises after it
+  ;; (spawn-refusal). A refused step frees what it allocated. Its
+  ;; allocations answer 0 rather than raise, its fill writes no value it has
+  ;; not checked (fill-options-block!), and it registers the process before
+  ;; uv_spawn, answering a refused registration (spawn-from-block!). One call
+  ;; in it can still raise, and only where an invariant outside it is
+  ;; broken: the failure cleanup's close, a one-step of its own
+  ;; (begin-close!), should uv_close fault.
+  ;; with-interrupts-disabled, a dynamic-wind, costs 96 B a spawn over
+  ;; one-step, a bare interrupt pair, as it did on a473313. It re-enables
+  ;; interrupts after a raise in the step's own body, a fault in uv_spawn
+  ;; among them, which arrives as a Scheme condition; after a raise inside
+  ;; the close's nested one-step they stay disabled.
 
-  ;; spawn-step! : uv-loop uv-process uptr (listof stdio-spec)
-  ;;               -> (or 'spawned status)
-  (define (spawn-step! loop proc block specs)
-    (let* ((loop-address (open-loop-ptr loop))
+  ;; spawn-step! : uv-loop (or procedure #f) options-layout spawn-request
+  ;;               spawn-options -> (or uv-process status)
+  (define (spawn-step! loop on-exit layout request options)
+    (let* ((specs (spawn-options-stdio options))
+           (loop-address (open-loop-ptr loop))
            (refusal (if (symbol? loop-address)
                         loop-address
                         (stdio-refusal specs))))
       (if refusal
-          (begin (free-options-block! block)
-                 (discard-failed-handle! proc)
-                 refusal)
-          (let ((ptr (handle-ptr proc)))
-            (fill-stream-pointers! block specs)
-            (let ((rc (uv-spawn-native loop-address ptr block)))
-              (free-options-block! block)
-              (mark-consumed-pipes! specs)
-              (if (zero? rc)
-                  (begin (registry-register! ptr 'process loop proc)
-                         (count-process-new!)
-                         'spawned)
-                  (clean-up-failed-spawn! loop proc rc)))))))
+          refusal
+          (let ((ptr (alloc-block (options-layout-handle-size layout)))
+                (block (alloc-options-block (options-layout-size layout))))
+            (cond ((or (zero? ptr) (zero? block))
+                   (free-block! ptr)
+                   (free-options-block! block)
+                   'no-memory)
+                  ((fill-options-block! block layout request options)
+                   (spawn-from-block! loop loop-address ptr block specs on-exit))
+                  (else
+                   (free-block! ptr)
+                   (free-options-block! block)
+                   'options-not-written))))))
+
+  ;; spawn-from-block! : uv-loop uptr uptr uptr (listof stdio-spec)
+  ;;                     (or procedure #f) -> (or uv-process status)
+  ;; The rest of the step, once BLOCK holds the options: the process record
+  ;; on the handle block at PTR, registered before libuv sees the block, as
+  ;; a constructor registers its handle before its init (register-then-init!);
+  ;; uv_spawn on the loop at LOOP-ADDRESS; the options block freed; the pipes
+  ;; marked; and the process counted, or the failure cleaned up. A refused
+  ;; registration frees both blocks and is answered, with nothing forked and
+  ;; no pipe marked. Registered after uv_spawn, it raised from the step with
+  ;; the child running and its handle in the loop, out of the teardown's
+  ;; reach (#68's review).
+  (define (spawn-from-block! loop loop-address ptr block specs on-exit)
+    (let* ((proc (%make-uv-process-record ptr loop on-exit))
+           (registered (registry-add! ptr 'process loop proc)))
+      (if (not (eq? registered 'registered))
+          (begin (free-block! ptr)
+                 (free-options-block! block)
+                 registered)
+          (let ((rc (uv-spawn-native loop-address ptr block)))
+            (free-options-block! block)
+            (mark-consumed-pipes! specs)
+            (if (zero? rc)
+                (begin (count-process-new!) proc)
+                (clean-up-failed-spawn! loop proc rc))))))
 
   ;; stdio-refusal : (listof stdio-spec) -> (or status #f)
   ;; The first spec the entry checks would now refuse for its handle's state:
@@ -475,28 +549,39 @@
 
   ;; spawn-refusal : status -> condition
   ;; What uv-spawn! raises for a status the step answered: what the checks
-  ;; on entry raise for the same state, or libuv's errno. A handle's refusal
-  ;; comes paired with the handle (stdio-refusal).
+  ;; on entry raise for the same state, ENOMEM, or libuv's errno. A handle's
+  ;; refusal comes paired with the handle (stdio-refusal). Options the fill
+  ;; could not write are the binding's own fault, not the caller's: the
+  ;; checks accepted them.
   (define (spawn-refusal status)
-    (if (pair? status)
-        (step-refusal (car status) 'uv-spawn! (cdr status))
-        (step-refusal status 'uv-spawn! #f)))
+    (cond ((pair? status) (step-refusal (car status) 'uv-spawn! (cdr status)))
+          ((eq? status 'options-not-written)
+           (condition (make-uv-error)
+                      (make-who-condition 'uv-spawn!)
+                      (make-message-condition
+                       "the options block could not hold the options checked for it")))
+          (else (step-refusal status 'uv-spawn! #f))))
 
   ;; clean-up-failed-spawn! : uv-loop uv-process exact-integer -> status
   ;; Spawn failures have opposite cleanups depending on whether libuv left the
   ;; handle in its loop queue. Ask uv_walk; errno values cannot classify this.
-  ;; A nonzero pid is an unclassifiable partial-success state and is left
-  ;; intact. Answers the status the verb raises, RC unless unclassifiable.
+  ;; The step registered the handle before uv_spawn. One still in the queue
+  ;; keeps its entry and is closed through it; one libuv unlinked loses its
+  ;; entry and is freed. A nonzero pid is an unclassifiable partial-success
+  ;; state, and the handle is left intact, its entry removed so that no
+  ;; teardown closes it. Answers the status the verb raises, RC unless
+  ;; unclassifiable.
   (define (clean-up-failed-spawn! loop proc rc)
     (let ((ptr (handle-ptr proc)))
       (cond ((not (zero? (uv-process-get-pid ptr)))
+             (registry-remove! ptr)
              'spawn-failure-state-unclassifiable)
             ((handle-in-loop-queue? loop proc)
-             (registry-register! ptr 'process loop proc)
              (count-process-new!)
              (close-handle! proc)
              rc)
             (else
+             (registry-remove! ptr)
              (discard-failed-handle! proc)
              rc))))
 

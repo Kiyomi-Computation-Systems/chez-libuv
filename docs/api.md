@@ -144,14 +144,22 @@ down from the moment it exists. `call-with-uv-loop` makes its loop inside
 its body, so an engine that expires anywhere from there on tears the loop
 down with it.
 
+`uv-spawn!` makes both promises for the handles in its `stdio` and for its
+loop ([Child processes](#child-processes--libuv-process)). One whose engine
+is never resumed either had not begun, or had finished: the loop holds its
+process, or a failed spawn has been cleaned up.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
 the task that is using it, and do not abandon an engine inside
-`uv-tcp-connect!`, a DNS request, `uv-spawn!`, or `call-with-uv-loop`'s
-teardown on the way out of its body. `uv-spawn!` already keeps the first
-promise for the handles in its `stdio` and for its loop
-([Child processes](#child-processes--libuv-process)), not yet the second.
+`uv-tcp-connect!`, a DNS request, `call-with-uv-loop`'s teardown on the way
+out of its body, or a verb that borrows a scratch block for its answer:
+`uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+`uv-tcp-peer-address`, and the four buffer-size verbs
+(`uv-send-buffer-size`, `uv-send-buffer-size!`, `uv-recv-buffer-size`,
+`uv-recv-buffer-size!`). Each of those loses its block, or both of them,
+when its engine is never resumed.
 
 ## Flow control
 
@@ -408,10 +416,11 @@ the design spec (§4–§6):
   failure). So such a change either finds the spawn finished, or makes it
   raise what the same state raises on entry: `&uv-handle-closed` for a
   closed handle or loop, `'pipe-already-used` for a consumed pipe. A spawn
-  refused there leaves nothing allocated and no pipe marked. One caveat
-  remains: an engine whose fuel runs out after the spawn has allocated and
-  before that step, and that is never resumed, strands the process handle
-  and the options block.
+  refused there leaves nothing allocated and no pipe marked. The same step
+  allocates the process handle and the options block, so an engine that
+  runs out of fuel during the call and is never resumed strands neither:
+  before the step the call holds nothing, and after it the loop holds the
+  process, or a failed spawn has been cleaned up.
 
 **Root lane.** Exercising `uid`/`gid` (which map to
 `UV_PROCESS_SETUID`/`SETGID`) needs to actually run as root, so that
