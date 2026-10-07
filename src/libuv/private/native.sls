@@ -3,9 +3,11 @@
 ;;; is evaluated because Chez resolves symbols at definition time. Load libuv
 ;;; before the shim so uv_* symbols are globally available on Linux.
 ;;;
-;;; tests/test-source-rules.sps holds the foreign calls below to two rules: a
-;;; caller's string crosses as bytes (u8*), never as a string argument, and no
-;;; __collect_safe call takes an argument in Scheme memory, such as a u8*.
+;;; tests/test-source-rules.sps holds the foreign calls below to its rules 3
+;;; to 5. A string crosses as its C string's bytes (u8*), never as a string
+;;; argument. No __collect_safe call takes an argument in Scheme memory, such
+;;; as a u8*. And every call is a foreign-procedure or shim-procedure form,
+;;; with its types spelt out where the rules can read them.
 (library (libuv private native)
   (export ;; loading and the init gate
           ensure-native-loaded! native-init-count native-initialized? init-mutex
@@ -180,11 +182,10 @@
   (define shim-compiled-version
     (shim-procedure "chez_uv_shim_compiled_version" () int))
 
-  ;; chez_uv_constant writes a C long through an out-parameter. Its name is
-  ;; the one string argument in src/ (test-source-rules.sps): it receives
-  ;; only the binding's own constant names.
+  ;; chez_uv_constant writes a C long through an out-parameter. The name
+  ;; crosses as its C string's bytes, as every string does here.
   (define raw-constant
-    (shim-procedure "chez_uv_constant" (string uptr) int))
+    (shim-procedure "chez_uv_constant" (u8* uptr) int))
 
   (define raw-errno-count (shim-procedure "chez_uv_errno_count" () int))
   (define raw-errno-name  (shim-procedure "chez_uv_errno_name" (int) uptr))
@@ -1090,14 +1091,18 @@
         (raise (make-uv-version-incompatible compiled runtime))))
 
   ;; lookup-constant : string -> (or exact-integer #f)
-  ;; Size the out-parameter as C long rather than assuming pointer width.
+  ;; Size the out-parameter as C long rather than assuming pointer width. A
+  ;; name holding a NUL names no constant, where the shim would read only
+  ;; up to the NUL (tests/test-native.sps).
   (define (lookup-constant name)
-    (let* ((out (foreign-alloc (foreign-sizeof 'long)))
-           (found (guard (e (#t (foreign-free out) (raise e)))
-                    (raw-constant name out)))
-           (value (if (zero? found) #f (foreign-ref 'long out 0))))
-      (foreign-free out)
-      value))
+    (let ((bytes (string->utf8 (string-append name "\x0;"))))
+      (and (c-string? bytes)
+           (let* ((out (foreign-alloc (foreign-sizeof 'long)))
+                  (found (guard (e (#t (foreign-free out) (raise e)))
+                           (raw-constant bytes out)))
+                  (value (if (zero? found) #f (foreign-ref 'long out 0))))
+             (foreign-free out)
+             value))))
 
   (define (errno-name-at i) (c-string->string (raw-errno-name i)))
 

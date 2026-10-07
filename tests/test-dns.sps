@@ -567,6 +567,9 @@
 ;; submission order.
 (define h-order '())
 
+;; The next submission runs in this callback, and a raise there would leave
+;; from the wait below as the suite's end. Caught, it is the chain's next
+;; entry, and the chain row fails carrying it.
 (define (h-submit! n)
   (uv-getaddrinfo! l "127.0.0.1" "80"
                    (suite-hints #t '(family . inet) '(socktype . stream))
@@ -575,7 +578,11 @@
                      (set! h-order (cons (list n (err->symbol err)
                                                (length results))
                                          h-order))
-                     (when (< n 3) (h-submit! (+ n 1))))))
+                     (when (< n 3)
+                       (guard (e (#t (set! h-order
+                                           (cons (list (+ n 1) 'raised (describe e))
+                                                 h-order))))
+                         (h-submit! (+ n 1)))))))
 
 (test-equal "a chain of three resubmissions: the first lookup starts"
   'started
@@ -997,8 +1004,8 @@
 ;; advances past it to the INET entry behind it. 203.0.113.9 is
 ;; TEST-NET-3: decode-only, never routed, and no lookup happens anyway.
 ;; fill-sockaddr! parses the address, so a parse that raises fails the
-;; first row here by name; the node then carries a NULL ai_addr, and the
-;; rows that decode it fail too.
+;; first row here by name. The node then carries a NULL ai_addr, and the
+;; row that decodes its address fails too.
 (define k-sockaddr
   (guard (e (#t (list 'raised (describe e))))
     (make-synthetic-sockaddr "203.0.113.9" 8080)))
@@ -1438,10 +1445,23 @@
 
 (define dc-attempts '())   ; most recent first
 
-;; An attempt that raises is kept as (raised description), with the key the
-;; retry reads, and ends the retries; the row after the loop reports it.
+;; drain-dns-requests! : uv-loop -> unspecified
+;; Steps LOOP until no lookup is live, for an attempt that raised after
+;; submitting some: left in flight, they would show in a later section's
+;; counts and blame code that is not at fault. Total, since it runs in a
+;; guard's handler, where a raise would end the suite.
+(define (drain-dns-requests! loop)
+  (guard (e (#t #f))
+    (run-until/ticking loop
+                       (lambda () (and (zero? (live-count 'getaddrinfo-req))
+                                       (zero? (live-count 'getnameinfo-req))))
+                       cap)))
+
+;; An attempt that raises is kept as ((raised description)) and ends the
+;; retries; the rows below report it as raised.
 (let attempt ((n 1))
-  (let ((obs (guard (e (#t (list (list 'raised (describe e)) (cons 'first 'raised))))
+  (let ((obs (guard (e (#t (drain-dns-requests! l)
+                           (list (list 'raised (describe e)))))
                (double-cancel-attempt!))))
     (set! dc-attempts (cons obs dc-attempts))
     (when (and (< n dc-max-attempts)
@@ -1455,13 +1475,18 @@
 ;; The wording branches on the OUTCOME: an exhausted retry bound must not
 ;; print "won" -- the catcher row below fails in that case, and the
 ;; informational line has to agree with it rather than contradict it.
-(display (if (eq? #t (cdr (assq 'first (car dc-attempts))))
-             (string-append "  [informational] double-cancel: first cancel won on attempt "
-                            (number->string (length dc-attempts))
-                            " of max " (number->string dc-max-attempts))
-             (string-append "  [informational] double-cancel: first cancel never won in "
-                            (number->string (length dc-attempts))
-                            " attempts (max " (number->string dc-max-attempts) ")")))
+(display (let ((final (car dc-attempts)))
+           (cond ((assq 'raised final)
+                  (string-append "  [informational] double-cancel: attempt "
+                                 (number->string (length dc-attempts)) " raised"))
+                 ((eq? #t (cdr (assq 'first final)))
+                  (string-append "  [informational] double-cancel: first cancel won on attempt "
+                                 (number->string (length dc-attempts))
+                                 " of max " (number->string dc-max-attempts)))
+                 (else
+                  (string-append "  [informational] double-cancel: first cancel never won in "
+                                 (number->string (length dc-attempts))
+                                 " attempts (max " (number->string dc-max-attempts) ")")))))
 (newline)
 
 ;; The losing attempts' tail-err is pinned to the two LEGAL outcomes: the
@@ -1473,6 +1498,7 @@
   'invariants-held
   (let check ((atts dc-attempts))
     (cond ((null? atts) 'invariants-held)
+          ((assq 'raised (car atts)) (list 'raised-attempt (car atts)))
           ((let ((a (car atts)))
              (and (= 4 (cdr (assq 'blocker-fires a)))
                   (= 1 (cdr (assq 'tail-fires a)))
@@ -1482,28 +1508,39 @@
            (check (cdr atts)))
           (else (list 'invariant-violated (car atts))))))
 
+;; The rows below read the final attempt; one that raised has nothing to
+;; read, and says so.
+(define (dc-final-or-raised read)
+  (let ((final (car dc-attempts)))
+    (if (assq 'raised final)
+        (list 'raised-on-attempt (length dc-attempts))
+        (read final))))
+
 (test-equal "double-cancel: a same-turn first cancel won within the attempt bound"
   'first-cancel-won
-  (let ((final (car dc-attempts)))
-    (if (eq? #t (cdr (assq 'first final)))
-        'first-cancel-won
-        (list 'never-won-in (length dc-attempts) 'attempts))))
+  (dc-final-or-raised
+   (lambda (final)
+     (if (eq? #t (cdr (assq 'first final)))
+         'first-cancel-won
+         (list 'never-won-in (length dc-attempts) 'attempts)))))
 
 (test-equal "double-cancel: the second cancel on the same queued node also answers #t"
   'second-cancel-true
-  (let ((final (car dc-attempts)))
-    (case (cdr (assq 'second final))
-      ((#t) 'second-cancel-true)
-      ((#f) 'second-cancel-false)
-      (else (list 'second-was (cdr (assq 'second final)))))))
+  (dc-final-or-raised
+   (lambda (final)
+     (case (cdr (assq 'second final))
+       ((#t) 'second-cancel-true)
+       ((#f) 'second-cancel-false)
+       (else (list 'second-was (cdr (assq 'second final))))))))
 
 (test-equal "double-cancel: the callback fired exactly once, cancelled, host and service #f"
   '(1 EAI_CANCELED host-absent service-absent)
-  (let ((final (car dc-attempts)))
-    (list (cdr (assq 'tail-fires final))
-          (cdr (assq 'tail-err final))
-          (cdr (assq 'tail-host final))
-          (cdr (assq 'tail-serv final)))))
+  (dc-final-or-raised
+   (lambda (final)
+     (list (cdr (assq 'tail-fires final))
+           (cdr (assq 'tail-err final))
+           (cdr (assq 'tail-host final))
+           (cdr (assq 'tail-serv final))))))
 
 ;; --- boundary: uv-getnameinfo! validation, before the first allocation ---
 ;; The TCP input vocabulary on the way in (S4.5, ADR-0012), each refusal
@@ -1645,28 +1682,34 @@
         (tail-err 'callback-never-fired)
         (tail-host 'callback-never-fired)
         (tail-serv 'callback-never-fired))
-    (let submit ((i 0))
-      (when (< i 4)
-        (let ((idx i))
-          (uv-getaddrinfo! l2 "127.0.0.1" "80"
-                           (suite-hints #t '(family . inet)
-                                        '(socktype . stream))
-                           (lambda (err results)
-                             (collect)
-                             (vector-set! blocker-fires idx
-                                          (+ 1 (vector-ref blocker-fires idx)))
-                             (vector-set! blocker-errs idx
-                                          (err->symbol err)))))
-        (submit (+ i 1))))
-    (uv-getnameinfo! l2 "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                     (lambda (err host service)
-                       (collect)
-                       (set! tail-fires (+ tail-fires 1))
-                       (set! tail-err (err->symbol err))
-                       (set! tail-host (if host (list 'host host) 'host-absent))
-                       (set! tail-serv (if service
-                                           (list 'service service)
-                                           'service-absent))))
+    ;; A submit that raises leaves l2 open with what was already submitted,
+    ;; which would show in the epilogue's counts. It is torn down before the
+    ;; raise goes on to the retry below, which records it.
+    (guard (e (#t (guard (x (#t #f))
+                    (when (uv-loop-open? l2) (uv-loop-teardown! l2)))
+                  (raise e)))
+      (let submit ((i 0))
+        (when (< i 4)
+          (let ((idx i))
+            (uv-getaddrinfo! l2 "127.0.0.1" "80"
+                             (suite-hints #t '(family . inet)
+                                          '(socktype . stream))
+                             (lambda (err results)
+                               (collect)
+                               (vector-set! blocker-fires idx
+                                            (+ 1 (vector-ref blocker-fires idx)))
+                               (vector-set! blocker-errs idx
+                                            (err->symbol err)))))
+          (submit (+ i 1))))
+      (uv-getnameinfo! l2 "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                       (lambda (err host service)
+                         (collect)
+                         (set! tail-fires (+ tail-fires 1))
+                         (set! tail-err (err->symbol err))
+                         (set! tail-host (if host (list 'host host) 'host-absent))
+                         (set! tail-serv (if service
+                                             (list 'service service)
+                                             'service-absent)))))
     ;; Teardown IMMEDIATELY: no loop step between the submits and the sweep.
     (uv-loop-teardown! l2)
     (list (cons 'loop-state (if (uv-loop-open? l2) 'still-open 'closed))
@@ -1685,9 +1728,10 @@
 
 (define td-attempts '())   ; most recent first
 
-;; An attempt that raises is kept and ends the retries, as above.
+;; An attempt that raises is kept as ((raised description)) and ends the
+;; retries, as above.
 (let attempt ((n 1))
-  (let ((obs (guard (e (#t (list (list 'raised (describe e)) (cons 'tail-err 'raised))))
+  (let ((obs (guard (e (#t (list (list 'raised (describe e)))))
                (teardown-attempt!))))
     (set! td-attempts (cons obs td-attempts))
     (when (and (< n td-max-attempts)
@@ -1700,13 +1744,18 @@
 
 ;; Branched on the outcome for the same reason as the double-cancel line:
 ;; exhaustion must not print "won" while the catcher row fails.
-(display (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err (car td-attempts))))
-             (string-append "  [informational] queued-tail teardown: cancel won on attempt "
-                            (number->string (length td-attempts))
-                            " of max " (number->string td-max-attempts))
-             (string-append "  [informational] queued-tail teardown: cancel never won in "
-                            (number->string (length td-attempts))
-                            " attempts (max " (number->string td-max-attempts) ")")))
+(display (let ((final (car td-attempts)))
+           (cond ((assq 'raised final)
+                  (string-append "  [informational] queued-tail teardown: attempt "
+                                 (number->string (length td-attempts)) " raised"))
+                 ((eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
+                  (string-append "  [informational] queued-tail teardown: cancel won on attempt "
+                                 (number->string (length td-attempts))
+                                 " of max " (number->string td-max-attempts)))
+                 (else
+                  (string-append "  [informational] queued-tail teardown: cancel never won in "
+                                 (number->string (length td-attempts))
+                                 " attempts (max " (number->string td-max-attempts) ")")))))
 (newline)
 
 ;; The tail's err is held to the same two-legal-outcomes set as the
@@ -1717,6 +1766,7 @@
   'invariants-held
   (let check ((atts td-attempts))
     (cond ((null? atts) 'invariants-held)
+          ((assq 'raised (car atts)) (list 'raised-attempt (car atts)))
           ((let ((a (car atts)))
              (and (eq? 'closed (cdr (assq 'loop-state a)))
                   (equal? '(1 1 1 1 1) (cdr (assq 'fires a)))
@@ -1728,20 +1778,29 @@
            (check (cdr atts)))
           (else (list 'invariant-violated (car atts))))))
 
+;; As for the double-cancel rows: a final attempt that raised says so.
+(define (td-final-or-raised read)
+  (let ((final (car td-attempts)))
+    (if (assq 'raised final)
+        (list 'raised-on-attempt (length td-attempts))
+        (read final))))
+
 (test-equal "queued-tail teardown: the sweep cancelled the queued tail within the attempt bound"
   'cancel-won-observed
-  (let ((final (car td-attempts)))
-    (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
-        'cancel-won-observed
-        (list 'never-cancelled-in (length td-attempts) 'attempts
-              'final-tail-err (cdr (assq 'tail-err final))))))
+  (td-final-or-raised
+   (lambda (final)
+     (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
+         'cancel-won-observed
+         (list 'never-cancelled-in (length td-attempts) 'attempts
+               'final-tail-err (cdr (assq 'tail-err final)))))))
 
 (test-equal "queued-tail teardown: the cancelled tail delivered EAI_CANCELED with host and service #f"
   '(EAI_CANCELED host-absent service-absent)
-  (let ((final (car td-attempts)))
-    (list (cdr (assq 'tail-err final))
-          (cdr (assq 'tail-host final))
-          (cdr (assq 'tail-serv final)))))
+  (td-final-or-raised
+   (lambda (final)
+     (list (cdr (assq 'tail-err final))
+           (cdr (assq 'tail-host final))
+           (cdr (assq 'tail-serv final))))))
 
 ;; --- uv-loop-close! with an in-flight request => 'EBUSY (S6; ADR-0011) ---
 ;; libuv's own guard is the check (vendor/libuv/src/uv-common.c:885): an
@@ -1783,10 +1842,14 @@
 (test-equal "close with in-flight request: the drained lookup delivered normally"
   '(no-error "127.0.0.1") (list eb-err eb-host))
 
+;; A loop the EBUSY row already closed had nothing to drain, so this close
+;; proves nothing about one: closing a closed loop answers the same.
 (test-equal "close with in-flight request: the loop closes cleanly after the drain"
   'closed-clean
-  (begin (uv-loop-close! l3)
-         (if (uv-loop-open? l3) 'still-open 'closed-clean)))
+  (if (uv-loop-open? l3)
+      (begin (uv-loop-close! l3)
+             (if (uv-loop-open? l3) 'still-open 'closed-clean))
+      'closed-before-any-drain))
 
 ;; --- balance epilogue ----------------------------------------------------
 (uv-close! probe-timer)

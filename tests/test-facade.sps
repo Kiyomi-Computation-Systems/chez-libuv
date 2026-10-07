@@ -32,11 +32,33 @@
         ;; (collect) only, so this suite's timer callback obeys design spec
         ;; S11's "every timer callback calls (collect)" like every other. It
         ;; is not a name the facade could be expected to supply, so it cannot
-        ;; stand in for a dropped re-export.
-        (only (chezscheme) collect))
+        ;; stand in for a dropped re-export. Nor is display-condition, which
+        ;; describe uses.
+        (only (chezscheme) collect display-condition))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. A row that catches a
+;; raise answers the condition as its actual value, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
+;; describe : object -> string
+;; A raised object's message, for a row to carry as evidence. Total, so a
+;; guard calling it cannot raise in turn. (tests/uv-evidence.sls has the
+;; same procedure, but nothing but the facade may stand between this suite
+;; and the binding.)
+(define (describe e)
+  (guard (err (#t "<the raised object could not be printed>"))
+    (call-with-string-output-port
+     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
 (test-begin "facade")
 
@@ -307,12 +329,20 @@
   '(a-tcp open)
   (list (if (uv-tcp? fserver) 'a-tcp 'not-a-tcp) (uv-handle-state fserver)))
 
-(uv-tcp-bind! fserver "127.0.0.1" 0)
+;; A bind that raises fails a row by name, where at top level it would end
+;; the suite (tests/test-seed-gates.sps, rule 4). An unbound handle has no
+;; socket to name, so the port is read only after a bind.
+(define f-bind
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! fserver "127.0.0.1" 0)
+    'bound))
 
-(define fport (uv-tcp-getsockname-port fserver))
+(define fport
+  (if (eq? f-bind 'bound) (uv-tcp-getsockname-port fserver) f-bind))
 
 (test-equal "uv-tcp-bind! and uv-tcp-getsockname-port are re-exported"
-  'ephemeral (if (and (> fport 1024) (< fport 65536)) 'ephemeral fport))
+  'ephemeral
+  (if (and (integer? fport) (> fport 1024) (< fport 65536)) 'ephemeral fport))
 
 (define f-accepted 'never-accepted)
 (define f-connect-err 'connect-cb-never-fired)
@@ -346,20 +376,24 @@
 ;; 'ECANCELED, and going on then, on the closing client, raised
 ;; &uv-handle-closed out of uv-loop-teardown! and aborted the suite (measured
 ;; 2026-10-06, by forcing the drain to give up).
-(uv-tcp-connect! fclient "127.0.0.1" fport
-                 (lambda (err)
-                   (collect)
-                   (set! f-connect-err err)
-                   (when (not err)
-                     (uv-tcp-nodelay! fclient #t)
-                     (uv-write! fclient (string->utf8 "facade")
-                                (lambda (werr)
-                                  (collect)
-                                  (set! f-write-err werr)
-                                  (uv-shutdown! fclient
-                                                (lambda (serr)
-                                                  (collect)
-                                                  (set! f-shutdown-err serr))))))))
+(test-equal "uv-tcp-connect! is re-exported and starts the client's connect"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-connect! fclient "127.0.0.1" fport
+                     (lambda (err)
+                       (collect)
+                       (set! f-connect-err err)
+                       (when (not err)
+                         (uv-tcp-nodelay! fclient #t)
+                         (uv-write! fclient (string->utf8 "facade")
+                                    (lambda (werr)
+                                      (collect)
+                                      (set! f-write-err werr)
+                                      (uv-shutdown! fclient
+                                                    (lambda (serr)
+                                                      (collect)
+                                                      (set! f-shutdown-err serr))))))))
+    'started))
 
 ;; Bounded by iteration count, never by a clock (design spec S11). The whole
 ;; chain above is driven by callbacks the loop itself delivers.
@@ -457,9 +491,16 @@
 (test-equal "the facade's write-queue-size answers zero on an idle stream"
   'zero (if (zero? (uv-stream-write-queue-size fclient)) 'zero 'nonzero))
 
+;; The port is read in the tested expression: an expected value is
+;; evaluated outside the row's catch, and on a client that never connected
+;; the read raises (AGENTS.md's plumbing trap).
 (test-equal "the facade's sockname-address answers this end's own name"
-  (list "127.0.0.1" (uv-tcp-getsockname-port fclient))
-  (let-values (((a p) (uv-tcp-sockname-address fclient))) (list a p)))
+  'its-own-name
+  (let-values (((a p) (uv-tcp-sockname-address fclient)))
+    (let ((port (uv-tcp-getsockname-port fclient)))
+      (if (equal? (list a p) (list "127.0.0.1" port))
+          'its-own-name
+          (list a p 'port port)))))
 
 (test-equal "the facade's peer-address answers the connected peer"
   (list "127.0.0.1" fport)
@@ -503,14 +544,21 @@
 (define d-err 'callback-never-fired)
 (define d-results 'callback-never-fired)
 
-(define d-req
-  (uv-getaddrinfo! dl "127.0.0.1" "80"
-                   '((family . inet) (socktype . stream) (protocol . tcp)
-                     (flags . (numeric-host numeric-serv)))
-                   (lambda (err results)
-                     (collect)
-                     (set! d-err (facade-err->symbol err))
-                     (set! d-results results))))
+;; The request the start answers, once it has started.
+(define d-req 'never-started)
+
+(test-equal "uv-getaddrinfo! is re-exported and starts the lookup"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (set! d-req
+          (uv-getaddrinfo! dl "127.0.0.1" "80"
+                           '((family . inet) (socktype . stream) (protocol . tcp)
+                             (flags . (numeric-host numeric-serv)))
+                           (lambda (err results)
+                             (collect)
+                             (set! d-err (facade-err->symbol err))
+                             (set! d-results results))))
+    'started))
 
 (test-equal "uv-dns-request? is re-exported and accepts the in-flight request"
   'a-dns-request
@@ -552,17 +600,28 @@
 (define n-host 'callback-never-fired)
 (define n-serv 'callback-never-fired)
 
-(define n-req
-  (uv-getnameinfo! dl "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                   (lambda (err host service)
-                     (collect)
-                     (set! n-err (facade-err->symbol err))
-                     (set! n-host (if host (list 'host host) 'host-absent))
-                     (set! n-serv (if service
-                                      (list 'service service)
-                                      'service-absent)))))
+;; The request the start answers, once it has started.
+(define n-req 'never-started)
 
-(define n-cancel-answer (uv-cancel! n-req))
+(test-equal "uv-getnameinfo! is re-exported and starts the reverse lookup"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (set! n-req
+          (uv-getnameinfo! dl "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                           (lambda (err host service)
+                             (collect)
+                             (set! n-err (facade-err->symbol err))
+                             (set! n-host (if host (list 'host host) 'host-absent))
+                             (set! n-serv (if service
+                                              (list 'service service)
+                                              'service-absent)))))
+    'started))
+
+;; A cancel that raises, of a request that never started too, is the answer
+;; the row below reports.
+(define n-cancel-answer
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-cancel! n-req)))
 
 (let drain ((i 0))
   (when (and (< i delivery-cap) (eq? n-err 'callback-never-fired))
@@ -622,9 +681,15 @@
 (define cl (make-uv-loop))
 (define cserver (make-uv-tcp cl))
 
-(uv-tcp-bind! cserver "127.0.0.1" 0)
+(define c-bind
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! cserver "127.0.0.1" 0)
+    'bound))
 
-(define cport (uv-tcp-getsockname-port cserver))
+(test-equal "resolve->connect: the listener binds 127.0.0.1, port 0" 'bound c-bind)
+
+(define cport
+  (if (eq? c-bind 'bound) (uv-tcp-getsockname-port cserver) c-bind))
 (define c-accepted 'never-accepted)
 
 (uv-listen! cserver 128
@@ -636,13 +701,17 @@
 (define c-resolve-err 'resolve-cb-never-fired)
 (define c-records 'resolve-cb-never-fired)
 
-(uv-getaddrinfo! cl "127.0.0.1" (number->string cport)
-                 '((family . inet) (socktype . stream) (protocol . tcp)
-                   (flags . (numeric-host numeric-serv)))
-                 (lambda (err results)
-                   (collect)
-                   (set! c-resolve-err (facade-err->symbol err))
-                   (set! c-records results)))
+(test-equal "resolve->connect: the lookup of the listener's port starts"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-getaddrinfo! cl "127.0.0.1" (number->string cport)
+                     '((family . inet) (socktype . stream) (protocol . tcp)
+                       (flags . (numeric-host numeric-serv)))
+                     (lambda (err results)
+                       (collect)
+                       (set! c-resolve-err (facade-err->symbol err))
+                       (set! c-records results)))
+    'started))
 
 ;; The ticker keeps both drains' iteration bounds real, exactly as the tcp
 ;; and dns blocks above.
@@ -667,13 +736,18 @@
 (define cclient (make-uv-tcp cl))
 (define c-connect-err 'connect-cb-never-fired)
 
-(when (uv-addrinfo? c-rec)
-  (uv-tcp-connect! cclient
-                   (uv-addrinfo-address c-rec)
-                   (uv-addrinfo-port c-rec)
-                   (lambda (err)
-                     (collect)
-                     (set! c-connect-err (facade-err->symbol err)))))
+(test-equal "resolve->connect: the connect to the record's address starts"
+  'started
+  (if (uv-addrinfo? c-rec)
+      (guard (e (#t (list 'raised (describe e))))
+        (uv-tcp-connect! cclient
+                         (uv-addrinfo-address c-rec)
+                         (uv-addrinfo-port c-rec)
+                         (lambda (err)
+                           (collect)
+                           (set! c-connect-err (facade-err->symbol err))))
+        'started)
+      (list 'no-record c-rec)))
 
 ;; Both ends waited for, as the tcp block above records: the accept and
 ;; the connect completion are separate poll events.

@@ -214,10 +214,13 @@
     (uv-tcp-bind! (make-uv-tcp l) "999.1.1.1" 0)
     'no-raise))
 
+;; The IPv6 handle the namelen row below reads.
+(define v6 (make-uv-tcp l))
+
 (test-equal "uv-tcp-bind! accepts an IPv6 address literal"
   'bound
-  (guard (e (#t (list 'raised (err->symbol e))))
-    (uv-tcp-bind! (make-uv-tcp l) "::1" 0)
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! v6 "::1" 0)
     'bound))
 
 ;; --- the namelen libuv writes back ---------------------------------------
@@ -231,14 +234,6 @@
 ;; the discriminating case, because its sockaddr_in6 is a DIFFERENT size from
 ;; the sockaddr_in every other row here produces -- a check spelled
 ;; `(= namelen (sizeof-sockaddr-in))` passes the whole suite except this row.
-(define v6 (make-uv-tcp l))
-
-(test-equal "uv-tcp-bind! binds the IPv6 handle the next row reads to ::1"
-  'bound
-  (guard (e (#t (list 'raised (describe e))))
-    (uv-tcp-bind! v6 "::1" 0)
-    'bound))
-
 (test-equal "uv-tcp-getsockname-port answers for an IPv6 handle too, whose namelen differs"
   'ephemeral
   (guard (e ((uv-invalid-argument? e)
@@ -2053,12 +2048,13 @@
   (run-until/ticking ml (lambda () (>= (collector-count m-in) m-total))
                      delivery-cap))
 
-;; UNCONDITIONAL, not failure-gated: SRFI-64's simple runner prints only row
-;; NAMES, never expected-vs-actual, so a red row here says "the megabyte did
-;; not arrive" and nothing whatever about why. This line exists because that
-;; happened -- an intermittent failure of these three rows on CI's Linux
-;; Valgrind leg (never reproduced on macOS, nor in 5/5 aarch64 Valgrind runs)
-;; could not be diagnosed from the log at all.
+;; UNCONDITIONAL, not failure-gated. A red row here prints its actual value
+;; (the hook at the top of this suite), but no row carries the byte count
+;; or the reader's on-error as the drain ended, and a passing run gets a
+;; baseline to compare with. The line exists because an intermittent
+;; failure of these three rows on CI's Linux Valgrind leg (never reproduced
+;; on macOS, nor in 5/5 aarch64 Valgrind runs) could not be diagnosed from
+;; the log at all, when the rows printed only their names.
 ;;
 ;; The three rows fail TOGETHER whenever the transfer falls short, so the
 ;; discriminating question is which of the two causes did it: the drain ran

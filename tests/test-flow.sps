@@ -15,10 +15,23 @@
         (libuv private conditions)
         (only (libuv private native) live-counts)
         (uv-testing)
+        (only (uv-evidence) describe)
         (only (chezscheme) collect))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. A row that catches a
+;; raise answers the condition as its actual value, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
 (test-begin "flow")
 
 ;; --- cross-stream isolation ----------------------------------------------
@@ -160,15 +173,30 @@
 ;; --- OS socket buffer sizes ------------------------------------------------
 (define bloop (make-uv-loop))
 (define btcp (make-uv-tcp bloop))
-(uv-tcp-bind! btcp "127.0.0.1" 0)          ; bind is enough; no connection needed
+
+;; A bind is enough; no connection is needed. A bind that raises fails this
+;; row by name, where at top level it would end the suite
+;; (tests/test-seed-gates.sps, rule 4). An unbound handle has no socket, so
+;; the sizes below are set and read only after a bind.
+(define b-bind
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! btcp "127.0.0.1" 0)
+    'bound))
+
+(test-equal "the buffer-size handle binds 127.0.0.1, port 0" 'bound b-bind)
+
+;; set-then-read : (uv-tcp -> unspecified) (uv-tcp -> object) -> object
+;; WRITE then READ on btcp once it is bound, else the bind's outcome.
+(define (set-then-read write read)
+  (if (eq? b-bind 'bound) (begin (write btcp) (read btcp)) b-bind))
 
 ;; TWO-POINT: set low, read; set high, read; assert the readings track the
 ;; direction. Not (< after default): Linux stores max(2n, SOCK_MIN_SNDBUF),
 ;; so 8192 lands exactly on tcp_wmem[1] and "below default" is false there.
-(uv-send-buffer-size! btcp 8192)
-(define send-low (uv-send-buffer-size btcp))
-(uv-send-buffer-size! btcp 262144)
-(define send-high (uv-send-buffer-size btcp))
+(define send-low
+  (set-then-read (lambda (h) (uv-send-buffer-size! h 8192)) uv-send-buffer-size))
+(define send-high
+  (set-then-read (lambda (h) (uv-send-buffer-size! h 262144)) uv-send-buffer-size))
 
 (test-equal "the send buffer tracks the value set, at two points"
   '(positive tracks-upward)
@@ -180,10 +208,10 @@
 ;; setter is ever cross-wired to write SO_SNDBUF, last-write-wins semantics
 ;; mean identical constants would silently land back on send-high and
 ;; send-unmoved would pass anyway, giving that assertion no probe at all.
-(uv-recv-buffer-size! btcp 16384)
-(define recv-low (uv-recv-buffer-size btcp))
-(uv-recv-buffer-size! btcp 131072)
-(define recv-high (uv-recv-buffer-size btcp))
+(define recv-low
+  (set-then-read (lambda (h) (uv-recv-buffer-size! h 16384)) uv-recv-buffer-size))
+(define recv-high
+  (set-then-read (lambda (h) (uv-recv-buffer-size! h 131072)) uv-recv-buffer-size))
 
 (test-equal "the receive buffer tracks independently of the send buffer"
   '(tracks-upward send-unmoved)
@@ -250,7 +278,13 @@
 ;; THE CLOSING GATE, one row per wrapper. 'closing, not 'closed: on a closing
 ;; handle the pointer is still live, so a missing gate silently SUCCEEDS.
 (define bclosing (make-uv-tcp bloop))
-(uv-tcp-bind! bclosing "127.0.0.1" 0)
+
+(test-equal "the closing-gate handle binds 127.0.0.1, port 0"
+  'bound
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-tcp-bind! bclosing "127.0.0.1" 0)
+    'bound))
+
 (uv-close! bclosing)                       ; not run: state is 'closing
 
 (test-equal "all four refuse a closing handle with &uv-handle-closed"
