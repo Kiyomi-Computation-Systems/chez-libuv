@@ -153,8 +153,13 @@ The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
 the task that is using it, and do not abandon an engine inside
-`uv-tcp-connect!`, a DNS request, or `call-with-uv-loop`'s teardown on the
-way out of its body.
+`uv-tcp-connect!`, a DNS request, `call-with-uv-loop`'s teardown on the way
+out of its body, or a verb that borrows a scratch block for its answer:
+`uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+`uv-tcp-peer-address`, and the four buffer-size verbs
+(`uv-send-buffer-size`, `uv-send-buffer-size!`, `uv-recv-buffer-size`,
+`uv-recv-buffer-size!`). Each of those loses its block, or both of them,
+when its engine is never resumed.
 
 ## Flow control
 

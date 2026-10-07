@@ -136,12 +136,17 @@ to a struct instead of a payload.
 > the block, builds the block, spawns and frees it. Before the step the
 > verb holds nothing, so a drop strands nothing; after it the loop holds
 > the process. The block is still freed the moment `uv_spawn` returns.
-> Inside the step nothing raises: the allocations answer 0 rather than
-> raise, a string that would not fit is answered as a status that the verb
-> raises after the step, and the strings are copied without the
-> per-string interrupt bracket `copy-in!` adds. A spawn allocates 992 B
-> less for argv of 3 and 4,832 B less with a 40-string env. Evidence and
-> the mutations: `.plans/spawn-drop-mutation-log.md`.
+> The step raises nothing it can avoid. Its allocations answer 0 rather
+> than raise. The fill writes no value it has not checked, a string that
+> would not fit or a number its C type cannot hold, and answers a status
+> instead; the checks before the step refuse the same values through the
+> same predicates. The strings are copied without the per-string interrupt
+> bracket `copy-in!` adds. And the process is registered before
+> `uv_spawn`, as a constructor registers its handle before its init, so a
+> refused registration is answered with nothing forked (decision 3's
+> registration moves with it). A spawn allocates 1,120 B less for argv of
+> 3 and 4,960 B less with a 40-string env. Evidence, the mutations and the
+> review: `.plans/spawn-drop-mutation-log.md`.
 
 **2. Cleanup after a nonzero rc is class-dependent, and the class is decided
 by whether the loop still owns the handle — never by the errno.** Both
@@ -303,6 +308,15 @@ use-after-free are neither.
 > as the build's own guard does when the build fails; on every other path
 > the block is still freed the moment `uv_spawn` returns. Evidence and the
 > mutations: `.plans/spawn-stdio-fence-mutation-log.md`.
+>
+> Since #63 (the amendment to decision 1), the step makes its checks
+> before it allocates, so a refusal there has nothing to free, and the
+> build's guard is gone with the build. The step frees both blocks
+> without calling `uv_spawn` on two paths of its own: an allocation the
+> allocator refuses (ENOMEM), and options the fill could not write. It
+> also registers the process before `uv_spawn` rather than after, and the
+> failure cleanup removes the entry where the handle is not kept: libuv
+> unlinked it, or the state is unclassifiable.
 
 **6. The pipe contract, rewritten from measurement.** On a failed spawn every
 pipe named in a `(pipe …)` spec is **marked connected, left open, and closed
