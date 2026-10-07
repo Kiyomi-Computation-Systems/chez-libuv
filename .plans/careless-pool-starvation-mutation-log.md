@@ -231,7 +231,9 @@ second is left for its own change.
 2. **"no collection completes while copy-out is inside its foreign call"**,
    run 86 of another loop, load 205: `(never-tried 0)`. The helper thread
    never tried to collect inside any of the three 64 MiB copy-out intervals,
-   so the row's precondition failed, not its property.
+   so the row's precondition failed, not its property. Fixed since: the
+   rows now run until the helper has tried inside an interval
+   (`.plans/bulk-copy-liveness-mutation-log.md`).
 
 ## The review's fixes
 

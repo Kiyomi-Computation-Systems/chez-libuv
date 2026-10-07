@@ -265,7 +265,12 @@ None is obvious from reading the code.
   thread's drains. Any wait on another thread needs a bound of its own, or
   a broken build hangs where it should fail a row: each pool's join, and the
   discipline pool's wait for a drain, give up after 10 s and say so
-  (`.plans/careless-pool-starvation-mutation-log.md`).
+  (`.plans/careless-pool-starvation-mutation-log.md`). The bulk-copy rows
+  were the same shape inverted: a fixed count of copy intervals, and a
+  verdict that needed the helper inside one. At loads of 170–340 it was
+  in none, in either row. They now run until it has tried, parking it
+  between intervals so each interval starts with it awake
+  (`.plans/bulk-copy-liveness-mutation-log.md`).
 * **Chez resolves its boot files by argv[0], not by the executable's path.**
   A Chez child spawned with `file` = the real binary but argv[0] hardcoded to
   another name (e.g. `"chez"` against an install whose binary is `scheme`)
