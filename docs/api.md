@@ -33,7 +33,7 @@ then whichever thread most recently entered `uv-run` on it — so a loop can be
 built on one thread and handed to a dedicated loop thread, which keeps it
 after `uv-run` returns. Every verb that operates on an open handle, every
 verb that makes something on a loop (the handle constructors, `uv-accept!`,
-`uv-spawn!`, `uv-getaddrinfo!` and `uv-getnameinfo!`), and
+`uv-spawn!`, `uv-getaddrinfo!` and `uv-getnameinfo!`), `uv-cancel!` and
 `uv-update-time!` raise `&uv-wrong-thread` from any other thread before
 they touch anything. The check cannot see a call that races the hand-off
 itself, made while the other thread is entering `uv-run`: hand a loop over

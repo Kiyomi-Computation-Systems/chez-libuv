@@ -175,14 +175,19 @@
             (#t (list 'getnameinfo-raised (describe e))))
     (uv-getnameinfo! loop "127.0.0.1" 80 (lambda (err host service) (settle! cell)))))
 
-;; uv-cancel!'s context is the cell with a lookup started on the loop, which
-;; settles it when it completes, cancelled or not. No one runs the loop
-;; before the call, so the lookup is still the loop's when it is made.
+;; uv-cancel!'s context is the cell with a lookup made on the loop and run
+;; to its completion. The resolver opens and closes descriptors of its own
+;; on libuv's worker thread while a lookup runs, which a row counting
+;; descriptors meanwhile would see; so the lookup is over before any row
+;; counts. The owner check comes before uv-cancel! reads the request, so a
+;; completed request is refused off the owner's thread all the same, and
+;; answers #f on it.
 (define (lookup-prepare loop)
   (let ((cell (vector 'pending #f)))
     (vector-set! cell 1 (uv-getaddrinfo! loop "localhost" #f
                                          (lambda (err results) (settle! cell))))
-    cell))
+    (run-until/ticking loop (lambda () (settled? cell)) 20000)
+    (and (settled? cell) cell)))
 
 (define (cancel-call loop cell)
   (guard (e ((uv-wrong-thread? e) (raise e))

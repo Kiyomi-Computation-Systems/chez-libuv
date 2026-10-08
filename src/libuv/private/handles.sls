@@ -13,7 +13,7 @@
           registry-lock with-step-lock
 
           ;; interrupt-free steps
-          one-step open-handle-ptr owned-loop-ptr step-refusal
+          one-step open-handle-ptr open-loop-ptr owned-loop-ptr step-refusal
           try-construct-handle construct-handle try-construct-loop
           wrong-thread-refusal
 
@@ -451,20 +451,29 @@
             ((not (valid-pointer? ptr)) 'no-pointer)
             (else ptr))))
 
-;; owned-loop-ptr : uv-loop
-  ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer 'wrong-thread)
-  ;; open-handle-ptr for a loop this thread owns: a step that makes something
-  ;; on the loop checks again that the loop it was given is open, since a
-  ;; teardown can free the loop between the verb's open check and its init,
-  ;; and that this thread owns it, since the loop can be handed to another
-  ;; thread there too. From another thread, libuv's init raced the loop's
-  ;; own thread on its handle queue, and corrupted it with no error (#79).
-  ;; Every step that calls libuv on a loop rather than a handle takes the
-  ;; loop's pointer here, so none can skip the owner check.
-  (define (owned-loop-ptr loop)
+  ;; open-loop-ptr : uv-loop -> (or uptr 'loop-not-open 'no-loop-pointer)
+  ;; open-handle-ptr for a loop: a constructor's step checks again that the
+  ;; loop it was given is open, since a teardown can free the loop between
+  ;; the constructor's open check and its init.
+  (define (open-loop-ptr loop)
     (let ((ptr (loop-ptr loop)))
       (cond ((not (eq? (loop-state loop) 'open)) 'loop-not-open)
             ((not (valid-pointer? ptr)) 'no-loop-pointer)
+            (else ptr))))
+
+  ;; owned-loop-ptr : uv-loop
+  ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer 'wrong-thread)
+  ;; open-loop-ptr for a loop this thread owns: a step that makes something
+  ;; on the loop also checks that this thread owns it, since the loop can be
+  ;; handed to another thread between the verb's entry and its init. From
+  ;; another thread, libuv's init raced the loop's own thread on its handle
+  ;; queue, and corrupted it with no error (#79). Every step that makes
+  ;; something on a loop takes the loop's pointer here, so none can skip the
+  ;; owner check. The step that decides who owns the loop (uv-run's claim)
+  ;; takes it from open-loop-ptr instead.
+  (define (owned-loop-ptr loop)
+    (let ((ptr (open-loop-ptr loop)))
+      (cond ((symbol? ptr) ptr)
             ((not (eqv? (loop-owner-thread loop) (current-thread-id))) 'wrong-thread)
             (else ptr))))
 
