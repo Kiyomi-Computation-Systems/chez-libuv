@@ -33,6 +33,8 @@
         (spawn-list-races)
         (only (uv-meter) fewest-bytes)
         (uv-level-3)
+        ;; The engine-sweep driver caps the changing-data sweeps' resumes.
+        (only (uv-sweep) run-capped)
         (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor
               ;; The changing-data sweeps drive a spawn in an engine, or race
@@ -1014,34 +1016,35 @@
 
 ;; start-run! : sweep-variant exact-positive-integer -> spawn-run
 ;; Spawns in an engine with FUEL ticks, makes the variant's change at the
-;; first expiry, resumes, and starts reading the child's report.
+;; first expiry, resumes, and starts reading the child's report. A spawn
+;; still running at the driver's cap answers its give-up, so a read that
+;; came to loop fails its run by name instead of hanging the suite: until
+;; #81 this resumed without a cap.
 (define (start-run! variant fuel)
   (let* ((pipe (make-uv-pipe sweep-loop))
          (data ((sweep-variant-setup variant) pipe))
          (run (make-spawn-run fuel (cadddr data))))
     (set-run-outcome!
      run
-     (let step ((eng (make-engine
-                      (lambda ()
-                        (guard (e ((uv-invalid-argument? e)
-                                   (list 'refused (uv-invalid-argument-who e)
-                                         (uv-invalid-argument-reason e)))
-                                  ((uv-errno-error? e)
-                                   (list 'errno (uv-errno-error-errno e)))
-                                  (#t (list 'raised (describe e))))
-                          (list 'spawned
-                                (uv-spawn! sweep-loop "/bin/sh" (car data) (cadr data)
-                                           (lambda (status signal)
-                                             (collect)
-                                             (set-run-status! run (list status signal)))))))))
-                (ticks fuel))
-       (eng ticks
-            (lambda (left v) v)
-            (lambda (next)
-              (unless (run-expired? run)
-                (set-run-expired! run #t)
-                ((caddr data)))
-              (step next 100000)))))
+     (let-values (((outcome expired)
+                   (run-capped
+                    (lambda ()
+                      (guard (e ((uv-invalid-argument? e)
+                                 (list 'refused (uv-invalid-argument-who e)
+                                       (uv-invalid-argument-reason e)))
+                                ((uv-errno-error? e)
+                                 (list 'errno (uv-errno-error-errno e)))
+                                (#t (list 'raised (describe e))))
+                        (list 'spawned
+                              (uv-spawn! sweep-loop "/bin/sh" (car data) (cadr data)
+                                         (lambda (status signal)
+                                           (collect)
+                                           (set-run-status! run (list status signal)))))))
+                    fuel
+                    (lambda ()
+                      (set-run-expired! run #t)
+                      ((caddr data))))))
+       outcome))
     (when (eq? (car (run-outcome run)) 'spawned)
       (guard (e (#t (set-run-eof! run (list 'read-refused (describe e)))))
         (uv-read-start! pipe
@@ -1419,32 +1422,31 @@
             'no-expiry #f '(not-run) 'not-yet 'unchanged 'not-yet)))))
 
 ;; start-state-run! : state-variant exact-positive-integer uv-loop -> state-run
+;; Its resumes are capped as start-run!'s are (tests/uv-sweep.sls).
 (define (start-state-run! variant fuel loop)
   (let* ((setup ((state-variant-setup variant) loop))
          (run (make-state-run fuel loop setup)))
     (set-state-run-outcome!
      run
-     (let step ((eng (make-engine
-                      (lambda ()
-                        (spawn-outcome
-                         (lambda ()
-                           (uv-spawn! loop (car (state-variant-program variant))
-                                      (cdr (state-variant-program variant))
-                                      (list (cons 'stdio (car setup)))
-                                      (lambda (status signal)
-                                        (collect)
-                                        (set-state-run-status! run (list status signal)))))))))
-                (ticks fuel))
-       (eng ticks
-            (lambda (left v) v)
-            (lambda (next)
-              (when (eq? (state-run-found run) 'no-expiry)
-                (set-state-run-found!
-                 run (if (> (registry-count) (state-run-registered-before run)) 'run 'not-run))
-                (set-state-run-built!
-                 run (> (live-count 'spawn-options) (state-run-blocks-before run)))
-                (set-state-run-change! run (spawn-outcome (lambda () ((cadr setup) run)))))
-              (step next 100000)))))
+     (let-values (((outcome expired)
+                   (run-capped
+                    (lambda ()
+                      (spawn-outcome
+                       (lambda ()
+                         (uv-spawn! loop (car (state-variant-program variant))
+                                    (cdr (state-variant-program variant))
+                                    (list (cons 'stdio (car setup)))
+                                    (lambda (status signal)
+                                      (collect)
+                                      (set-state-run-status! run (list status signal)))))))
+                    fuel
+                    (lambda ()
+                      (set-state-run-found!
+                       run (if (> (registry-count) (state-run-registered-before run)) 'run 'not-run))
+                      (set-state-run-built!
+                       run (> (live-count 'spawn-options) (state-run-blocks-before run)))
+                      (set-state-run-change! run (spawn-outcome (lambda () ((cadr setup) run))))))))
+       outcome))
     run))
 
 (define (state-run-finished? run)

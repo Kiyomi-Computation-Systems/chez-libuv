@@ -22,12 +22,14 @@
         (libuv private addrinfo)
         ;; The sweeps below run the validators in engines and change their
         ;; arguments mid-call, from a timer handler and from another thread.
-        (only (chezscheme) make-engine string-truncate! collect
+        (only (chezscheme) string-truncate! collect
               fork-thread make-mutex make-condition with-mutex
               condition-wait condition-broadcast display-condition getenv)
         ;; The flags' cost, and tests/flags-level-3-child.sps under a
         ;; deadline. Both are pure.
         (uv-meter)
+        ;; The engine-sweep driver. Pure.
+        (uv-sweep)
         (uv-level-3))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
@@ -358,48 +360,32 @@
 ;; the two. Anything else means the validator read the argument more than
 ;; once, or handed back something the change still reached.
 (define sweep-max-fuel 2000)
-(define sweep-max-resumes 10)
-
 ;; engine-sweep : (-> state) (state -> answer) (state -> any)
-;;                -> (list-of (list fuel expired? outcome))
-;; OUTCOME is (answered answer), (refused reason), (raised text), or (stuck)
-;; for a call still running after sweep-max-resumes resumptions of 100000
-;; ticks, which a validator that walks a changed list forever comes to.
+;;                -> (list-of (list fuel outcome expired?))
+;; OUTCOME is (answered answer), (refused reason), (raised text), or the
+;; driver's give-up for a call still running at its cap, which a validator
+;; that walks a changed list forever comes to (tests/uv-sweep.sls).
 (define (engine-sweep make-state call change!)
-  (let run ((fuel 1) (acc '()))
-    (let* ((state (make-state))
-           (expired #f)
-           (outcome
-            (let step ((eng (make-engine
-                             (lambda ()
-                               (guard (e ((uv-invalid-argument? e)
-                                          (list 'refused
-                                                (uv-invalid-argument-reason e)))
-                                         (#t (list 'raised (describe e))))
-                                 (list 'answered (call state))))))
-                       (ticks fuel)
-                       (resumes 0))
-              (eng ticks
-                   (lambda (left v) v)
-                   (lambda (next)
-                     (unless expired
-                       (set! expired #t)
-                       (change! state))
-                     (if (= resumes sweep-max-resumes)
-                         '(stuck)
-                         (step next 100000 (+ resumes 1)))))))
-           (row (list fuel expired outcome)))
-      (if (or (not expired) (= fuel sweep-max-fuel))
-          (reverse (cons row acc))
-          (run (+ fuel 1) (cons row acc))))))
+  (sweep-fuels
+   (lambda (fuel)
+     (let ((state (make-state)))
+       (run-capped (lambda ()
+                     (guard (e ((uv-invalid-argument? e)
+                                (list 'refused (uv-invalid-argument-reason e)))
+                               (#t (list 'raised (describe e))))
+                       (list 'answered (call state))))
+                   fuel
+                   (lambda () (change! state)))))
+   sweep-max-fuel
+   (lambda (outcome) #f)))
 
 ;; sweep-reach : rows -> (list outcome-of-the-first-run expired?-of-the-last)
 (define (sweep-reach rows)
-  (list (caddr (car rows)) (cadr (list-ref rows (- (length rows) 1)))))
+  (list (cadr (car rows)) (caddr (list-ref rows (- (length rows) 1)))))
 
 ;; bad-rows : rows (outcome -> boolean) -> rows
 (define (bad-rows rows legal?)
-  (filter (lambda (row) (not (legal? (caddr row)))) rows))
+  (filter (lambda (row) (not (legal? (cadr row)))) rows))
 
 ;; The hints sweeps. Each makes one change at the first expiry, and a run
 ;; either refuses the change or answers the hints as they were.
@@ -427,7 +413,7 @@
    ;; cycle however the list is cut. Chez's list?, which the validator asked
    ;; first until #66, walks two pointers, and a self-loop made at each of
    ;; the first two pairs at one expiry could leave them on separate cycles,
-   ;; where the call never returned: (stuck).
+   ;; where the call never returned: the driver's give-up.
    (list 'spine-split-in-two 'hints-not-an-alist '(hints-not-an-alist)
          (lambda (hints)
            (let ((first hints) (second (cdr hints)))

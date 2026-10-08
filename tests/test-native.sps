@@ -41,6 +41,7 @@
         ;; pure.
         (only (uv-race) watch-flipper)
         (only (uv-meter) fewest-bytes)
+        (uv-sweep)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1328,42 +1329,35 @@
   (let* ((n 4096)
          (bv (make-bytevector n #x11))
          (dst (alloc-zeroed n))
-         (expired #f)
-         (spray '())
-         (answer
-          (let run ((eng (make-engine
-                          (lambda ()
-                            (guard (e ((uv-invalid-argument? e) 'refused)
-                                      (#t 'raised-otherwise))
-                              (copy-in! dst bv 0 n)
-                              'returned))))
-                    (ticks fuel))
-            (eng ticks
-                 (lambda (left v) v)
-                 (lambda (next)
-                   (unless expired
-                     (set! expired #t)
+         (spray '()))
+    (let-values (((answer expired)
+                  (run-capped
+                   (lambda ()
+                     (guard (e ((uv-invalid-argument? e) 'refused)
+                               (#t 'raised-otherwise))
+                       (copy-in! dst bv 0 n)
+                       'returned))
+                   fuel
+                   (lambda ()
                      (bytevector-truncate! bv 16)
                      (collect)
                      (set! spray
                        (let fill ((i 0) (acc '()))
                          (if (= i 2000)
                              acc
-                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc))))))
-                   (run next 100000)))))
-         (copied (foreign->bytevector dst n)))
-    (free! dst)
-    (cond ((memq answer '(refused raised-otherwise)) answer)
-          ((not (bytevector=? copied (make-bytevector n #x11))) 'read-past-the-end)
-          (expired 'copied-before-the-truncation)
-          (else 'finished-before-any-expiry))))
+                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc)))))))))
+      (let ((copied (foreign->bytevector dst n)))
+        (free! dst)
+        (values
+         (cond ((memq answer '(refused raised-otherwise)) answer)
+               ((stuck? answer) answer)
+               ((not (bytevector=? copied (make-bytevector n #x11))) 'read-past-the-end)
+               (expired 'copied-before-the-truncation)
+               (else 'finished-before-any-expiry))
+         expired)))))
 
 (define truncation-scan
-  (let loop ((fuel 1) (seen '()))
-    (let ((outcome (truncation-outcome fuel)))
-      (if (or (eq? outcome 'finished-before-any-expiry) (= fuel 512))
-          (reverse (cons outcome seen))
-          (loop (+ fuel 1) (cons outcome seen))))))
+  (map cadr (sweep-fuels truncation-outcome 512 (lambda (outcome) #f))))
 
 (test-equal "the truncation scan spanned the check: some runs refused, the last untouched"
   '(#t #t)
@@ -1720,22 +1714,18 @@
 ;; or is made one during the call, is refused under the caller's own name and
 ;; reason, never walked forever (tests/test-address.sps sweeps the change).
 ;; Each call here runs in an engine whose resumes are capped, so a walk that
-;; loops answers 'stuck instead of hanging the suite.
+;; loops answers the driver's give-up instead of hanging the suite
+;; (tests/uv-sweep.sls).
 (define (fold-flags-answer flags)
-  (let run ((eng (make-engine
-                  (lambda ()
-                    (guard (e ((uv-invalid-argument? e)
-                               (list (uv-invalid-argument-who e)
-                                     (uv-invalid-argument-reason e)))
-                              (#t (list 'wrong-condition (describe e))))
-                      (fold-flags flags 'test-flags 'flags-not-a-list
-                                  (lambda (flag)
-                                    (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
-            (resumes 0))
-    (eng 100000
-         (lambda (left v) v)
-         (lambda (next)
-           (if (= resumes 100) 'stuck (run next (+ resumes 1)))))))
+  (capped
+   (lambda ()
+     (guard (e ((uv-invalid-argument? e)
+                (list (uv-invalid-argument-who e)
+                      (uv-invalid-argument-reason e)))
+               (#t (list 'wrong-condition (describe e))))
+       (fold-flags flags 'test-flags 'flags-not-a-list
+                   (lambda (flag)
+                     (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
 
 ;; A list whose last pair points back at its pair number K (0-based).
 (define (circular items k)
@@ -1782,29 +1772,16 @@
 ;; OP on a fresh twelve-element list in an engine at rising fuel, with
 ;; CHANGE! made to the list at the first expiry.
 (define (list-sweep op change!)
-  (let next ((fuel 1) (acc '()))
-    (let* ((l (iota* 12))
-           (expired #f)
-           (answer
-            (let run ((eng (make-engine
-                            (lambda ()
-                              (guard (e (#t (list 'raised (describe e))))
-                                (op l)))))
-                      (ticks fuel)
-                      (resumes 0))
-              (eng ticks
-                   (lambda (left v) v)
-                   (lambda (more)
-                     (unless expired
-                       (set! expired #t)
-                       (change! l))
-                     (if (= resumes 100)
-                         'stuck
-                         (run more 100000 (+ resumes 1)))))))
-           (acc (cons (list fuel answer expired) acc)))
-      (if (and expired (not (eq? answer 'stuck)) (< fuel 400))
-          (next (+ fuel 1) acc)
-          (reverse acc)))))
+  (sweep-fuels
+   (lambda (fuel)
+     (let ((l (iota* 12)))
+       (run-capped (lambda ()
+                     (guard (e (#t (list 'raised (describe e))))
+                       (op l)))
+                   fuel
+                   (lambda () (change! l)))))
+   400
+   (lambda (answer) #f)))
 
 ;; Two cycles at once: the fifth pair's cdr back to the fourth, and the
 ;; twelfth's back to the eleventh. A count that walked a second pointer
@@ -1851,25 +1828,20 @@
 
 ;; read-trace : object -> (list answer elements-read)
 ;; What read-proper-list answered for X, 'refused for #f, with the elements
-;; its READ saw, in the order it saw them. It reads in an engine, and a
-;; read still running after 100 resumes of 100000 ticks answers 'stuck, so
-;; a read that never ends fails its row instead of hanging the suite.
+;; its READ saw, in the order it saw them. It reads in an engine whose
+;; resumes are capped, so a read that never ends answers the driver's
+;; give-up and fails its row instead of hanging the suite.
 (define (read-trace x)
   (let* ((seen '())
          (answer
-          (let run ((eng (make-engine
-                          (lambda ()
-                            (guard (e (#t (list 'raised (describe e))))
-                              (or (read-proper-list
-                                   x (lambda (element)
-                                       (set! seen (cons element seen))
-                                       (list 'read element)))
-                                  'refused)))))
-                    (resumes 0))
-            (eng 100000
-                 (lambda (left v) v)
-                 (lambda (more)
-                   (if (= resumes 100) 'stuck (run more (+ resumes 1))))))))
+          (capped
+           (lambda ()
+             (guard (e (#t (list 'raised (describe e))))
+               (or (read-proper-list
+                    x (lambda (element)
+                        (set! seen (cons element seen))
+                        (list 'read element)))
+                   'refused))))))
     (list answer (reverse seen))))
 
 (define (read-all l) (read-proper-list l (lambda (e) e)))

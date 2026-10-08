@@ -31,8 +31,10 @@
         (only (uv-evidence) live-count describe)
         ;; The span race's liveness watch, shared and pure.
         (only (uv-race) watch-flipper)
-        ;; make-engine drives the engine sweeps, and bytevector-truncate!
-        ;; the shrinking-payload one; the interrupt pair checks that no
+        (uv-sweep)
+        ;; The engine-sweep driver runs the change sweeps; make-engine
+        ;; drives the split sweeps, and bytevector-truncate! shrinks the
+        ;; payload in one; the interrupt pair checks that no
         ;; refusal leaves interrupts disabled; foreign-procedure binds the
         ;; libuv queries the split sweeps' witnesses read. The thread
         ;; primitives run the span race, and getenv skips it under Valgrind.
@@ -245,75 +247,69 @@
 ;; evidence, a list; the second value says whether an expiry reached the run.
 ;; FILL is unique to the run among its neighbours and never 0 or #xff, so a
 ;; run that sent a zeroed or a stale block, or read past the truncated end,
-;; cannot match the bytes it was given. A call still running after
-;; resume-cap resumes is given up there, so a walk that never ends fails its
-;; run by name.
-(define resume-cap 20)
+;; cannot match the bytes it was given. A call still running at the
+;; driver's cap is given up there (tests/uv-sweep.sls), so a walk that never
+;; ends fails its run by name.
 
 (define (change-verdict fuel make call change! expected-for refusal)
   (let* ((fill (+ 1 (mod fuel 254)))
          (argument (make fill))
-         (expired #f)
          (registry-before (registry-count))
-         (requests-before (live-count 'write-req))
-         (outcome
-          (let run ((eng (make-engine
-                          (lambda ()
-                            (guard (e ((uv-invalid-argument? e)
-                                       (list 'refused
-                                             (uv-invalid-argument-who e)
-                                             (uv-invalid-argument-reason e)))
-                                      (#t (list 'raised (describe e))))
-                              (call argument fill)
-                              '(written)))))
-                    (ticks fuel)
-                    (resumes 0))
-            (eng ticks
-                 (lambda (left v) v)
-                 (lambda (next)
-                   (unless expired
-                     (set! expired #t)
-                     (change! argument))
-                   (if (= resumes resume-cap)
-                       (list 'stuck-after-resumes resumes)
-                       (run next 100000 (+ resumes 1)))))))
-         (registry-after (registry-count))
-         (requests-after (live-count 'write-req)))
-    (values
-     (case (car outcome)
-       ((refused)
-        (if (and (equal? (cdr outcome) refusal)
-                 (= registry-after registry-before)
-                 (= requests-after requests-before))
-            'refused
-            (list 'refused-as (cdr outcome)
-                  'registered (- registry-after registry-before)
-                  'counted (- requests-after requests-before))))
-       ((written)
-        (set! s-issued (+ s-issued 1))
-        (set! s-received (make-byte-collector))
-        (let* ((expected (expected-for fill))
-               ;; Every bytevector a right write can send, all one length.
-               (rights (if (bytevector? expected) (list expected) expected))
-               (drained (run-until/ticking
-                         s-loop
-                         (lambda ()
-                           (and (= s-completed s-issued)
-                                (>= (collector-count s-received)
-                                    (bytevector-length (car rights)))))
-                         drain-steps))
-               (got (collector-bytes s-received))
-               (sent (if (exists (lambda (right)
-                                   (eq? (compare-bytes right got) 'identical))
-                                 rights)
-                         'identical
-                         (compare-bytes (car rights) got))))
-          (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
-                 (list 'written-but-sent sent drained))
-                (expired 'written)
-                (else 'untouched))))
-       (else outcome))
-     expired)))
+         (requests-before (live-count 'write-req)))
+    (let-values (((outcome expired)
+                  (run-capped
+                   (lambda ()
+                     (guard (e ((uv-invalid-argument? e)
+                                (list 'refused
+                                      (uv-invalid-argument-who e)
+                                      (uv-invalid-argument-reason e)))
+                               (#t (list 'raised (describe e))))
+                       (call argument fill)
+                       '(written)))
+                   fuel
+                   (lambda () (change! argument)))))
+      (let* ((registry-after (registry-count))
+             (requests-after (live-count 'write-req)))
+        (values
+         (case (car outcome)
+           ((refused)
+            (if (and (equal? (cdr outcome) refusal)
+                     (= registry-after registry-before)
+                     (= requests-after requests-before))
+                'refused
+                (list 'refused-as (cdr outcome)
+                      'registered (- registry-after registry-before)
+                      'counted (- requests-after requests-before))))
+           ((written)
+            (set! s-issued (+ s-issued 1))
+            (set! s-received (make-byte-collector))
+            (let* ((expected (expected-for fill))
+                   ;; Every bytevector a right write can send, all one length.
+                   (rights (if (bytevector? expected) (list expected) expected))
+                   (drained (run-until/ticking
+                             s-loop
+                             (lambda ()
+                               (and (= s-completed s-issued)
+                                    (>= (collector-count s-received)
+                                        (bytevector-length (car rights)))))
+                             drain-steps))
+                   (got (collector-bytes s-received))
+                   ;; The rights after the first: the argument as the
+                   ;; change left it.
+                   (as-changed (exists (lambda (right)
+                                         (eq? (compare-bytes right got) 'identical))
+                                       (cdr rights)))
+                   (sent (if (or as-changed
+                                 (eq? (compare-bytes (car rights) got) 'identical))
+                             'identical
+                             (compare-bytes (car rights) got))))
+              (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
+                     (list 'written-but-sent sent drained))
+                    (as-changed 'written-as-changed)
+                    (expired 'written)
+                    (else 'untouched))))
+           (else outcome))
+         expired)))))
 
 (define (shrink! bv)
   (bytevector-fill! bv #xff)
@@ -337,25 +333,17 @@
        (not (eq? (caddr verdict) 'satisfied))))
 
 ;; sweep-runs : (exact-positive-integer -> (values verdict boolean))
-;;              -> (list-of (list fuel verdict))
+;;              -> (list-of (list fuel verdict expired?))
 ;; It stops at the first run no expiry reached, whatever that run's verdict.
-;; It stops at a run whose drain ran out, too, and at one given up after
-;; resume-cap resumes: a build that cannot deliver, or a walk that never
+;; It stops at a run whose drain ran out, too, and the driver stops at one
+;; given up at its cap: a build that cannot deliver, or a walk that never
 ;; ends, would cost every later run the same, and outlast the suite's
 ;; timeout before any row could say why (the segment-list sweeps below write
-;; three dozen runs each). A raise between runs would abort the suite, so
-;; the whole sweep is caught and its evidence handed to the rows.
+;; three dozen runs each). The driver ends the sweep at a raise between
+;; runs, with a sweep-raised verdict, rather than abort the suite
+;; (tests/uv-sweep.sls).
 (define (sweep-runs verdict-at)
-  (guard (e (#t (list (list 0 (list 'sweep-raised (describe e))))))
-    (let run ((fuel 1) (acc '()))
-      (let-values (((verdict expired) (verdict-at fuel)))
-        (let ((acc (cons (list fuel verdict) acc)))
-          (if (or (not expired)
-                  (drain-ran-out? verdict)
-                  ((verdict-is? 'stuck-after-resumes) verdict)
-                  (= fuel sweep-max-fuel))
-              (reverse acc)
-              (run (+ fuel 1) acc)))))))
+  (sweep-fuels verdict-at sweep-max-fuel drain-ran-out?))
 
 (define (shrink-sweep variant)
   (sweep-runs (lambda (fuel) (shrink-verdict variant fuel))))
@@ -380,7 +368,7 @@
   (map (lambda (sweep)
          (let ((rows (cdr sweep)))
            (list (car sweep)
-                 (car rows)
+                 (list (car (car rows)) (cadr (car rows)))
                  (cadr (list-ref rows (- (length rows) 1))))))
        sweeps))
 
@@ -570,12 +558,15 @@
 
 (test-equal "a uv-write*! whose segment list became another proper list during the call writes it as it was or as the change left it, never refusing it"
   '()
-  (filter (lambda (row) (not (memq (cadr row) '(written untouched))))
+  (filter (lambda (row)
+            (not (memq (cadr row) '(written written-as-changed untouched))))
           splice-sweep))
 
+;; Its first run must send the list as the change left it: a sweep whose
+;; change never landed would write every run as the list was.
 (test-equal "the splice sweep changed the list before the call began and ended in a run no expiry reached"
-  '((1 written) untouched)
-  (list (car splice-sweep)
+  '((1 written-as-changed) untouched)
+  (list (list (car (car splice-sweep)) (cadr (car splice-sweep)))
         (cadr (list-ref splice-sweep (- (length splice-sweep) 1)))))
 
 ;; --- a span another thread changes during the call (#64) -------------------

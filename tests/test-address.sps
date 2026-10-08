@@ -40,10 +40,11 @@
         (only (libuv private constants) uv-connect-req-type sizeof-sockaddr-in6)
         (uv-testing)
         (only (uv-evidence) describe)
-        ;; make-engine drives the changed-address sweeps. foreign-procedure
-        ;; reaches libuv's own parser and if_nametoindex, for references made
-        ;; without the binding.
-        (only (chezscheme) collect make-engine foreign-procedure))
+        ;; The engine-sweep driver drives the changed-address sweeps.
+        (uv-sweep)
+        ;; foreign-procedure reaches libuv's own parser and if_nametoindex,
+        ;; for references made without the binding.
+        (only (chezscheme) collect foreign-procedure))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -84,10 +85,8 @@
 (define landing-cap 2000)
 
 ;; Every call here runs in an engine whose resumes are capped, so a call
-;; that never finishes answers (stuck-after-resumes n) instead of hanging
-;; the suite.
-(define resume-fuel 100000)
-(define resume-cap 100)
+;; that never finishes answers the driver's give-up instead of hanging the
+;; suite (tests/uv-sweep.sls).
 
 (define l (make-uv-loop))
 
@@ -266,17 +265,9 @@
 (define (observe make-run argument)
   (let-values (((call finish) (make-run)))
     (finish
-     (let run ((eng (make-engine
-                     (lambda ()
-                       (guard (e (#t (raise->observation e)))
-                         (call argument)))))
-               (resumes 0))
-       (eng resume-fuel
-            (lambda (left v) v)
-            (lambda (next)
-              (if (= resumes resume-cap)
-                  (list 'stuck-after-resumes resumes)
-                  (run next (+ resumes 1)))))))))
+     (capped (lambda ()
+               (guard (e (#t (raise->observation e)))
+                 (call argument)))))))
 
 ;; --- an address holding a NUL --------------------------------------------
 ;; Before this was refused, each verb handed the caller's string to libuv
@@ -506,32 +497,22 @@
 ;;                 -> (list expired? observation)
 ;; The run's argument is a fresh copy, so each run starts from the same one.
 (define (run-in-engine variant fuel)
-  (let ((argument ((sweep-variant-copy variant) (sweep-variant-argument variant)))
-        (expired #f))
+  (let ((argument ((sweep-variant-copy variant) (sweep-variant-argument variant))))
     (let-values (((call finish) ((sweep-variant-make-run variant))))
-      (let ((answer
-             (let run ((eng (make-engine
-                             (lambda ()
-                               (guard (e (#t (raise->observation e)))
-                                 (call argument)))))
-                       (ticks fuel)
-                       (resumes 0))
-               (eng ticks
-                    (lambda (left v) v)
-                    (lambda (next)
-                      (unless expired
-                        (set! expired #t)
-                        ((sweep-variant-change! variant) argument))
-                      (if (= resumes resume-cap)
-                          (list 'stuck-after-resumes resumes)
-                          (run next resume-fuel (+ resumes 1))))))))
+      (let-values (((answer expired)
+                    (run-capped (lambda ()
+                                  (guard (e (#t (raise->observation e)))
+                                    (call argument)))
+                                fuel
+                                (lambda ()
+                                  ((sweep-variant-change! variant) argument)))))
         (list expired (finish answer))))))
 
 ;; A run that waited out a cap, a call that never finished or a lookup that
 ;; never landed, would cost every later run the same.
 (define (stalled? observed)
   (or (eq? observed 'callback-never-fired)
-      (and (pair? observed) (eq? (car observed) 'stuck-after-resumes))))
+      (stuck? observed)))
 
 ;; The registry and every debug count, and how a run moved them: a run must
 ;; leave both as it found them. A snapshot per run keeps a leak attributed
@@ -568,14 +549,13 @@
                      (if expired 'original 'untouched))
                     (else (list 'answered observed))))))))
 
-;; sweep : sweep-variant -> (list-of (list fuel verdict))
+;; sweep : sweep-variant -> (list-of (list fuel verdict go-on?))
 (define (sweep variant)
-  (let run ((fuel 1) (acc '()))
-    (let* ((v (run-verdict variant fuel))
-           (acc (cons (list fuel (cadr v)) acc)))
-      (if (and (car v) (< fuel sweep-max-fuel))
-          (run (+ fuel 1) acc)
-          (reverse acc)))))
+  (sweep-fuels (lambda (fuel)
+                 (let ((v (run-verdict variant fuel)))
+                   (values (cadr v) (car v))))
+               sweep-max-fuel
+               (lambda (verdict) #f)))
 
 ;; One sweep after another, in the order listed (map would not fix one).
 (define sweeps
