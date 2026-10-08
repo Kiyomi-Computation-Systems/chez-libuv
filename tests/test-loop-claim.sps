@@ -389,11 +389,69 @@
 ;; unclaimed. That thread may still get in between the teardown's steps,
 ;; and keeps the loop then: the row asks only that no loop is left claimed
 ;; once that thread has stopped.
+;;
+;; The race says nothing unless that thread got in at least once, which
+;; the precondition holds. It gets in when the body's thread is slow
+;; between two of the teardown's steps, mostly when a collection lands
+;; there, and that is rare: with a fixed 2,000 bodies on one thread it never
+;; got in, in 6 of 8 runs on Ubuntu 24.04 and in CI's first run on 26.04
+;; (#91). So the bodies go on until the other thread has got in
+;; exit-race-hits times, bounded by race-time-cap, never by a count of this
+;; thread's own (#74). A machine that cannot get to that many by the cap
+;; still passes the precondition with one.
+;;
+;; One run would prove the race happened, but a loop is left claimed only
+;; when the other thread's run ends in the instant between a refused
+;; teardown and the exit's next move. An exit that re-claims after any
+;; refusal (N3 in .plans/loop-claim-mutation-log.md) strands a loop exactly
+;; there. With 100 runs the main row caught it in 5 of 5 races on macOS
+;; and 1 of 10 on Linux, where 2,000 bodies on one thread caught it in
+;; none. The 100 runs took 1 to 5 s.
+;;
+;; Each body leaves its callback by a continuation, and that strands the
+;; C frames of the uv_run it left on its thread's stack for as long as the
+;; thread lives (docs/api.md, "A callback ends only by returning"). 20,000
+;; of them overflowed an 8 MB stack on Linux, and 2,000 a secondary
+;; thread's on macOS, which then hung instead of crashing. So the bodies
+;; run in batches of exit-race-batch, each on a thread of its own, whose
+;; stack goes when it ends.
 (define exit-race-attempts 2000)
+(define exit-race-batch 250)
+(define exit-race-hits 100)
 
+;; exit-batch : box -> list
+;; EXIT-RACE-BATCH bodies, each leaving call-with-uv-loop from inside a
+;; timer callback after it has put its loop in SHARED: the loops the bodies
+;; left open.
+(define (exit-batch shared)
+  (let attempt ((i 0) (left '()))
+    (if (= i exit-race-batch)
+        left
+        (let ((the-loop #f))
+          (guard (e (#t (evidence e)))
+            (call/cc
+             (lambda (k)
+               (call-with-uv-loop
+                (lambda (loop)
+                  (set! the-loop loop)
+                  (uv-timer-start! (make-uv-timer loop)
+                                   (lambda (t) (set-box! shared loop) (k 'escaped))
+                                   0 0)
+                  (uv-run loop 'default)
+                  'returned)))))
+          (set-box! shared #f)
+          (attempt (+ i 1)
+                   (if (and the-loop (uv-loop-open? the-loop)) (cons the-loop left) left))))))
+
+;; exit-race : -> list
+;; (stranded stopped ran bodies): how many loops were left claimed once the
+;; other thread stopped, whether it stopped, how many loops it ran, and how
+;; many bodies were made; a batch that never ended within race-time-cap
+;; adds (batch-never-ended).
 (define (exit-race)
   (let ((shared (box #f)) (stop (box #f)) (ran (box 0)) (done (box #f))
-        (m (make-mutex)) (cv (make-condition)))
+        (m (make-mutex)) (cv (make-condition))
+        (end (+ (real-time) race-time-cap)))
     (fork-thread
      (lambda ()
        (let spin ()
@@ -405,30 +463,28 @@
                  (atomic-add! ran 1))))
            (spin)))
        (with-mutex m (set-box! done #t) (condition-broadcast cv))))
-    (let attempt ((i 0) (left '()))
-      (if (< i exit-race-attempts)
-          (let* ((the-loop #f)
-                 (outcome
-                  (guard (e (#t (evidence e)))
-                    (call/cc
-                     (lambda (k)
-                       (call-with-uv-loop
-                        (lambda (loop)
-                          (set! the-loop loop)
-                          (uv-timer-start! (make-uv-timer loop)
-                                           (lambda (t) (set-box! shared loop) (k 'escaped))
-                                           0 0)
-                          (uv-run loop 'default)
-                          'returned)))))))
-            (set-box! shared #f)
-            (attempt (+ i 1)
-                     (if (and the-loop (uv-loop-open? the-loop)) (cons the-loop left) left)))
-          (begin
-            (set-box! stop #t)
-            (let* ((stopped (with-mutex m (await m cv (lambda () (unbox done)))))
-                   (stranded (length (filter loop-running? left))))
-              (for-each (lambda (l) (unless (loop-running? l) (tear-down l))) left)
-              (list stranded (if stopped 'stopped 'never-stopped) (unbox ran))))))))
+    (let batch ((bodies 0) (left '()))
+      (if (and (< (real-time) end)
+               (or (< bodies exit-race-attempts) (< (unbox ran) exit-race-hits)))
+          (let ((made (box #f)))
+            (fork-thread
+             (lambda ()
+               (let ((batch-left (exit-batch shared)))
+                 (with-mutex m (set-box! made batch-left) (condition-broadcast cv)))))
+            (if (with-mutex m (await m cv (lambda () (unbox made))))
+                (batch (+ bodies exit-race-batch) (append (unbox made) left))
+                (finish-exit-race stop m cv done ran bodies left '(batch-never-ended))))
+          (finish-exit-race stop m cv done ran bodies left '())))))
+
+;; finish-exit-race : box mutex condition box box integer list list -> list
+;; Stops the other thread and answers exit-race's list.
+(define (finish-exit-race stop m cv done ran bodies left more)
+  (set-box! stop #t)
+  (let* ((stopped (with-mutex m (await m cv (lambda () (unbox done)))))
+         (stranded (length (filter loop-running? left))))
+    (for-each (lambda (l) (unless (loop-running? l) (tear-down l))) left)
+    (append (list stranded (if stopped 'stopped 'never-stopped) (unbox ran) bodies)
+            more)))
 
 ;; --- an already-closed loop, closed from two threads at once ------------------
 
@@ -1054,6 +1110,13 @@
           (moved-pair state)))
 
       (let ((exits (unless-stuck exit-race)))
+        (when (and (list? exits) (= (length exits) 4))
+          (display "  [informational] exit race: the other thread ran ")
+          (display (caddr exits))
+          (display " loops in ")
+          (display (cadddr exits))
+          (display " bodies")
+          (newline))
         (test-equal "bodies left from a timer callback, while another thread runs every loop it finds unclaimed: no loop is left claimed once that thread has stopped"
           '(0 stopped)
           (if (and (pair? exits) (number? (car exits)))
