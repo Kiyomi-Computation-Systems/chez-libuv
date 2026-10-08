@@ -11,7 +11,7 @@
 ;;; the list stops changing. Pure: no native code (tests/test-addrinfo.sps,
 ;;; under make check-purity).
 (library (libuv private lists)
-  (export proper-length read-proper-list fold-flags)
+  (export proper-length read-proper-list fold-flags let-fixed-list)
   (import (rnrs)
           (only (libuv private conditions) make-uv-invalid-argument))
 
@@ -117,4 +117,35 @@
               ((not (pair? rest))
                (raise (make-uv-invalid-argument who reason)))
               (else
-               (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest))))))))))
+               (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest)))))))))
+
+;; let-fixed-list : (let-fixed-list (name ...) list-expr mismatch body ...)
+  ;; BODY with each NAME bound to the matching element of LIST-EXPR's value
+  ;; when that is a proper list exactly as long as the NAMEs; MISMATCH
+  ;; otherwise, evaluated once and only then. The list is walked once, each
+  ;; pair checked before its car and cdr are read, and its end required after
+  ;; the last NAME, so a list another thread changes during the read binds
+  ;; each element as its pair stood when the walk reached it, or mismatches,
+  ;; and is never read through a non-pair. Checking a shape first and reading
+  ;; its fields after, as cadr does, reads each pair twice: uv-spawn!'s pipe
+  ;; specs did, and a cut made in between raised Chez's own condition, or at
+  ;; --optimize-level 3 read through it (#66). Nothing is allocated
+  ;; (tests/test-native.sps).
+  (define-syntax let-fixed-list
+    (syntax-rules ()
+      ((_ (name ...) list-expr mismatch body0 body ...)
+       (let ((on-mismatch (lambda () mismatch)))
+         (walk-fixed (name ...) list-expr (on-mismatch)
+                     (let () body0 body ...))))))
+
+  ;; walk-fixed: let-fixed-list's walk, one NAME a pair.
+  (define-syntax walk-fixed
+    (syntax-rules ()
+      ((_ () p-expr fail done)
+       (if (null? p-expr) done fail))
+      ((_ (name more ...) p-expr fail done)
+       (let ((p p-expr))
+         (if (pair? p)
+             (let ((name (car p)) (rest (cdr p)))
+               (walk-fixed (more ...) rest fail done))
+             fail))))))

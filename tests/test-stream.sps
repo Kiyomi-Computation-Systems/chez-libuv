@@ -293,14 +293,21 @@
         (set! s-issued (+ s-issued 1))
         (set! s-received (make-byte-collector))
         (let* ((expected (expected-for fill))
+               ;; Every bytevector a right write can send, all one length.
+               (rights (if (bytevector? expected) (list expected) expected))
                (drained (run-until/ticking
                          s-loop
                          (lambda ()
                            (and (= s-completed s-issued)
                                 (>= (collector-count s-received)
-                                    (bytevector-length expected))))
+                                    (bytevector-length (car rights)))))
                          drain-steps))
-               (sent (compare-bytes expected (collector-bytes s-received))))
+               (got (collector-bytes s-received))
+               (sent (if (exists (lambda (right)
+                                   (eq? (compare-bytes right got) 'identical))
+                                 rights)
+                         'identical
+                         (compare-bytes (car rights) got))))
           (cond ((not (and (eq? drained 'satisfied) (eq? sent 'identical)))
                  (list 'written-but-sent sent drained))
                 (expired 'written)
@@ -472,13 +479,17 @@
 
 ;; list-sweep : (fill -> segments) (segments -> unspecified) list -> sweep
 (define (list-sweep make change! refusal)
+  (list-sweep-sending make change! seg-bytes refusal))
+
+;; list-sweep-sending : as list-sweep, with the bytes a right write sends
+(define (list-sweep-sending make change! expected-for refusal)
   (sweep-runs
    (lambda (fuel)
      (change-verdict fuel
                      make
                      (lambda (segs fill) (uv-write*! s-client segs on-swept))
                      change!
-                     seg-bytes
+                     expected-for
                      refusal))))
 
 (define cut-sweep
@@ -514,6 +525,58 @@
 (test-equal "a uv-write*! the segment-list sweeps let through sent the peer exactly the segments it was given"
   '()
   (rows-in list-sweeps (verdict-is? 'written-but-sent)))
+
+;; --- a segment list changed into another proper list (#81) ----------------
+;; uv-write*! reads its segment list with read-proper-list, which counts the
+;; list again and walks it once more when a walk contradicts its count. So a
+;; list changed during the read into another proper list is written as it
+;; was or as the change left it, and refusing it is wrong: it was a list of
+;; segments at every instant. The splice turns the third pair's cdr into ten
+;; fresh segments, five of 5 bytes and five of 4, so the list grows from
+;; twelve segments to thirteen and its bytes stay sixty: a write of either
+;; version drains the same count, and the bytes say which it was. A walk
+;; that refused a list contradicting its count, as uv-write*!'s own walk did
+;; until #81, refused every run the splice reached between the count and the
+;; walk's end.
+;; The change sees only the list, so a spliced segment's byte comes from the
+;; list's first byte, which is (seg-byte fill 0).
+(define (splice-byte first-byte j) (+ 1 (mod (+ first-byte 100 (* 13 j)) 254)))
+
+(define (splice-tail first-byte)
+  (let make ((j 0))
+    (if (= j 10)
+        '()
+        (cons (make-bytevector (if (< j 5) 5 4) (splice-byte first-byte j))
+              (make (+ j 1))))))
+
+(define (spliced-bytes fill)
+  (let ((out (make-bytevector (* seg-count seg-len))))
+    (bytevector-copy! (seg-bytes fill) 0 out 0 (* 3 seg-len))
+    (let fill-in ((j 0) (at (* 3 seg-len)))
+      (when (< j 10)
+        (let ((len (if (< j 5) 5 4)))
+          (bytevector-fill-range! out at (+ at len)
+                                  (splice-byte (seg-byte fill 0) j))
+          (fill-in (+ j 1) (+ at len)))))
+    out))
+
+(define splice-sweep
+  (list-sweep-sending
+   seg-list
+   (lambda (segs)
+     (set-cdr! (cddr segs) (splice-tail (bytevector-u8-ref (car segs) 0))))
+   (lambda (fill) (list (seg-bytes fill) (spliced-bytes fill)))
+   'no-refusal-is-right))
+
+(test-equal "a uv-write*! whose segment list became another proper list during the call writes it as it was or as the change left it, never refusing it"
+  '()
+  (filter (lambda (row) (not (memq (cadr row) '(written untouched))))
+          splice-sweep))
+
+(test-equal "the splice sweep changed the list before the call began and ended in a run no expiry reached"
+  '((1 written) untouched)
+  (list (car splice-sweep)
+        (cadr (list-ref splice-sweep (- (length splice-sweep) 1)))))
 
 ;; --- a span another thread changes during the call (#64) -------------------
 ;; An engine stops a call only at a trap check, but another thread can

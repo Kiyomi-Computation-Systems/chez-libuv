@@ -9,7 +9,7 @@
           (libuv private constants)
           (libuv private native)
           (libuv private handles)
-          (only (libuv private lists) read-proper-list)
+          (only (libuv private lists) read-proper-list let-fixed-list)
           (only (libuv private c-string) read-utf8 nul-free?)
           ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
           (libuv private require-threaded)
@@ -96,10 +96,11 @@
 
   ;; stdio spec = ignore | (inherit-fd . integer) | (inherit-stream . stream)
   ;;              | (pipe uv-pipe direction)
-  ;; Each pair of a spec is read once. A pipe spec's (cdr rest), checked as
-  ;; a pair and then read again as (cddr rest) and (cadr rest), could be a
-  ;; non-pair by the second read: Chez's own cddr or cadr raised there, and
-  ;; at --optimize-level 3 the read went through it (#66).
+  ;; Each pair of a spec is read once, a pipe spec's tail with
+  ;; let-fixed-list. Its (cdr rest), checked as a pair and then read again as
+  ;; (cddr rest) and (cadr rest), could be a non-pair by the second read:
+  ;; Chez's own cddr or cadr raised there, and at --optimize-level 3 the read
+  ;; went through it (#66).
   (define (read-stdio-spec spec)
     (cond
       ((eq? spec 'ignore) (make-stdio-spec 'ignore #f #f))
@@ -108,10 +109,8 @@
          (case kind
            ((inherit-fd inherit-stream) (make-stdio-spec kind rest #f))
            ((pipe)
-            (let ((tail (and (pair? rest) (cdr rest))))
-              (if (and (pair? tail) (null? (cdr tail)))
-                  (make-stdio-spec 'pipe (car rest) (car tail))
-                  (make-stdio-spec #f #f #f))))
+            (let-fixed-list (pipe direction) rest (make-stdio-spec #f #f #f)
+              (make-stdio-spec 'pipe pipe direction)))
            (else (make-stdio-spec #f #f #f)))))
       (else (make-stdio-spec #f #f #f))))
 

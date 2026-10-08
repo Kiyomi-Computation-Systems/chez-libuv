@@ -17,7 +17,7 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
-          (only (libuv private lists) proper-length)
+          (only (libuv private lists) read-proper-list let-fixed-list)
           (libuv private handles))
 
   ;; Passing a non-stream handle to libuv stream functions is undefined.
@@ -115,52 +115,22 @@
   ;; A whole bytevector is the span [0, len); an explicit (bv start end) span
   ;; is range-checked exactly as uv-write! checks its own. Anything else is a
   ;; malformed segment, named before the caller's list is copied anywhere.
-  ;; A span is read once, each pair checked as it is read: asking list? and
-  ;; length first left a gap an engine's handler could change the span in,
-  ;; and length then raised a condition of its own (#64).
+  ;; A span is read once with let-fixed-list, each pair checked as it is
+  ;; read: asking list? and length first left a gap an engine's handler could
+  ;; change the span in, and length then raised a condition of its own (#64).
   (define (parse-write-segment seg)
-    (cond
-      ((bytevector? seg) (make-spec seg 0 (bytevector-length seg)))
-      ((pair? seg)
-       (let* ((bv (car seg))
-              (after-bv (cdr seg)))
-         (unless (and (bytevector? bv) (pair? after-bv))
-           (refuse-segments 'segment-not-a-bytevector))
-         (let* ((start (car after-bv))
-                (after-start (cdr after-bv)))
-           (unless (pair? after-start)
-             (refuse-segments 'segment-not-a-bytevector))
-           (let ((end (car after-start)))
-             (unless (null? (cdr after-start))
-               (refuse-segments 'segment-not-a-bytevector))
-             (unless (and (integer? start) (exact? start)
-                          (integer? end) (exact? end)
-                          (<= 0 start) (<= start end)
-                          (<= end (bytevector-length bv)))
-               (refuse-segments 'segment-span-out-of-range))
-             (make-spec bv start (- end start))))))
-      (else (refuse-segments 'segment-not-a-bytevector))))
-
-  ;; read-segments : object exact-positive-integer -> (listof spec)
-  ;; Parses SEGMENTS, which proper-length found to hold N segments, reading
-  ;; each pair once and checking it as it is read. An engine's handler or
-  ;; another thread can change the list during the walk. A walk that meets a
-  ;; non-pair, or that does not find the list's end after N pairs, refuses
-  ;; the list, and none takes more than N steps, so a list made circular is
-  ;; not walked forever. Chez's map, which this replaces, measured the list
-  ;; and then walked it without checking its pairs, and read through a
-  ;; non-pair put in its way (#64). Unlike fold-flags, the walk requires the
-  ;; list's end too: a list made circular after the count would otherwise
-  ;; send its first segments again.
-  (define (read-segments segments n)
-    (let walk ((p segments) (left n))
-      (cond ((zero? left)
-             (if (null? p) '() (refuse-segments 'segments-not-a-list)))
-            ((pair? p)
-             (let* ((spec (parse-write-segment (car p)))
-                    (rest (walk (cdr p) (- left 1))))
-               (cons spec rest)))
-            (else (refuse-segments 'segments-not-a-list)))))
+    (if (bytevector? seg)
+        (make-spec seg 0 (bytevector-length seg))
+        (let-fixed-list (bv start end) seg
+          (refuse-segments 'segment-not-a-bytevector)
+          (unless (bytevector? bv)
+            (refuse-segments 'segment-not-a-bytevector))
+          (unless (and (integer? start) (exact? start)
+                       (integer? end) (exact? end)
+                       (<= 0 start) (<= start end)
+                       (<= end (bytevector-length bv)))
+            (refuse-segments 'segment-span-out-of-range))
+          (make-spec bv start (- end start)))))
 
   ;; spans-fit? : (listof spec) -> boolean
   ;; Whether every span still lies inside its bytevector, which can have been
@@ -202,11 +172,17 @@
     ;; Normalize and range-check every segment before the step, so a
     ;; malformed list is refused before anything is allocated. The step
     ;; checks every span again, against the bytevectors as they are then.
-    (let* ((n (or (proper-length segments)
-                  (refuse-segments 'segments-not-a-list)))
-           (specs (if (zero? n)
-                      (refuse-segments 'empty-segment-list)
-                      (read-segments segments n)))
+    ;; read-proper-list reads the list once, each pair checked: a list an
+    ;; engine's handler or another thread changes during the read is refused,
+    ;; or written as it was or as the change left it, and never read through
+    ;; a non-pair or walked forever. Chez's map, which this replaced, read
+    ;; through a non-pair put in its way (#64), and the walk that followed it
+    ;; refused a list changed into another proper list (#81).
+    (let* ((specs (or (read-proper-list segments parse-write-segment)
+                      (refuse-segments 'segments-not-a-list)))
+           (n (if (null? specs)
+                  (refuse-segments 'empty-segment-list)
+                  (length specs)))
            (total (fold-left (lambda (acc s) (+ acc (spec-len s))) 0 specs))
            (bufs-offset (align-16 (uv-req-size (uv-write-req-type))))
            (payload-offset (+ bufs-offset (* n (sizeof-uv-buf-t))))

@@ -1941,6 +1941,55 @@
                    (if (caddr last-run) 'expired (cadr last-run))))))
        read-sweeps))
 
+;; --- let-fixed-list: a caller's list of a fixed length, read once (#81) ----
+;; uv-spawn!'s pipe specs and uv-write*!'s (bv start end) spans are lists of
+;; a fixed length. let-fixed-list binds their elements walking the list once,
+;; each pair checked before it is read through, and requires the end after
+;; the last. Each pipe spec's tail used to be checked and then read again, a
+;; read Chez's own cadr raised on, or at --optimize-level 3 read through, when
+;; another thread cut it in between (#66). The race row below holds the
+;; once-only read; these hold the shape.
+(define (fixed-3 x)
+  (let-fixed-list (a b c) x 'mismatch (list a b c)))
+
+;; The race list's twelve elements, or #f, which the race counts as a cut.
+(define (fixed-12 x)
+  (let-fixed-list (e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 e10 e11) x #f
+    (list e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 e10 e11)))
+
+(test-equal "let-fixed-list binds each element of a list exactly as long as its names"
+  '((1) (1 2) (1 2 3))
+  (list (let-fixed-list (a) (list 1) 'mismatch (list a))
+        (let-fixed-list (a b) (list 1 2) 'mismatch (list a b))
+        (fixed-3 (list 1 2 3))))
+
+(test-equal "let-fixed-list answers its mismatch for any other shape, wherever it goes wrong"
+  (map (lambda (i) 'mismatch) (iota* 11))
+  (map fixed-3
+       (list 'x
+             (vector 1 2 3)
+             '()
+             (list 1)
+             (list 1 2)
+             (list 1 2 3 4)
+             (cons 1 2)
+             (cons 1 (cons 2 3))
+             (cons 1 (cons 2 (cons 3 4)))
+             (circular '(1 2 3) 0)
+             (circular '(1) 0))))
+
+(test-equal "let-fixed-list evaluates its mismatch only on a mismatch, once"
+  '(1 0 mismatch 1)
+  (let* ((evaluated 0)
+         (read (lambda (x)
+                 (let-fixed-list (a) x
+                   (begin (set! evaluated (+ evaluated 1)) 'mismatch)
+                   a)))
+         (matched (read (list 1)))
+         (after-match evaluated)
+         (mismatched (read (list 1 2))))
+    (list matched after-match mismatched evaluated)))
+
 ;; --- fold-flags: a flag list spliced longer during the walk ---------------
 ;; fold-flags walks no further than its count and requires the list's end
 ;; after it, as read-proper-list does. Without the end, a tail spliced in
@@ -2253,6 +2302,22 @@
         (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
           '(flipping flipping)
           (list-tail race 5)))
+      (let ((race (list-race fixed-12 vector-cut (whole-or-cut (iota* 12)))))
+        (display "  [informational] let-fixed-list race: ")
+        (display (cadddr race))
+        (display " of ")
+        (display (car race))
+        (display " reads found the list cut")
+        (newline)
+        ;; A read that always answered its mismatch would pass as cut every
+        ;; round, so the row requires some reads to answer the list.
+        (test-equal "let-fixed-list answers the list or its mismatch for a list another thread changes, never raising"
+          (list list-race-rounds 0 #f 'some-whole)
+          (list (car race) (cadr race) (caddr race)
+                (if (< (cadddr race) (car race)) 'some-whole 'never-whole)))
+        (test-equal "precondition: the let-fixed-list race's flipper was changing the read list before the first read and after the last"
+          '(flipping flipping)
+          (list-tail race 5)))
       (let ((race (list-race read-all vector-cut (whole-or-cut (iota* 12)))))
         (display "  [informational] read-proper-list race: ")
         (display (cadddr race))
@@ -2308,6 +2373,17 @@
   (let ((flags (list 'a 'b 'c))
         (bit (lambda (flag) (case flag ((a) 1) ((b) 2) ((c) 4) (else 64)))))
     (list (fewest-bytes (lambda () (fold-flags flags 'test-flags 'flags-not-a-list bit)))
+          (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
+              'meter-live
+              'meter-blind))))
+
+;; A read of a span or a pipe spec allocates nothing of its own, so a write
+;; of a million spans pays nothing for reading them.
+(test-equal "let-fixed-list allocates nothing, where the meter sees a 64-byte allocation"
+  '(0 0 meter-live)
+  (let ((span (list 1 2 3)) (short (list 1 2)))
+    (list (fewest-bytes (lambda () (let-fixed-list (a b c) span 'mismatch (+ a b c))))
+          (fewest-bytes (lambda () (let-fixed-list (a b c) short 'mismatch (+ a b c))))
           (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
               'meter-live
               'meter-blind))))
