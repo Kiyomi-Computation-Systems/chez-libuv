@@ -240,15 +240,19 @@ jobs:
 
       # THE SPEC §9.4 / ADR-0016: the setuid/setgid positive tests are
       # excluded from the default `make test` (see ROOT_TESTS in the
-      # Makefile) and run only here, under sudo. `-E env "PATH=$PATH"`
-      # because plain sudo drops the PATH this job put the pinned Chez on;
-      # `HAVE_PKG=no` matches the vendored-path build just above so
+      # Makefile) and run only here, under sudo. sudo drops the job's
+      # environment, so `env` hands make each variable the lane needs by
+      # name: PATH, which this job put the pinned Chez on, and CHEZ, its
+      # name (`scheme`), without which make runs `chez`. Not `sudo -E`:
+      # Ubuntu 26.04's sudo is sudo-rs, which ignores -E, and the lane
+      # failed `chez: not found` there (2026-10-08, reproduced with sudo-rs
+      # 0.2.13). `HAVE_PKG=no` matches the vendored-path build just above so
       # test-root's artifact-precondition check accepts what that build
       # produced -- the target deliberately does NOT rebuild (under sudo
       # a `build` prerequisite would relink the shim as root; see the
       # Makefile's test-root comment).
       - name: Root lane (setuid/setgid, sudo)
-        run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
+        run: sudo env "PATH=$PATH" "CHEZ=$CHEZ" make HAVE_PKG=no test-root
 
       # The gate below proves nothing unless it can fail, and for a month it
       # could not: from #14 (2026-08-30) Valgrind's client was timeout(1), Chez

@@ -109,7 +109,7 @@ lane as root:
 | vendor (cmake 4.2.3), build (vendored) | 0 | |
 | check-purity | 0 | |
 | test (vendored) | 2 | the same row, the same `(0 stopped 0)` |
-| root lane (sudo) | 0 | ROOT LANE PASSED |
+| root lane (sudo) | 0 | ROOT LANE PASSED, but see below: the mirror's sudo was not CI's |
 | check-memory-gate | 0 | all four plants caught, `shim-overrun` in `chez_uv_copy_in`; MEMORY GATE CAN FAIL |
 | test-memory (Valgrind 3.26.0) | 0 | all 30 suites ERROR SUMMARY 0 and 0 B definitely lost; 82 forked children, 0 errors, 0 B definitely lost |
 | the `make test` sabotage check | 0 | |
@@ -145,3 +145,27 @@ thread's progress, the shape AGENTS.md's careless-pool trap names. Filed as
 - #89: test-tcp's `graise-peer` is never read
 - #90: no CI run links a libuv below 1.49 after the move to 26.04
 - #91: test-loop-claim's exit-race precondition fails on Linux (section 3)
+
+## 4. The root lane on the real 26.04 runner
+
+CI's second run on #92 (de5a740) passed both test legs and failed the root
+lane: `sudo: preserving the entire environment is not supported, '-E' is
+ignored`, then `/bin/sh: 3: chez: not found`. The runner's sudo is sudo-rs,
+which ignores `-E`, so `CHEZ=scheme` (from `$GITHUB_ENV`) never reached make,
+which defaults to `chez`.
+
+The mirror missed it twice over. Its image installed apt's `sudo`, which on
+26.04 is classic sudo (`sudo.ws` 1.9.17) and honours `-E`. And the mirror's
+script passed `CHEZ=scheme` to the lane explicitly, which is not ci.yml's
+command.
+
+Reproduced in a 26.04 container with `sudo-rs` 0.2.13 installed, the
+vendored build made as `dev`, and `CHEZ=scheme` exported:
+
+| Command | Result |
+|---|---|
+| `sudo-rs -E env "PATH=$PATH" make HAVE_PKG=no test-root` (CI's) | `chez: not found`, Error 1 |
+| `sudo-rs env "PATH=$PATH" "CHEZ=$CHEZ" make HAVE_PKG=no test-root` | ROOT LANE PASSED |
+| `sudo.ws env "PATH=$PATH" "CHEZ=$CHEZ" make HAVE_PKG=no test-root` | ROOT LANE PASSED |
+
+ci.yml now hands `env` the two variables by name and drops `-E`.
