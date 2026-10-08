@@ -39,7 +39,7 @@
               ;; it from another thread, and change the caller's lists and
               ;; strings mid-call.
               make-engine last-pair list-head set-car! set-cdr! string-set!
-              fork-thread thread-join getenv
+              fork-thread thread-join getenv get-thread-id
               ;; The state sweeps count this process's open descriptors.
               directory-list
               ;; The drop sweeps check that no run leaves interrupts off.
@@ -1210,9 +1210,12 @@
 ;;   ADR-0015 decision 5's unclassifiable state, its handle left to leak;
 ;; - a loop torn down in between leaked the options block and the process
 ;;   handle, reached uv_spawn freed, or failed its teardown with EBUSY on a
-;;   process the spawn had not registered yet.
-;; Now the step that calls uv_spawn checks the loop and every stdio handle
-;; again, and in the same step marks the pipes and registers the process,
+;;   process the spawn had not registered yet;
+;; - a loop handed to another thread in between, by uv-run on that thread,
+;;   was spawned on from this one, racing the loop's own thread on libuv's
+;;   handle queue (#79).
+;; Now the step that calls uv_spawn checks the loop, its owner and every
+;; stdio handle again, and in the same step marks the pipes and registers the process,
 ;; or cleans up after a failure.
 ;;
 ;; Each sweep runs a spawn in an engine at rising fuel, as above. At the
@@ -1233,6 +1236,7 @@
   (guard (e ((uv-invalid-argument? e)
              (list 'refused (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
             ((uv-handle-closed? e) (list 'closed (uv-handle-closed-kind e)))
+            ((uv-wrong-thread? e) (list 'wrong-thread (uv-wrong-thread-who e)))
             ((uv-errno-error? e) (list 'errno (uv-errno-error-errno e)))
             (#t (list 'raised (describe e))))
     (thunk)))
@@ -1343,6 +1347,23 @@
               (lambda () '()))))
     '((closed tcp) not-yet closed not-yet ())
     '((spawned) (7 #f) closed not-yet ())
+    '((spawned) (7 #f) unchanged not-yet ()))
+   ;; Each run has a loop of its own, handed to another thread as uv-run on
+   ;; that thread would: the change only names another owner, and the run's
+   ;; finish takes the loop back by running it (finish-own-loop-run!).
+   (make-state-variant
+    'hand-off-loop
+    "a spawn whose loop was handed to another thread during the call was refused as the wrong thread, or had spawned first"
+    #t exits-7
+    (lambda (loop)
+      (list (list 'ignore)
+            (lambda (run)
+              (set-loop-owner-thread! loop (+ (get-thread-id) 1))
+              'handed-off)
+            (lambda () '())
+            (lambda () '())))
+    '((wrong-thread uv-spawn!) not-yet handed-off not-yet ())
+    '((spawned) (7 #f) handed-off not-yet ())
     '((spawned) (7 #f) unchanged not-yet ()))
    ;; Each run has a loop of its own. A child spawned before the teardown
    ;; runs on, its handle closed by the teardown, so its exit never arrives.
@@ -1498,10 +1519,13 @@
 ;; finish-own-loop-run! : state-variant state-run exact-integer
 ;;                        -> (list-of (list fuel verdict))
 ;; A run on a loop of its own: waits for its child if the loop is still
-;; open, then tears it down.
+;; open, then tears it down. Running the loop first takes it back from
+;; another owner a change named (hand-off-loop), as the waits' timers are
+;; made on it.
 (define (finish-own-loop-run! variant run before)
   (let ((loop (state-run-loop run)))
     (when (uv-loop-open? loop)
+      (uv-run loop 'nowait)
       (run-until/ticking loop (lambda () (state-run-finished? run)) 20000))
     (let* ((verdict (state-verdict variant run))
            (verdict (if (uv-loop-open? loop)

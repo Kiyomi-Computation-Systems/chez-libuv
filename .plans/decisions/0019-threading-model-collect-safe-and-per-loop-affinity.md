@@ -549,6 +549,64 @@ outside it, keeping their existing guards:
 > `uv-stop!` keep their standing above; changing a released verb's contract
 > remains the follow-up this section names.
 
+> **Extended 2026-10-07 (issue #79): every verb that makes something on a
+> loop is checked.** The boundary above left the other constructors out as
+> "a clean follow-up if a future consumer needs it", as though an
+> off-thread constructor risked only the binding's registry. It risks
+> libuv's own lists. `uv__handle_init` links the handle into
+> `loop->handle_queue`, which the loop's thread unlinks closed handles from
+> (`uv__finish_close`), and the DNS inits count their request in the loop
+> with a plain `active_reqs.count++`. Measured reviewing #77: a second
+> thread making 20,000 timers on a loop the first thread was running
+> corrupted the handle queue in 11 of 13 runs. Up to 17,672 handles were
+> missing from the forward chain, the two directions disagreed, and once
+> the backward chain formed a cycle. The registry held every entry, and
+> `uv-loop-teardown!` answered ok every time. The registry lock (#70)
+> cannot help: it guards the binding's table, not libuv's (decision 4).
+>
+> - A step that makes something on a loop takes the loop's pointer from
+>   `owned-loop-ptr`, which is `open-loop-ptr` plus the owner check, so no
+>   such step can skip it. `uv-run`'s claim (#78) still takes it from
+>   `open-loop-ptr`: that step decides who owns the loop. That covers every
+>   handle constructor (`try-construct-handle`, which lost its `owned?`
+>   flag), `uv-accept!`'s client and `uv-spawn!`. The step must check,
+>   because an engine can suspend the verb while the loop is handed to
+>   another thread. The handoff sweeps in `tests/test-constructors.sps`
+>   and `tests/test-process.sps` hold the steps.
+> - The four handle constructors check nowhere else. Nothing between their
+>   entry and the step allocates, so an entry check would refuse nothing
+>   the step does not: a check no mutation could break. `uv-spawn!` also
+>   checks on entry, so a caller on the wrong thread is told so before its
+>   arguments are read, as `require-open-handle` tells it before a handle's
+>   state; a row holds that order. `make-uv-async` keeps its entry check,
+>   which refuses before it makes its send fence, and `uv-accept!` its
+>   server's (`require-open-tcp`).
+> - The DNS verbs have no step yet (decision 3's amendments list them).
+>   `uv-getaddrinfo!` and `uv-getnameinfo!` call `require-loop-thread` on
+>   entry, after `require-open-loop` (`make-uv-async`'s order) and before
+>   reading their arguments. `uv-cancel!` checks too: from another thread,
+>   the loop's thread could complete the request and free its block between
+>   the pointer's read and `uv_cancel`. A DNS request carries its loop for
+>   that, given as an optional fifth argument to its record's constructor.
+> - `tests/test-constructor-owner.sps` calls each of the ten verbs three
+>   ways. From a thread that does not own the loop, it must be refused
+>   naming itself, the owner and the caller, with nothing registered,
+>   counted, allocated or open. From the loop's creator, and from a thread
+>   the loop was handed to by `uv-run`, it must make what it makes (or
+>   for `uv-cancel!`, answer), and the creator is then refused. The verbs
+>   that take arguments are also called with arguments they refuse, and
+>   from the wrong thread must still say so first.
+> - The create-on-A, run-on-B hand-off still works, since the owner moves
+>   at `uv-run`'s entry. No check here sees a call that races the hand-off
+>   itself: one already past its check when the other thread's `uv-run`
+>   takes the loop. Closing that would need the constructors and
+>   `uv-run`'s claim (#78) to share a lock held across libuv's init, and
+>   the registry lock's bodies call only table operations
+>   (`tests/test-source-rules.sps`, rule 6). So docs/api.md makes it the
+>   caller's: hand a loop over once its builder is done with it.
+> - Still unchecked, by contract: `uv-close!`, `uv-stop!` and the loop
+>   queries.
+
 ## Consequences
 
 - A single-threaded program is unchanged except that the collect interlock is

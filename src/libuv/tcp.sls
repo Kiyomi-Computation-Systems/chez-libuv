@@ -33,7 +33,7 @@
     (let ((handle-size (uv-handle-size (uv-tcp-type))))
       (construct-handle 'make-uv-tcp loop (stream-block-size handle-size)
                         uv-tcp-init (tcp-record-maker loop handle-size)
-                        count-tcp-new! #f)))
+                        count-tcp-new!)))
 
   (define (tcp-record-maker loop handle-size)
     (lambda (ptr) (%make-uv-tcp-record ptr loop handle-size)))
@@ -173,16 +173,16 @@
                (if (symbol? server-ptr)
                    server-ptr
                    (let ((client (try-construct-handle loop size uv-tcp-init make-record
-                                                       count-tcp-new! #f)))
+                                                       count-tcp-new!)))
                      (if (not (uv-handle? client))
                          client
                          (let ((rc (uv-accept server-ptr (handle-ptr client))))
                            (if (zero? rc)
                                client
                                (begin (begin-close! client #f) rc))))))))))
-      (if (uv-handle? accepted)
-          accepted
-          (raise (step-refusal accepted 'uv-accept! server)))))
+      (cond ((uv-handle? accepted) accepted)
+            ((eq? accepted 'wrong-thread) (raise (wrong-thread-refusal loop 'uv-accept!)))
+            (else (raise (step-refusal accepted 'uv-accept! server))))))
 
   ;; uv-tcp-connect! : uv-tcp string exact-nonnegative-integer procedure
   ;;                   -> uv-request

@@ -282,38 +282,46 @@
                          (if (eq? torn 'torn-down) verdict (list verdict 'teardown torn))
                          #t))))))
 
-;; --- an async whose loop changes hands ------------------------------------------
-;; make-uv-async is loop-thread-only (ADR-0019). Here the scheduler hands
-;; the loop to another thread at the expiry, as uv-run on that thread
-;; would, and the constructor resumes on this one:
+;; --- a loop that changes hands -------------------------------------------------
+;; Every constructor is loop-thread-only, and checks the owner on entry and
+;; again in its step (ADR-0019; #79). Here the scheduler hands the loop to
+;; another thread at the expiry, as uv-run on that thread would, and the
+;; constructor resumes on this one:
 ;;   'refused              not yet made: &uv-wrong-thread;
 ;;   'made-before-handoff  made and registered while this thread owned it;
 ;;   'untouched            no expiry.
-(define (handoff-run fuel)
+;; A constructor that resumes past its entry check and makes its handle
+;; anyway has run libuv's init on a loop another thread may be running.
+(define (handoff-run v fuel)
   (let* ((before (balance))
          (loop (make-uv-loop))
-         (me (get-thread-id))
-         (eng (make-engine
-               (lambda ()
-                 (guard (e ((uv-wrong-thread? e) 'refused)
-                           (#t (list 'raised (describe e))))
-                   (list 'returned (make-uv-async loop nop))))))
-         (verdict
-          (eng fuel
-               (lambda (ticks o)
-                 (if (and (pair? o) (eq? (car o) 'returned)) 'untouched (list 'untouched o)))
-               (lambda (resume)
-                 (let ((made (pair? (uv-loop-live-handles loop))))
-                   (set-loop-owner-thread! loop (+ me 1))
-                   (let ((o (resume 1000000 (lambda (ticks o) o)
-                                    (lambda (more) 'still-running))))
-                     (set-loop-owner-thread! loop me)
-                     (cond ((and (eq? o 'refused) (not made)) 'refused)
-                           ((and (pair? o) (eq? (car o) 'returned) made)
-                            'made-before-handoff)
-                           (else (list o (if made 'made-before 'made-after-handoff))))))))))
-    (finish! loop)
-    (run-verdict before verdict #t)))
+         (ctx ((variant-prepare v) loop))
+         (me (get-thread-id)))
+    (if (not ctx)
+        (begin (finish! loop) '(prepare-failed))
+        (let* ((fixtures (length (uv-loop-live-handles loop)))
+               (eng (make-engine
+                     (lambda ()
+                       (guard (e ((uv-wrong-thread? e) 'refused)
+                                 (#t (list 'raised (describe e))))
+                         (list 'returned ((variant-start v) loop ctx))))))
+               (verdict
+                (eng fuel
+                     (lambda (ticks o)
+                       (if (and (pair? o) (eq? (car o) 'returned)) 'untouched (list 'untouched o)))
+                     (lambda (resume)
+                       (let ((made (> (length (uv-loop-live-handles loop)) fixtures)))
+                         (set-loop-owner-thread! loop (+ me 1))
+                         (let ((o (resume 1000000 (lambda (ticks o) o)
+                                          (lambda (more) 'still-running))))
+                           (set-loop-owner-thread! loop me)
+                           (cond ((and (eq? o 'refused) (not made)) 'refused)
+                                 ((and (pair? o) (eq? (car o) 'returned) made)
+                                  'made-before-handoff)
+                                 (else (list (if (and (pair? o) (eq? (car o) 'returned)) 'returned o)
+                                             (if made 'made-before 'made-after-handoff))))))))))
+          (finish! loop)
+          (run-verdict before verdict #t)))))
 
 ;; --- dropped ----------------------------------------------------------------------
 ;; The scheduler drops the engine at the expiry, and the loop is torn down
@@ -425,7 +433,7 @@
 (define server-close-sweeps
   (list (cons 'closing (sweep (lambda (fuel) (server-close-run 'closing fuel))))
         (cons 'freed (sweep (lambda (fuel) (server-close-run 'freed fuel))))))
-(define handoff-sweeps (list (cons 'make-uv-async (sweep handoff-run))))
+(define handoff-sweeps (named-sweeps handoff-run variants))
 (define drop-sweeps
   (append (named-sweeps drop-run variants)
           (list (cons 'make-uv-loop (sweep loop-drop-run))
@@ -486,12 +494,12 @@
   '((closing refused untouched) (freed refused untouched))
   (reach server-close-sweeps))
 
-(test-equal "an async whose loop changes hands is refused, or had been made before"
+(test-equal "a constructor whose loop changes hands is refused, or had made its handle before"
   '()
   (bad-runs (lambda (v) (memq v '(refused made-before-handoff untouched))) handoff-sweeps))
 
-(test-equal "the handoff sweep caught make-uv-async before its checks and ran it to the end"
-  '((make-uv-async refused untouched))
+(test-equal "each handoff sweep caught its constructor before its checks and ran it to the end"
+  (map (lambda (s) (list (car s) 'refused 'untouched)) handoff-sweeps)
   (reach handoff-sweeps))
 
 (test-equal "a constructor whose engine is dropped leaves no block, handle, descriptor or held lock"
@@ -552,7 +560,7 @@
   (list emfile '() 'torn-down)
   (refused-step
    (lambda (loop)
-     (try-construct-handle loop 64 failing-init (timer-maker loop) count-timer-new! #f))))
+     (try-construct-handle loop 64 failing-init (timer-maker loop) count-timer-new!))))
 
 (test-equal "a handle whose block is already registered is refused, its block freed"
   (list 'pointer-already-registered '() 'torn-down)
@@ -565,7 +573,7 @@
                      (registry-add! ptr 'timer loop 'squatter)
                      (set! squatted ptr)
                      ((timer-maker loop) ptr))
-                   count-timer-new! #f)))
+                   count-timer-new!)))
        (when squatted (registry-remove! squatted))
        made))))
 
@@ -573,7 +581,7 @@
   (list 'no-memory '() 'torn-down)
   (refused-step
    (lambda (loop)
-     (try-construct-handle loop 0 uv-timer-init (timer-maker loop) count-timer-new! #f))))
+     (try-construct-handle loop 0 uv-timer-init (timer-maker loop) count-timer-new!))))
 
 (test-equal "a loop whose init fails is refused with its errno, leaving nothing behind"
   (list emfile '() 'not-kept)

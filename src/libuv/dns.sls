@@ -92,8 +92,12 @@
   ;; the hints as the ints the block receives. So nothing the caller can
   ;; still change reaches C, and nothing between the allocation and the
   ;; guard can raise (tests/test-dns.sps's sweeps; Valgrind holds the free).
+  ;; Loop-thread-only, checked on entry: libuv counts the request in the
+  ;; loop with a plain increment the loop's thread decrements, so from
+  ;; another thread the loop could exit early or never (#79).
   (define (start-getaddrinfo! loop node service hints on-complete)
     (require-open-loop loop 'uv-getaddrinfo!)
+    (require-loop-thread loop 'uv-getaddrinfo!)
     (let* ((strings (validate-node-and-service node service 'uv-getaddrinfo!))
            (writes (hint-writes (validate-hints hints 'uv-getaddrinfo!))))
       (unless (procedure? on-complete)
@@ -106,7 +110,7 @@
         ;; assign different defaults to those two forms.
         (unless (eq? writes 'absent)
           (write-hints! hints-tail writes))
-        (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete)))
+        (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete loop)))
           (registry-register! block 'getaddrinfo-req loop req)
           (count-getaddrinfo-req-new!)
           (guard (e (#t (abandon-request! req) (count-getaddrinfo-req-free!)
@@ -151,9 +155,11 @@
        (start-getnameinfo! loop ip port flags on-complete))))
 
   ;; The address is read once, by validate-address, and libuv parses that
-  ;; copy (tests/test-address.sps).
+  ;; copy (tests/test-address.sps). Loop-thread-only, checked on entry, as
+  ;; uv-getaddrinfo! is.
   (define (start-getnameinfo! loop ip port flags on-complete)
     (require-open-loop loop 'uv-getnameinfo!)
+    (require-loop-thread loop 'uv-getnameinfo!)
     (let ((ip-bytes (validate-address ip 'uv-getnameinfo!)))
       (require-port port 'uv-getnameinfo!)
       (let ((flags-int (nameinfo-flag-symbols->int flags)))
@@ -165,7 +171,7 @@
                (addr (+ block addr-offset)))
           (guard (e (#t (free! block) (raise e)))
             (fill-sockaddr! addr ip-bytes port 'uv-getnameinfo!))
-          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete)))
+          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete loop)))
             (registry-register! block 'getnameinfo-req loop req)
             (count-getnameinfo-req-new!)
             (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
@@ -179,10 +185,14 @@
   ;; uv-cancel! : uv-dns-request -> boolean
   ;; A true result means cancellation won, but the completion callback still
   ;; fires. False covers work already running or already completed.
+  ;; Loop-thread-only, checked: from another thread, the loop's thread could
+  ;; complete the request and free its block between the pointer's read and
+  ;; uv_cancel (#79).
   (define (uv-cancel! req)
     (unless (uv-dns-request? req)
       (raise (make-uv-invalid-argument 'uv-cancel!
                                        'not-a-cancellable-request)))
+    (require-loop-thread (req-loop req) 'uv-cancel!)
     (let ((ptr (req-ptr req)))
       (if (zero? ptr)
           #f
