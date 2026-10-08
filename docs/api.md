@@ -29,7 +29,7 @@ libraries exist for narrower imports.
 **One thread per loop**
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)).
 A loop and its handles belong to one thread: the one that created the loop,
-then whichever thread most recently entered `uv-run` on it — so a loop can be
+then whichever thread most recently ran it or tore it down — so a loop can be
 built on one thread and handed to a dedicated loop thread, which keeps it
 after `uv-run` returns. Every verb that operates on an open handle, plus
 `make-uv-async` and `uv-update-time!`, raises `&uv-wrong-thread` from any
@@ -65,15 +65,27 @@ ADR-0019's amendment to decision 4 weighs this lock against a table for each
 loop.
 
 **One call inside a loop at a time.** `uv-run`, `uv-loop-close!` and
-`uv-loop-teardown!` each claim the loop, atomically, before they touch it,
-and give the claim back when they are done. While one call holds it, the
-others are refused `'loop-running`, from any thread. Running one loop from
-two threads is still a caller bug, since the loop belongs to one thread, but
-the second call is refused by name and changes nothing, not even the loop's
-owner. Until #78 both calls could get in: two of the loop's callbacks ran at
-once on two threads, `invalid memory reference` was raised out of `uv-run`,
-or both threads hung inside libuv. A run and a teardown take the loop over;
-a close does not, so a close refused `'EBUSY` leaves the loop with its owner.
+`uv-loop-teardown!` each claim the loop, atomically, before they call libuv
+on it, and give the claim back when they are done. While one call holds it,
+the others are refused `'loop-running`, from any thread. Running one loop
+from two threads is still a caller bug, since the loop belongs to one
+thread, but the second call is refused by name and changes nothing, not even
+the loop's owner. Until #78 both calls could get in: two of the loop's
+callbacks ran at once on two threads, `invalid memory reference` was raised
+out of `uv-run`, or both threads hung inside libuv.
+
+- A run and a teardown take the loop over; a close does not, so a close
+  refused `'EBUSY` leaves the loop with its owner.
+- A teardown claims the loop for each of its steps: closing the handles,
+  each run of its drain, and closing the loop. Between steps another call can
+  get in. A teardown that then finds the loop closed returns; one that finds
+  it claimed is refused `'loop-running` with its handles already closing,
+  and can be called again.
+- Closing a closed loop stays a quiet no-op, from any number of threads.
+- An engine dropped inside `uv-loop-close!` never leaves the loop claimed.
+  One dropped inside a teardown leaves it claimed only inside a run of the
+  drain, as one dropped inside `uv-run` does; anywhere else, calling the
+  teardown again finishes it.
 
 **A callback ends only by returning.** To end a run early, call `uv-stop!` or
 raise. A continuation that escapes a callback leaves libuv in the middle of

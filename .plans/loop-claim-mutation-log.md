@@ -4,169 +4,213 @@ Issue #78, found reviewing #77: `uv-run` meant to refuse a loop another call
 was running (`'loop-running`), but it read the mark and set it as two plain
 steps, with the mode, the pointer, the deferred list and the owner in
 between. `uv-loop-close!` and `uv-loop-teardown!` read the same mark the same
-way. This log holds the reproduction, the design, the tests, and the
-mutations that show each test fails by name.
+way. This log holds the reproduction, the design, what the review of the
+first version found and how the design changed, the tests, and the mutations
+that show each test fails by name.
 
 macOS arm64, Chez 10.4.1 threaded, libuv 1.52.1 (Homebrew), base main
-`41fdf4c` (#77). The box carried another session's CPU hogs from 19:16 to
-19:46 (load average up to 455); the runs below say which ran under them.
+`41fdf4c` (#77). Times are at load average 4–6 unless a section says
+otherwise.
 
 ## The reproduction
 
 The issue's probe (two threads, 200,000 `uv-run 'nowait` each, on one loop
-with 20 repeating 1 ms timers) on `41fdf4c`, three runs at load 5: two
-raised `invalid memory reference` out of a thread's `uv-run`, and one ran
-clean.
+with 20 repeating 1 ms timers) on `41fdf4c`, three runs: two raised
+`invalid memory reference` out of a thread's `uv-run`, and one ran clean.
 
 The issue left a same-thread version "plausible but untested": an engine
-suspended between the check and the set. It is real. The new suite's split
-sweep runs a `uv-run 'nowait` in an engine at fuel 1, 2, ..., and at the
-first expiry closes the loop on the same thread. On `41fdf4c`, at fuel 8
-and 9 the close was accepted, and the resumed run raised `invalid memory
-reference`: it had read the pointer before the expiry, and ran the block
-the close had freed. Tearing down instead of closing failed at the same
-fuels.
+suspended between the check and the set. It is real. A split sweep runs a
+`uv-run 'nowait` in an engine at fuel 1, 2, ..., and at the first expiry
+closes the loop on the same thread. On `41fdf4c`, at fuel 8 and 9 the close
+was accepted, and the resumed run raised `invalid memory reference`: it had
+read the pointer before the expiry, and ran the block the close had freed.
+Tearing down instead of closing failed at the same fuels.
 
 ## The design
 
 `claim-loop!` in `(libuv private handles)`:
 
-- The mark is a box per loop, taken by `box-cas!`. No lock: a lock every
-  loop's thread shares would put every run of every loop behind it, and the
-  registry's lock is held to table operations by rule 6. 16 B a loop.
+- The mark is a box per loop holding the claiming thread's id, or `#f`,
+  taken by `box-cas!`. No lock: a lock every loop's thread shares would put
+  every run of every loop behind it. 16 B a loop.
 - The take, the open check and the owner transfer are one `one-step`, so no
   engine of the claiming thread comes between them. The open check comes
   after the take, so a run that claims after a close finds the loop closed.
+  A closed loop is answered before any claim: it never reopens.
 - A refused claim changes nothing: not the mark, not the owner.
 - `memory-order-acquire` after the take, `memory-order-release` before the
-  clear.
-- A failed `box-cas!` is a refusal only when the mark is set; otherwise the
-  take is retried (a compare-and-set may fail spuriously on some
-  platforms).
+  clear. On arm64 `box-cas!` is a bare `ldxr`/`stxr` with no ordering (two
+  reviewers dumped the code), and fails now and then with the box unchanged,
+  so a failed take is a refusal only when the mark is really held.
+- `release-loop!` gives back only this thread's claim, and raises
+  (`assertion-violation`) on any other: a release that cleared another
+  thread's claim is the defect the review found in the exit.
 
-`uv-run`, `uv-loop-close!` and `uv-loop-teardown!` each claim, and give the
-claim back on every exit, raises included. A run and a close answer their
-refusals (a callback's error, libuv's `EBUSY`) and raise them once the claim
-is back; a teardown, whose raises come from deep in its work, gives the
-claim back in a `guard` (`holding-claim`). A run and a teardown take the
-loop over; a close does not. The pending callback error is taken while the
-claim is held. `uv-run` keeps its unfenced first check of the mark only to
-keep refusing `'loop-running` before an unknown mode.
+The verbs:
+
+- `uv-run` and every run of a teardown's drain go through one `run-step!`:
+  claim (taking the loop over), `uv_run`, then take the pending callback
+  error and release, as one interrupt-free step.
+  `take-pending-callback-error!` asserts that this thread holds the claim.
+- `uv-loop-close!` is one interrupt-free step (`close-step!`): claim without
+  taking the loop over, `uv_loop_close`, the record closed and freed,
+  release. It answers a status, and the verb raises after.
+- `uv-loop-teardown!` is steps that each hold the claim only while they call
+  libuv: `start-teardown!` (one step: claim, cancel requests, begin every
+  handle's close, release), drain runs (`run-step!`), and `close-step!`.
+  Nothing in a claimed step raises; the teardown answers what to raise, and
+  no `guard` sits around it.
+- `call-with-uv-loop`'s exit takes a claim back only when the mark names its
+  own thread, and hands it to the teardown's first step. A failed teardown is
+  claimed again for good (an abandoned run, #45), unless it failed because
+  another call took the claim between its steps.
+- `uv-run` keeps its unfenced first check of the mark only to keep refusing
+  `'loop-running` before an unknown mode.
+
+## The review, and what it changed
+
+A max-effort review of the first version (10 finder angles, 18 verifiers, a
+gap sweep) reported 15 findings. The first version kept the mark as `#t`,
+held the teardown's claim across the whole teardown inside a `guard`, and
+left `call-with-uv-loop`'s exit as it was.
+
+| Finding | Measured on the first version | Now |
+|---|---|---|
+| The exit took "marked and owned by this thread" for its own claim; a close claims without moving the owner | another thread's close: SIGABRT (double `uv_loop_close`) 3 of 3 | the mark names its holder; a close-shaped claim another thread holds is refused by name |
+| `claim-loop!` stored the mark before the owner, so the exit also took another thread's fresh run claim for its own | hand-off probe: SIGABRT 3 of 3; base 9,000 rounds clean | as above |
+| The exit cleared its claim and then re-claimed, and re-marked over another thread's claim on a refusal | 15 of 2,000 loops left claimed with no run in them (base worse) | 0 of 2,000; the exit never re-claims after a refusal |
+| A dropped close or teardown stranded the loop at almost every expiry | teardown 2,997 of 3,000 drop points (base 624, inside `uv_run` only); close 8 of 11 | close: none; teardown: 1 expiry, the same as a dropped `uv-run` |
+| The teardown's `guard` gave the claim back over a fault out of `uv_run` | the loop was enterable again | no guard; a fault keeps the claim |
+| A concurrent close of a closed loop was refused | ~5% of closes, ~2% of teardowns | 0 of 40,000 |
+| The teardown's `guard` cost ~400 B | make + teardown 970 B | 576 B (base 946) |
+
+The review's other findings were in the tests and this log: the close race
+could not see a broken claim (an empty loop has no callback to witness it);
+suite plumbing could raise outside a row; one row leaked a loop into the
+memory-gated process; the drain-bound row waited ~1.4 s; a judge lacked a
+case its contract promised; one row depended on argument order; the log
+misreported M2 and miscounted its table. Each is fixed below.
 
 ## Cost
 
-A scratch benchmark (1,000,000 runs; 100,000 make-and-close cycles), base and fix alternating, three runs each,
-load 5:
+A scratch benchmark (1,000,000 runs; 100,000 make-and-close cycles), base and
+the final code alternating, three runs each, load 4–5:
 
 | Call | Base | Fix |
 |---|---|---|
-| `uv-run 'nowait` on an empty loop | 80.9–81.8 ns, 16 B | 86.3–87.6 ns, 16 B |
-| `make-uv-loop` + `uv-loop-close!` | 448 B, 5.5–5.6 µs | 464 B, 5.6 µs |
-| `make-uv-loop` + `uv-loop-teardown!` | 946 B, 5.9–6.0 µs | 970 B, 5.9–6.3 µs |
+| `uv-run 'nowait` on an empty loop | 81.3–83.2 ns, 16 B | 99.6–101.7 ns, 16 B |
+| `make-uv-loop` + `uv-loop-close!` | 448 B | 464 B |
+| `make-uv-loop` + `uv-loop-teardown!` | 946 B | 576 B |
 
-The 16 B is the box. A first shape put `uv-loop-close!`'s work inside the
-same `guard` as the teardown's: 858 B a close, +410 B. The close now answers
-libuv's return code and raises after giving the claim back.
+Of the run's +17 ns, no one piece dominates: variants without the pending
+take's assertion, without the release's interrupt-free step, or with a plain
+store for the release each saved 2–5 ns. The first version cost +5 ns; the
+checks the review asked for cost the rest.
 
 ## The tests
 
-`tests/test-loop-claim.sps`, 26 rows, 1.8 s at load 5 (32 s at load 450):
+`tests/test-loop-claim.sps`, 36 rows, 1.2 s:
 
-- **From another thread, while this thread runs the loop** (3 rows): each
-  verb is refused `'loop-running`, and inside the run the loop is still
-  claimed and still this thread's; after the run the claim is free.
-- **A close refused `EBUSY` on another thread leaves the owner** (1), and a
-  `uv-run` with an unknown mode on a running loop is refused `'loop-running`
-  (1).
-- **Every way out gives the claim back** (5): a run whose callback raised, a
-  close refused `EBUSY`, a teardown that re-raises a close callback's
-  error, a teardown that gives up at its drain bound (a close callback
-  starts a timer the teardown never saw), a second close of a closed loop.
-- **A teardown on another thread whose close callback escapes** leaves the
-  loop claimed and owned by that thread (1).
-- **Engine splits** (3 sweeps, each with a precondition row that the split
-  landed both before the run's claim and during it): close, teardown, and
-  another run whose callbacks raise, judged by the deferred errors the
-  resumed run reports.
-- **Races** (skipped under Valgrind): two threads run one loop with 20 timers
-  (3 runs: every call runs or is refused, at most one callback at once, the
-  claim free afterwards, and preconditions that each thread saw the other
-  move and was refused at least once); one thread runs a loop while another
-  tears it down, and while another closes it (200 loops each, with a
-  precondition that some ender was refused first).
+- **From another thread, while this thread runs the loop** (3): each verb is
+  refused `'loop-running`, and inside the run the loop is still claimed and
+  still this thread's.
+- **Ownership and refusal order** (2): a close refused `EBUSY` on another
+  thread leaves the owner; a `uv-run` with an unknown mode on a running loop
+  is refused `'loop-running`.
+- **Every way out gives the claim back** (6): a run whose callback raised, a
+  close refused `EBUSY`, a teardown that re-raises a close callback's error,
+  a teardown at its drain bound (an async that stops each run and re-sends
+  itself, so no run waits), a second close of a closed loop, and a release
+  by a thread that does not hold the claim, which is refused.
+- **An escaping teardown on another thread** (2): the loop is left claimed
+  by that thread and owned by it; then the suite takes it back.
+- **`call-with-uv-loop`'s exit** (1, plus a race below): another thread
+  holds a claim taken as a close takes it; the exit refuses it by name, and
+  the claim stays that thread's.
+- **Engine splits** (6): close, teardown, and another run, each with a
+  precondition that the split landed before the run's claim and inside it.
+  Each fuel's teardown result is checked, and a raise between fuels ends the
+  sweep as a row's evidence.
+- **Engine drops** (3): a dropped close never leaves its loop claimed and a
+  retry closes it; a dropped teardown of an empty loop leaves it claimed at
+  no more expiries than a dropped `uv-run` does, and a retry finishes it; a
+  precondition that every sweep was dropped and a dropped run did strand.
+- **Races**, skipped under Valgrind (13): two runners on one loop (every
+  call runs or is refused, at most one callback at once, every callback
+  finds the claim naming its own thread, the claim free afterwards, two
+  preconditions); a runner against a teardown and against a close, 200 loops
+  each (the close race's timers close themselves after three fires, so its
+  callbacks witness the claim while the closer tries); two threads closing a
+  closed loop; bodies left from a timer callback while another thread runs
+  every unclaimed loop it sees.
 
-Every wait on another thread gives up at 10 s, so a build that hangs two
-threads in `uv_run` fails rows by name: on `41fdf4c` a run of the suite
-reported `(never-ended never-ended)` and skipped the races after it, naming
-the stuck run.
-
-## Against the base
-
-The final suite against `41fdf4c`'s `src/` (a scratch copy), three runs at
-load 4: 6, 9 and 11 rows failed by name. These failed in every run:
-
-| Row | Failed with |
-|---|---|
-| uv-run split, close | fuel 8, 9: `accepted` then `invalid memory reference` |
-| uv-run split, teardown | the same |
-| two threads run one loop | `invalid memory reference` raised out of `uv-run` |
-| ...the claim is free afterwards | follows from the raise, or `'loop-running` for good |
-| teardown while another runs | `invalid memory reference` in the runner |
-
-The others failed in some runs: "no two callbacks at once" (`2`), the close
-race (both threads `never-ended`), and the preconditions of races skipped
-after a stuck run, which name the stuck run as their evidence. One run under
-load ~300 failed only the five above.
+Rule 7 of `tests/test-source-rules.sps` (2 rows) keeps `set-loop-holder!`,
+which sets the mark outright for the tests' forgeries, out of `src/`.
 
 ## Mutations
 
-Each row copies the worktree's `src/` fresh into the scratchpad, applies one
-exact replacement (the script aborts unless it matches once), and runs
-`tests/test-loop-claim.sps` against the copy. Control: 0 failures.
+Each row copies the worktree's `src/` fresh into the scratchpad, applies
+exact replacements (each must match once), and runs `test-loop-claim.sps`
+against the copy. Control: 0 failures. Final sweep on the final code:
 
 | # | Mutation | Result |
 |---|---|---|
-| M1w | the claim always takes the mark (`(begin (set-box! mark #t) #t)`): the base's shape, refusals only from the unfenced first check | 13 FAIL: close and teardown from another thread, the close split sweep, every race row |
-| M1t | non-atomic check-then-set inside the step (`(and (not (unbox mark)) (set-box! …))`) | 9 FAIL: every race row |
-| M2 | a refused claim clears the mark | 11 FAIL, including all three "from another thread" rows (`not-running` inside the run) |
-| M3 | a refused claim takes the owner | 2 FAIL: close and teardown from another thread (`owner-moved`) |
-| M4 | the open check read before the take | **survived**, see below |
-| M5 | `holding-claim` re-raises without giving the claim back | 1 FAIL: the drain-bound teardown row |
-| M5c | `uv-loop-close!` raises libuv's refusal before giving the claim back | 2 FAIL: both `EBUSY` rows |
-| M6 | teardown never gives the claim back | 3 FAIL: the teardown re-raise row, the teardown split sweep, the teardown race |
-| M7 | `uv-run` raises the callback error before giving the claim back | 3 FAIL: the raising-callback row, the deferral split sweep and its precondition |
+| M1w | the claim always takes the mark (no CAS) | 20 FAIL, among them all three "from another thread", the exit row, and every race row |
+| M1t | check-then-set inside the step | 4 FAIL: two runners, the teardown race and the close race |
+| M2 | a refused claim clears the mark | 20 FAIL, including the close and teardown "from another thread" rows |
+| M3 | a refused claim takes the owner | 2 FAIL: the close and teardown "from another thread" rows |
+| M5 | a close refused `EBUSY` keeps its claim | 4 FAIL: both `EBUSY` rows, the close race and its precondition |
+| M6 | a run never gives its claim back | 32 FAIL |
 | M8 | a close takes the loop over | 1 FAIL: the `EBUSY`-on-another-thread row |
-| M9 | a teardown does not take the loop over | 1 FAIL: the escaping-close-callback row (`owned-by-another`), once that row existed; it survived the first sweep |
-| M10a | no acquire fence after the take | **survived**, see below |
-| M10b | no release fence before the clear | **survived**, see below |
-| M11 | the pending error taken after the claim is given back | **survived**, see below |
+| M11 | the pending error taken after the release | 34 FAIL: the assertion fires in every run |
 | M12 | no unfenced first check in `uv-run` | 1 FAIL: the unknown-mode row |
-| M13 | a failed `box-cas!` is always a refusal | **survived**, see below |
-| M14 | the deferred list reset before the claim, not in the claimed run | 1 FAIL: the deferral split sweep, once it existed; it survived the first sweep |
+| M14 | the deferred list reset before the claim | 1 FAIL: the deferral split sweep |
+| N1 | the exit asks "marked and owned by me" | 18 FAIL, the exit row first |
+| N3 | the exit re-claims after a refusal too | 1 FAIL: the exit race |
+| N4 | a closed loop is claimed before it is answered | 1 FAIL: two threads closing a closed loop |
+| N5 | a close is not one step | 2 FAIL: the close drop row and the teardown drop row |
+| N6 | the teardown's first step is not one step | 1 FAIL: the teardown drop row |
+| N7 | `release-loop!` clears whatever the mark holds | 1 FAIL: the release-by-another-thread row |
+| N9 | the teardown holds its claim across its steps | 5 FAIL: the drain-bound row, the close split row and its precondition, the teardown drop row, and the exit race's precondition |
+| M4 | the open check read before the take | survived, see below |
+| M9 | the teardown's first step does not take the loop over | survived, see below |
+| M10a | no acquire fence after the take | survived, see below |
+| M10b | no release fence before the clear | survived, see below |
+| M13 | a failed `box-cas!` is always a refusal | survived, see below |
+| N2 | the exit releases its claim, then tears down as any caller | survived, see below |
+| N8 | `take-pending-callback-error!` without its assertion | survived, see below |
 
-M9 and M14 survived the first sweep. The escaping-teardown row and the
-deferral split sweep were written for them, and each fails by name now.
-When the close stopped using the `guard` (see Cost), M5 lost the `EBUSY`
-rows that had caught it, and the drain-bound row was written for it. The
-table is the final sweep on the final code: 18 mutants, 13 caught by
-name.
+24 mutants: 17 fail by name, 7 survive. N5 aborted the process (a retried
+close of a half-closed loop) until the drop sweeps stopped taking back loops
+a dropped close or teardown left claimed; it now fails by name.
+
+The first version's sweep, for the record: 18 mutants, 13 caught. Its log
+said M2 failed all three "from another thread" rows, but the `uv-run` one
+cannot fail under M2 (the unfenced first check refuses before the claim),
+and the table had 17 rows, 12 caught. Both were wrong in the log, not in the
+code.
 
 ### Uncovered, and why
 
-- **M4** (open check before the take). No expiry of the split sweeps landed
-  between the read and the step: the read is the last call before
-  `one-step` disables interrupts. Across threads the window is the few
-  instructions between the read and the compare-and-set, and the close race
-  did not reach it. The comment on
-  `claim-loop!` states the order; nothing checks it.
-- **M10a/M10b** (fences). No test here can observe a reordering: arm64's
-  reorderings across a contended compare-and-set are not reproducible on
-  demand. They are kept because the release/acquire pairing is what makes
-  one thread's libuv state visible to the next holder.
-- **M11** (pending error after release). No expiry of the deferral sweep
-  landed between the release and the take, which are adjacent. Across
-  threads, another run would have to claim, run and raise in a callback
-  within those few instructions.
-- **M13** (spurious failure). Whether `box-cas!` fails spuriously depends on
-  the platform's code generation; no run here produced a refusal from an
-  unset mark. The retry is defensive.
+- **M4** (open check before the take). No expiry of the split sweeps lands
+  between the read and the step: the read is the last call before `one-step`
+  disables interrupts. Across threads the window is the few instructions
+  between the read and the compare-and-set.
+- **M9** (the first step keeps the owner). Equivalent: every drain run takes
+  the loop over, so the owner is the teardown's thread before any callback
+  runs.
+- **M10a/M10b** (fences). No test here can observe a reordering on demand.
+  Two reviewers confirmed in the generated arm64 code that `box-cas!` carries
+  no ordering of its own and that each fence emits a `dmb`; the fences stay
+  because the release/acquire pairing is what hands libuv's state from one
+  holder to the next.
+- **M13** (spurious failure). Real on arm64 (a single `ldxr`/`stxr`), but no
+  run here produced a refusal from an unset mark; a spurious refusal would
+  surface as a `'loop-running` on an idle loop.
+- **N2** (no hand-off in the exit). Equivalent under the final design: a
+  call that gets in between the release and the teardown is a call that
+  could get in between the teardown's steps anyway, and the exit then leaves
+  the loop to it instead of re-claiming. The hand-off only makes the
+  handles' closes begin before another call can get in.
+- **N8** (the assertion itself). It is the check that turns M11 from a
+  survivor (the first version's sweep) into 34 named failures.

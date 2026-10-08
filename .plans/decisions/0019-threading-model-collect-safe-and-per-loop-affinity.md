@@ -109,44 +109,80 @@ constructor mutates the registry before a handle exists to check.
 > out of `uv-run` and left the loop marked running for good, or both
 > threads spun in libuv's timer heap. `uv-loop-close!` and
 > `uv-loop-teardown!` read the mark the same way, so either could free the
-> loop, or close its handles, under a run that had just begun.
+> loop, or close its handles, under a run that had just begun. One thread
+> was enough, too: a `uv-run` an engine split between its read and its
+> write let the same thread close the loop, and the resumed run used the
+> freed block.
 >
-> - **The claim.** `uv-run`, `uv-loop-close!` and `uv-loop-teardown!` now
->   each take the loop's claim before they touch it (`claim-loop!` in
->   `(libuv private handles)`) and give it back when they are done. The
->   mark is a box taken by `box-cas!`, so no two calls on any threads hold
->   it at once. The take, the open check and the owner transfer are one
->   interrupt-free step, so no engine of the claiming thread comes between
->   them, and a refused claim changes nothing.
+> - **The claim.** A run, a close and each step of a teardown take the
+>   loop's claim before they call libuv on it (`claim-loop!` in `(libuv
+>   private handles)`) and give it back when they are done. The mark is a
+>   box per loop holding the claiming thread's id, taken by `box-cas!`, so
+>   no two calls on any threads hold it at once. The take, the open check
+>   and the owner transfer are one interrupt-free step, so no engine of the
+>   claiming thread comes between them, and a refused claim changes
+>   nothing. A closed loop is answered before any claim: it never reopens.
 > - **No lock.** The registry's lock would have served too, but the claim
 >   needs nothing a lock gives beyond one compare-and-set, and a lock every
->   loop's thread shares would put each run of every loop behind it. A
->   per-loop box costs 16 B a loop and no wait.
+>   loop's thread shares would put each run of every loop behind it. A box
+>   per loop costs 16 B a loop and no wait.
 > - **Order.** The open check comes after the take. A close sets the loop
 >   closed while it holds the claim, so a run that claims after the close
 >   finds it closed, never a freed pointer. An acquire fence after the take
 >   and a release fence before the clear order libuv's own state, written
->   by one thread's `uv_run`, before the next holder reads it.
-> - **Close and teardown claim too** (the issue left this to decide).
->   docs/api.md makes both loop-thread-only, so a call from another thread
->   is a caller bug either way. But their read of the mark had the same
->   window, and a teardown runs the loop: its drain was a `uv-run` all
->   along. A close claims without taking the loop over, so a close refused
->   `'EBUSY` on another thread leaves the loop with its owner. A teardown
->   takes it over, as its drain's `uv-run` always did.
-> - **Every exit gives the claim back**, a raise included: a callback
->   error, libuv's `'EBUSY`, the drain bound. A callback that never returns
->   (an engine's suspension, an escaping continuation) still leaves it held,
->   as #45 decided above. The pending callback error is taken while the
->   claim is held, since once it is given back another thread's run can set
->   one of its own.
-> - **Left as it was:** a drop between the claim and `uv_run`, or between
->   `uv_run`'s return and the release, leaves the loop claimed, as the
->   series' last part already records (decision 3's amendment).
+>   by one thread's `uv_run`, before the next holder reads it: on arm64
+>   `box-cas!` is a bare exclusive load and store with no ordering of its
+>   own, and fails now and then with the box unchanged, so a failed take
+>   is a refusal only when the mark is really held.
+> - **Close and teardown claim too** (the issue left this to decide). A
+>   close is one interrupt-free step: claim, `uv_loop_close`, the record
+>   closed and freed, release. A teardown is three kinds of step, each
+>   claimed only while it calls libuv: closing every handle, one
+>   interrupt-free step; each run of the drain, claimed as `uv-run` claims
+>   (the same `run-step!`); and the close. A close does not take the loop
+>   over, so a close refused `'EBUSY` on another thread leaves the loop with
+>   its owner; a teardown takes it over at each run, as its drain's
+>   `uv-run` always did.
+> - **Why the teardown releases between steps.** Held across the whole
+>   teardown, the claim made an engine dropped anywhere in it strand the
+>   loop for good: every later call refused, the loop and its descriptors
+>   kept. A review of the first version measured that at 2,997 of 3,000
+>   drop points of a teardown, against 624 on v0.7.3, where only a drop
+>   inside the drain's `uv_run` left the loop marked. Now a dropped close
+>   never strands its loop, and a dropped teardown does only inside a run
+>   of its drain, at no more expiries than a dropped `uv-run`. The price:
+>   between steps another call can get in. A teardown that then finds the
+>   loop closed returns, and one that finds it claimed is refused
+>   `'loop-running` with its handles closing, to be called again; no two
+>   calls are ever inside libuv at once.
+> - **`call-with-uv-loop`'s exit.** It asked "marked, and owned by this
+>   thread" to find a claim its own thread left. A close claims without
+>   moving the owner, and a run takes the mark before it stores the owner,
+>   so another thread's claim of either kind passed that test, and the exit
+>   tore the loop down under it (SIGABRT in 3 of 3 runs of the review's
+>   probe). The exit now asks whether the mark names its own thread, and
+>   hands that claim straight to the teardown: clearing it first let
+>   another thread's run in, and the exit then wrote its mark over that
+>   run's claim, leaving the loop claimed with no run in it.
+> - **Every exit gives the claim back**, a refusal included: libuv's
+>   `'EBUSY`, a callback's error, the drain bound. Nothing in a claimed step
+>   raises; each answers a status and the verb raises after the release,
+>   so no `guard` sits around a teardown (one cost about 400 B a teardown,
+>   and gave the claim back over a fault raised out of `uv_run`). A callback
+>   that never returns (an engine's suspension, an escaping continuation)
+>   still leaves the claim held, as #45 decided above. The pending callback
+>   error is taken by the claim's holder only, an assertion: once the claim
+>   is given back, another thread's run can set one of its own.
+> - **Left as it was:** a drop between a run's claim and `uv_run`, or
+>   between `uv_run`'s return and the release, leaves the loop claimed, as
+>   the series' last part already records (decision 3's amendment).
 >
 > `tests/test-loop-claim.sps` races two threads on one loop for each verb,
 > with bounded waits so a broken build fails by name instead of hanging,
-> and holds every way out of a claim. Evidence and mutations:
+> sweeps engine splits and drops of each verb, holds every way out of a
+> claim, and holds the exit against another thread's claim. Rule 7 of
+> `tests/test-source-rules.sps` keeps `set-loop-holder!`, which sets the
+> mark outright, out of `src/`. Evidence and mutations:
 > `.plans/loop-claim-mutation-log.md`.
 
 **3. `uv-async-send!` is the one exempt verb.** `uv_async_send` is libuv's sole
