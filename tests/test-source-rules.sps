@@ -61,6 +61,12 @@
 ;;;    only through a procedure that takes it as an argument, or by a macro
 ;;;    whose name does not end in ! (.plans/registry-lock-mutation-log.md).
 ;;;
+;;; 7. A loop's claim is taken and given back only through claim-loop! and
+;;;    release-loop! (#78). set-loop-holder!, which sets the mark outright,
+;;;    is for the tests' forgeries: src/ never calls it. A call there could
+;;;    clear a claim another thread holds, as call-with-uv-loop's exit did
+;;;    until #78's review, or leave one no call will give back.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1152,6 +1158,24 @@
   (filter (lambda (e) (positive? (cdr e)))
           (map (lambda (e) (cons (car e) (calls-of 'uv-handle-set-data (cdr e))))
                libraries)))
+
+;; calls-in-src : symbol -> (listof (cons string exact-positive-integer))
+;; Each library in src/ that calls NAME, with how many times.
+(define (calls-in-src name)
+  (filter (lambda (e) (positive? (cdr e)))
+          (map (lambda (e) (cons (car e) (calls-of name (cdr e)))) libraries)))
+
+;; Live: the scan finds the claim's own release, which loop.sls calls.
+(test-equal "rule 7 is live: the scan finds loop.sls giving claims back with release-loop!"
+  'found
+  (if (assoc "src/libuv/loop.sls" (calls-in-src 'release-loop!))
+      'found
+      (calls-in-src 'release-loop!)))
+
+;; The one list headed by set-loop-holder! is its definition's own header.
+(test-equal "rule 7: no library in src/ sets a loop's claim outright with set-loop-holder!"
+  '(("src/libuv/private/handles.sls" . 1))
+  (calls-in-src 'set-loop-holder!))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"

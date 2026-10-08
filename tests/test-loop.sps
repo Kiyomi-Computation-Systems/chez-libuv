@@ -1326,7 +1326,7 @@
 ;; with the run by then, so it clears the mark and takes the loop back.
 (define (tear-down-row-loop loop)
   (guard (e (#t (list 'raised (raise-evidence e))))
-    (set-loop-running! loop #f)
+    (set-loop-holder! loop #f)
     (set-loop-owner-thread! loop (current-thread-id))
     (uv-loop-teardown! loop)
     'torn-down))
@@ -1485,8 +1485,8 @@
 
 ;; A loop another thread is running is live under that thread's uv_run, and
 ;; the exit leaves it alone: its teardown refuses it, as before #45. The row
-;; forges that state, the mark and another thread's id, on a loop no thread
-;; is running, so a build that tore the loop down anyway fails here by name
+;; forges that state, a claim held by another thread's id, on a loop no
+;; thread is running, so a build that tore the loop down anyway fails here by name
 ;; instead of racing a real thread.
 (define foreign-run-loop #f)
 (define foreign-run-outcome
@@ -1495,7 +1495,7 @@
      (lambda (l)
        (set! foreign-run-loop l)
        (set-loop-owner-thread! l (+ (current-thread-id) 1))
-       (set-loop-running! l #t)
+       (set-loop-holder! l (+ (current-thread-id) 1))
        'body-returned))))
 
 (test-equal "call-with-uv-loop's exit refuses a loop another thread is running"
