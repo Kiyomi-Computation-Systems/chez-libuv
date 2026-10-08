@@ -27,7 +27,7 @@
         (only (libuv private native) live-counts alloc-block free-block! uv-handle-size)
         (only (libuv private constants) uv-process-type)
         (uv-testing)
-        (only (uv-evidence) live-count describe)
+        (only (uv-evidence) live-count describe under-memory-tool?)
         ;; uv-spawn!'s list reads against another thread (#66), the
         ;; meter its cost rows use, and the level-3 child's runner.
         (spawn-list-races)
@@ -460,9 +460,10 @@
 ;;     correct cleanup, so this binding takes the EXEC-CLASS arm: the handle
 ;;     is registered and counted, and `process` returns to baseline only
 ;;     after the loop turns (ADR-0015 decision 3 -- the free is async).
-;;     Measured, not inferred: CI's ubuntu-noble leg links apt's libuv
-;;     1.48.0 and takes this arm; its vendored leg (1.52.1) and macOS's
-;;     homebrew libuv (1.52.1) take the other.
+;;     Measured, not inferred: CI's pkg-config leg takes this arm, on
+;;     Ubuntu 24.04's apt libuv 1.48.0 and on 26.04's 1.51.0 (a mirror of
+;;     the job, 2026-10-08); its vendored leg (1.52.1) and macOS's homebrew
+;;     libuv (1.52.1) take the other.
 ;;
 ;; That divergence is exactly what ADR-0015 decision 2 exists to absorb --
 ;; the class is decided BY ASKING THE LOOP, never by the errno and never by
@@ -1860,7 +1861,10 @@
 ;;
 ;; Neither memory tool hands a freed block back, Memcheck's freelist and
 ;; ASan's quarantine both hold it, so under either the row asks only that
-;; the spawn ran and left nothing.
+;; the spawn ran and left nothing. Which run this is, under-memory-tool?
+;; asks the allocator as well as the environment: asked of the environment
+;; alone, a plain run that inherited ASAN_OPTIONS from a shell took the
+;; weaker row, and failed a correct build, whose spawn was refused.
 (define squatted-blocks 64)
 
 ;; squatted-spawn : -> list
@@ -1904,7 +1908,7 @@
         (list seed (if (uv-process? outcome) 'spawned outcome) marked torn
               (state-residue before))))))
 
-(if (or (getenv "CHEZ_LIBUV_UNDER_VALGRIND") (getenv "ASAN_OPTIONS"))
+(if under-memory-tool?
     (test-equal "a spawn made among freed blocks that entries still name left nothing behind (a memory tool: reuse unobservable by design)"
       '(spawned marked torn-down (0 0 0 0 0))
       (cdr (squatted-spawn)))

@@ -17,16 +17,15 @@
               alloc-block free-block! uv-handle-size uv-process-get-pid)
         (only (libuv private constants) uv-process-type)
         (uv-testing)
-        (only (uv-evidence) describe)
+        (only (uv-evidence) describe exact-block-sizes? under-memory-tool?)
         ;; make-engine drives the sweeps; the interrupt pair checks that no
         ;; run leaves interrupts disabled; foreign-procedure binds waitpid,
         ;; which reaps a child whose handle a run closed, and sleep paces
         ;; it; foreign-ref and foreign-set! copy a handle into the block a
-        ;; reuse run places at a freed address; getenv and foreign-entry?
-        ;; find a memory tool, which never hands a freed block back.
+        ;; reuse run places at a freed address.
         (only (chezscheme) make-engine disable-interrupts enable-interrupts
-              collect foreign-procedure foreign-entry? foreign-ref foreign-set!
-              sleep make-time getenv))
+              collect foreign-procedure foreign-ref foreign-set!
+              sleep make-time))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -90,38 +89,13 @@
   (zero? (enable-interrupts)))
 
 ;; A memory tool never hands a freed block back: Memcheck's freelist and
-;; ASan's quarantine hold it, and the reuse rows then ask less. The memory
-;; gates say so in the environment, but a plain run can inherit
-;; ASAN_OPTIONS from a shell, and would then ask less for nothing. So the
-;; allocator is asked as well: both tools report a block's size as
-;; requested, where a plain allocator rounds it up. A 288 B block from the
-;; shim read 288 under ASan and Valgrind, 320 on macOS and 296 on glibc
-;; 2.36 and 2.39. (getenv answers "" for a variable set empty.)
-(define (env-set? name)
-  (let ((v (getenv name))) (and v (not (string=? v "")))))
-
+;; ASan's quarantine hold it, and the reuse rows then ask less.
+;; under-memory-tool? asks the environment and the allocator both
+;; (tests/uv-evidence.sls), so a plain run that inherits ASAN_OPTIONS from a
+;; shell still asks everything.
 (define counts-at-start (live-counts))
 
 (define loop (make-uv-loop))
-
-;; The allocator's size of a block: malloc_size on macOS, malloc_usable_size
-;; on glibc, as test-tcp asks it. The loop above has loaded libc.
-(define allocation-size
-  (cond ((foreign-entry? "malloc_size")
-         (foreign-procedure "malloc_size" (uptr) size_t))
-        ((foreign-entry? "malloc_usable_size")
-         (foreign-procedure "malloc_usable_size" (uptr) size_t))
-        (else #f)))
-
-(define exact-block-sizes?
-  (let* ((block (alloc-block 288))
-         (size (and allocation-size (allocation-size block))))
-    (free-block! block)
-    (eqv? size 288)))
-
-(define under-memory-tool?
-  (and (or (env-set? "CHEZ_LIBUV_UNDER_VALGRIND") (env-set? "ASAN_OPTIONS"))
-       exact-block-sizes?))
 
 ;; waitpid reaps a child whose handle a run closed: libuv waits only for the
 ;; children of open process handles. WNOHANG is 1 on macOS and Linux. The
