@@ -373,8 +373,9 @@ None is obvious from reading the code.
   build passed and the first Linux compile failed. The Makefile adds
   `-D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L` in the non-Darwin branch only
   (defining `_POSIX_C_SOURCE` on macOS can hide BSD extensions).
-* **apt's `chezscheme` on ubuntu-latest is 9.5.x — below this project's floor —
-  and building pinned Chez has two of its own traps.** CI builds 10.4.1 from
+* **apt's `chezscheme` is below this project's floor — 9.5.8 on Ubuntu 24.04,
+  10.0.0 on 26.04, which CI runs on by name, not as ubuntu-latest — and
+  building pinned Chez has two of its own traps.** CI builds 10.4.1 from
   the release tarball with `./configure --disable-x11 --disable-curses` (the
   expeditor otherwise requires X11/ncurses headers absent on runners) and a
   SERIAL `make` (parallel bootstrap raced: `nanopass.so` not created). A

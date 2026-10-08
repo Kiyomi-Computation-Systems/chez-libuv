@@ -43,7 +43,7 @@
         (only (uv-meter) fewest-bytes)
         (uv-sweep)
         ;; Reaches (libuv private native) only, never handles.sls.
-        (only (uv-evidence) live-count describe))
+        (only (uv-evidence) live-count describe under-memory-tool? under-asan?))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
@@ -884,8 +884,10 @@
 ;; test-memory sets CHEZ_LIBUV_UNDER_VALGRIND=1 on its Linux leg and
 ;; ASAN_OPTIONS on its macOS one, and under either the seed requires only
 ;; that the allocations were made; the dirty-memory property is held by the
-;; plain run (the stage-1 mutation log addendum).
-(if (or (getenv "CHEZ_LIBUV_UNDER_VALGRIND") (getenv "ASAN_OPTIONS"))
+;; plain run (the stage-1 mutation log addendum). under-memory-tool? asks
+;; the allocator as well, so a plain run that inherits ASAN_OPTIONS from a
+;; shell still holds the seed.
+(if under-memory-tool?
     (test-equal "seed: alloc-zeroed made every allocation (a memory tool: reuse unobservable by design)"
       32 (length shim-dirt))
     (test-equal "seed: the shim's allocator handed alloc-zeroed the very block just dirtied"
@@ -936,8 +938,10 @@
 ;; A size the allocator refuses. ASan aborts on a request this large
 ;; rather than answering NULL, so the macOS memory gate (which sets
 ;; ASAN_OPTIONS) leaves these two rows to the plain run and to Valgrind.
+;; under-asan? asks the allocator as well: asked of the environment alone,
+;; a plain run that inherited ASAN_OPTIONS from a shell skipped both.
 (define refused-size (expt 2 59))
-(unless (getenv "ASAN_OPTIONS")
+(unless under-asan?
   (test-equal "alloc-block answers 0 when the allocator refuses, and counts no block"
     '(0 0)
     (let* ((before (live-count 'block))

@@ -268,11 +268,9 @@
              (complete-request! 'getaddrinfo 'uv-getaddrinfo!
                                 count-getaddrinfo-req-free!
                                 req block-ptr status payload)
-             ;; The loop is read while the request is still registered.
-             (let ((loop (registry-loop-of block-ptr)))
-               (abandon-request! req)
-               (count-getaddrinfo-req-free!)
-               (loop-record-error! loop payload)))))))
+             (begin (abandon-request! req)
+                    (count-getaddrinfo-req-free!)
+                    (loop-record-error! (req-loop req) payload)))))))
 
   ;; hostname and service point inside the request block; copy both before
   ;; complete-request! frees that block.

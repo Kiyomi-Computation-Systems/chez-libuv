@@ -39,7 +39,12 @@ env:
 jobs:
   linux:
     name: linux (vendored + valgrind)
-    runs-on: ubuntu-latest
+    # A named image, not ubuntu-latest: the label moves on GitHub's schedule
+    # (to Ubuntu 26.04 from 2026-10-19), and with it the compiler, glibc,
+    # Valgrind and the apt libuv the pkg-config leg links. Moving is a commit
+    # here, run once in a mirror of this job first. On 26.04: gcc 15.2,
+    # cmake 4.2, Valgrind 3.26, libuv 1.51.0 (measured 2026-10-08).
+    runs-on: ubuntu-26.04
     # Observed wall clock: ~4min on a Chez-cache hit, ~14min on a cache miss
     # (Chez Scheme built from source -- see the cache steps below). 30min
     # gives headroom over the worst case observed (cache miss + apt install +
@@ -59,15 +64,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             valgrind cmake pkg-config build-essential libuv1-dev
 
-      # apt's chezscheme on ubuntu-latest (noble) is 9.5.8 -- below this
-      # project's declared $CHEZ_FLOOR_VERSION floor (README.org), and no PPA
-      # covers it either: Launchpad only packages 10.4.1 for Ubuntu's
-      # in-development suite, not any released one this runner could use.
+      # apt's chezscheme on Ubuntu 26.04 is 10.0.0 (24.04's was 9.5.8) --
+      # below this project's declared $CHEZ_FLOOR_VERSION floor (README.org).
       # Built from source instead. The release tarball ships prebuilt "pb"
       # (portable bytecode) boot files, so `configure && make` self-hosts the
       # native boot files with no pre-existing Chez required -- and the
-      # result is cached on the pinned version so only a version bump ever
-      # pays the build cost again.
+      # result is cached on the pinned version and the runner image, so only
+      # a version bump or a new image ever pays the build cost again.
       # -v2: the v1 key cached a build that never finished (see the disable
       # flags below) -- bumping the suffix means the retry can't be served a
       # poisoned cache entry from the failed run under the old key.
@@ -85,14 +88,24 @@ jobs:
       # to anything based on it, but a cache written on `main` is visible to
       # every PR. So the miss is paid once per floor bump on main, not once
       # per branch, provided main runs at least once after a bump.
+      #
+      # The key names the image the build ran on, read from the runner
+      # itself, so a new runs-on builds Chez with the new image's compiler
+      # rather than restoring a build made with the old one.
+      - name: Identify the runner image
+        id: image
+        run: |
+          . /etc/os-release
+          echo "id=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
+
       - name: Restore built Chez Scheme
         id: cache-chez
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.chez-install
-          key: chez-${{ env.CHEZ_FLOOR_VERSION }}-linux-${{ runner.arch }}-v2
+          key: chez-${{ env.CHEZ_FLOOR_VERSION }}-${{ steps.image.outputs.id }}-${{ runner.arch }}-v2
 
-      - name: Build Chez Scheme (pinned; apt's is 9.5.x, below the floor)
+      - name: Build Chez Scheme (pinned; apt's is 10.0.0, below the floor)
         if: steps.cache-chez.outputs.cache-hit != 'true'
         run: |
           curl -fsSL -o /tmp/chez.tar.gz \
@@ -227,15 +240,19 @@ jobs:
 
       # THE SPEC §9.4 / ADR-0016: the setuid/setgid positive tests are
       # excluded from the default `make test` (see ROOT_TESTS in the
-      # Makefile) and run only here, under sudo. `-E env "PATH=$PATH"`
-      # because plain sudo drops the PATH this job put the pinned Chez on;
-      # `HAVE_PKG=no` matches the vendored-path build just above so
+      # Makefile) and run only here, under sudo. sudo drops the job's
+      # environment, so `env` hands make each variable the lane needs by
+      # name: PATH, which this job put the pinned Chez on, and CHEZ, its
+      # name (`scheme`), without which make runs `chez`. Not `sudo -E`:
+      # Ubuntu 26.04's sudo is sudo-rs, which ignores -E, and the lane
+      # failed `chez: not found` there (2026-10-08, reproduced with sudo-rs
+      # 0.2.13). `HAVE_PKG=no` matches the vendored-path build just above so
       # test-root's artifact-precondition check accepts what that build
       # produced -- the target deliberately does NOT rebuild (under sudo
       # a `build` prerequisite would relink the shim as root; see the
       # Makefile's test-root comment).
       - name: Root lane (setuid/setgid, sudo)
-        run: sudo -E env "PATH=$PATH" make HAVE_PKG=no test-root
+        run: sudo env "PATH=$PATH" "CHEZ=$CHEZ" make HAVE_PKG=no test-root
 
       # The gate below proves nothing unless it can fail, and for a month it
       # could not: from #14 (2026-08-30) Valgrind's client was timeout(1), Chez
