@@ -25,7 +25,8 @@
         (only (libuv private handles) loop-owner-thread)
         (only (libuv private native) copy-in! copy-out)
         (only (chezscheme)
-              collect collect-trip-bytes foreign-alloc foreign-free
+              collect collect-trip-bytes bytes-allocated
+              foreign-alloc foreign-free
               fork-thread
               make-mutex make-condition condition-wait condition-signal
               condition-broadcast with-mutex
@@ -104,29 +105,63 @@
 ;;
 ;; A collection that did run inside the call would be the defect, so the
 ;; buffers are 64 MiB, a size Chez's collector does not move, and a broken
-;; binding fails the row instead of crashing the suite. collect-trip-bytes is
-;; raised for the duration so no allocation-triggered request can stall the
-;; helper inside an interval; each copy-out interval allocates 64 MiB, so
-;; there are only 3 of them.
+;; binding fails the row instead of crashing the suite: always idle, though
+;; under heavy load it can abort Chez outright ("nonrecoverable invalid
+;; memory reference"). collect-trip-bytes is raised for the duration so no
+;; allocation-triggered request can stall the helper inside an interval.
+;;
+;; Each row runs intervals until the helper has tried inside one: at least
+;; its minimum (10 for copy-in!, 3 for copy-out) and at most MAX-INTERVALS.
+;; Fixed counts once failed at loads of 170-340 with the helper never
+;; scheduled inside any (`(never-tried 0)`, in either row). Copy-out keeps
+;; its 3 because each further interval is another chance for a broken
+;; binding to abort Chez. Between intervals the helper is parked, and it
+;; collects while parked, when the main thread is waiting for it and no
+;; other thread is active. So every interval starts with the helper just
+;; woken, and a copy-out interval's 64 MiB result is collected before the
+;; next one: only one is ever alive, which the third row holds.
 (let ()
   (define n (* 64 1024 1024))
   (define bv (make-bytevector n 1))
   (define buf (foreign-alloc n))
+  (define max-intervals 100)
+  (define park-waits 1000)           ; waits of 10 ms: 10 s to park the helper
+  (define ten-ms (make-time 'time-duration 10000000 0))
   (define epoch 0)                   ; odd while the main thread is inside a copy
   (define stop #f)
   (define attempts-inside 0)
   (define collections-inside 0)
   (define m (make-mutex))
-  (define helper-done-cond (make-condition))
+  (define cv (make-condition))       ; parks, releases and the helper's end
+  (define park-requested #t)         ; the helper starts parked
+  (define park-for 0)                ; the last park the main thread asked for
+  (define parked-for 0)              ; the last park the helper collected in
   (define helper-done #f)
   (define saved-trip (collect-trip-bytes))
 
+  ;; park! : -> unspecified. Holds the helper while a park is requested. The
+  ;; first time it sees each new request, it collects and acknowledges. The
+  ;; main thread is then waiting on CV, so no other thread is active; the
+  ;; guard keeps a collect refused anyway (the main thread gave up waiting)
+  ;; from killing the helper.
+  (define (park!)
+    (with-mutex m
+      (let w ()
+        (when (and park-requested (not stop))
+          (unless (= parked-for park-for)
+            (guard (e (#t #f)) (collect))
+            (set! parked-for park-for)
+            (condition-broadcast cv))
+          (condition-wait cv m)
+          (w)))))
+
   ;; Each refused (collect) allocates a little, and nothing collects it
-  ;; while the trip is raised, so the helper pauses 50 us between attempts;
-  ;; a 64 MiB copy still sees dozens.
+  ;; outside a park while the trip is raised, so the helper pauses 50 us
+  ;; between attempts; a 64 MiB copy still sees dozens.
   (define (helper)
     (let loop ()
       (unless stop
+        (when park-requested (park!))
         (let* ((e0 epoch)
                (collected (guard (e (#t #f)) (collect) #t))
                (e1 epoch))
@@ -135,21 +170,57 @@
             (when collected (set! collections-inside (+ collections-inside 1)))))
         (sleep (make-time 'time-duration 50000 0))
         (loop)))
-    (with-mutex m (set! helper-done #t) (condition-signal helper-done-cond)))
+    (with-mutex m (set! helper-done #t) (condition-broadcast cv)))
 
-  ;; inside-verdict : exact-positive-integer thunk -> (list symbol count)
+  ;; park-helper! : -> boolean. Requests a park and waits, at most PARK-WAITS
+  ;; waits, until the helper has collected in it. Answers whether it did.
+  (define (park-helper!)
+    (with-mutex m
+      (set! park-for (+ park-for 1))
+      (set! park-requested #t)
+      (condition-broadcast cv)
+      (let wait ((k 0))
+        (cond ((= parked-for park-for) #t)
+              ((= k park-waits) #f)
+              (else (condition-wait cv m ten-ms) (wait (+ k 1)))))))
+
+  (define (release-helper!)
+    (with-mutex m (set! park-requested #f) (condition-broadcast cv)))
+
+  ;; intervals-run and peak-growth describe the last inside-verdict's run:
+  ;; how many intervals it ran, and the most (bytes-allocated) rose above
+  ;; its start at the end of any of them.
+  (define intervals-run 0)
+  (define peak-growth 0)
+
+  ;; inside-verdict : exact-positive-integer thunk -> list
   ;; '(tried 0) is the only success value: attempts landed inside the
-  ;; copies, and not one of them collected.
-  (define (inside-verdict intervals thunk)
+  ;; copies, and not one of them collected. Every other value names why.
+  ;; The thunk's result is dropped, for the next park to collect.
+  (define (inside-verdict min-intervals thunk)
     (set! attempts-inside 0)
     (set! collections-inside 0)
-    (let loop ((i 0))
-      (when (< i intervals)
-        (set! epoch (+ epoch 1))
-        (thunk)
-        (set! epoch (+ epoch 1))
-        (loop (+ i 1))))
-    (list (if (> attempts-inside 0) 'tried 'never-tried) collections-inside))
+    (set! intervals-run 0)
+    (set! peak-growth 0)
+    (if (not (park-helper!))
+        (list 'never-parked 'after 0 'intervals)
+        (let ((base (bytes-allocated)))
+          (let loop ((i 0))
+            (set! intervals-run i)
+            (cond
+              ((and (>= i min-intervals) (> attempts-inside 0))
+               (list 'tried collections-inside))
+              ((= i max-intervals)
+               (list 'never-tried collections-inside 'in i 'intervals))
+              (else
+               (release-helper!)
+               (set! epoch (+ epoch 1))
+               (thunk)
+               (set! epoch (+ epoch 1))
+               (set! peak-growth (max peak-growth (- (bytes-allocated) base)))
+               (if (park-helper!)
+                   (loop (+ i 1))
+                   (list 'never-parked 'after (+ i 1) 'intervals))))))))
 
   (copy-in! buf bv 0 n)
   (collect-trip-bytes (expt 2 40))
@@ -159,15 +230,28 @@
             (inside-verdict 10 (lambda () (copy-in! buf bv 0 n)))))
          (copy-out-verdict
           (guard (e (#t (list 'raised (describe e))))
-            (inside-verdict 3 (lambda () (copy-out buf n))))))
-    (set! stop #t)
-    (with-mutex m (let w () (unless helper-done (condition-wait helper-done-cond m) (w))))
+            (inside-verdict 3 (lambda () (copy-out buf n)))))
+         ;; 'bounded needs a run long enough to show growth, and a peak
+         ;; that held one result: a copy-out that allocated nothing, or a
+         ;; run that ended early, cannot produce it.
+         (copy-out-memory
+          (cond ((< intervals-run 2) (list 'ran intervals-run 'intervals))
+                ((< peak-growth n) (list 'peak-below-one-result peak-growth))
+                ((< peak-growth (* 2 n)) 'bounded)
+                (else
+                 (list 'grew peak-growth 'over intervals-run 'intervals)))))
+    (with-mutex m
+      (set! stop #t)
+      (condition-broadcast cv)
+      (let w () (unless helper-done (condition-wait cv m) (w))))
     (collect-trip-bytes saved-trip)
     (foreign-free buf)
     (test-equal "no collection completes while copy-in! is inside its foreign call"
       '(tried 0) copy-in-verdict)
     (test-equal "no collection completes while copy-out is inside its foreign call"
-      '(tried 0) copy-out-verdict)))
+      '(tried 0) copy-out-verdict)
+    (test-equal "copy-out's intervals keep at most one 64 MiB result alive"
+      'bounded copy-out-memory)))
 
 ;; --- real cross-thread affinity refusal (design §6.3) -------------------
 ;; The deterministic suite (test-async.sps) simulates a foreign owner by
