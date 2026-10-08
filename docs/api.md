@@ -105,6 +105,15 @@ the engine finishes the run. Inside `call-with-uv-loop` the suspension is an
 exit like any other: the loop is torn down, and resuming the engine raises
 `&uv-handle-closed`.
 
+An escape also costs its thread stack. The C frames of the `uv_run` a
+continuation leaves stay on the thread's stack for as long as the thread
+lives. Measured with `call-with-uv-loop` bodies that each leave from a timer
+callback: on Linux, 16,000 to 20,000 of them filled an 8 MB stack and the
+process died with `SIGSEGV`. On macOS the main thread held 20,000 to 40,000,
+and a thread made with `fork-thread` 1,000 to 2,000, after which it hung. A
+program that leaves callbacks by continuation as a habit should do it on a
+thread it can end.
+
 ## Handles — `(libuv handle)`
 
 | Export | |
