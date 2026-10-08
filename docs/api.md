@@ -576,7 +576,9 @@ behaviours worth knowing before the design spec:
   `service`, or two hints entries, can be seen in one and not the other.
   Another thread can do that even within one string. `uv-getnameinfo!`
   reads its address the same way (TCP, above), and it and `uv-tcp-bind!`
-  read their flag lists once.
+  read their flag lists once, as `uv-write*!` reads its segment list: a
+  list changed once during the read is folded as it was or as the change
+  left it, or refused when that version is not a list.
 - **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**
   ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
   link-local result renders as `"fe80::1"` with its zone silently absent.

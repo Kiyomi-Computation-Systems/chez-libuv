@@ -24,12 +24,13 @@
         ;; arguments mid-call, from a timer handler and from another thread.
         (only (chezscheme) string-truncate! collect
               fork-thread make-mutex make-condition with-mutex
-              condition-wait condition-broadcast display-condition getenv)
+              condition-wait condition-broadcast getenv)
         ;; The flags' cost, and tests/flags-level-3-child.sps under a
         ;; deadline. Both are pure.
         (uv-meter)
-        ;; The engine-sweep driver. Pure.
+        ;; The engine-sweep driver and describe. Both are pure.
         (uv-sweep)
+        (uv-describe)
         (uv-level-3))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
@@ -50,14 +51,6 @@
         (newline)))))
 
 ;; describe : object -> string
-;; A raised object's message, for a row to carry as evidence. Total, so a
-;; guard calling it cannot raise in turn. (tests/uv-evidence.sls has the
-;; same procedure, but it imports native code, which this suite must not.)
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (call-with-string-output-port
-     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
-
 ;; Every rejection row asserts (who reason) out of the raised
 ;; &uv-invalid-argument, with a distinct sentinel for "raised something
 ;; else" and 'no-raise for "did not raise" -- never a bare #t/#f

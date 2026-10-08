@@ -13,9 +13,10 @@
 ;;; PURE: (rnrs) and make-engine only, so the pure suites can use it too
 ;;; (PURE_TESTS; make check-purity holds it).
 (library (uv-sweep)
-  (export resume-fuel resume-cap run-capped capped stuck? sweep-fuels)
+  (export resume-fuel resume-cap run-capped run-capped* capped stuck? sweep-fuels)
   (import (rnrs)
-          (only (chezscheme) make-engine display-condition))
+          (only (chezscheme) make-engine)
+          (uv-describe))
 
   ;; A call is resumed with resume-fuel ticks at a time, at most resume-cap
   ;; times: 10,000,000 ticks, which a bare loop spends in about 8 ms
@@ -25,17 +26,14 @@
   (define resume-cap 100)
 
   ;; The give-up: what a call still running after resume-cap resumes
-  ;; answers. A call's own value could only match it by returning this very
-  ;; list, which no verb returns.
+  ;; answers. A call's own value could only match it by returning a list
+  ;; headed by this symbol, which no verb returns.
   (define (give-up) (list 'stuck-after-resumes resume-cap))
 
   ;; stuck? : object -> boolean
+  ;; The give-up, or a verdict that adds its run's evidence after it.
   (define (stuck? x)
-    (and (pair? x) (eq? (car x) 'stuck-after-resumes)
-         (pair? (cdr x)) (null? (cddr x))))
-
-  ;; A raise inside the engine, carried out of it in this record.
-  (define-record-type raised (fields object))
+    (and (pair? x) (eq? (car x) 'stuck-after-resumes)))
 
   ;; run-capped : (-> object) exact-positive-integer (-> any)
   ;;              -> (values object boolean)
@@ -43,29 +41,36 @@
   ;; reached it. At the first expiry CHANGE is called, once, from outside
   ;; the engine; the call is then resumed with resume-fuel ticks at a time,
   ;; and given up after resume-cap resumes, answering (stuck-after-resumes
-  ;; resume-cap). What CALL raises is caught inside the engine and raised
-  ;; again once the engine has returned, for the caller's own guard.
+  ;; resume-cap). The caller's handlers are in effect inside the engine: what
+  ;; CALL raises reaches the caller's guard, and a continuable raise resumes
+  ;; CALL with what the caller's handler returns. A guard here that caught
+  ;; every raise to raise it again outside would end the call at a warning.
   (define (run-capped call fuel change)
-    (let* ((expired #f)
+    (run-capped* call fuel change 1))
+
+  ;; run-capped* : (-> object) exact-positive-integer (-> any)
+  ;;               exact-positive-integer -> (values object boolean)
+  ;; run-capped, with CHANGE called at each of the first CHANGES expiries
+  ;; and the call resumed with FUEL ticks until the last of them, then with
+  ;; resume-fuel.
+  (define (run-capped* call fuel change changes)
+    (let* ((made 0)
            (answer
-            (let run ((eng (make-engine
-                            (lambda ()
-                              (guard (e (#t (make-raised e)))
-                                (call)))))
+            (let run ((eng (make-engine call))
                       (ticks fuel)
                       (resumes 0))
               (eng ticks
                    (lambda (left v) v)
                    (lambda (next)
-                     (unless expired
-                       (set! expired #t)
+                     (when (< made changes)
+                       (set! made (+ made 1))
                        (change))
                      (if (= resumes resume-cap)
                          (give-up)
-                         (run next resume-fuel (+ resumes 1))))))))
-      (if (raised? answer)
-          (raise (raised-object answer))
-          (values answer expired))))
+                         (run next
+                              (if (< made changes) fuel resume-fuel)
+                              (+ resumes 1))))))))
+      (values answer (positive? made))))
 
   ;; capped : (-> object) -> object
   ;; CALL's value, run in an engine whose resumes are capped as
@@ -75,14 +80,6 @@
     (let-values (((answer expired) (run-capped call resume-fuel (lambda () #f))))
       answer))
 
-  ;; describe : object -> string
-  ;; A raised object's message, total. (tests/uv-evidence.sls has one too,
-  ;; but it is not pure.)
-  (define (describe e)
-    (guard (err (#t "<the raised object could not be printed>"))
-      (call-with-string-output-port
-       (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
-
   ;; sweep-fuels : (exact-positive-integer -> (values verdict boolean))
   ;;               exact-positive-integer (verdict -> boolean)
   ;;               -> (list-of (list fuel verdict expired?))
@@ -90,19 +87,19 @@
   ;; run. It stops at the first run no expiry reached, since more fuel
   ;; changes nothing after it; at MAX-FUEL; at a run given up, which would
   ;; cost every later run the same; and at a verdict STOP? names. A raise in
-  ;; a run, outside whatever the run guards itself, would abort the suite
-  ;; before any row could say why, so the sweep ends there, keeping the runs
-  ;; before it, with (sweep-raised message) as the last run's verdict.
+  ;; a run, outside whatever the run guards itself, or in STOP?, would abort
+  ;; the suite before any row could say why, so the sweep ends there,
+  ;; keeping the runs before it, with (sweep-raised message) as the last
+  ;; run's verdict.
   (define (sweep-fuels run-at max-fuel stop?)
     (let next ((fuel 1) (acc '()))
-      (let* ((run (guard (e (#t (list (list 'sweep-raised (describe e)) #f)))
-                    (call-with-values (lambda () (run-at fuel)) list)))
-             (verdict (car run))
-             (expired (cadr run))
-             (acc (cons (list fuel verdict expired) acc)))
-        (if (or (not expired)
-                (= fuel max-fuel)
-                (stuck? verdict)
-                (stop? verdict))
+      ;; run : (list verdict expired? last?)
+      (let* ((run (guard (e (#t (list (list 'sweep-raised (describe e)) #f #t)))
+                    (call-with-values (lambda () (run-at fuel))
+                      (lambda (verdict expired)
+                        (list verdict expired
+                              (or (not expired) (stuck? verdict) (stop? verdict)))))))
+             (acc (cons (list fuel (car run) (cadr run)) acc)))
+        (if (or (caddr run) (= fuel max-fuel))
             (reverse acc)
             (next (+ fuel 1) acc))))))

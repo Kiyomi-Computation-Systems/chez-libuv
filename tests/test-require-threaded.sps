@@ -23,7 +23,8 @@
 (import (rnrs)
         (srfi :64)
         (uv-source)
-        (only (chezscheme) eval interaction-environment display-condition))
+        (uv-describe)
+        (only (chezscheme) eval interaction-environment))
 
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
@@ -207,11 +208,6 @@
                             (if (equal? e '(threaded?)) 1 (threaded-calls e)))
                           x))
       0))
-
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (call-with-string-output-port
-      (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
 (define (starts-with? prefix s)
   (and (string? s)

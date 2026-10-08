@@ -308,6 +308,11 @@
                     (as-changed 'written-as-changed)
                     (expired 'written)
                     (else 'untouched))))
+           ;; A give-up, with what the run left behind.
+           ((stuck-after-resumes)
+            (append outcome
+                    (list 'registered (- registry-after registry-before)
+                          'counted (- requests-after requests-before))))
            (else outcome))
          expired)))))
 
@@ -568,6 +573,26 @@
   '((1 written-as-changed) untouched)
   (list (list (car (car splice-sweep)) (cadr (car splice-sweep)))
         (cadr (list-ref splice-sweep (- (length splice-sweep) 1)))))
+
+;; --- a write still running at the driver's cap ---------------------------
+;; A stand-in spins for three times the cap's ticks and then writes, so a
+;; driver without a cap lets it write, and a capped one gives it up. The
+;; give-up carries what the run left registered and counted.
+(define (spin-past-cap)
+  (let spin ((i 0))
+    (when (< i (* 3 resume-cap resume-fuel)) (spin (+ i 1)))))
+
+(test-equal "a write still running at the driver's cap is given up, with what its run left behind"
+  (list (list 'stuck-after-resumes resume-cap 'registered 0 'counted 0) #t)
+  (let-values (((verdict expired)
+                (change-verdict 1 seg-list
+                                (lambda (segs fill)
+                                  (spin-past-cap)
+                                  (uv-write*! s-client segs on-swept))
+                                (lambda (segs) #f)
+                                seg-bytes
+                                '(uv-write*! segments-not-a-list))))
+    (list verdict expired)))
 
 ;; --- a span another thread changes during the call (#64) -------------------
 ;; An engine stops a call only at a trap check, but another thread can

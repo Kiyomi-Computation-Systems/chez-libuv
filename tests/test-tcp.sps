@@ -2544,10 +2544,10 @@
 ;; capped (tests/uv-sweep.sls) runs its call in an engine whose resumes
 ;; are capped: a call that never ends answers the driver's give-up, so a
 ;; count that loops on a circular list fails its row by name instead of
-;; hanging the suite. A raise inside is raised again outside, for the row's
-;; own guard. The row below wraps it round the whole of wv-refusal, so that
-;; the give-up is the row's evidence: inside it, wv-refusal would record the
-;; give-up as a call that returned.
+;; hanging the suite. A raise inside reaches the row's own guard. The row
+;; below wraps it round the whole of wv-refusal, so that the give-up is the
+;; row's evidence: inside it, wv-refusal would record the give-up as a call
+;; that returned.
 
 (test-equal "an improper or circular segment list is refused before allocation"
   '(((uv-write*! segments-not-a-list) (0 0) 0)

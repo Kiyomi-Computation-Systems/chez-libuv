@@ -19,7 +19,8 @@
 (library (uv-level-3)
   (export level-3-run level-3-entry)
   (import (rnrs)
-          (only (chezscheme) display-condition open-process-ports
+          (uv-describe)
+          (only (chezscheme) open-process-ports
                 input-port-ready? sleep make-time system current-time
                 time-difference time-second))
 
@@ -27,14 +28,6 @@
   ;; under a second; a poll count of 10 ms sleeps, as #69's runner kept, came
   ;; to about 81 s for 6,000 polls on macOS, whose sleeps overshoot.
   (define level-3-deadline-seconds 60)
-
-  ;; describe : object -> string
-  ;; A raised object's message, total. (tests/uv-evidence.sls has one too,
-  ;; but it is not pure.)
-  (define (describe e)
-    (guard (err (#t "<the raised object could not be printed>"))
-      (call-with-string-output-port
-       (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
   ;; level-3-run : string string (list-of symbol) -> (or alist symbol list)
   ;; The datum CHEZ printed running PROGRAM at --optimize-level 3 with NAMES

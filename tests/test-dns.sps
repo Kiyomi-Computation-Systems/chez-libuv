@@ -828,16 +828,17 @@
     'nul-in-service 'service-contains-nul
     (lambda (node service hints) (string-set! service 2 #\nul)))))
 
-;; lookup-verdict : sweep-variant exact-positive-integer
-;;                  (string string hints procedure -> object)
+;; lookup-verdict : sweep-variant exact-positive-integer (-> any)
 ;;                  -> (values verdict expired?)
-;; One run of a sweep: LOOKUP on a fresh node, service and hints, in an
-;; engine with FUEL, with the variant's change made at the first expiry.
-;; The sweeps' LOOKUP is uv-getaddrinfo! itself. A call still running after
-;; the driver's cap is given up there (tests/uv-sweep.sls), so a lookup
-;; whose walk came to loop fails its run by name instead of hanging the
-;; suite: until #81 this driver resumed without a cap.
-(define (lookup-verdict variant fuel lookup)
+;; One run of a sweep: uv-getaddrinfo! on a fresh node, service and hints,
+;; in an engine with FUEL, with the variant's change made at the first
+;; expiry. BEFORE runs in the engine just ahead of the lookup; the sweeps'
+;; does nothing. A call still running after the driver's cap is given up
+;; there (tests/uv-sweep.sls), so a lookup whose walk came to loop fails
+;; its run by name instead of hanging the suite: until #81 this driver
+;; resumed without a cap. The verb is called here by name, inside the
+;; guard, where seed-gates' rule 4 reads it.
+(define (lookup-verdict variant fuel before)
   (let* ((node (string-copy "127.0.0.1"))
          (service (string-copy "8080"))
          (hints (suite-hints #t (cons 'family 'inet) (cons 'socktype 'stream)))
@@ -853,12 +854,13 @@
                                       (uv-invalid-argument-who e)
                                       (uv-invalid-argument-reason e)))
                                (#t (list 'raised (describe e))))
+                       (before)
                        (list 'submitted
-                             (lookup node service hints
-                                     (lambda (err results)
-                                       (collect)
-                                       (set! delivered
-                                             (resolution err results)))))))
+                             (uv-getaddrinfo! l node service hints
+                                              (lambda (err results)
+                                                (collect)
+                                                (set! delivered
+                                                      (resolution err results)))))))
                    fuel
                    (lambda ()
                      ((sweep-variant-change! variant) node service hints)))))
@@ -889,17 +891,20 @@
                      (list 'resolved-as delivered drained))
                     (expired 'resolved)
                     (else 'untouched))))
+           ;; A give-up, with what the run left behind.
+           ((stuck-after-resumes)
+            (append outcome
+                    (list 'registered (- registry-after registry-before)
+                          'counted (- requests-after requests-before)
+                          'blocks (- blocks-after blocks-before))))
            (else outcome))
          expired)))))
-
-(define (getaddrinfo node service hints on-complete)
-  (uv-getaddrinfo! l node service hints on-complete))
 
 ;; lookup-sweep : sweep-variant -> (list-of (list fuel verdict expired?))
 ;; The driver keeps a raise between runs from aborting the suite: the
 ;; sweep ends there with a sweep-raised verdict (tests/uv-sweep.sls).
 (define (lookup-sweep variant)
-  (sweep-fuels (lambda (fuel) (lookup-verdict variant fuel getaddrinfo))
+  (sweep-fuels (lambda (fuel) (lookup-verdict variant fuel (lambda () #f)))
                sweep-max-fuel
                (lambda (verdict) #f)))
 
@@ -946,21 +951,22 @@
   '()
   (rows-where (verdict-is? 'resolved-as)))
 
-;; A lookup still running at the driver's cap is given up. The stand-in
-;; spins for three times the cap's ticks and then calls uv-getaddrinfo!, so
-;; a driver that resumed without a cap, as this one did until #81, lets it
+;; A lookup still running at the driver's cap is given up. The run spins
+;; for three times the cap's ticks before it calls uv-getaddrinfo!, so a
+;; driver that resumed without a cap, as this one did until #81, lets it
 ;; finish, and the run answers the lookup's own verdict instead of the
 ;; give-up. With no cap at all, a lookup that never ended would hang the
 ;; suite where this row fails.
-(define (outlasting-lookup node service hints on-complete)
+(define (spin-past-cap)
   (let spin ((i 0))
-    (when (< i (* 3 resume-cap resume-fuel)) (spin (+ i 1))))
-  (getaddrinfo node service hints on-complete))
+    (when (< i (* 3 resume-cap resume-fuel)) (spin (+ i 1)))))
 
+;; The give-up carries the run's counts, so a lookup given up after it had
+;; registered a request or allocated a block says so.
 (test-equal "a lookup still running at the driver's cap is given up, failing its run by name instead of hanging the suite"
-  (list (list 'stuck-after-resumes resume-cap) #t)
+  (list (list 'stuck-after-resumes resume-cap 'registered 0 'counted 0 'blocks 0) #t)
   (let-values (((verdict expired)
-                (lookup-verdict (car sweep-variants) 1 outlasting-lookup)))
+                (lookup-verdict (car sweep-variants) 1 spin-past-cap)))
     (list verdict expired)))
 
 (test-equal "the sweeps left no request registered or counted, and no block allocated"

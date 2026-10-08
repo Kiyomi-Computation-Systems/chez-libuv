@@ -6,10 +6,12 @@
 ;;; between any two instructions. Chez's own list procedures assume nothing
 ;;; changes. map measures a list and then walks it unchecked, and at
 ;;; --optimize-level 3 length walks it with no check at all, so a list made
-;;; circular is walked forever (#64, #66). These count a caller's list and
-;;; then read it, check each pair before reading through it, and end once
-;;; the list stops changing. Pure: no native code (tests/test-addrinfo.sps,
-;;; under make check-purity).
+;;; circular is walked forever (#64, #66). These check each pair before
+;;; reading through it, and every walk is bounded. A list of any length is
+;;; counted first and walked no further than its count (read-proper-list,
+;;; fold-flags), and its walk ends once the list stops changing. A list of
+;;; a fixed length is walked no further than that length (let-fixed-list).
+;;; Pure: no native code (tests/test-addrinfo.sps, under make check-purity).
 (library (libuv private lists)
   (export proper-length read-proper-list fold-flags let-fixed-list)
   (import (rnrs)
@@ -71,11 +73,24 @@
   ;; is, sees no engine's handler, so only another thread can do it. Nothing
   ;; is allocated but the answer, and what READ allocates.
   (define (read-proper-list x read)
-    (let ((n (proper-length x)))
-      (and n
-           (or (read-counted x n read)
-               (let ((n (proper-length x)))
-                 (and n (read-counted x n read)))))))
+    (walk-counted x read-counted read))
+
+  ;; (walk-counted x-expr walk arg ...) -> (or answer #f)
+  ;; (WALK x n ARG ...) for X's count N, or #f when X is not a proper list.
+  ;; A walk that answers #f has found X contradicting its count, and X is
+  ;; counted and walked once more. read-proper-list and fold-flags both read
+  ;; this way, so a list changed once during either read answers as it was
+  ;; before the change or after it (#81). A macro, so that fold-flags hands
+  ;; its walk BIT without a closure: it allocates nothing. Each ARG is
+  ;; evaluated once a walk, so it is a variable.
+  (define-syntax walk-counted
+    (syntax-rules ()
+      ((_ x-expr walk arg ...)
+       (let* ((x x-expr) (n (proper-length x)))
+         (and n
+              (or (walk x n arg ...)
+                  (let ((n (proper-length x)))
+                    (and n (walk x n arg ...)))))))))
 
   ;; read-counted : object exact-nonnegative-integer (object -> object)
   ;;                -> (or list #f)
@@ -93,33 +108,35 @@
   ;; fold-flags : object symbol symbol (object -> exact-integer)
   ;;              -> exact-integer
   ;; The bitwise-ior of (BIT flag) over a caller's flag list, which is read
-  ;; once: its length from proper-length, #f for an improper or circular list
-  ;; and then the refusal (WHO, REASON), then at most that many pairs, each
-  ;; checked as it is read, and the list's end after them. A list changed
-  ;; during the walk is refused, or read as each pair stood when the walk
-  ;; reached it, and never walked forever. Without the end, a tail spliced
-  ;; in during the walk was folded as far as the stale count, into flags the
-  ;; caller never held: (a b) made (a c d) folded a and c
-  ;; (tests/test-native.sps's fold-flags splice sweep). Asking list? first
-  ;; would leave a gap an engine's handler can change the list in, and
-  ;; fold-left walks a list made circular there forever
-  ;; (tests/test-address.sps's flags sweeps). Nothing here allocates
+  ;; once, as read-proper-list reads: counted with proper-length, at most
+  ;; that many pairs walked, each checked as it is read, and the list's end
+  ;; required after them. A walk the list contradicts counts and walks it
+  ;; once more (walk-counted), so a list changed once during the walk is
+  ;; folded as it was or as the change left it; a list that is improper or
+  ;; circular as read is refused (WHO, REASON), and none is walked forever.
+  ;; Without the end, a tail spliced in during the walk was folded as far as
+  ;; the stale count, into flags the caller never held: (a b) made (a c d)
+  ;; folded a and c; without the second walk, a list proper before and
+  ;; after the splice was refused (tests/test-native.sps's fold-flags splice
+  ;; sweep). Asking list? first would leave a gap an engine's handler can
+  ;; change the list in, and fold-left walks a list made circular there
+  ;; forever (tests/test-address.sps's flags sweeps). Nothing here allocates
   ;; (tests/test-native.sps).
   (define (fold-flags flags who reason bit)
-    (let ((n (proper-length flags)))
-      (unless n
-        (raise (make-uv-invalid-argument who reason)))
-      (let walk ((rest flags) (left n) (bits 0))
-        (cond ((zero? left)
-               (unless (null? rest)
-                 (raise (make-uv-invalid-argument who reason)))
-               bits)
-              ((not (pair? rest))
-               (raise (make-uv-invalid-argument who reason)))
-              (else
-               (walk (cdr rest) (- left 1) (bitwise-ior bits (bit (car rest)))))))))
+    (or (walk-counted flags fold-counted bit)
+        (raise (make-uv-invalid-argument who reason))))
 
-;; let-fixed-list : (let-fixed-list (name ...) list-expr mismatch body ...)
+  ;; fold-counted : object exact-nonnegative-integer (object -> exact-integer)
+  ;;                -> (or exact-integer #f)
+  ;; The bitwise-ior of (BIT e) for the first N pairs of X, each checked
+  ;; before it is read through, when X's end follows them; #f otherwise.
+  (define (fold-counted x n bit)
+    (let walk ((p x) (left n) (bits 0))
+      (cond ((zero? left) (and (null? p) bits))
+            ((pair? p) (walk (cdr p) (- left 1) (bitwise-ior bits (bit (car p)))))
+            (else #f))))
+
+  ;; let-fixed-list : (let-fixed-list (name ...) list-expr mismatch body ...)
   ;; BODY with each NAME bound to the matching element of LIST-EXPR's value
   ;; when that is a proper list exactly as long as the NAMEs; MISMATCH
   ;; otherwise, evaluated once and only then. The list is walked once, each

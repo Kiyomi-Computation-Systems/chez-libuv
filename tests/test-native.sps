@@ -27,15 +27,15 @@
         ;; foreign-alloc / foreign-set! / foreign-ref / foreign-free build
         ;; and mutate real C buffers for the string- and memory-helper tests
         ;; below; current-directory anchors the synthetic absolute paths used
-        ;; by the resolve-shim-path matrix; make-engine, bytevector-truncate!
-        ;; and collect drive the copy-in! truncation scan. None collides with
+        ;; by the resolve-shim-path matrix; bytevector-truncate! and collect
+        ;; drive the copy-in! truncation scan. None collides with
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
         ;; bytes-allocated, bytes-deallocated and collect-request-handler
         ;; meter fold-flags. random draws proper-length's random trials, and
         ;; the thread primitives run its cross-thread races.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
-              make-engine bytevector-truncate! collect
+              bytevector-truncate! collect
               random random-seed fork-thread thread-join)
         ;; The races' liveness watch and the allocation meter, shared and
         ;; pure.
@@ -1966,10 +1966,12 @@
 ;; fold-flags walks no further than its count and requires the list's end
 ;; after it, as read-proper-list does. Without the end, a tail spliced in
 ;; during the walk was folded as far as the stale count, into flags the
-;; caller never held. The sweep splices splice-tail in at the first expiry,
-;; as the read sweeps do, and folds 2^e for each element e, so that each
-;; list's flags are its own: every run must answer the flags of the list as
-;; it was or as the splice left it, or refuse it.
+;; caller never held. A walk the splice contradicts counts and walks the
+;; list once more, as read-proper-list does, so a list that was proper
+;; before the splice and after it is never refused (#81). The sweep splices
+;; splice-tail in at the first expiry, as the read sweeps do, and folds 2^e
+;; for each element e, so that each list's flags are its own: every run must
+;; answer the flags of the list as it was or as the splice left it.
 (define (flag-bit e) (expt 2 e))
 
 (define (bits-of l)
@@ -1984,12 +1986,10 @@
 
 (define spliced-bits (bits-of (append '(0 1 2) splice-tail)))
 
-(test-equal "fold-flags folds a flag list spliced longer during the walk as it was or as the splice left it, or refuses it"
+(test-equal "fold-flags folds a flag list spliced longer during the walk as it was or as the splice left it, never refusing it"
   '()
   (filter (lambda (run)
-            (not (member (cadr run)
-                         (list (bits-of (iota* 12)) spliced-bits
-                               '(refused flags-not-a-list)))))
+            (not (member (cadr run) (list (bits-of (iota* 12)) spliced-bits))))
           fold-splice-sweep))
 
 ;; The row above finds no bad answer, which says nothing unless the sweep
@@ -2020,32 +2020,25 @@
                   (if (pair? p) (collect (cdr p) (cons p acc)) (reverse acc))))
          (fuel (+ 1 (random (+ len 1))))
          (expiries (+ 1 (random 2)))
-         (seen 0))
+         (changes 0))
     (define (change!)
+      (set! changes (+ changes 1))
       (let ((p (list-ref pairs (random len))))
         (case (random 3)
           ((0) (set-cdr! p (list-ref pairs (random len))))
           ((1) (set-cdr! p '()))
           (else (set-cdr! p (vector 'not 'a 'pair))))))
-    (let ((answer
-           (let run ((eng (make-engine
-                           (lambda ()
-                             (guard (e (#t (list 'raised (describe e))))
-                               (proper-length l)))))
-                     (ticks fuel)
-                     (resumes 0))
-             (eng ticks
-                  (lambda (left v) v)
-                  (lambda (more)
-                    (when (< seen expiries)
-                      (set! seen (+ seen 1))
-                      (change!)
-                      (when (zero? (random 2)) (change!)))
-                    (if (= resumes 100)
-                        'stuck
-                        (run more (if (< seen expiries) fuel 100000)
-                             (+ resumes 1))))))))
-      (list (positive? seen) answer))))
+    (let-values (((answer expired)
+                  (run-capped* (lambda ()
+                                 (guard (e (#t (list 'raised (describe e))))
+                                   (proper-length l)))
+                               fuel
+                               (lambda ()
+                                 (change!)
+                                 (when (zero? (random 2)) (change!)))
+                               expiries)))
+      ;; Changed only if a change was made: an expiry alone is no change.
+      (list (and expired (positive? changes)) answer))))
 
 (random-seed 64)
 (define trial-results

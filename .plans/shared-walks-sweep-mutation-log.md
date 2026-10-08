@@ -98,7 +98,9 @@ the bytes are the spliced version's, and the reach row requires it at fuel 1.
 
 ### What no suite row covers, and why
 
-- **The cap, in every suite except test-dns.** A cap is visible only on a
+- **The cap, in every suite except test-dns and test-stream (superseded:
+  see "The review" below, whose engine census now holds every suite).** A
+  cap is visible only on a
   call that never ends, and a correct build has none. test-sweep holds the
   driver's cap, and test-dns's stand-in row holds that `lookup-verdict` goes
   through it. In test-addrinfo, test-address, test-native, test-stream and
@@ -124,3 +126,27 @@ Each stops an engine once, acts, and then resumes it once with a 10,000,000-tick
 budget or drops it. Each is already capped. test-native's `count-trial`
 makes up to two changes at random expiries and resumes at a chosen fuel. It
 is capped at 100 resumes.
+
+## The review (2026-10-08)
+
+A /code-review of the branch reported nine findings, and each is fixed
+below. Each new row was watched failing, by name, against the code before
+its fix or against a mutation.
+
+| Finding | Fix | Evidence |
+|---|---|---|
+| `sweep-fuels` checked its stop rules (`stuck?`, `stop?`) outside its guard, which the replaced `sweep-runs` and `lookup-sweep` did not | The stop rules run inside the guard | New row "keeps the runs before a raise in its stop predicate" failed before the fix (`#f`: the raise escaped). The mutation moving `stop?` back out fails it again |
+| Only test-dns held a suite's use of the cap | An engine census in test-sweep: every `make-engine` in tests/ is the driver's or one of 20 listed split and drop sweeps | test-process's `start-run!` put back on a private uncapped loop fails "every engine in the tests is the driver's, or a split or drop sweep listed here" |
+| A give-up dropped the run's leak counts | test-dns's and test-stream's verdicts append `registered`/`counted`/`blocks` to a give-up; `stuck?` accepts a give-up with evidence after it | test-dns's cap row and a new test-stream stand-in row expect the counts. Each failed with `((stuck-after-resumes 100) #t)` before the fix and fails again with its branch removed. The `stuck?` row failed `(#t #f ...)` before |
+| `run-capped` caught every raise inside the engine and re-raised it, so a continuable warning ended the call | The engine runs the call bare: the caller's handlers are in effect inside it (measured: a handler outside an engine answers a `raise-continuable` inside it, and engines work after a raise escapes one) | New row "lets a continuable raise resume the call" failed before the fix (`#f`). A catch-all guard put back fails it |
+| `fold-flags` was a fourth count-then-walk, which refused a list changed into another proper list | `walk-counted`, a macro shared by `read-proper-list` and `fold-flags`: count, walk, and count and walk once more on a contradiction | test-native's fold-flags splice row now forbids refusal, and failed before with runs 16 onward `(refused flags-not-a-list)`. As a procedure taking a closure, `walk-counted` cost fold-flags 16 B, which the allocation row caught (`(16 meter-live)`). As a macro it costs 0 |
+| `count-trial` kept its own driver and `'stuck` | `run-capped*`: the change at each of the first CHANGES expiries, with FUEL ticks between them; `run-capped` is its one-change case | New row "changes at each of the first CHANGES expiries" failed against a stub ignoring CHANGES (`((1 #t) (1 #t))`), and fails when resumes after the first change use resume-fuel |
+| Seven copies of `describe` | One pure `(uv-describe)`; `(uv-evidence)` re-exports it | Census row "describe is defined once" fails on a copy put back in test-c-string |
+| test-dns passed `uv-getaddrinfo!` through a parameter, which rule 4 cannot follow | `lookup-verdict` calls the verb by name inside its guard; the cap row injects only a hook run before the lookup | Removing that guard now fails seed-gates' rule 4 row for test-dns, `((lookup-sweep define lookup-sweeps))`. The same removal on the committed version passed every seed-gates row |
+| The `lists.sls` header said every read counts first, and a comment sat at column 0 | The header names both bounds: a count, or a fixed length | Comment only |
+
+The driver-wide mutations were rerun across all eight suites after these
+changes:
+
+- **No cap.** Fails test-sweep (2 rows), test-dns's cap row and test-stream's new stand-in row.
+- **Change never made.** Fails every ported suite's reach rows, as before, plus test-sweep's `run-capped*` row. It also fails test-native's count-trial precondition, which now counts changes made rather than expiries. Before, it counted expiries, and this mutation left it green.
