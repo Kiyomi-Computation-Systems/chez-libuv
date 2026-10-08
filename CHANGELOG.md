@@ -3,6 +3,192 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.4 — 2026-10-08
+
+This release closes the ways a call could reach freed or wrong memory while
+something else ran in the middle of it: an engine's timer, a scheduler that
+closed a handle or tore its loop down before resuming the engine, another
+thread, or a caller's string or list that changed while the verb read it.
+The verbs that checked a handle and then called libuv now do both in one
+step that no engine can split. The verbs that read a caller's data read it
+once. Two loops on two threads no longer corrupt the table they share. And
+no two calls are ever inside one loop at once. Calls and callbacks allocate
+less. There are no API changes, but the shim gained exports: run
+`make build` after upgrading. An old shim is refused at import with
+`&uv-shim-unavailable`, naming it.
+
+### Fixed
+
+- **Loops on several threads.**
+  - Two loops run on two threads at once no longer corrupt the binding's
+    table from libuv's pointers to handles and requests (#70). It is one
+    table for every loop, and it now has one lock, taken only with
+    interrupts disabled. On macOS arm64 the lock costs about 30 ns an
+    access uncontended. Four threads that did nothing but make, fire and
+    close timers ran 1.6 to 2.2 times slower than with a table each. A
+    teardown, and `uv-loop-live-handles`, copy the whole table while they
+    hold it. The walk that classifies a failed spawn keeps its pointers per
+    thread, orphan-callback events are no longer lost, and the debug
+    shim's counters are atomic.
+  - No two calls are inside one loop at once (#78). `uv-run`,
+    `uv-loop-close!` and `uv-loop-teardown!` claim the loop atomically
+    before they call libuv on it. While one holds the claim, the others are
+    refused `'loop-running` from any thread, and the refusal changes
+    nothing, not even the loop's owner. Before, the check and the mark were
+    two steps, and two threads could both get in: two of the loop's
+    callbacks ran at once, `invalid memory reference` was raised out of
+    `uv-run`, both threads hung, or a close freed the loop under a run. A
+    teardown claims the loop for each of its steps, so another thread's
+    call can get in between and make it refuse `'loop-running` part-way,
+    its handles already closing; calling it again finishes it.
+    `call-with-uv-loop`'s exit no longer tears down a loop another thread's
+    call is inside.
+  - Every verb that makes something on a loop now refuses a thread that
+    does not own it with `&uv-wrong-thread`, leaving nothing behind (#79):
+    the handle constructors, `uv-accept!`, `uv-spawn!`, `uv-getaddrinfo!`
+    and `uv-getnameinfo!`, and `uv-cancel!`. Before, libuv's init raced the
+    loop's thread on its handle queue and corrupted it without an error (11
+    of 13 runs), the lookups raced the loop's count of requests, and
+    `uv-cancel!` could read a request its completion had freed. A call made
+    while the loop is being handed to another thread still goes unseen
+    (`docs/api.md`, "One thread per loop").
+- **Verbs an engine stops.** An engine's timer can stop a verb anywhere. A
+  scheduler can then close the handle or tear the loop down before resuming
+  the engine, or never resume it. These verbs now check the handle and the
+  loop, allocate, and call libuv in one step that no engine timer
+  interrupts. One resumed after its handle or loop was closed raises
+  `&uv-handle-closed` without touching it, and one whose engine is never
+  resumed leaves nothing behind (`docs/api.md`, "Inside an engine"):
+  - the stream verbs: `uv-write!`, `uv-write*!`, `uv-shutdown!`,
+    `uv-read-start!`, `uv-read-stop!` and `uv-stream-write-queue-size`
+    (#53). Resumed after its stream closed, a `uv-write!` called libuv on
+    the freed handle, and a new connection given the same address received
+    the bytes;
+  - the constructors, `make-uv-loop` and `call-with-uv-loop` included, and
+    `uv-accept!` (#59). A teardown between the check and the init linked
+    the new handle into the freed loop. A constructor dropped after the
+    init left a handle no teardown could close: `EBUSY` for good, and for
+    an async a teardown that never returned. A thread could also be left
+    holding the library's initialisation lock;
+  - `uv-spawn!` (#60, #63). It checks its `stdio` handles and its loop
+    again where it spawns, and allocates its process handle and options
+    block there. A pipe consumed or a handle closed mid-call had leaked a
+    descriptor, connected the child to another pipe, or left the spawn in
+    its unclassifiable state, and a dropped spawn leaked one or two blocks
+    in 124 of 190 runs;
+  - `uv-process-kill!` and `uv-process-pid` (#71). Resumed after their
+    process was closed, the kill signalled whatever process a later spawn
+    had been given at the same address, and returned normally.
+
+  The rest are not safe to abandon yet, and `docs/api.md` lists them: the
+  DNS verbs, `uv-tcp-connect!`, the verbs that borrow a scratch block, and
+  the other handle verbs (#85, #86).
+- **Arguments read once.** A caller's string or list can change while a
+  verb reads it, from an engine's handler or from another thread. These
+  verbs now read it once, into a copy nothing else reaches, and work only
+  from the copy:
+  - `uv-getaddrinfo!` reads `node`, `service` and `hints` (#51, #66). A
+    bogus hint written mid-call had leaked the request block, and a NUL
+    written into the node after the check resolved its prefix;
+  - `uv-tcp-bind!`, `uv-tcp-connect!` and `uv-getnameinfo!` read the
+    address and the flag list (#61). An address holding a NUL is refused
+    (`&uv-invalid-argument`, `'address-contains-nul`): C read it only up
+    to the NUL, so `"127.0.0.1\x0;anything"` bound `127.0.0.1`. Mid-call, a
+    NUL written into `"::1"` bound, connected or resolved `::`, a widened
+    character overran the encoding, and a list made circular spun forever;
+  - `uv-spawn!` reads `file`, `args` and `options` (#56, #66). Before, a
+    string or list that grew mid-call was written past the options block,
+    a growing `stdio` list wrote over argv, a NUL written after the check
+    cut the child's strings short, and at `--optimize-level 3` a list made
+    circular was walked forever with interrupts disabled;
+  - `uv-write*!` reads its segment list, and each `(bv start end)` span
+    (#64, #81). Chez's `map` had read through a non-pair put in its way
+    (`invalid memory reference`), or walked a list made circular without
+    end.
+
+  A list changed once during the read is read as it was or as the change
+  left it. A list changed several times, by another thread, can be read as
+  a mix of its versions or refused, but never read through a non-pair or
+  walked without end.
+- **Writes.** A write whose payload shrinks during the call no longer
+  leaks its block (#49). It is refused under the verb's own name,
+  `uv-write!`'s `'span-out-of-range` or `uv-write*!`'s
+  `'segment-span-out-of-range`, where it was `uv-copy-in!`'s.
+
+### Changed
+
+- **A continuation that escapes a callback leaves its loop marked
+  running** (#45). The escape leaves libuv in the middle of an iteration
+  that nothing can finish, and `uv-run` no longer clears the mark on the
+  way out, so `uv-run`, `uv-loop-close!` and `uv-loop-teardown!` refuse
+  the loop from then on. `call-with-uv-loop` still tears its own loop
+  down on the way out. To end a run early, call `uv-stop!` or raise. The
+  same mark protects an engine suspended inside a callback: its loop now
+  stays marked until the engine is resumed and the run finishes. Before,
+  `uv-run` cleared the mark on the way out of the call, a teardown was
+  accepted while the engine was suspended, and resuming the engine died
+  with `invalid memory reference`.
+- **Calls and callbacks allocate less.** Each callback crosses one guarded
+  seam, `uv-run` has no `dynamic-wind`, and libuv's alloc callback for
+  reads is answered by the shim, with no Scheme at all (#45). Measured on
+  macOS arm64, bytes on the Scheme heap per call, the fewest of 64:
+
+  | Call | 0.7.3 | 0.7.4 |
+  |---|---|---|
+  | `uv-write!` of 64 bytes | 544 | 144 |
+  | `uv-write*!`, 1 segment | 624 | 176 |
+  | `uv-write*!`, 64 segments | 11,712 | 3,200 |
+  | `make-uv-timer` | 624 | 512 |
+  | `uv-spawn!`, argv of 3 | 1,744 | 1,056 |
+  | a timer started and its callback run | 880 | 416 |
+- **Refusals.** A pipe named twice in one spawn is refused
+  `'pipe-already-used`; libuv had opened it twice, with the child already
+  running. A segment or flag list that changes once during the call is
+  now read as one of its versions, where it was refused.
+- **The shim** gained exports (`chez_uv_alloc_cb`, `chez_uv_alloc`,
+  `chez_uv_free`, `chez_uv_live_block`), and its debug counters are
+  atomic. Run `make build` after upgrading.
+- **CI** runs on `ubuntu-26.04` by name, not `ubuntu-latest`, and keys its
+  cached Chez by the runner's image (#92). The pkg-config leg now links
+  libuv 1.51.0, so no CI run links a libuv below 1.49, though the floor
+  is 1.44.0 (#90).
+
+### Notes
+
+- **Escaping a callback costs stack.** Each escape leaves the C frames of
+  the `uv_run` it left on its thread's stack for the life of the thread.
+  On Linux, 16,000 to 20,000 escapes filled an 8 MB stack and the process
+  died with `SIGSEGV`. On macOS a `fork-thread` thread held 1,000 to 2,000,
+  and then hung. This is as old as the binding. `docs/api.md` now says so,
+  and #94 and #95 track what is still unknown.
+- `docs/api.md` gains "One call inside a loop at a time", "A callback ends
+  only by returning" and "Inside an engine", and states the cost of the
+  registry's lock, how a segment list and an address are read, and two
+  more `uv-spawn!` behaviours.
+- ADR-0019 is amended for the engine-split series (decision 3), the
+  registry lock (decision 4), the owner checks and the loop's claim.
+  ADR-0002 and ADR-0008 are amended for the shim's alloc callback,
+  ADR-0003 for the memory gate's view of the shim's copies, ADR-0009 and
+  ADR-0012 for the read-once copies and addresses, and ADR-0015 for the
+  spawn step.
+- New checks hold these changes:
+  - `tests/test-source-rules.sps` holds every foreign call to the FFI
+    rules (no string arguments, nothing in Scheme memory passed to a
+    `__collect_safe` call), and lists every process-wide variable with how
+    threads share it.
+  - New suites: `test-constructors`, `test-constructor-owner`,
+    `test-loop-claim`, `test-loop-threads`, `test-process-steps`,
+    `test-address`, `test-c-string`, `test-callback-alloc`,
+    `test-seed-gates` and `test-sweep`. Most suites gained engine sweeps
+    that split or drop each verb at every point an engine can.
+  - `make check-memory-gate` also plants an overrun through the shim's own
+    copy, on both platforms, and requires the report to name
+    `chez_uv_copy_in` (#55).
+- Rows that relax under a memory tool now ask the allocator as well as the
+  environment, so a plain run that inherits `ASAN_OPTIONS` from a shell
+  still checks everything (#92).
+- The evidence is in `.plans/*-mutation-log.md`, one log per change.
+
 ## 0.7.3 — 2026-09-28
 
 `uv-async-send!` can no longer send on a handle that a close has freed. It

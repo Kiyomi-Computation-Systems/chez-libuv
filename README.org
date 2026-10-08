@@ -24,7 +24,7 @@ design, with nineteen accepted decision records, lives under
 
 * Status
 
-*v0.7.3* — event loop (with ~uv-update-time!~ to refresh its cached clock
+*v0.7.4* — event loop (with ~uv-update-time!~ to refresh its cached clock
 after a callback that held it, before arming a deadline), TCP (bind with an
 optional reuseport flag, listen, accept, connect, reads with backpressure,
 scalar and vectored writes, shutdown, nodelay, keepalive, local and peer
