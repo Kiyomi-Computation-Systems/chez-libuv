@@ -220,6 +220,15 @@ None is obvious from reading the code.
   `tests/test-tcp.sps` holds the read buffer to its length within one malloc
   granule. Compare `malloc_size` of both sizes before putting a header on an
   allocation.
+* **A continuation that escapes a callback strands the C frames under it
+  for the life of its thread.** Every escape from a libuv callback leaves
+  its `uv_run`'s frames on the thread's stack, and the next call pushes
+  below them. A probe of #91's fix, 20,000 escapes on one thread, died with
+  `SIGSEGV` on Linux at 8 MB (16,000 passed; a 64 MB stack held 40,000). On
+  macOS the main thread held 20,000, and a `fork-thread` thread only 1,000:
+  at 2,000 it hung inside Chez, with no crash and no message. A suite that
+  escapes callbacks in bulk (test-loop-claim's exit race) runs them in
+  batches on threads it lets end, and docs/api.md tells users the cost.
 
 ### The event loop and child processes
 
