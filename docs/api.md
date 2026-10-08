@@ -143,13 +143,17 @@ pipe handle.
 
 **A segment list is read once.** `uv-write*!` counts its list without
 raising, then reads it, and each `(bv start end)` span in it, one pair at
-a time, checking each pair as it reads it and taking no more pairs than it
-counted. So a list that an engine's timer handler or another thread changes
-during the call is written as the call read it, or refused
-(`&uv-invalid-argument`, reason `'segments-not-a-list`, or
-`'segment-not-a-bytevector` for a span) when what it read is no longer one
-list of that length. It is never read through a non-pair, and a list made
-circular is never walked without end. The spans' bytes are copied later, in
+a time, checking each pair as it reads it, taking no more pairs than it
+counted, and requiring the list's end after them. A read that contradicts
+its count, because the list changed after it was counted, counts and reads
+the list once more. So a list that an engine's timer handler or another
+thread changes once during the call is written as it was before the change
+or as the change left it, or refused (`&uv-invalid-argument`, reason
+`'segments-not-a-list`, or `'segment-not-a-bytevector` for a span) when
+that version is not a list of segments. A list changed more than once
+during the call can be written as a mix of its versions, or refused. It is
+never read through a non-pair, and a list made circular is never walked
+without end. The spans' bytes are copied later, in
 the verb's step, which checks each span against its bytevector again: one
 that shrank meanwhile is refused with `'segment-span-out-of-range`.
 
