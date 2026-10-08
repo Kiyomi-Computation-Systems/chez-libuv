@@ -32,9 +32,10 @@
         ;; (collect) only, so this suite's timer callback obeys design spec
         ;; S11's "every timer callback calls (collect)" like every other. It
         ;; is not a name the facade could be expected to supply, so it cannot
-        ;; stand in for a dropped re-export. Nor is display-condition, which
-        ;; describe uses.
-        (only (chezscheme) collect display-condition))
+        ;; stand in for a dropped re-export. Nor is describe, from the pure
+        ;; (uv-describe), which reaches nothing of the binding's.
+        (only (chezscheme) collect)
+        (uv-describe))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -49,16 +50,6 @@
         (display "  actual: ")
         (write (test-result-ref r 'actual-value))
         (newline)))))
-
-;; describe : object -> string
-;; A raised object's message, for a row to carry as evidence. Total, so a
-;; guard calling it cannot raise in turn. (tests/uv-evidence.sls has the
-;; same procedure, but nothing but the facade may stand between this suite
-;; and the binding.)
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (call-with-string-output-port
-     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
 (test-begin "facade")
 

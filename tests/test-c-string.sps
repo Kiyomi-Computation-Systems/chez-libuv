@@ -17,9 +17,10 @@
         (libuv private c-string)
         (libuv private conditions)
         ;; The interrupt pair checks that read-utf8 leaves interrupts
-        ;; enabled; the meter is pure.
-        (only (chezscheme) disable-interrupts enable-interrupts display-condition)
-        (uv-meter))
+        ;; enabled; the meter and describe are pure.
+        (only (chezscheme) disable-interrupts enable-interrupts)
+        (uv-meter)
+        (uv-describe))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -38,14 +39,6 @@
         (newline)))))
 
 (test-begin "c-string")
-
-;; describe : object -> string
-;; A raised object's message, total so that a guard calling it cannot
-;; raise in turn. (tests/uv-evidence.sls has one too, but it is not pure.)
-(define (describe e)
-  (guard (err (#t "<the raised object could not be printed>"))
-    (call-with-string-output-port
-     (lambda (p) (if (condition? e) (display-condition e p) (write e p))))))
 
 ;; --- read-utf8 --------------------------------------------------------------
 ;; It reads a caller's string once, into a copy taken with interrupts

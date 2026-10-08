@@ -166,13 +166,17 @@ pipe handle.
 
 **A segment list is read once.** `uv-write*!` counts its list without
 raising, then reads it, and each `(bv start end)` span in it, one pair at
-a time, checking each pair as it reads it and taking no more pairs than it
-counted. So a list that an engine's timer handler or another thread changes
-during the call is written as the call read it, or refused
-(`&uv-invalid-argument`, reason `'segments-not-a-list`, or
-`'segment-not-a-bytevector` for a span) when what it read is no longer one
-list of that length. It is never read through a non-pair, and a list made
-circular is never walked without end. The spans' bytes are copied later, in
+a time, checking each pair as it reads it, taking no more pairs than it
+counted, and requiring the list's end after them. A read that contradicts
+its count, because the list changed after it was counted, counts and reads
+the list once more. So a list that an engine's timer handler or another
+thread changes once during the call is written as it was before the change
+or as the change left it, or refused (`&uv-invalid-argument`, reason
+`'segments-not-a-list`, or `'segment-not-a-bytevector` for a span) when
+that version is not a list of segments. A list changed more than once
+during the call can be written as a mix of its versions, or refused. It is
+never read through a non-pair, and a list made circular is never walked
+without end. The spans' bytes are copied later, in
 the verb's step, which checks each span against its bytevector again: one
 that shrank meanwhile is refused with `'segment-span-out-of-range`.
 
@@ -595,7 +599,9 @@ behaviours worth knowing before the design spec:
   `service`, or two hints entries, can be seen in one and not the other.
   Another thread can do that even within one string. `uv-getnameinfo!`
   reads its address the same way (TCP, above), and it and `uv-tcp-bind!`
-  read their flag lists once.
+  read their flag lists once, as `uv-write*!` reads its segment list: a
+  list changed once during the read is folded as it was or as the change
+  left it, or refused when that version is not a list.
 - **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**
   ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
   link-local result renders as `"fe80::1"` with its zone silently absent.

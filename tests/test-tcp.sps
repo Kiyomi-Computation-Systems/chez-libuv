@@ -68,7 +68,8 @@
         ;; reset section's look into a receive queue (queued-bytes, below);
         ;; make-engine suspends a read start anywhere (the install sweep).
         (only (chezscheme) collect foreign-entry? foreign-entry foreign-procedure
-              make-engine))
+              make-engine)
+        (only (uv-sweep) capped))
 
 ;; SRFI-64's default runner sets no process exit status (AGENTS.md).
 (define runner (test-runner-simple))
@@ -2540,24 +2541,13 @@
 ;; pair as it reads it (#64), so these are the shapes that walk must refuse
 ;; as the old list? and length checks did.
 ;;
-;; capped : (-> object) -> object
-;; THUNK's value, run in an engine whose resumes are capped: a call that
-;; never ends answers 'stuck, so a count that loops on a circular list fails
-;; its row by name instead of hanging the suite. A raise inside is raised
-;; again outside, for the row's own guard. The row below wraps it round the
-;; whole of wv-refusal, so that 'stuck is the row's evidence: inside it,
-;; wv-refusal would record the give-up as a call that returned.
-(define (capped thunk)
-  (let run ((eng (make-engine
-                  (lambda ()
-                    (guard (e (#t (cons 'raised e)))
-                      (thunk)))))
-            (resumes 0))
-    (eng 100000
-         (lambda (left v)
-           (if (and (pair? v) (eq? (car v) 'raised)) (raise (cdr v)) v))
-         (lambda (more)
-           (if (= resumes 100) 'stuck (run more (+ resumes 1)))))))
+;; capped (tests/uv-sweep.sls) runs its call in an engine whose resumes
+;; are capped: a call that never ends answers the driver's give-up, so a
+;; count that loops on a circular list fails its row by name instead of
+;; hanging the suite. A raise inside reaches the row's own guard. The row
+;; below wraps it round the whole of wv-refusal, so that the give-up is the
+;; row's evidence: inside it, wv-refusal would record the give-up as a call
+;; that returned.
 
 (test-equal "an improper or circular segment list is refused before allocation"
   '(((uv-write*! segments-not-a-list) (0 0) 0)

@@ -27,20 +27,21 @@
         ;; foreign-alloc / foreign-set! / foreign-ref / foreign-free build
         ;; and mutate real C buffers for the string- and memory-helper tests
         ;; below; current-directory anchors the synthetic absolute paths used
-        ;; by the resolve-shim-path matrix; make-engine, bytevector-truncate!
-        ;; and collect drive the copy-in! truncation scan. None collides with
+        ;; by the resolve-shim-path matrix; bytevector-truncate! and collect
+        ;; drive the copy-in! truncation scan. None collides with
         ;; an (rnrs) export (unlike file-exists? and exit, which do).
         ;; bytes-allocated, bytes-deallocated and collect-request-handler
         ;; meter fold-flags. random draws proper-length's random trials, and
         ;; the thread primitives run its cross-thread races.
         (only (chezscheme) foreign-alloc foreign-set! foreign-ref foreign-free
               foreign-sizeof current-directory getenv
-              make-engine bytevector-truncate! collect
+              bytevector-truncate! collect
               random random-seed fork-thread thread-join)
         ;; The races' liveness watch and the allocation meter, shared and
         ;; pure.
         (only (uv-race) watch-flipper)
         (only (uv-meter) fewest-bytes)
+        (uv-sweep)
         ;; Reaches (libuv private native) only, never handles.sls.
         (only (uv-evidence) live-count describe))
 
@@ -1328,42 +1329,35 @@
   (let* ((n 4096)
          (bv (make-bytevector n #x11))
          (dst (alloc-zeroed n))
-         (expired #f)
-         (spray '())
-         (answer
-          (let run ((eng (make-engine
-                          (lambda ()
-                            (guard (e ((uv-invalid-argument? e) 'refused)
-                                      (#t 'raised-otherwise))
-                              (copy-in! dst bv 0 n)
-                              'returned))))
-                    (ticks fuel))
-            (eng ticks
-                 (lambda (left v) v)
-                 (lambda (next)
-                   (unless expired
-                     (set! expired #t)
+         (spray '()))
+    (let-values (((answer expired)
+                  (run-capped
+                   (lambda ()
+                     (guard (e ((uv-invalid-argument? e) 'refused)
+                               (#t 'raised-otherwise))
+                       (copy-in! dst bv 0 n)
+                       'returned))
+                   fuel
+                   (lambda ()
                      (bytevector-truncate! bv 16)
                      (collect)
                      (set! spray
                        (let fill ((i 0) (acc '()))
                          (if (= i 2000)
                              acc
-                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc))))))
-                   (run next 100000)))))
-         (copied (foreign->bytevector dst n)))
-    (free! dst)
-    (cond ((memq answer '(refused raised-otherwise)) answer)
-          ((not (bytevector=? copied (make-bytevector n #x11))) 'read-past-the-end)
-          (expired 'copied-before-the-truncation)
-          (else 'finished-before-any-expiry))))
+                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc)))))))))
+      (let ((copied (foreign->bytevector dst n)))
+        (free! dst)
+        (values
+         (cond ((memq answer '(refused raised-otherwise)) answer)
+               ((stuck? answer) answer)
+               ((not (bytevector=? copied (make-bytevector n #x11))) 'read-past-the-end)
+               (expired 'copied-before-the-truncation)
+               (else 'finished-before-any-expiry))
+         expired)))))
 
 (define truncation-scan
-  (let loop ((fuel 1) (seen '()))
-    (let ((outcome (truncation-outcome fuel)))
-      (if (or (eq? outcome 'finished-before-any-expiry) (= fuel 512))
-          (reverse (cons outcome seen))
-          (loop (+ fuel 1) (cons outcome seen))))))
+  (map cadr (sweep-fuels truncation-outcome 512 (lambda (outcome) #f))))
 
 (test-equal "the truncation scan spanned the check: some runs refused, the last untouched"
   '(#t #t)
@@ -1720,22 +1714,18 @@
 ;; or is made one during the call, is refused under the caller's own name and
 ;; reason, never walked forever (tests/test-address.sps sweeps the change).
 ;; Each call here runs in an engine whose resumes are capped, so a walk that
-;; loops answers 'stuck instead of hanging the suite.
+;; loops answers the driver's give-up instead of hanging the suite
+;; (tests/uv-sweep.sls).
 (define (fold-flags-answer flags)
-  (let run ((eng (make-engine
-                  (lambda ()
-                    (guard (e ((uv-invalid-argument? e)
-                               (list (uv-invalid-argument-who e)
-                                     (uv-invalid-argument-reason e)))
-                              (#t (list 'wrong-condition (describe e))))
-                      (fold-flags flags 'test-flags 'flags-not-a-list
-                                  (lambda (flag)
-                                    (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
-            (resumes 0))
-    (eng 100000
-         (lambda (left v) v)
-         (lambda (next)
-           (if (= resumes 100) 'stuck (run next (+ resumes 1)))))))
+  (capped
+   (lambda ()
+     (guard (e ((uv-invalid-argument? e)
+                (list (uv-invalid-argument-who e)
+                      (uv-invalid-argument-reason e)))
+               (#t (list 'wrong-condition (describe e))))
+       (fold-flags flags 'test-flags 'flags-not-a-list
+                   (lambda (flag)
+                     (case flag ((a) 1) ((b) 2) ((c) 4) (else 64))))))))
 
 ;; A list whose last pair points back at its pair number K (0-based).
 (define (circular items k)
@@ -1782,29 +1772,16 @@
 ;; OP on a fresh twelve-element list in an engine at rising fuel, with
 ;; CHANGE! made to the list at the first expiry.
 (define (list-sweep op change!)
-  (let next ((fuel 1) (acc '()))
-    (let* ((l (iota* 12))
-           (expired #f)
-           (answer
-            (let run ((eng (make-engine
-                            (lambda ()
-                              (guard (e (#t (list 'raised (describe e))))
-                                (op l)))))
-                      (ticks fuel)
-                      (resumes 0))
-              (eng ticks
-                   (lambda (left v) v)
-                   (lambda (more)
-                     (unless expired
-                       (set! expired #t)
-                       (change! l))
-                     (if (= resumes 100)
-                         'stuck
-                         (run more 100000 (+ resumes 1)))))))
-           (acc (cons (list fuel answer expired) acc)))
-      (if (and expired (not (eq? answer 'stuck)) (< fuel 400))
-          (next (+ fuel 1) acc)
-          (reverse acc)))))
+  (sweep-fuels
+   (lambda (fuel)
+     (let ((l (iota* 12)))
+       (run-capped (lambda ()
+                     (guard (e (#t (list 'raised (describe e))))
+                       (op l)))
+                   fuel
+                   (lambda () (change! l)))))
+   400
+   (lambda (answer) #f)))
 
 ;; Two cycles at once: the fifth pair's cdr back to the fourth, and the
 ;; twelfth's back to the eleventh. A count that walked a second pointer
@@ -1851,25 +1828,20 @@
 
 ;; read-trace : object -> (list answer elements-read)
 ;; What read-proper-list answered for X, 'refused for #f, with the elements
-;; its READ saw, in the order it saw them. It reads in an engine, and a
-;; read still running after 100 resumes of 100000 ticks answers 'stuck, so
-;; a read that never ends fails its row instead of hanging the suite.
+;; its READ saw, in the order it saw them. It reads in an engine whose
+;; resumes are capped, so a read that never ends answers the driver's
+;; give-up and fails its row instead of hanging the suite.
 (define (read-trace x)
   (let* ((seen '())
          (answer
-          (let run ((eng (make-engine
-                          (lambda ()
-                            (guard (e (#t (list 'raised (describe e))))
-                              (or (read-proper-list
-                                   x (lambda (element)
-                                       (set! seen (cons element seen))
-                                       (list 'read element)))
-                                  'refused)))))
-                    (resumes 0))
-            (eng 100000
-                 (lambda (left v) v)
-                 (lambda (more)
-                   (if (= resumes 100) 'stuck (run more (+ resumes 1))))))))
+          (capped
+           (lambda ()
+             (guard (e (#t (list 'raised (describe e))))
+               (or (read-proper-list
+                    x (lambda (element)
+                        (set! seen (cons element seen))
+                        (list 'read element)))
+                   'refused))))))
     (list answer (reverse seen))))
 
 (define (read-all l) (read-proper-list l (lambda (e) e)))
@@ -1941,14 +1913,65 @@
                    (if (caddr last-run) 'expired (cadr last-run))))))
        read-sweeps))
 
+;; --- let-fixed-list: a caller's list of a fixed length, read once (#81) ----
+;; uv-spawn!'s pipe specs and uv-write*!'s (bv start end) spans are lists of
+;; a fixed length. let-fixed-list binds their elements walking the list once,
+;; each pair checked before it is read through, and requires the end after
+;; the last. Each pipe spec's tail used to be checked and then read again, a
+;; read Chez's own cadr raised on, or at --optimize-level 3 read through, when
+;; another thread cut it in between (#66). The race row below holds the
+;; once-only read; these hold the shape.
+(define (fixed-3 x)
+  (let-fixed-list (a b c) x 'mismatch (list a b c)))
+
+;; The race list's twelve elements, or #f, which the race counts as a cut.
+(define (fixed-12 x)
+  (let-fixed-list (e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 e10 e11) x #f
+    (list e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 e10 e11)))
+
+(test-equal "let-fixed-list binds each element of a list exactly as long as its names"
+  '((1) (1 2) (1 2 3))
+  (list (let-fixed-list (a) (list 1) 'mismatch (list a))
+        (let-fixed-list (a b) (list 1 2) 'mismatch (list a b))
+        (fixed-3 (list 1 2 3))))
+
+(test-equal "let-fixed-list answers its mismatch for any other shape, wherever it goes wrong"
+  (map (lambda (i) 'mismatch) (iota* 11))
+  (map fixed-3
+       (list 'x
+             (vector 1 2 3)
+             '()
+             (list 1)
+             (list 1 2)
+             (list 1 2 3 4)
+             (cons 1 2)
+             (cons 1 (cons 2 3))
+             (cons 1 (cons 2 (cons 3 4)))
+             (circular '(1 2 3) 0)
+             (circular '(1) 0))))
+
+(test-equal "let-fixed-list evaluates its mismatch only on a mismatch, once"
+  '(1 0 mismatch 1)
+  (let* ((evaluated 0)
+         (read (lambda (x)
+                 (let-fixed-list (a) x
+                   (begin (set! evaluated (+ evaluated 1)) 'mismatch)
+                   a)))
+         (matched (read (list 1)))
+         (after-match evaluated)
+         (mismatched (read (list 1 2))))
+    (list matched after-match mismatched evaluated)))
+
 ;; --- fold-flags: a flag list spliced longer during the walk ---------------
 ;; fold-flags walks no further than its count and requires the list's end
 ;; after it, as read-proper-list does. Without the end, a tail spliced in
 ;; during the walk was folded as far as the stale count, into flags the
-;; caller never held. The sweep splices splice-tail in at the first expiry,
-;; as the read sweeps do, and folds 2^e for each element e, so that each
-;; list's flags are its own: every run must answer the flags of the list as
-;; it was or as the splice left it, or refuse it.
+;; caller never held. A walk the splice contradicts counts and walks the
+;; list once more, as read-proper-list does, so a list that was proper
+;; before the splice and after it is never refused (#81). The sweep splices
+;; splice-tail in at the first expiry, as the read sweeps do, and folds 2^e
+;; for each element e, so that each list's flags are its own: every run must
+;; answer the flags of the list as it was or as the splice left it.
 (define (flag-bit e) (expt 2 e))
 
 (define (bits-of l)
@@ -1963,12 +1986,10 @@
 
 (define spliced-bits (bits-of (append '(0 1 2) splice-tail)))
 
-(test-equal "fold-flags folds a flag list spliced longer during the walk as it was or as the splice left it, or refuses it"
+(test-equal "fold-flags folds a flag list spliced longer during the walk as it was or as the splice left it, never refusing it"
   '()
   (filter (lambda (run)
-            (not (member (cadr run)
-                         (list (bits-of (iota* 12)) spliced-bits
-                               '(refused flags-not-a-list)))))
+            (not (member (cadr run) (list (bits-of (iota* 12)) spliced-bits))))
           fold-splice-sweep))
 
 ;; The row above finds no bad answer, which says nothing unless the sweep
@@ -1999,32 +2020,25 @@
                   (if (pair? p) (collect (cdr p) (cons p acc)) (reverse acc))))
          (fuel (+ 1 (random (+ len 1))))
          (expiries (+ 1 (random 2)))
-         (seen 0))
+         (changes 0))
     (define (change!)
+      (set! changes (+ changes 1))
       (let ((p (list-ref pairs (random len))))
         (case (random 3)
           ((0) (set-cdr! p (list-ref pairs (random len))))
           ((1) (set-cdr! p '()))
           (else (set-cdr! p (vector 'not 'a 'pair))))))
-    (let ((answer
-           (let run ((eng (make-engine
-                           (lambda ()
-                             (guard (e (#t (list 'raised (describe e))))
-                               (proper-length l)))))
-                     (ticks fuel)
-                     (resumes 0))
-             (eng ticks
-                  (lambda (left v) v)
-                  (lambda (more)
-                    (when (< seen expiries)
-                      (set! seen (+ seen 1))
-                      (change!)
-                      (when (zero? (random 2)) (change!)))
-                    (if (= resumes 100)
-                        'stuck
-                        (run more (if (< seen expiries) fuel 100000)
-                             (+ resumes 1))))))))
-      (list (positive? seen) answer))))
+    (let-values (((answer expired)
+                  (run-capped* (lambda ()
+                                 (guard (e (#t (list 'raised (describe e))))
+                                   (proper-length l)))
+                               fuel
+                               (lambda ()
+                                 (change!)
+                                 (when (zero? (random 2)) (change!)))
+                               expiries)))
+      ;; Changed only if a change was made: an expiry alone is no change.
+      (list (and expired (positive? changes)) answer))))
 
 (random-seed 64)
 (define trial-results
@@ -2253,6 +2267,22 @@
         (test-equal "precondition: the race's flipper was changing the counted list before the first count and after the last"
           '(flipping flipping)
           (list-tail race 5)))
+      (let ((race (list-race fixed-12 vector-cut (whole-or-cut (iota* 12)))))
+        (display "  [informational] let-fixed-list race: ")
+        (display (cadddr race))
+        (display " of ")
+        (display (car race))
+        (display " reads found the list cut")
+        (newline)
+        ;; A read that always answered its mismatch would pass as cut every
+        ;; round, so the row requires some reads to answer the list.
+        (test-equal "let-fixed-list answers the list or its mismatch for a list another thread changes, never raising"
+          (list list-race-rounds 0 #f 'some-whole)
+          (list (car race) (cadr race) (caddr race)
+                (if (< (cadddr race) (car race)) 'some-whole 'never-whole)))
+        (test-equal "precondition: the let-fixed-list race's flipper was changing the read list before the first read and after the last"
+          '(flipping flipping)
+          (list-tail race 5)))
       (let ((race (list-race read-all vector-cut (whole-or-cut (iota* 12)))))
         (display "  [informational] read-proper-list race: ")
         (display (cadddr race))
@@ -2308,6 +2338,17 @@
   (let ((flags (list 'a 'b 'c))
         (bit (lambda (flag) (case flag ((a) 1) ((b) 2) ((c) 4) (else 64)))))
     (list (fewest-bytes (lambda () (fold-flags flags 'test-flags 'flags-not-a-list bit)))
+          (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
+              'meter-live
+              'meter-blind))))
+
+;; A read of a span or a pipe spec allocates nothing of its own, so a write
+;; of a million spans pays nothing for reading them.
+(test-equal "let-fixed-list allocates nothing, where the meter sees a 64-byte allocation"
+  '(0 0 meter-live)
+  (let ((span (list 1 2 3)) (short (list 1 2)))
+    (list (fewest-bytes (lambda () (let-fixed-list (a b c) span 'mismatch (+ a b c))))
+          (fewest-bytes (lambda () (let-fixed-list (a b c) short 'mismatch (+ a b c))))
           (if (>= (fewest-bytes (lambda () (make-bytevector 64))) 64)
               'meter-live
               'meter-blind))))
