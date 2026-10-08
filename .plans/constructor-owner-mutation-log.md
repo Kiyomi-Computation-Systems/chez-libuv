@@ -91,7 +91,10 @@ on libuv's worker thread while it runs, so the row's descriptor count raced
 it. The mutants only moved the timing. The fixture now runs its lookup to
 completion before any row counts; the owner check comes before `uv-cancel!`
 reads the request, so a completed request still tells a refusing build from
-one without the check (M13 answers `#f` from the wrong thread).
+one without the check (M13 answers `#f` from the wrong thread). Ten runs
+each afterwards: the correct build clean 10 of 10; M6 failing exactly its
+own three rows 10 of 10, the descriptor race gone; M13 its own two, 10 of
+10.
 
 ## The review
 
@@ -121,6 +124,12 @@ Uncovered by design:
 
 ## Gates
 
-On `076a598`: `make test` (28 suites), `make test-threading`, `make
-test-memory` (ASan), `check-purity`, `check-help`. On the final head: see
-the PR.
+On `132b5bf`, the code under review:
+- `make test` (28 suites), `make test-threading`, `make test-memory`
+  (ASan), `check-purity`, `check-help`;
+- `make test-memory-docker` from a `--no-hardlinks` clone: check-memory-gate
+  first, then Valgrind. All 28 suites had 0 errors. There were 80 forked
+  children: the known 131 B and 117 B, and 78 of test-process's failed-spawn
+  children at 147 B. That is four more than #77's run of 74. Unmeasured, but
+  consistent with `uv-spawn!`'s entry check lengthening that sweep by a fuel
+  or so.
