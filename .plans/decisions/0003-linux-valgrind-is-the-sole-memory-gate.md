@@ -290,3 +290,14 @@ should it appear.
 >   that gated; it now requires each `match-leak-kinds` line to name
 >   `definite` or `all`. Its count of exactly three was measured on x86-64
 >   by this change's first CI run as well.
+
+> **Amended 2026-10-09: the pure suites leave the lane.** `test-memory`
+> now runs every suite except `PURE_TESTS`. A pure suite loads no native
+> code, which `make check-purity` proves by running each with the shim's
+> path poisoned, so under Valgrind or ASan it checks Chez alone and none
+> of the binding. On CI's run of #101 (run 37954992095), the seven took
+> 7.0 to 10.1 s each, 58 s together, most of it Chez starting under
+> Valgrind. A suite that comes to reach native code fails `check-purity`
+> until it leaves `PURE_TESTS`, and leaving puts it back in the lane.
+> `test-memory` now refuses an empty list, which would pass having checked
+> nothing. Evidence: `.plans/memory-lane-speed-mutation-log.md`.

@@ -135,7 +135,6 @@ ROOT_TESTS   := tests/test-process-setuid.sps
 STRESS_TESTS := tests/test-threading-stress.sps
 
 TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test-*.sps))
-MEMORY_TESTS := $(TESTS)
 
 # check-purity poisons CHEZ_LIBUV_SHIM and runs every suite listed here, so a
 # suite whose run reaches (libuv private native) fails it. That run, not a
@@ -153,6 +152,14 @@ PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
                            tests/test-require-threaded.sps \
                            tests/test-source-rules.sps tests/test-seed-gates.sps \
                            tests/test-c-string.sps tests/test-sweep.sps)
+
+# test-memory runs every suite but the pure ones. A pure suite loads no
+# native code, as check-purity proves, so under Valgrind or ASan it checks
+# Chez alone and none of the binding: about 7 s a suite under Valgrind on
+# CI, 58 s for the seven (2026-10-09). A suite that starts reaching native
+# code fails check-purity until it comes off PURE_TESTS, which puts it back
+# here.
+MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 
 .PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
 
@@ -594,6 +601,10 @@ MEMORY_ESCAPE_SUITES := tests/test-loop.sps tests/test-loop-claim.sps \
   tests/test-async-fence.sps tests/test-loop-threads.sps
 
 test-memory: build deps check-pins $(STALE_SHIM) ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
+	@test -n "$(strip $(MEMORY_TESTS))" || { \
+	  echo "test-memory: MEMORY_TESTS is empty; refusing to pass having checked nothing" >&2; \
+	  exit 1; \
+	}
 ifeq ($(UNAME_S),Linux)
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
 # seccomp profiles, containers that disallow the io_uring syscalls) reject

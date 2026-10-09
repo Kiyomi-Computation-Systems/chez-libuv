@@ -246,11 +246,15 @@
 
 ;; finish! : uv-loop object -> (or 'torn-down list)
 ;; Takes LOOP back to this thread by running it, waits for a child or a
-;; lookup a call started, and tears the loop down.
+;; lookup a call started, and tears the loop down. A call that was refused
+;; started nothing, and leaves nothing active on the loop: its cell is
+;; never settled, and a wait on it would tick to its cap, about 24 s a row
+;; (2026-10-09). So the wait is made only while libuv holds something.
 (define (finish! loop ctx)
   (guard (e (#t (list 'finish-raised (describe e))))
     (uv-run loop 'nowait)
-    (run-until/ticking loop (lambda () (settled? ctx)) 20000)
+    (when (uv-loop-alive? loop)
+      (run-until/ticking loop (lambda () (settled? ctx)) 20000))
     (uv-loop-teardown! loop)
     'torn-down))
 
