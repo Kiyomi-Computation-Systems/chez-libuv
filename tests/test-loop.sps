@@ -434,6 +434,31 @@
     (uv-update-time! 'not-a-loop)
     'no-raise))
 
+;; Each query refuses a non-loop on entry: its step reads the loop's
+;; record, and nothing in a step may raise.
+(test-equal "uv-stop!, uv-now and uv-loop-alive? reject a non-loop argument, naming who and why"
+  '((uv-stop! not-a-uv-loop) (uv-now not-a-uv-loop) (uv-loop-alive? not-a-uv-loop))
+  (map (lambda (query)
+         (guard (e ((uv-invalid-argument? e)
+                    (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                   (#t 'wrong-condition))
+           (query 'not-a-loop)
+           'no-raise))
+       (list uv-stop! uv-now uv-loop-alive?)))
+
+;; A closed loop is refused as closed before its owner is asked, as
+;; make-uv-async's order: closed, the loop has no owner left to run it.
+(test-equal "uv-update-time! on a closed loop another thread owns is refused as closed"
+  'loop
+  (let ((l (make-uv-loop)))
+    (uv-loop-close! l)
+    (set-loop-owner-thread! l foreign-owner)
+    (guard (e ((uv-handle-closed? e) (uv-handle-closed-kind e))
+              ((uv-wrong-thread? e) 'wrong-thread)
+              (#t 'wrong-condition))
+      (uv-update-time! l)
+      'no-raise)))
+
 (uv-loop-teardown! sc-loop)
 (uv-loop-teardown! rn-loop)
 (uv-loop-close! wt-loop)

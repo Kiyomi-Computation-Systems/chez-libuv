@@ -107,35 +107,56 @@
          (raise-if-error! error)
          (not (zero? rc))))))
 
+  ;; (loop-call loop who ptr-of native) answers (NATIVE ptr) for LOOP's
+  ;; pointer, taken in the same interrupt-free step from PTR-OF:
+  ;; open-loop-ptr, or owned-loop-ptr for a query that also checks this
+  ;; thread owns the loop. Once the step is over it raises WHO's refusal
+  ;; for a check that failed. The query's open check was made on entry and
+  ;; its pointer read after it, with interrupts enabled between, so an
+  ;; engine could suspend the query there while a teardown freed the loop:
+  ;; resumed, it called libuv on the freed block, or on a new loop the
+  ;; allocator gave its address (tests/test-handle-steps.sps). NATIVE must
+  ;; answer something other than a symbol.
+  (define-syntax loop-call
+    (syntax-rules ()
+      ((_ loop who ptr-of native)
+       (let* ((l loop)
+              (answer (one-step
+                       (let ((ptr (ptr-of l)))
+                         (if (symbol? ptr) ptr (native ptr))))))
+         (cond ((not (symbol? answer)) answer)
+               ((eq? answer 'wrong-thread) (raise (wrong-thread-refusal l who)))
+               (else (raise (step-refusal answer who #f))))))))
+
   ;; uv-stop! : uv-loop -> unspecified
   (define (uv-stop! loop)
-    (require-open-loop loop 'uv-stop!)
-    (uv-loop-stop (loop-pointer loop 'uv-stop!)))
+    (require-loop loop 'uv-stop!)
+    (loop-call loop 'uv-stop! open-loop-ptr uv-loop-stop))
 
   ;; uv-loop-alive? : uv-loop -> boolean
   (define (uv-loop-alive? loop)
-    (require-open-loop loop 'uv-loop-alive?)
-    (not (zero? (uv-loop-alive (loop-pointer loop 'uv-loop-alive?)))))
+    (require-loop loop 'uv-loop-alive?)
+    (not (zero? (loop-call loop 'uv-loop-alive? open-loop-ptr uv-loop-alive))))
 
   ;; uv-now : uv-loop -> exact-nonnegative-integer
   ;; This is libuv's cached time. It changes only when the loop updates it,
   ;; once per iteration, or when uv-update-time! does.
   (define (uv-now loop)
-    (require-open-loop loop 'uv-now)
-    (uv-loop-now (loop-pointer loop 'uv-now)))
+    (require-loop loop 'uv-now)
+    (loop-call loop 'uv-now open-loop-ptr uv-loop-now))
 
   ;; uv-update-time! : uv-loop -> unspecified
   ;; Refresh the cached time from libuv's clock. Timers are armed from that
   ;; cache, so a callback that held the loop calls this before arming a
   ;; deadline, or the deadline starts from before the callback ran (#28).
   ;; Legal while the loop runs, and it runs nothing. Unlike uv-now it is
-  ;; affinity-checked, before the write: it writes the cache the loop thread
-  ;; rewrites every iteration, so from another thread it is a write-write race
-  ;; that can move the clock backwards (ADR-0019).
+  ;; affinity-checked, in the step that writes: it writes the cache the loop
+  ;; thread rewrites every iteration, so from another thread it is a
+  ;; write-write race that can move the clock backwards (ADR-0019). A closed
+  ;; loop is refused before the owner is asked, as make-uv-async's order.
   (define (uv-update-time! loop)
-    (require-open-loop loop 'uv-update-time!)
-    (require-loop-thread loop 'uv-update-time!)
-    (uv-loop-update-time (loop-pointer loop 'uv-update-time!)))
+    (require-loop loop 'uv-update-time!)
+    (loop-call loop 'uv-update-time! owned-loop-ptr uv-loop-update-time))
 
   ;; uv-loop-live-handles : uv-loop -> (listof uv-handle)
   (define (uv-loop-live-handles loop)
