@@ -659,13 +659,17 @@ drains a caller-side queue rather than assuming one item per send.
 >
 > Each step now takes its pointer from `owned-handle-ptr`, which checks
 > the owner first, as the entry check does, and the verb raises
-> `&uv-wrong-thread` after the step (`step-refusal`). So every step on a
-> handle checks its loop's owner. `tests/test-source-rules.sps`'s rule 8
-> holds `open-handle-ptr` to `owned-handle-ptr` and three steps that need
-> no owner check of their own: `uv-close!`'s, loop-thread-only by contract
-> and unchecked; `uv-accept!`'s, whose client's construction checks the
-> owner of the server's loop; and `uv-spawn!`'s, which checks its loop's
-> owner first, every stdio handle being on that loop.
+> `&uv-wrong-thread` after the step (`step-refusal`). So every verb that
+> checks its handle's owner on entry checks it again in its step.
+> `tests/test-source-rules.sps`'s rule 8 holds each route from a handle
+> record to its pointer to the definitions it lists, counting a route
+> passed as a value as well as one called. `open-handle-ptr` is named only
+> by `owned-handle-ptr` and three steps that need no owner check of their
+> own: `uv-close!`'s, loop-thread-only by contract and unchecked;
+> `uv-accept!`'s, whose client's construction checks the owner of the
+> server's loop; and `uv-spawn!`'s, which checks its loop's owner first,
+> every stdio handle being on that loop. The pointer field and
+> `handle-pointer` are read only where the rule says why.
 >
 > - **Measured after:** every suspended run is refused with
 >   `&uv-wrong-thread`, and the process's kill is never sent. Bytes per

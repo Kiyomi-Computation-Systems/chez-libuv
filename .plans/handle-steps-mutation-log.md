@@ -660,8 +660,9 @@ so each checks again that this thread owns the loop, as its entry check
   unchecked), `stdio-refusal` (`uv-spawn!`'s step checks its loop's owner
   first, and its stdio handles are on that loop) and `uv-accept!` (its
   client's construction checks the owner of the server's loop). It holds
-  the claim that every step on a handle checks the owner, where a comment
-  would have stated it.
+  the claim that a verb checking the owner on entry checks it again in
+  its step, where a comment would have stated it. (The review below
+  widened it to every route to a handle's pointer.)
 
 ## On main (6e848d3)
 
@@ -739,3 +740,46 @@ are each **killed** by their suite's handoff row.
 - The engine census in `tests/test-sweep.sps` failed `make test` first:
   test-stream's split runs now make their engine in `start-engine`, which
   the census lists in place of `split-run`.
+
+## Part four: the review's follow-ups
+
+PR #109's review (2026-10-09, /code-review xhigh) found eight things.
+Four are fixed here, one went to #102 as a comment, and three are left.
+
+- **Rule 8 counted only calls.** `calls-of` counts the lists headed by a
+  name, so `open-handle-ptr` passed as a value, as loop.sls passes
+  `open-loop-ptr` to `loop-call`, escaped it. It now counts every mention
+  (`mentions-of`).
+- **It named the definitions, not how often each names the helper.** A
+  second `open-handle-ptr` in `uv-accept!` passed. Each definition now
+  carries its count.
+- **Its row said every step, but it held only `open-handle-ptr`.** A step
+  that read the pointer field itself passed. Rule 8 now pins each route
+  from a handle record to its pointer: `open-handle-ptr`, the field's
+  accessor `handle-ptr` (eight definitions, each with its reason in the
+  rule's header) and `handle-pointer` (one). A definition with a
+  parameter named `handle-ptr`, as the dispatchers and native.sls have,
+  shadows the accessor and is not counted.
+- **Comments said every step checks the owner with `owned-handle-ptr`.**
+  `uv-close!`'s step checks none, and `uv-accept!`'s and `uv-spawn!`'s
+  check the owner of the loop they make something on. `require-open-handle`'s
+  comment, the ADR and AGENTS.md now say so.
+- **#102:** the eight verbs now raise `&uv-wrong-thread` from their steps
+  through `wrong-thread-refusal`, which reads the owner after the step.
+  #102 gained a comment adding them.
+
+Mutants, on a copy of the fixed tree (scratchpad `g4/mut/mutants2.py`),
+each run against the fixed rule and, for R1–R3, the committed one:
+
+| Mutant | Change | Fixed rule | Committed rule |
+|---|---|---|---|
+| R1 | `uv-stream-write-queue-size`'s step takes `((values open-handle-ptr) stream)` | **killed**: the `open-handle-ptr` row | passes |
+| R2 | `uv-read-stop!`'s step reads `handle-ptr` after its own open test | **killed**: the pointer-field row | passes |
+| R3 | `uv-accept!` names `open-handle-ptr` twice | **killed**: the `open-handle-ptr` row (count 2) | passes |
+| R4 | no definition counts as shadowing `handle-ptr` | **killed**: the pointer-field row lists the dispatchers and native.sls | — |
+| R5 | `uv-stream-write-queue-size`'s step takes `handle-pointer` | **killed**: the `handle-pointer` row | — |
+
+Left: `open-handle-ptr` keeps its name, though the owner-blind helper is
+now the exception; test-stream's `handoff-run` repeats `close-run`'s
+skeleton; and `me` and `other-thread` are now defined in four suites
+(#103's territory).

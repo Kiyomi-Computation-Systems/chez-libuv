@@ -187,12 +187,13 @@ None is obvious from reading the code.
     `tests/test-constructors.sps` sweeps them.
   - The other families ADR-0019's decision 3 amendments listed followed
     (#85, #86): the request verbs, the scratch and other handle verbs, and
-    the loop queries. A step on a handle also checks that this thread
-    still owns its loop (`owned-handle-ptr`): the stream verbs' and the
-    process kill's checked only that the handle was open, and a kill
-    resumed after a handoff signalled its process from a thread that no
-    longer owned the loop. Rule 8 of `tests/test-source-rules.sps` holds
-    it. A new verb, or a change to one, takes the same shape and the same
+    the loop queries. A verb that checks its handle's owner on entry
+    checks it again in its step (`owned-handle-ptr`): the stream verbs'
+    and the process kill's steps checked only that the handle was open,
+    and a kill resumed after a handoff signalled its process from a thread
+    that no longer owned the loop. Rule 8 of `tests/test-source-rules.sps`
+    holds every route from a handle record to its pointer to the
+    definitions it lists. A new verb, or a change to one, takes the same shape and the same
     sweeps: split, reuse and drop, and handoff for a verb that checks the
     owner on entry.
 * **Affinity keeps each loop to one thread, not the process.** ADR-0019

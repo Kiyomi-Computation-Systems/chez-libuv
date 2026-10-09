@@ -370,8 +370,10 @@
   ;; thread check comes first — a verb from the wrong thread is refused before
   ;; its handle's open state is even consulted. It does not cover the verb's
   ;; native call, which an engine can suspend it before while the loop is
-  ;; handed on, so the verb's step checks both again (owned-handle-ptr;
-  ;; tests/test-source-rules.sps's rule 8). uv-async-send! is the one verb that
+  ;; handed on, so the verb's step checks both again: with owned-handle-ptr,
+  ;; or, in uv-accept! and uv-spawn!, the owner of the loop the step makes
+  ;; something on (tests/test-source-rules.sps's rule 8). uv-close! does not
+  ;; come through here, and is unchecked. uv-async-send! is the one verb that
   ;; does NOT come through here (it is libuv's sole thread-safe call); it
   ;; validates kind on its own path in (libuv async), and checks open state
   ;; inside the send fence.
@@ -570,7 +572,8 @@
   ;; check a verb makes on entry does not cover a native call an engine can
   ;; suspend it before, so the step checks again. A verb's step takes its
   ;; handle's pointer from owned-handle-ptr, which asks for the owner too;
-  ;; only the steps rule 8 of tests/test-source-rules.sps names call this.
+  ;; only the definitions rule 8 of tests/test-source-rules.sps lists name
+  ;; this.
   (define (open-handle-ptr handle)
     (let ((ptr (handle-ptr handle)))
       (cond ((not (eq? (handle-state handle) 'open)) 'not-open)

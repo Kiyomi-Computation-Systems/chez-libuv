@@ -67,20 +67,37 @@
 ;;;    clear a claim another thread holds, as call-with-uv-loop's exit did
 ;;;    until #78's review, or leave one no call will give back.
 ;;;
-;;; 8. A step on a handle checks that this thread owns its loop. Every verb
-;;;    entering through require-open-handle checks the owner on entry, and
-;;;    an engine can suspend it after that while the loop is handed to
-;;;    another thread. So its step takes the handle's pointer from
-;;;    owned-handle-ptr, which checks again. open-handle-ptr, which asks
-;;;    only whether the handle is open, is called by owned-handle-ptr and by
-;;;    three steps that need no owner check of their own. begin-close! is
-;;;    uv-close!'s step, loop-thread-only by contract and unchecked.
-;;;    uv-accept!'s step builds its client with try-construct-handle, which
-;;;    checks the owner of the server's loop. And uv-spawn!'s step checks
-;;;    its loop's owner first (spawn-step!), every stdio handle being on that
-;;;    loop. The stream verbs and the process kill and pid took
-;;;    open-handle-ptr until #86, and a kill resumed after a handoff
-;;;    signalled its process from a thread that no longer owned the loop.
+;;; 8. A verb that checks its handle's owner on entry checks it again in
+;;;    its step. Every verb entering through require-open-handle checks on
+;;;    entry that this thread owns the loop, and an engine can suspend it
+;;;    after that while the loop is handed to another thread. So its step
+;;;    takes the handle's pointer from owned-handle-ptr, which checks again.
+;;;    The stream verbs and the process kill and pid took open-handle-ptr
+;;;    until #86, and a kill resumed after a handoff signalled its process
+;;;    from a thread that no longer owned the loop. So this suite holds each
+;;;    route from a handle record to its pointer to the definitions that
+;;;    take it, named and counted, whether called or passed as a value:
+;;;    - open-handle-ptr, which asks only whether the handle is open:
+;;;      owned-handle-ptr, and three steps that need no owner check of their
+;;;      own. begin-close! is uv-close!'s step, loop-thread-only by contract
+;;;      and unchecked. uv-accept!'s step builds its client with
+;;;      try-construct-handle, which checks the owner of the server's loop.
+;;;      uv-spawn!'s step checks its loop's owner before stdio-refusal, and
+;;;      every stdio handle is on that loop.
+;;;    - The pointer field, handle-ptr: open-handle-ptr; handle-pointer, the
+;;;      checked accessor outside a step; uv-async-send!, the one verb any
+;;;      thread may call, inside its send fence; handle-in-loop-queue?,
+;;;      which only compares it with what uv_walk reports; uv-accept!, for
+;;;      the client its step has just made; and, in uv-spawn!'s step,
+;;;      fill-stdio-containers!, for the stdio handles stdio-refusal has just
+;;;      checked, and clean-up-failed-spawn!, for the process the step has
+;;;      just made.
+;;;    - handle-pointer: discard-failed-handle!, for a failed spawn's
+;;;      process.
+;;;    A definition with a parameter named handle-ptr shadows the field's
+;;;    accessor for its whole body, and is not counted: the dispatchers and
+;;;    native.sls name a raw pointer that way. What the scan cannot see: an
+;;;    accessor imported under another name.
 ;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
@@ -1192,39 +1209,79 @@
   '(("src/libuv/private/handles.sls" . 1))
   (calls-in-src 'set-loop-holder!))
 
+;; mentions-of : symbol datum -> exact-nonnegative-integer
+;; How many times NAME occurs anywhere within X: called, or passed as a
+;; value, as loop.sls passes open-loop-ptr to its loop-call macro.
+(define (mentions-of name x)
+  (cond ((eq? x name) 1)
+        ((pair? x) (+ (mentions-of name (car x)) (mentions-of name (cdr x))))
+        ((vector? x) (mentions-of name (vector->list x)))
+        (else 0)))
+
 ;; definition-name : datum -> (or symbol #f)
-;; The name a (define ...) or (define-syntax ...) form defines.
+;; The name a define, define-syntax or define-record-type form defines.
 (define (definition-name form)
   (and (pair? form)
-       (memq (car form) '(define define-syntax))
+       (memq (car form) '(define define-syntax define-record-type))
        (pair? (cdr form))
        (let ((target (cadr form)))
          (cond ((symbol? target) target)
                ((and (pair? target) (symbol? (car target))) (car target))
                (else #f)))))
 
-;; callers-in-src : symbol -> (listof (list string symbol))
-;; Each top-level form of a library in src/ that calls NAME, as (file
-;; definition), in file and source order: 'top-level for a form that defines
-;; nothing. NAME's own definition, whose header is a list headed by NAME, is
-;; not its caller.
-(define (callers-in-src name)
+;; binds-parameter? : symbol datum -> boolean
+;; Whether FORM is a (define (f param ...) ...) that takes NAME as a
+;; parameter, which shadows NAME for the whole body: the dispatchers and
+;; native.sls name a handle's raw pointer handle-ptr.
+(define (binds-parameter? name form)
+  (and (pair? form)
+       (eq? (car form) 'define)
+       (pair? (cdr form))
+       (pair? (cadr form))
+       (let params ((ps (cdadr form)))
+         (cond ((pair? ps) (or (eq? (car ps) name) (params (cdr ps))))
+               (else (eq? ps name))))))
+
+;; namers-in-src : symbol -> (listof (list string symbol exact-positive-integer))
+;; Each top-level form of a library in src/ that names NAME, as (file
+;; definition count), in file and source order: 'top-level for a form that
+;; defines nothing. NAME's own definition does not count, nor does a
+;; definition whose parameter shadows NAME.
+(define (namers-in-src name)
   (apply append
          (map (lambda (e)
                 (let ((body (list-tail (cdr e) 4)))  ; after library, name, export, import
-                  (map (lambda (form) (list (car e) (or (definition-name form) 'top-level)))
+                  (map (lambda (form)
+                         (list (car e) (or (definition-name form) 'top-level)
+                               (mentions-of name form)))
                        (filter (lambda (form)
                                  (and (not (eq? (definition-name form) name))
-                                      (positive? (calls-of name form))))
+                                      (not (binds-parameter? name form))
+                                      (positive? (mentions-of name form))))
                                body))))
               libraries)))
 
-(test-equal "rule 8: every step on a handle takes its pointer from owned-handle-ptr, except three that check the owner another way or not at all"
-  '(("src/libuv/private/handles.sls" owned-handle-ptr)
-    ("src/libuv/private/handles.sls" begin-close!)
-    ("src/libuv/process.sls" stdio-refusal)
-    ("src/libuv/tcp.sls" uv-accept!))
-  (callers-in-src 'open-handle-ptr))
+(test-equal "rule 8: open-handle-ptr is named only by owned-handle-ptr and three steps that check the owner another way or not at all, once each"
+  '(("src/libuv/private/handles.sls" owned-handle-ptr 1)
+    ("src/libuv/private/handles.sls" begin-close! 1)
+    ("src/libuv/process.sls" stdio-refusal 1)
+    ("src/libuv/tcp.sls" uv-accept! 1))
+  (namers-in-src 'open-handle-ptr))
+
+(test-equal "rule 8: a handle's pointer field is read only by the definitions listed, once each"
+  '(("src/libuv/async.sls" uv-async-send! 1)
+    ("src/libuv/private/handles.sls" uv-handle-record 1)
+    ("src/libuv/private/handles.sls" handle-pointer 1)
+    ("src/libuv/private/handles.sls" open-handle-ptr 1)
+    ("src/libuv/private/handles.sls" handle-in-loop-queue? 1)
+    ("src/libuv/process.sls" fill-stdio-containers! 1)
+    ("src/libuv/process.sls" clean-up-failed-spawn! 1)
+    ("src/libuv/tcp.sls" uv-accept! 1))
+  (namers-in-src 'handle-ptr))
+
+(test-equal "rule 8: handle-pointer, the checked accessor outside a step, is named only by discard-failed-handle!"
+  '(("src/libuv/private/handles.sls" discard-failed-handle! 1))
+  (namers-in-src 'handle-pointer))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"
