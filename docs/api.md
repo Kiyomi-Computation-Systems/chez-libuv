@@ -142,8 +142,15 @@ callback, an escape costs about 400 bytes of stack on Linux x86-64, and 400
 to 500 on arm64. On arm64, 16,000 to 20,000 of them filled an 8 MB stack
 and the process died with `SIGSEGV`, and on x86-64, 20,000 to 24,000; a
 thread made with `fork-thread` held 16,000 on both. On macOS the main
-thread held 20,000 to 40,000, and a thread made with `fork-thread` 1,000 to
-2,000, after which it hung. A raise costs nothing: the seam catches it
+thread held 20,000 to 40,000. A thread made with `fork-thread` gets macOS's
+default 512 KiB stack, not 8 MB, and on arm64 its 1,430th escape faulted.
+There the fault does not end the process: Chez raises it as a Scheme
+error, "invalid memory reference". Let that error end the thread. A
+program that catches it and goes on can hang for good, with no message,
+at its next garbage collection: Chez leaves the thread marked as running
+outside Scheme, and the collection waits for it to stop. Chez does this
+after any fault inside a foreign call that it turns into an error, with or
+without libuv. A raise costs nothing: the seam catches it
 inside the callback, which then returns. Neither does an engine that is
 resumed. Short of the thread's end, the frames go only when a callback
 entered before them returns, so a program that leaves callbacks by

@@ -10,7 +10,11 @@
 (define on-thread? (and (> (length (command-line)) 3)
                         (string=? (cadddr (command-line)) "thread")))
 
+;; VmStk is Linux's; macOS has no /proc, and reports "?".
 (define (vmstk)
+  (if (file-exists? "/proc/self/status") (proc-vmstk) "?"))
+
+(define (proc-vmstk)
   (call-with-input-file "/proc/self/status"
     (lambda (p)
       (let loop ()
