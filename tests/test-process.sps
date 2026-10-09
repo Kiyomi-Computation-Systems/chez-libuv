@@ -252,6 +252,40 @@
        (not (handle-in-loop-queue? loop late))))))
 
 ;; --- 'EPERM: setuid as non-root (design spec v0.3 §9.2 -- the NORMAL suite)
+;; Which errno refuses it depends on whether uid 1 exists here. In a user
+;; namespace that maps only the caller's own uid, as a rootless container's
+;; does (the Guix container's, ADR-0020), the kernel refuses an unmapped uid
+;; with EINVAL before it checks permission. Elsewhere it is EPERM, or EACCES
+;; on some platforms. uid-in-map? reads a uid_map from port: #t when a line
+;; of it, "inside outside count", maps uid. uid-mapped? is #t where there is
+;; no /proc/self/uid_map (macOS), or where that map holds uid.
+(define (uid-in-map? uid port)
+  (let next ()
+    (let* ((inside (read port)) (outside (read port)) (count (read port)))
+      (cond ((eof-object? inside) #f)
+            ((and (<= inside uid) (< uid (+ inside count))) #t)
+            (else (next))))))
+
+(define (uid-mapped? uid)
+  (or (not (file-exists? "/proc/self/uid_map"))
+      (call-with-input-file "/proc/self/uid_map"
+        (lambda (port) (uid-in-map? uid port)))))
+
+;; Any one environment takes only one of the row's branches, so the parser
+;; that picks the branch is held here, on maps of both kinds.
+(define (map-answer uid text)
+  (if (uid-in-map? uid (open-string-input-port text)) 'mapped 'unmapped))
+(test-equal "uid map: the initial namespace's maps uid 1"
+  'mapped (map-answer 1 "         0          0 4294967295\n"))
+(test-equal "uid map: a rootless container's, only its own uid, does not"
+  'unmapped (map-answer 1 "      1000       1000          1\n"))
+(test-equal "uid map: it does map its own uid"
+  'mapped (map-answer 1000 "      1000       1000          1\n"))
+(test-equal "uid map: a range's end is outside it"
+  'unmapped (map-answer 1001 "      1000       1000          1\n"))
+(test-equal "uid map: a later line can map it"
+  'mapped (map-answer 1 "      1000       1000          1\n         0     100000      65536\n"))
+
 (with-loop
  (lambda (loop)
    (define raised
@@ -259,8 +293,14 @@
        (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0")
                   (list (cons 'uid 1)) #f)
        'no-raise))
-   (test-assert "uid as non-root fails 'EPERM (or 'EACCES per platform) at spawn"
-     (memq raised '(EPERM EACCES)))
+   ;; The map is read inside the tested expression, so a failure to read
+   ;; it fails this row instead of aborting the suite.
+   (test-equal "uid as non-root is refused at spawn: 'EPERM ('EACCES per platform), or 'EINVAL where uid 1 is unmapped"
+     'refused-as-expected
+     (let ((expected (if (uid-mapped? 1) '(EPERM EACCES) '(EINVAL))))
+       (if (memq raised expected)
+           'refused-as-expected
+           (list 'raised raised 'expected expected))))
    (test-equal "the uid failure leaked no options block"
      0 (live-count 'spawn-options))))
 

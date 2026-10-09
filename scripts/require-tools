@@ -1,0 +1,43 @@
+#!/bin/sh
+# scripts/require-tools GOAL TOOL...
+#
+# Fails fast, before a make recipe runs, when one of its external tools
+# isn't on PATH, instead of the recipe failing obscurely later. GOAL names
+# the make target to show in the hint: the Makefile passes it $(GOAL), the
+# goals the user typed, never an inner prerequisite's own name. The hint
+# names goals only, not variables set on the command line, and a recipe
+# that re-enters make (prod) names the inner make's goal.
+#
+# Prints one "make GOAL: TOOL not found." line per missing TOOL, to
+# stderr, then one hint line, and exits 2:
+#   - guix on PATH, outside any Guix environment: run it in the project's
+#     container, scripts/guix-env, which holds the whole toolchain
+#     (ADR-0020);
+#   - otherwise: install the missing tools.
+# Silent, and exits 0, when every TOOL is found.
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: require-tools GOAL TOOL..." >&2
+  exit 2
+fi
+
+goal=$1
+shift
+
+missing=0
+for tool in "$@"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "make $goal: $tool not found." >&2
+    missing=1
+  fi
+done
+
+[ "$missing" -eq 0 ] && exit 0
+
+if command -v guix >/dev/null 2>&1 && [ -z "${GUIX_ENVIRONMENT:-}" ]; then
+  echo "On this Guix host, run it in the project's container: scripts/guix-env make $goal" >&2
+else
+  echo "Install the missing tools, then run make $goal again." >&2
+fi
+exit 2

@@ -1,0 +1,264 @@
+#!/bin/sh
+# Runs INSIDE the pinned container, as `make check-guix-inside`. Not a
+# launcher: `make check-guix` runs tests/guix-env-launcher.sh on the host,
+# then this through scripts/guix-env. Asserts what the environment exists
+# for (ADR-0020). Each failure names its assertion.
+set -u
+
+if [ -z "${GUIX_ENVIRONMENT:-}" ]; then
+  echo "check-guix: FAILED not-in-environment: this is the self-test, not the launcher; use make check-guix" >&2
+  exit 2
+fi
+
+fail=0
+ok()  { echo "check-guix: ok $*"; }
+bad() { echo "check-guix: FAILED $*" >&2; fail=1; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Each make below runs without the MAKEFLAGS of the make that started this
+# script: `make check-guix-inside HAVE_PKG=no` must not change what the
+# assertions compare against.
+cleanmake() { env -u MAKEFLAGS -u MFLAGS make "$@"; }
+
+# makevar NAME: the Makefile's own value of NAME, so no floor is written
+# down twice.
+makevar() {
+  cleanmake --no-print-directory -s --eval "print-makevar: ; @echo '\$($1)'" print-makevar
+}
+
+# at_least FLOOR VERSION: VERSION is a dotted number, and FLOOR or later by
+# version order. sort -V puts a digit before a letter, so without the first
+# test any error message would count as later than every floor.
+at_least() {
+  printf '%s\n' "$2" | grep -Eqx '[0-9]+(\.[0-9]+)*' \
+    && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+}
+
+# The git common directory, when this is a linked worktree: the launcher
+# shares it, so the path to it may show in HOME as the path to $PWD does.
+common=
+if [ -f .git ]; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+fi
+
+# Assertion 1: nothing of the host's HOME is visible. The container's HOME
+# holds at most the directories leading down to the repository and, in a
+# worktree, to the main repository's .git, which it shares; anything else
+# (a dotfile, a key, a host tool's config, a sibling checkout) means the
+# isolation this environment exists for is gone. So HOME, and each
+# directory on the way down from it to either, holds only the next step
+# toward one of them.
+home_ok=1
+check_dir() {  # DIR
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    case "$PWD/" in "$e"/*) continue ;; esac
+    if [ -n "$common" ]; then
+      case "$common/" in "$e"/*) continue ;; esac
+    fi
+    bad "isolated-home: $e is visible inside the container"; home_ok=0
+  done
+}
+check_dir "$HOME"
+seen=$HOME
+for target in "$PWD" ${common:+"$common"}; do
+  case "$target/" in "$HOME"/*) ;; *) continue ;; esac
+  rest=${target#"$HOME"/}
+  d=$HOME
+  while :; do
+    d=$d/${rest%%/*}
+    case "$rest" in */*) rest=${rest#*/} ;; *) break ;; esac
+    case "
+$seen
+" in
+      *"
+$d
+"*) ;;
+      *) seen="$seen
+$d"; check_dir "$d" ;;
+    esac
+  done
+done
+[ "$home_ok" -eq 1 ] && ok "isolated-home ($HOME holds only the path to $PWD${common:+ and $common})"
+
+# Assertion 2: however a tool is found, it is the pinned binary: on the
+# PATH this script, and so make, runs with ("env"), and however a login
+# shell rebuilds PATH, both forms, since rc files branch on $-. A login
+# shell does not see a stub put first on the inherited PATH, and make
+# does. Compared by resolved path: a host or guix-home copy that is a
+# different store item is not the pinned one.
+for mode in env -lc -lic; do
+  for tool in scheme gcc pkg-config cmake valgrind git make; do
+    if [ "$mode" = env ]; then
+      p=$(command -v "$tool")
+    else
+      p=$(bash "$mode" "command -v $tool" 2>/dev/null | tail -n 1)
+    fi
+    want=$(readlink -f "$GUIX_ENVIRONMENT/bin/$tool")
+    got=
+    [ -n "$p" ] && got=$(readlink -f "$p")
+    if [ -n "$got" ] && [ "$got" = "$want" ]; then
+      ok "tool-path[$mode] ($tool: $p)"
+    else
+      bad "tool-path[$mode]: $tool resolves to '${got:-nothing}' (via '${p:-nothing}'), expected $want"
+    fi
+  done
+done
+
+# Assertion 3: the Makefile's $(CHEZ) is the profile's Chez binary itself.
+# A wrapper script that execs Chez satisfies the suites while hiding Chez
+# from Valgrind, which then prints no ERROR SUMMARY. One that doesn't exec
+# makes Valgrind report on the shell instead, so the ELF check is needed
+# too.
+chez=${CHEZ:-}
+case "$chez" in
+  "$GUIX_ENVIRONMENT"/*) ok "chez-variable ($chez)" ;;
+  *) bad "chez-variable: CHEZ is '${chez:-unset}', expected under $GUIX_ENVIRONMENT" ;;
+esac
+magic=$(head -c 4 "$chez" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$magic" = 7f454c46 ]; then
+  ok "chez-is-elf"
+else
+  bad "chez-is-elf: '${chez:-unset}' starts with '${magic:-nothing}', not an ELF header"
+fi
+if valgrind "$chez" --version 2>&1 | grep -q 'ERROR SUMMARY'; then
+  ok "valgrind-instruments-chez"
+else
+  bad "valgrind-instruments-chez: valgrind '${chez:-unset}' --version printed no ERROR SUMMARY"
+fi
+
+# Assertion 4: that Chez is at the project's floor, and threaded. The
+# floor is ci.yml's CHEZ_FLOOR_VERSION, which the Makefile reads.
+floor=$(makevar CHEZ_FLOOR_VERSION)
+version=$("$chez" --version 2>&1)
+if [ -z "$floor" ]; then
+  bad "chez-floor: the Makefile's CHEZ_FLOOR_VERSION is empty"
+elif at_least "$floor" "$version"; then
+  ok "chez-floor ($version, floor $floor)"
+else
+  bad "chez-floor: '${chez:-unset}' is '${version:-nothing}', not a version at or above the floor $floor"
+fi
+threaded=$(printf '%s\n' '(display (if (threaded?) "threaded" "not threaded"))' \
+  | "$chez" -q 2>&1)
+if [ "$threaded" = threaded ]; then
+  ok "chez-threaded"
+else
+  bad "chez-threaded: '${chez:-unset}' answered '${threaded:-nothing}'"
+fi
+
+# Assertion 5: the Makefile's $(CC) is the profile's gcc, and it compiles
+# and runs a program against libuv's headers and library, found as the
+# Makefile finds them: through pkg-config. It prints the headers' version,
+# then the loaded library's.
+cc=${CC:-}
+case "$cc" in
+  "$GUIX_ENVIRONMENT"/*) ok "cc-variable ($cc)" ;;
+  *) bad "cc-variable: CC is '${cc:-unset}', expected under $GUIX_ENVIRONMENT" ;;
+esac
+cat >"$tmp/uv.c" <<'EOF'
+#include <stdio.h>
+#include <uv.h>
+int main(void) {
+  printf("libuv %d.%d.%d %s\n", UV_VERSION_MAJOR, UV_VERSION_MINOR,
+         UV_VERSION_PATCH, uv_version_string());
+  return 0;
+}
+EOF
+got=
+# shellcheck disable=SC2046
+if "$cc" -o "$tmp/uv" "$tmp/uv.c" $(pkg-config --cflags --libs libuv) 2>"$tmp/cc.err"; then
+  got=$("$tmp/uv")
+fi
+case "$got" in
+  "libuv "[0-9]*.[0-9]*.[0-9]*" "[0-9]*.[0-9]*.[0-9]*) ok "libuv-headers (${got#libuv })" ;;
+  *) bad "libuv-headers: '${cc:-unset}' could not build and run against <uv.h>: $(grep -m 1 -E 'error|undefined' "$tmp/cc.err" || head -n 1 "$tmp/cc.err")" ;;
+esac
+
+# Assertion 6: the Makefile builds against the profile's libuv, through
+# pkg-config, and it is at the floor. A libuv below it is passed over for
+# the vendored build, which would leave the pkg-config leg untested here.
+uv_floor=$(makevar UV_FLOOR_DOTTED)
+uv_version=$(pkg-config --modversion libuv 2>/dev/null)
+info=$(cleanmake --no-print-directory -s deps-info 2>&1)
+source_line=$(printf '%s\n' "$info" | sed -n 's/^libuv source : //p')
+dlls=$(printf '%s\n' "$info" | sed -n 's/^uv dlls *: //p')
+if ! at_least "$uv_floor" "$uv_version"; then
+  bad "libuv-floor: pkg-config's libuv is '${uv_version:-nothing}', not a version at or above the floor $uv_floor"
+elif [ "$source_line" != pkg-config ]; then
+  bad "libuv-floor: make deps-info chose '${source_line:-nothing}', expected pkg-config"
+else
+  case "$(readlink -f "$dlls")" in
+    /gnu/store/*) ok "libuv-floor ($uv_version, floor $uv_floor: $dlls)" ;;
+    *) bad "libuv-floor: the Makefile links '$dlls', which is not in the store" ;;
+  esac
+fi
+
+# Assertion 7: the programs the suites spawn by absolute path exist.
+fhs_ok=1
+for p in /bin/sh /bin/cat /usr/bin/id; do
+  if [ ! -x "$p" ]; then
+    bad "fhs-paths: $p is missing; the suites spawn it by that path"; fhs_ok=0
+  fi
+done
+[ "$fhs_ok" -eq 1 ] && ok "fhs-paths (/bin/sh, /bin/cat, /usr/bin/id)"
+
+# Assertion 8: the network is loopback only. The one interface is lo, and
+# an outside address (TEST-NET-1, RFC 5737) is unreachable at once, not
+# merely silent. make test, below, connects over loopback in every TCP
+# suite.
+ifaces=$(ls /sys/class/net 2>&1 | tr '\n' ' ')
+outside=$(timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)
+case "$ifaces|$outside" in
+  "lo |"*"Network is unreachable"*) ok "loopback-only (interfaces: ${ifaces% }; 192.0.2.1 unreachable)" ;;
+  *) bad "loopback-only: interfaces '${ifaces% }'; 192.0.2.1: '${outside:-connected, or silent for 5s}'" ;;
+esac
+
+# Assertion 9: git reads this repository, in a worktree too: `make deps`
+# and `make check-pins` need it.
+top=$(git rev-parse --show-toplevel 2>&1)
+pin=$(git ls-files -s vendor/chez-srfi 2>&1 | awk '{print $1}')
+if [ "$top" = "$PWD" ] && [ "$pin" = 160000 ]; then
+  ok "git-reads-repo ($top${common:+, common $common})"
+else
+  bad "git-reads-repo: toplevel '$top' (expected $PWD), vendor/chez-srfi entry '${pin:-none}'"
+fi
+
+# Assertion 10: git has nothing to act as anyone with. No identity, no
+# credential helper, no remote URL carrying a password, no agent. The
+# repository's own .git/config is shared, so this is where a token written
+# into it would show.
+cred_ok=1
+for key in user.name user.email; do
+  v=$(git config --get "$key")
+  [ -z "$v" ] || { bad "no-git-credentials: git has $key '$v'"; cred_ok=0; }
+done
+# Keys only, never values: a value may be the secret.
+keys=$(git config --name-only --get-regexp '^(credential\..*|http\..*extraheader|core\.askpass)$' 2>/dev/null | tr '\n' ' ')
+[ -z "$keys" ] || { bad "no-git-credentials: git has credential settings: $keys"; cred_ok=0; }
+# A URL with userinfo, user:password@ or a bare token@, in a remote or in
+# an insteadOf rule's key. scp-like ssh URLs (git@host:path) have no ://.
+# Printed as key names with any userinfo masked: an insteadOf rule's key
+# is itself the URL.
+urls=$(git config --get-regexp '^(remote\..*\.(push)?url|url\..*)$' 2>/dev/null | grep -E '://[^/@]*@' | cut -d ' ' -f 1 | sed -E 's#://[^/@]*@#://***@#' | tr '\n' ' ')
+[ -z "$urls" ] || { bad "no-git-credentials: a URL carries credentials: $urls"; cred_ok=0; }
+for var in SSH_AUTH_SOCK GIT_ASKPASS SSH_ASKPASS GH_TOKEN GITHUB_TOKEN; do
+  eval "v=\${$var-}"
+  [ -z "$v" ] || { bad "no-git-credentials: $var is set"; cred_ok=0; }
+done
+[ "$cred_ok" -eq 1 ] && ok "no-git-credentials"
+
+# Assertion 11: the Makefile's own checks pass in here too: check-help,
+# and test, which runs check-pins and every default suite.
+if ! make --no-print-directory check-help; then
+  bad "check-help"
+fi
+if ! make --no-print-directory test; then
+  bad "test"
+fi
+
+if [ "$fail" -eq 0 ]; then
+  echo "check-guix: ALL CHECKS PASSED"
+fi
+exit "$fail"

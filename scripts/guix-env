@@ -1,0 +1,87 @@
+#!/bin/sh
+# The pinned Guix development container (ADR-0020).
+#
+#   scripts/guix-env                an interactive bash
+#   scripts/guix-env CMD [ARG...]   run CMD, e.g. `make test`
+#
+# The container holds the toolchain and nothing of yours: no git config,
+# no credentials, no agents, no tokens, and no network but loopback. Edit,
+# commit, fetch and push on the host; send builds and tests through here.
+#
+# GUIX_ENV_DRY_RUN=1 prints `cd <dir>` and the guix command, one argument
+# per line, instead of running it: tests/guix-env-launcher.sh asserts on
+# that.
+set -eu
+
+die() { printf 'guix-env: %s\n' "$*" >&2; exit 2; }
+
+if [ -n "${GUIX_ENVIRONMENT:-}" ]; then
+  die "already inside a Guix environment (GUIX_ENVIRONMENT=$GUIX_ENVIRONMENT); run the command directly"
+fi
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+if [ $# -eq 0 ]; then
+  set -- bash
+fi
+
+# A linked worktree's .git is a file naming its git directory, which lies
+# inside the main repository's .git: the common directory, named by that
+# directory's `commondir` file. The container shares only $root, so git
+# there would find no repository, and `make deps`, `make vendor` and
+# `make check-pins` would fail. Share the common directory too, read-write,
+# since `git submodule update` writes there. Read without git: the host
+# may not have it. Either path may be relative (worktree.useRelativePaths):
+# a gitdir from $root, which is the working directory by now, and a
+# commondir from the gitdir.
+share=
+if [ -f .git ]; then
+  gitdir=$(sed -n 's/^gitdir: //p' .git)
+  [ -n "$gitdir" ] || die "$root/.git is a file with no gitdir line"
+  common=$gitdir
+  if [ -f "$gitdir/commondir" ]; then
+    c=$(cat "$gitdir/commondir")
+    case "$c" in /*) common=$c ;; *) common=$gitdir/$c ;; esac
+  fi
+  named=$common
+  common=$(CDPATH='' cd -- "$named" 2>/dev/null && pwd) \
+    || die "$root/.git names $gitdir, whose common directory $named does not exist"
+  # Share only a git directory, and nothing that holds the checkout or
+  # HOME: a hand-edited .git file (gitdir: .., gitdir: /) must not hand the
+  # container a parent of the repository. ${common%/} so that / holds
+  # everything. guix splits --share at its first `=`, so a path holding one
+  # would share some other directory.
+  case "$root/" in
+    "${common%/}"/*) die "refusing to share $common, named by $root/.git: it holds $root" ;;
+  esac
+  case "$HOME/" in
+    "${common%/}"/*) die "refusing to share $common, named by $root/.git: it holds $HOME" ;;
+  esac
+  case "$common" in
+    *=*) die "refusing to share $common, named by $root/.git: guix would split it at the =" ;;
+  esac
+  [ -f "$common/HEAD" ] \
+    || die "$root/.git names $gitdir, whose common directory $common is not a git directory"
+  case "$common/" in
+    "$root"/*) ;;
+    *) share=--share=$common ;;
+  esac
+fi
+
+# No --network: the container's one interface is loopback, so no build or
+# test can reach anything else. --emulate-fhs: the suites spawn /bin/cat
+# and /usr/bin/id by absolute path, as they would on any FHS host. Nothing
+# loads a library by bare name: config.sls names libuv and the shim by
+# absolute path.
+set -- -- sh scripts/guix-env-enter "$@"
+[ -z "$share" ] || set -- "$share" "$@"
+set -- time-machine -C channels.scm -- shell -m manifest.scm \
+  --container --emulate-fhs '--preserve=^(TERM|COLORTERM|LANG)$' "$@"
+
+if [ -n "${GUIX_ENV_DRY_RUN:-}" ]; then
+  printf 'cd %s\n' "$PWD"
+  printf '%s\n' guix "$@"
+  exit 0
+fi
+exec guix "$@"
