@@ -19,8 +19,11 @@ FROM debian:bookworm
 ARG CHEZ_VERSION
 RUN test -n "$CHEZ_VERSION" || (echo "build-arg CHEZ_VERSION is required" >&2; exit 1)
 
-# libuv1-dev supplies the pkg-config acquisition path (ADR-0001). valgrind,
-# cmake and build-essential match ci.yml's linux toolchain step.
+# libuv1-dev is Debian 12's 1.44.2, below the floor, so the build passes it
+# over for the vendored libuv (ADR-0001, amended 2026-10-09), and
+# `make deps-info` here says so. It stays installed as the real case of that
+# fallback; removing it would also rebuild the Chez layer below for nothing.
+# valgrind, cmake and build-essential match ci.yml's linux toolchain step.
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       valgrind cmake pkg-config build-essential libuv1-dev \
       curl ca-certificates git uuid-dev \

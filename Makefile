@@ -54,8 +54,12 @@ endif
 # The hex digits are built once (UV_RANGE_LO_HEX/UV_RANGE_HI_HEX) and reused
 # for both the shell/C "0x..." spelling used by check-pins and the Scheme
 # "#x..." spelling written into config.sls.
+#
+# 1.48.0 is Ubuntu 24.04 LTS's libuv, and CI's floor job links exactly it.
+# The floor was 1.44.0 until #90, a version no run had tested: against
+# Debian 12's 1.44.2, two test-lifecycle rows fail (ADR-0001's amendment).
 UV_FLOOR_MAJOR  := 1
-UV_FLOOR_MINOR  := 44
+UV_FLOOR_MINOR  := 48
 UV_FLOOR_DOTTED := $(UV_FLOOR_MAJOR).$(UV_FLOOR_MINOR).0
 
 UV_RANGE_LO_HEX := $(shell printf '%02x%02x00' $(UV_FLOOR_MAJOR) $(UV_FLOOR_MINOR))
@@ -64,7 +68,11 @@ UV_RANGE_LO     := 0x$(UV_RANGE_LO_HEX)
 UV_RANGE_HI     := 0x$(UV_RANGE_HI_HEX)
 
 # --- native dependency discovery (ADR-0001) --------------------------
-HAVE_PKG := $(shell pkg-config --exists libuv && echo yes || echo no)
+# A system libuv is used only when it meets the floor. One below it is
+# passed over for the vendored build, as a missing one is: a shim linked
+# against it would refuse itself at load (&uv-version-incompatible).
+# check-pins holds this.
+HAVE_PKG := $(shell pkg-config --atleast-version=$(UV_FLOOR_DOTTED) libuv && echo yes || echo no)
 
 ifeq ($(HAVE_PKG),yes)
   UV_CFLAGS := $(shell pkg-config --cflags libuv)
@@ -224,7 +232,16 @@ deps: ## Vendor chez-srfi and symlink it (plus %3a-decoded names) into build/sch
 	  [ "$$d" = "$$b" ] || ln -sfn "$$f" "$$dst/$$d"; \
 	done
 
-check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, manifest/CHANGELOG version, and vendor read-path facts agree
+# The floor-detection part of check-pins asks a second make which libuv
+# it would build against, with a fake pkg-config entry for libuv just below
+# the floor and one at it, so it checks HAVE_PKG's own expression rather
+# than a copy of it. MAKEFLAGS is cleared for that make, or a HAVE_PKG=no on
+# this one's command line (CI's vendored leg) would answer for it. It
+# re-enters make through this alias, as check-memory-gate does, so that
+# `make -n check-pins` runs nothing.
+PINS_MAKE = $(MAKE)
+
+check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, floor detection, manifest/CHANGELOG version, and vendor read-path facts agree
 	@rec=$$(git ls-files -s $(SRFI_SRC) | awk '{print $$2}'); \
 	lock=$$(sed -n 's/.*akku\.[0-9]*\.\([a-f0-9]*\)_repack.*/\1/p' Akku.lock | head -1); \
 	if [ -z "$$rec" ] || [ -z "$$lock" ]; then \
@@ -255,6 +272,29 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	  exit 1; \
 	}
 	@echo "README states the libuv floor ($(UV_FLOOR_DOTTED))"
+	@if ! command -v pkg-config >/dev/null 2>&1; then \
+	  echo "floor detection: no pkg-config here, so every build is vendored"; \
+	else \
+	  tmp=$$(mktemp -d); \
+	  below="$(UV_FLOOR_MAJOR).$$(( $(UV_FLOOR_MINOR) - 1 )).99"; \
+	  for v in "$$below" "$(UV_FLOOR_DOTTED)"; do \
+	    mkdir -p "$$tmp/$$v"; \
+	    printf 'Name: libuv\nDescription: floor probe\nVersion: %s\nLibs: -luv\nCflags:\n' "$$v" \
+	      > "$$tmp/$$v/libuv.pc"; \
+	  done; \
+	  chose() { MAKEFLAGS= PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$$tmp/$$1" \
+	    $(PINS_MAKE) -s --no-print-directory deps-info | sed -n 's/^libuv source : //p'; }; \
+	  got_below=$$(chose "$$below"); \
+	  got_floor=$$(chose "$(UV_FLOOR_DOTTED)"); \
+	  rm -rf "$$tmp"; \
+	  if [ "$$got_below" != vendored ] || [ "$$got_floor" != pkg-config ]; then \
+	    echo "FLOOR DETECTION: a system libuv $$below chose '$$got_below' (want vendored)," >&2; \
+	    echo "and one at the floor, $(UV_FLOOR_DOTTED), chose '$$got_floor' (want pkg-config)." >&2; \
+	    echo "A build against a libuv below the floor refuses itself at load." >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "floor detection ok: a system libuv $$below is passed over, $(UV_FLOOR_DOTTED) is used"; \
+	fi
 	@man=$$(sed -n 's/.*("chez-libuv" "\([0-9][^"]*\)").*/\1/p' Akku.manifest | head -1); \
 	chg=$$(sed -n 's/^## \([0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -1); \
 	if [ -z "$$man" ] || [ -z "$$chg" ]; then \
@@ -824,10 +864,12 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	@#
 	@# HAVE_PKG=no is NOT optional and NOT a preference. ci.yml's valgrind step
 	@# is `make HAVE_PKG=no test-memory` -- the VENDORED leg, at the pinned
-	@# libuv. Debian's libuv is 1.44.2 and the pin is 1.52.1, and the two do not
-	@# behave identically: run through pkg-config, this target failed two
-	@# test-lifecycle rows that assert libuv's documented close-vs-timer
-	@# ordering, rows CI passes every run. A gate that silently tests a
+	@# libuv. The image's own libuv is Debian 12's 1.44.2, below the floor,
+	@# so detection passes it over anyway; HAVE_PKG=no keeps this the vendored
+	@# leg whatever the image's libuv becomes. The two do not behave
+	@# identically: run through pkg-config on 1.44.2, this target failed two
+	@# test-lifecycle rows that assert the close-vs-timer ordering newer
+	@# libuv has, rows CI passes every run (#90). A gate that silently tests a
 	@# different libuv than CI invents failures CI cannot reproduce and misses
 	@# ones it would catch. Mirror the leg or do not claim to mirror it.
 	@#
