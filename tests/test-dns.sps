@@ -1665,6 +1665,41 @@
       'still-registered
       'entry-disturbed))
 
+;; A request of the OTHER DNS kind is a request too, so only the kind
+;; comparison tells the seam to leave it. Each DNS seam takes its pointer's
+;; entry in the step that finds it, and puts back one its dispatcher refuses
+;; (#87): this is the case where a seam that asked only uv-req? would keep
+;; the entry its dispatcher raised over.
+(define (other-kind-dns-run slot-name registered-kind req-kind call)
+  (let* ((block (alloc-zeroed 64))
+         (req (%make-uv-req-record block req-kind #f
+                                   (lambda args (set! other-kind-completed 'completed))
+                                   l)))
+    (registry-register! block registered-kind l req)
+    (call (dispatcher-ref slot-name) block)
+    (let* ((raised (guard (e ((uv-callback-error? e) (condition-who e))
+                             (#t (list 'wrong-condition e)))
+                     (uv-run l 'nowait)
+                     'no-raise))
+           (entry (if (eq? req (registry-ref block)) 'still-registered 'entry-disturbed)))
+      (when (eq? entry 'still-registered) (registry-deregister! block))
+      ;; A dispatcher that completed the request freed its block and zeroed
+      ;; its pointer.
+      (unless (eqv? (req-ptr req) 0) (free! block))
+      (list raised entry other-kind-completed))))
+
+(define other-kind-completed 'not-completed)
+
+(test-equal "a getnameinfo request at the getaddrinfo seam: raised by name, entry kept, nothing completed"
+  '(uv-getaddrinfo-dispatch still-registered not-completed)
+  (other-kind-dns-run 'getaddrinfo 'getnameinfo-req 'getnameinfo
+                      (lambda (slot block) (slot block 0 0))))
+
+(test-equal "a getaddrinfo request at the getnameinfo seam: raised by name, entry kept, nothing completed"
+  '(uv-getnameinfo-dispatch still-registered not-completed)
+  (other-kind-dns-run 'getnameinfo 'getaddrinfo-req 'getaddrinfo
+                      (lambda (slot block) (slot block 0 0 0))))
+
 ;; --- pool-pinned queued-tail teardown (S6; ADR-0011; Stage 3's M3 caveat)
 ;; A second loop per attempt: four numeric blockers head the single
 ;; worker's queue (Q3's exactly-measured same-turn regime -- 1000/1000

@@ -890,7 +890,7 @@
 ;; The stub raised before anything could pop or free the block, so this
 ;; suite owns the cleanup -- and the balance rows at the end of the file
 ;; are what would notice if it did not happen.
-(registry-deregister! seam-block)
+(when (registry-ref seam-block) (registry-deregister! seam-block))
 (free! seam-block)
 
 (uv-loop-teardown! seam-loop)

@@ -566,7 +566,19 @@
 (test-equal "the handle entry is still in that same snapshot"
   'listed (if (memq fake-handle (uv-loop-live-handles l0)) 'listed 'missing))
 
-(registry-deregister! (car fake-req))
+;; The close seam takes its pointer's entry out of the registry in the same
+;; locked step that finds it (#87), and puts back one whose object is not a
+;; handle: the close dispatcher records that as an orphan and frees nothing,
+;; so the entry must stay where its owner left it.
+(define close-orphans-before (length (orphan-callback-events)))
+((dispatcher-ref 'close) (car fake-req))
+
+(test-equal "the close seam leaves a request's entry in place, and records an orphan"
+  (list 'same (list (cons 'close (car fake-req))))
+  (list (if (eq? fake-req (registry-ref (car fake-req))) 'same 'disturbed)
+        (list-tail (orphan-callback-events) close-orphans-before)))
+
+(when (registry-ref (car fake-req)) (registry-deregister! (car fake-req)))
 
 (test-equal "registering the same pointer twice is refused, naming who and why"
   '(uv-registry-register! pointer-already-registered)
@@ -1167,11 +1179,42 @@
 (test-equal "the handle-less completion delivered err then the extras, via apply"
   '(#f record-a record-b) synth-delivered)
 
-(test-equal "the handle-less completion deregistered, counted, and zeroed the block"
-  (list 'deregistered 1 0)
+;; The seam takes a completing request's entry out of the registry before it
+;; calls the dispatcher (#87), so complete-request! leaves the registry
+;; alone: called directly, as here, it finds the entry still registered.
+(test-equal "the handle-less completion counted and zeroed the block, and left the registry to the seam"
+  (list 'still-registered 1 0)
   (list (if (registry-ref synth-block) 'still-registered 'deregistered)
         synth-freed
         (req-ptr synth-req)))
+
+(when (registry-ref synth-block) (registry-deregister! synth-block))
+
+;; abandon-request! is complete-request!'s release without a callback, for
+;; the getaddrinfo dispatcher's conversion-failure arm, which no input can
+;; reach (.plans/dns-stage-4-mutation-log.md). Its seam has taken the entry
+;; already, so it too leaves the registry alone; driven directly, here. The
+;; let* orders the reads after the call: Chez may evaluate a list's
+;; arguments right to left.
+(define abandon-block (alloc-zeroed 64))
+(define abandon-delivered 'not-delivered)
+(define abandon-req
+  (%make-uv-req-record abandon-block 'getaddrinfo #f
+                       (lambda args (set! abandon-delivered 'delivered))))
+(registry-register! abandon-block 'getaddrinfo-req sweep-loop abandon-req)
+
+(test-equal "abandon-request! zeroes the request, delivers nothing, and leaves the registry to the seam"
+  '(released 0 still-registered not-delivered)
+  (let* ((released (guard (e (#t (list 'raised e)))
+                     (abandon-request! abandon-req)
+                     'released))
+         (ptr (req-ptr abandon-req))
+         (entry (if (eq? abandon-req (registry-ref abandon-block))
+                    'still-registered
+                    'deregistered)))
+    (list released ptr entry abandon-delivered)))
+
+(when (registry-ref abandon-block) (registry-deregister! abandon-block))
 
 ;; The loop read must happen BEFORE the deregister pops the entry, and its
 ;; answer is where a raising on-complete lands. Since #45 the seam reads it,

@@ -60,6 +60,7 @@
 
           ;; request records
           %make-uv-req-record uv-req?
+          getaddrinfo-req? getnameinfo-req?
           req-ptr set-req-ptr! req-kind req-handle req-loop
           req-on-complete set-req-on-complete!
 
@@ -722,6 +723,43 @@
     (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
       (and entry (registry-entry-object entry))))
 
+  ;; registry-find : uptr -> (or registry-entry #f)
+  ;; A seam's lookup, for a callback that leaves its pointer registered.
+  (define (registry-find ptr)
+    (with-registry-lock (hashtable-ref registry ptr #f)))
+
+  ;; registry-take-accepted! : uptr (object -> boolean) -> (or registry-entry #f)
+  ;; A seam's lookup, for a callback whose dispatcher completes what is
+  ;; registered under PTR: a close, or a request's completion. It finds
+  ;; PTR's entry and deletes it in one use of the lock, where a lookup and
+  ;; the dispatcher's own delete took it twice (#87). An entry whose object
+  ;; ACCEPTS? refuses is put back, in a second use: its dispatcher raises,
+  ;; or records an orphan, and frees nothing, so the entry stays its
+  ;; owner's (tests/test-dns.sps's kind-mismatch rows). No other entry can
+  ;; take PTR meanwhile: its block is still allocated, and only the loop's
+  ;; own thread, which is running this callback, closes or tears down what
+  ;; is registered on that loop. ACCEPTS? is the test the dispatcher makes.
+  ;; The kind check runs after the release, since a lock's body calls only
+  ;; table operations (rule 6 of tests/test-source-rules.sps).
+  (define (registry-take-accepted! ptr accepts?)
+    (let ((entry (with-registry-lock
+                  (let ((entry (hashtable-ref registry ptr #f)))
+                    (when entry (hashtable-delete! registry ptr))
+                    entry))))
+      (when (and entry (not (accepts? (registry-entry-object entry))))
+        (with-registry-lock (hashtable-set! registry ptr entry)))
+      entry))
+
+  ;; What each completing seam takes: the object its dispatcher completes.
+  ;; A dispatcher tests the object with the same predicate, so the seam and
+  ;; the dispatcher cannot disagree on whether an entry is gone.
+  (define (getaddrinfo-req? x) (and (uv-req? x) (eq? (req-kind x) 'getaddrinfo)))
+  (define (getnameinfo-req? x) (and (uv-req? x) (eq? (req-kind x) 'getnameinfo)))
+  (define (take-handle-entry! ptr) (registry-take-accepted! ptr uv-handle?))
+  (define (take-request-entry! ptr) (registry-take-accepted! ptr uv-req?))
+  (define (take-getaddrinfo-entry! ptr) (registry-take-accepted! ptr getaddrinfo-req?))
+  (define (take-getnameinfo-entry! ptr) (registry-take-accepted! ptr getnameinfo-req?))
+
   (define (registry-loop-of ptr)
     (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
       (and entry (registry-entry-loop entry))))
@@ -819,13 +857,13 @@
             (on-connection (status->err status 'uv-listen!))))
         (record-orphan-callback! 'connection server-ptr)))
 
-  ;; Deregister and free the complete request block before invoking user code.
-  ;; REQ is what the seam found registered under BLOCK-PTR. Extra payloads
-  ;; must already be Scheme-owned values.
+  ;; Free the complete request block before invoking user code. REQ is what
+  ;; the seam took out of the registry under BLOCK-PTR (registry-take-
+  ;; accepted!), which it does for exactly the objects uv-req? accepts.
+  ;; Extra payloads must already be Scheme-owned values.
   (define (complete-request! name who count-free! req block-ptr status . extras)
     (if (uv-req? req)
         (let ((on-complete (req-on-complete req)))
-          (registry-deregister! block-ptr)
           (free! block-ptr)
           (count-free!)
           (set-req-ptr! req 0)
@@ -833,10 +871,10 @@
             (apply on-complete (status->err status who) extras)))
         (record-orphan-callback! name block-ptr)))
 
-  ;; Synchronous-start failure uses the same release order without a callback.
+  ;; complete-request!'s release, without a callback, for a request its seam
+  ;; has already taken out of the registry.
   (define (abandon-request! req)
     (let ((ptr (req-ptr req)))
-      (registry-deregister! ptr)
       (free! ptr)
       (set-req-ptr! req 0)))
 
@@ -878,12 +916,13 @@
       (when on-error
         (on-error (uv-errno-condition nread 'uv-read-start!)))))
 
-  ;; The close callback is the sole handle-freeing site. Deregister, free the
-  ;; read buffer and handle, zero the pointer, mark closed, then call user code.
+  ;; The close callback is the sole handle-freeing site. Its seam has taken
+  ;; the handle out of the registry (take-handle-entry!, by uv-handle?). Free
+  ;; the read buffer and handle, zero the pointer, mark closed, then call
+  ;; user code.
   (define (close-dispatch handle handle-ptr)
     (if (uv-handle? handle)
         (begin
-          (registry-deregister! handle-ptr)
           (free-read-buffer! handle)
           (free! handle-ptr)
           (count-handle-free! (handle-kind handle))
@@ -1210,44 +1249,49 @@
 
   ;; This is the outermost Scheme error boundary reachable from libuv, and
   ;; the only one a callback crosses (#45). ENTRY is what the seam found
-  ;; registered under PTR before dispatch: a dispatcher deregisters a
-  ;; completing request or a closing handle before it calls user code, and
-  ;; the address may belong to another object by the time a raise arrives.
+  ;; registered under PTR before dispatch: the seam of a completing request
+  ;; or a closing handle has already taken it out of the registry, and the
+  ;; dispatcher frees the block before it calls user code, so the address
+  ;; may belong to another object by the time a raise arrives.
   (define (contain-dispatcher-raise! name ptr entry obj)
     (if entry
         (loop-record-error! (registry-entry-loop entry) obj)
         (record-orphan-callback! name ptr)))
 
-  ;; (seam-lambda name (ptr arg ...) ...) is a case-lambda with one clause
-  ;; per argument list, so a callback's arguments are never gathered into a
-  ;; rest list. Each clause looks PTR up in the registry once, under its lock
-  ;; (another loop's thread may be changing it), hands the dispatcher the
-  ;; registered object, and contains every raise with one guard; an else
-  ;; clause takes Chez's cheaper guard path. A one-shot continuation would
-  ;; allocate less for an empty callback, but a callback that captures a
-  ;; full continuation, as its own guard does, promotes it and copies the
-  ;; stack: about 4 KB a callback on the mean
+  ;; (seam-lambda name find (ptr arg ...) ...) is a case-lambda with one
+  ;; clause per argument list, so a callback's arguments are never gathered
+  ;; into a rest list. Each clause looks PTR up in the registry with FIND,
+  ;; which takes its lock once (another loop's thread may be changing it;
+  ;; a take its dispatcher would refuse takes it again to put it back),
+  ;; hands the dispatcher the registered object, and contains every raise
+  ;; with one guard; an else clause takes Chez's cheaper guard path. A
+  ;; one-shot continuation would allocate less for an empty callback, but a
+  ;; callback that captures a full continuation, as its own guard does,
+  ;; promotes it and copies the stack: about 4 KB a callback on the mean
   ;; (tests/test-callback-alloc.sps holds both).
   (define-syntax seam-lambda
     (syntax-rules ()
-      ((_ name (ptr arg ...) ...)
+      ((_ name find (ptr arg ...) ...)
        (case-lambda
          ((ptr arg ...)
-          (let ((entry (with-registry-lock (hashtable-ref registry ptr #f))))
+          (let ((entry (find ptr)))
             (guard (e (else (contain-dispatcher-raise! name ptr entry e)))
               ((dispatch-procedure name)
                (and entry (registry-entry-object entry)) ptr arg ...))))
          ...))))
 
-  ;; (seams name ...) builds each seam with its name as a literal, so no
-  ;; closure inside it captures the name: one variable fewer is 16 B less on
-  ;; every callback. The trampolines pass one to four arguments (native.sls).
-  ;; install-callback-dispatchers! refuses a set that does not name every
-  ;; slot in dispatcher-names exactly once.
+  ;; (seams (name find) ...) builds each seam with its name as a literal, so
+  ;; no closure inside it captures the name: one variable fewer is 16 B less
+  ;; on every callback. FIND is registry-find for a callback that leaves its
+  ;; pointer registered, and a take for one whose dispatcher completes it,
+  ;; which deletes the entry as it finds it. The trampolines pass one to
+  ;; four arguments (native.sls). install-callback-dispatchers! refuses a
+  ;; set that does not name every slot in dispatcher-names exactly once.
   (define-syntax seams
     (syntax-rules ()
-      ((_ name ...)
-       (list (cons 'name (seam-lambda 'name (a) (a b) (a b c) (a b c d))) ...))))
+      ((_ (name find) ...)
+       (list (cons 'name (seam-lambda 'name find (a) (a b) (a b c) (a b c d)))
+             ...))))
 
   ;; Use definitions for library-body effects; R6RS requires definitions before
   ;; expressions, and wiring must complete before a callback can fire.
@@ -1267,7 +1311,18 @@
                       (cons 'connect    connect-dispatch)
                       (cons 'read       read-dispatch)))
       (install-callback-dispatchers!
-       (seams read connection write-done close timer shutdown connect
-              getaddrinfo getnameinfo exit walk signal async))
+       (seams (read registry-find)
+              (connection registry-find)
+              (write-done take-request-entry!)
+              (close take-handle-entry!)
+              (timer registry-find)
+              (shutdown take-request-entry!)
+              (connect take-request-entry!)
+              (getaddrinfo take-getaddrinfo-entry!)
+              (getnameinfo take-getnameinfo-entry!)
+              (exit registry-find)
+              (walk registry-find)
+              (signal registry-find)
+              (async registry-find)))
       (install-close-handle! real-close-handle!)
       'wired)))

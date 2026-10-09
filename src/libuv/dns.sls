@@ -289,7 +289,7 @@
        (uv-freeaddrinfo res)
        (complete-request! 'getaddrinfo 'uv-getaddrinfo!
                           count-getaddrinfo-req-free! req block-ptr status))
-      ((not (and (uv-req? req) (eq? (req-kind req) 'getaddrinfo)))
+      ((not (getaddrinfo-req? req))
        (raise (condition
                (make-uv-error)
                (make-who-condition 'uv-getaddrinfo-dispatch)
@@ -315,7 +315,7 @@
       ((not req)
        (complete-request! 'getnameinfo 'uv-getnameinfo!
                           count-getnameinfo-req-free! req block-ptr status))
-      ((not (and (uv-req? req) (eq? (req-kind req) 'getnameinfo)))
+      ((not (getnameinfo-req? req))
        (raise (condition
                (make-uv-error)
                (make-who-condition 'uv-getnameinfo-dispatch)
