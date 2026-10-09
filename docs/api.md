@@ -101,25 +101,50 @@ callback strands the rest of libuv's batch of closes), the loop is left
 marked running instead, and its body cannot be re-entered either way. An engine whose fuel runs out inside a callback is different,
 because it can be resumed. The loop stays marked running while the engine is
 suspended, so nothing can run, close or free the loop under it, and resuming
-the engine finishes the run. Inside `call-with-uv-loop` the suspension is an
+the engine finishes the run, as long as it is resumed as the next paragraph
+says. Inside `call-with-uv-loop` the suspension is an
 exit like any other: the loop is torn down, and resuming the engine raises
 `&uv-handle-closed`.
 
+Resume such an engine on the thread whose fuel ran out, and not from inside
+a callback entered after it. A callback returns by jumping back to the C
+frame that called it, and that jump abandons every callback entered after
+it on the thread that has not yet returned. Two cases follow:
+- Of two engines suspended inside callbacks on one thread, resume the later
+  one first. Resumed the other way, the earlier one finishes its run, but
+  the later one's callback has no frame left to return to. Resuming it
+  raises Chez's "attempt to return to stale foreign context", and its loop
+  is left as an escape leaves it: marked running for good.
+- A scheduler that resumes engines from inside a callback of its own loop,
+  a timer's or an idle handle's, abandons that callback. The engine finishes
+  its run, but the scheduler's callback cannot return: its `uv-run` raises
+  the same error, and the scheduler's loop is left marked running.
+
+Resumed on another thread, an engine raises the same error, since that
+thread's chain of C frames never held the callback's.
+
 An escape also costs its thread stack. The C frames of the `uv_run` a
 continuation leaves stay on the thread's stack for as long as the thread
-lives. Measured with `call-with-uv-loop` bodies that each leave from a timer
-callback: on Linux, 16,000 to 20,000 of them filled an 8 MB stack and the
-process died with `SIGSEGV`. On macOS the main thread held 20,000 to 40,000,
-and a thread made with `fork-thread` 1,000 to 2,000, after which it hung. A
-program that leaves callbacks by continuation as a habit should do it on a
-thread it can end.
+lives, and an engine dropped inside a callback leaves them the same way.
+Measured with `call-with-uv-loop` bodies that each leave from a timer
+callback, an escape costs about 400 bytes of stack on Linux x86-64, and 400
+to 500 on arm64. On arm64, 16,000 to 20,000 of them filled an 8 MB stack
+and the process died with `SIGSEGV`, and on x86-64, 20,000 to 24,000; a
+thread made with `fork-thread` held 16,000 on both. On macOS the main
+thread held 20,000 to 40,000, and a thread made with `fork-thread` 1,000 to
+2,000, after which it hung. A raise costs nothing: the seam catches it
+inside the callback, which then returns. Neither does an engine that is
+resumed. Short of the thread's end, the frames go only when a callback
+entered before them returns, so a program that leaves callbacks by
+continuation as a habit should do it on a thread it can end.
 
-It costs heap as well, and that a thread's end does not give back. Chez
-allocates a block for each call from C into Scheme, a callback included,
-and frees it when the call returns; an escape never returns, so the block
-stays allocated until the process exits: 312 bytes an escape on Linux
-arm64. An engine dropped while it is inside a callback costs the same
-block; one that is resumed costs nothing.
+It costs heap as well, and neither of those gives it back. Chez allocates
+a block for each call from C into Scheme, a callback included, and frees it
+when the call returns; an escape never returns, so the block stays
+allocated until the process exits: 312 bytes an escape on Linux arm64, 200
+on x86-64. An engine dropped while it is inside a callback costs the same
+block, and so does one whose callback a resume out of order abandoned,
+whether it is resumed or not. One that is resumed in order costs nothing.
 
 ## Handles — `(libuv handle)`
 
@@ -206,7 +231,10 @@ handed to another thread raises `&uv-wrong-thread`. Before, a write or a
 shutdown resumed after a handoff made its call on a stream the other
 thread now owned, and returned normally. A verb whose engine is never
 resumed leaves nothing behind: either it had not begun, or libuv holds its
-request and the request's completion frees it.
+request and the request's completion frees it. That is the verb's own
+promise. If the verb ran inside a callback, the dropped engine leaves the
+callback as an escape leaves it, at the cost given under
+[the loop](#the-loop--libuv-loop).
 
 The constructors (`make-uv-loop`, `make-uv-timer`, `make-uv-tcp`,
 `make-uv-pipe`, `make-uv-signal`, `make-uv-async`) and `uv-accept!` make

@@ -264,6 +264,29 @@ None is obvious from reading the code.
   thread's end does not free; so does an engine dropped inside a callback. Valgrind calls it reachable or definitely
   lost by collection timing, so the gate suppresses exactly it
   (`tests/valgrind-chez.supp`; #94, ADR-0003's amendment of 2026-10-09).
+* **A return from a callback abandons every callback entered after it on
+  the thread that has not returned.** Chez's `S_return` longjmps to the
+  frame that entered the callback and drops every newer context from the
+  thread's chain. So engines suspended inside callbacks resume latest
+  first, and never from inside a callback entered after them. Of two
+  engines suspended in callbacks on one thread, resuming the earlier one
+  finishes its run, and the later one then raises "attempt to return to
+  stale foreign context". Its loop is left marked running for good. A
+  scheduler that resumes an engine from its own timer callback finishes
+  the engine, and then its own `uv-run` raises the same error. A
+  round-robin engine scheduler on one thread has the first order, and
+  docs/api.md promised that resuming always finishes the run.
+  - The same jump gives the stack back. 40,000 escapes, in batches of
+    1,000 above an engine resumed after each batch, never grew the stack
+    past one batch.
+  - It does not give the heap back. `S_call_help` sets `CCHAIN` to the
+    returning context *before* its walk "to unlock code objects that we're
+    escaping past" (schlib.c:257-258). The walk stops at once, so the
+    newer contexts' `jmp_buf`s are never freed, and their code objects
+    stay immobilized.
+  - test-loop's "two runs suspended inside callbacks" rows hold both
+    orders and the scheduler's case
+    (`.plans/escape-costs-mutation-log.md`).
 
 ### The event loop and child processes
 

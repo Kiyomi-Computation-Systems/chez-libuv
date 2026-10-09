@@ -1462,6 +1462,139 @@
 (test-equal "the escaped run's loop tears down once the suite clears its mark"
   'torn-down (tear-down-row-loop escaped-loop))
 
+;; --- two runs suspended inside callbacks on one thread (#94) -----------
+;; Each callback is entered from C, and a return from it longjmps to the C
+;; frame that entered it. Returning to an older frame abandons every frame
+;; entered after it on the thread, so of two engines suspended inside
+;; callbacks, the later one must be resumed first. Resumed the other way, the
+;; later one's callback has no frame left to return to: Chez raises instead,
+;; and its run is left as an escape leaves it.
+
+;; suspend-in-callback : uv-loop -> (list first-slice counts)
+;; Starts a run of `loop` in an engine and lets the engine run out of fuel
+;; inside the run's timer callback. `counts` is #(entries inside?): how many
+;; times the callback was entered, and whether it is still inside.
+(define (suspend-in-callback loop)
+  (let ((counts (vector 0 #f)))
+    (uv-timer-start! (make-uv-timer loop)
+                     (lambda (t)
+                       (vector-set! counts 1 #t)
+                       (vector-set! counts 0 (+ (vector-ref counts 0) 1))
+                       (spin 200000)
+                       (vector-set! counts 1 #f))
+                     0 0)
+    (list (run-slice (make-engine (lambda () (uv-run loop 'default))) slice-fuel)
+          counts)))
+
+(define (suspended-inside? s)
+  (list (car (car s)) (vector-ref (cadr s) 1)))
+
+(define (resume-suspended s)
+  (if (eq? (car (car s)) 'suspended)
+      (run-slice (cadr (car s)) 100000000)
+      'never-suspended))
+
+(define (marked l) (if (loop-running? l) 'running 'not-running))
+
+(define lifo-early-loop (make-uv-loop))
+(define lifo-late-loop (make-uv-loop))
+(define lifo-early (suspend-in-callback lifo-early-loop))
+(define lifo-late (suspend-in-callback lifo-late-loop))
+
+(test-equal "seed: both engines ran out of fuel inside their callbacks"
+  '((suspended #t) (suspended #t))
+  (list (suspended-inside? lifo-early) (suspended-inside? lifo-late)))
+
+(define lifo-late-resumed (resume-suspended lifo-late))
+(define lifo-early-resumed (resume-suspended lifo-early))
+
+(test-equal "resumed later one first, both engines finish their callbacks and runs"
+  '((finished #f) #(1 #f) (finished #f) #(1 #f))
+  (list lifo-late-resumed (cadr lifo-late)
+        lifo-early-resumed (cadr lifo-early)))
+
+(test-equal "...after which neither loop is marked running"
+  '(not-running not-running)
+  (map marked (list lifo-early-loop lifo-late-loop)))
+
+;; Torn down as they are, without the suite's hand on the mark: a loop the
+;; runs left marked running is refused here.
+(define (tear-down-as-is loop)
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (uv-loop-teardown! loop)
+    'torn-down))
+
+(test-equal "both loops resumed in that order tear down as they are"
+  '(torn-down torn-down)
+  (map tear-down-as-is (list lifo-early-loop lifo-late-loop)))
+
+(define fifo-early-loop (make-uv-loop))
+(define fifo-late-loop (make-uv-loop))
+(define fifo-early (suspend-in-callback fifo-early-loop))
+(define fifo-late (suspend-in-callback fifo-late-loop))
+
+(test-equal "seed: both engines ran out of fuel inside their callbacks, again"
+  '((suspended #t) (suspended #t))
+  (list (suspended-inside? fifo-early) (suspended-inside? fifo-late)))
+
+(define fifo-early-resumed (resume-suspended fifo-early))
+
+(test-equal "resumed earlier one first, the earlier engine finishes its run"
+  '((finished #f) #(1 #f) not-running)
+  (list fifo-early-resumed (cadr fifo-early) (marked fifo-early-loop)))
+
+(define fifo-late-resumed (resume-suspended fifo-late))
+
+(test-equal "...and the later one's return to its callback's frame is refused by Chez"
+  '(raised "Exception: attempt to return to stale foreign context")
+  fifo-late-resumed)
+
+(test-equal "...and its loop stays marked running, as an escape leaves it"
+  'running (marked fifo-late-loop))
+
+(test-equal "...so uv-run refuses it from then on"
+  '(uv-run loop-running)
+  (refusal-of-marked fifo-late-loop (lambda () (uv-run fifo-late-loop 'nowait))))
+
+;; As with the escape above, the stale callback was a timer's, after which
+;; libuv's state is whole, so the suite may clear the mark by hand.
+(test-equal "both loops resumed in that order tear down once the suite clears the mark"
+  '(torn-down torn-down)
+  (map tear-down-row-loop (list fifo-early-loop fifo-late-loop)))
+
+;; A scheduler that resumes an engine from inside a callback of its own loop
+;; abandons that callback: the engine's return jumps past it.
+(define resumed-loop (make-uv-loop))
+(define scheduled (suspend-in-callback resumed-loop))
+(define scheduler-loop (make-uv-loop))
+(define resumed-from-callback 'never-resumed)
+(uv-timer-start! (make-uv-timer scheduler-loop)
+                 (lambda (t)
+                   (set! resumed-from-callback (resume-suspended scheduled)))
+                 0 0)
+
+(test-equal "seed: the engine ran out of fuel inside its callback, once more"
+  '(suspended #t) (suspended-inside? scheduled))
+
+(define scheduler-run
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (uv-run scheduler-loop 'default)))
+
+(test-equal "an engine resumed from inside another loop's callback finishes its run"
+  '((finished #f) #(1 #f) not-running)
+  (list resumed-from-callback (cadr scheduled) (marked resumed-loop)))
+
+(test-equal "...and the scheduler's callback is refused its return by Chez"
+  '(raised "Exception: attempt to return to stale foreign context")
+  scheduler-run)
+
+(test-equal "...and the scheduler's loop stays marked running"
+  'running (marked scheduler-loop))
+
+(test-equal "both loops tear down once the suite clears the scheduler's mark"
+  '(torn-down torn-down)
+  (list (tear-down-as-is resumed-loop) (tear-down-row-loop scheduler-loop)))
+
 ;; --- call-with-uv-loop after a run left from inside a callback (#45) ----
 ;; call-with-uv-loop's loop does not outlive it. Its exit tears the loop down
 ;; even when the body left from inside one of the loop's callbacks, leaving
