@@ -162,7 +162,9 @@ which passed with 21 escape blocks suppressed. After the review, on
 ad3bb47: `make test`, `make check-purity`, and the Valgrind run (25 rows,
 0 bytes definitely lost, 21 escape blocks suppressed) again.
 
-**Not run on macOS.** The tick bands above are measured on Linux. The sweep
-finds its own first slice, so a different count on macOS changes where it
-starts, not what the row asks. One `make test` on a Mac, with N3 planted
-once, would settle the issue's "both platforms".
+**macOS** (the user's run, on #112's branch): `make test` passed, with
+test-loop-claim at 38 passes. With N3 planted, the new row failed by name
+with the same evidence as on Linux, `(((47 5 claimed-by-this-thread))
+reached)`, so macOS reaches the exit at the same tick. The exit race failed
+too, `(2 stopped)`: test-loop-claim had 36 passes and 2 failures, and no
+other suite failed. CI passed on both Linux jobs.
