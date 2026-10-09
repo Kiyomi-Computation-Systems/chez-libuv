@@ -219,9 +219,13 @@
     (set-box! mark #f))
 
   ;; require-loop-thread : uv-loop symbol -> unspecified
-  ;; The single affinity predicate. Raised BEFORE any registry mutation, so a
-  ;; wrong-thread verb is a named refusal, never the registry corruption it
-  ;; would otherwise cause.
+  ;; The affinity check on a verb's entry, so that a caller on the wrong
+  ;; thread is told so before the verb reads its other arguments or makes
+  ;; anything (require-open-handle, make-uv-async, the lookups, uv-spawn!).
+  ;; It does not guard the native call: an engine can suspend the verb after
+  ;; it while the loop is handed on, so the step checks again
+  ;; (owned-loop-ptr, owned-handle-ptr). Raised before any registry
+  ;; mutation, so a wrong-thread verb is a named refusal.
   (define (require-loop-thread loop who)
     (let ((owner (loop-owner-thread loop))
           (caller (current-thread-id)))

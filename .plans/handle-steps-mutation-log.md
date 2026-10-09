@@ -537,8 +537,9 @@ control): 0 for each query, on main and after.
 
 ## Mutants
 
-Driver as in part two (scratchpad `g3/mut/`: `mutants.py`, `window.py`),
-on a copy of the committed `src/` and `tests/`. Of the 20 source mutants,
+Driver as in part two (scratchpad `g3/mut/`: `mutants.py`, `window.py`,
+and `l2b.py` for L2b and W-L2b), on a copy of the committed `src/` and
+`tests/`. Of the 20 source mutants,
 14 are killed by name, 5 are equivalent in the committed code, each
 killed once a window is opened, and 1 is equivalent in any build.
 
@@ -592,3 +593,39 @@ window:
   test-memory` (ASan, 25 suites).
 - Debian 12 aarch64 (the Valgrind image), vendored: `make test`, `make
   check-memory-gate`, `make test-memory`.
+
+## Part three: the review's follow-ups
+
+PR #107's review (2026-10-09, /code-review xhigh) found seven things. Two
+are fixed here, one went to #102 as a comment, one was refuted by
+measurement, and three are left.
+
+- **`uv-update-time!` now builds its wrong-thread refusal after its
+  step**, reading the owner again (#102's defect), where
+  `require-loop-thread` built it from the owner it had just compared. #102
+  gained a comment adding it, with the six copies of the
+  `'wrong-thread`/`step-refusal` mapping its fix will have to change.
+- **`require-loop-thread`'s comment called it "the single affinity
+  predicate".** It is the entry check now, and the comment says so, and
+  that the steps check again.
+- **This log named only `mutants.py` and `window.py`;** L2b and W-L2b ran
+  from `l2b.py`, which it now names.
+- **Refuted: "the fill does nothing for loops".** The review took a loop
+  block (1072 B on macOS) to be above glibc's tcache limit (1032 B), so
+  that only the hunt could land it. On Linux `uv_loop_size` is 856 B, and
+  the fill counts (scratchpad `g3/nofill/`, the loop fill skipped, with
+  each restart printed):
+
+  | Platform | With the fill | Without it |
+  |---|---|---|
+  | glibc 2.36, 2 and 3 runs | no restart | the first loop reuse run (`uv-stop!`, fuel 1) restarts once, every run |
+  | macOS, 3 and 5 runs | `uv-stop!` restarts once at fuel 1 | it restarts once at fuel 2 |
+
+  So the fill stays, for loops as for handles.
+
+Left: the `'wrong-thread`/`step-refusal` mapping written out a sixth time
+(#102's fix is where to fold it); the loop sweeps living in a suite named
+for handles, since moving them means copying its harness (#103); and
+`loop-call`'s rule that its native never answers a symbol, held only by a
+comment, which no native today can break (each answers void, an int or an
+unsigned-64).
