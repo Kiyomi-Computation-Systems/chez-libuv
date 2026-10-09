@@ -191,9 +191,9 @@
                            (if (zero? rc)
                                client
                                (begin (begin-close! client #f) rc))))))))))
-      (cond ((uv-handle? accepted) accepted)
-            ((eq? accepted 'wrong-thread) (raise (wrong-thread-refusal loop 'uv-accept!)))
-            (else (raise (step-refusal accepted 'uv-accept! server))))))
+      (if (uv-handle? accepted)
+          accepted
+          (raise (step-refusal accepted 'uv-accept! server)))))
 
   ;; uv-tcp-connect! : uv-tcp string exact-nonnegative-integer procedure
   ;;                   -> uv-request
@@ -229,10 +229,9 @@
                                   count-connect-req-new! count-connect-req-free!
                                   (uv-tcp-connect-native block ptr addr))
                                  (begin (free-block! block) filled))))))))))
-        (cond ((uv-req? started) started)
-              ((eq? started 'wrong-thread)
-               (raise (wrong-thread-refusal loop 'uv-tcp-connect!)))
-              (else (raise (step-refusal started 'uv-tcp-connect! tcp)))))))
+        (if (uv-req? started)
+            started
+            (raise (step-refusal started 'uv-tcp-connect! tcp))))))
 
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
   ;; Require a boolean because Scheme's 0 is true while C's 0 is false.

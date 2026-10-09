@@ -199,3 +199,43 @@ The uncovered ones:
 | T2 | no restart for a missed landing | survived on the committed suite, where no run restarts: a guard |
 | T3 | no `(collect)` before an attempt | survived: no collection came due inside a step in these runs; the premise's guard, as in test-request-steps and test-process-steps |
 | T4 | the handoff changes nothing | **killed**: handoff and handoff-reach |
+
+## The review's follow-ups
+
+PR #101's review (2026-10-09, /code-review xhigh) found nine things. Seven
+are fixed here; two are filed as issues of their own (below).
+
+**The suite's plumbing.** Each was reproduced on the committed suite first,
+with one edit in a scratch copy, then run against the fixed one.
+
+| Probe | Committed suite | Fixed suite |
+|---|---|---|
+| P1: the peer target connects to 10.255.255.1, which never answers | each peer sweep blocked in `'once` until macOS's own connect timeout: **300 s**, `make test`'s per-suite cap | the connect ticks (`run-until/ticking`, 4000) and gives up: `connect-never-completed`, every row named, **20 s** |
+| P2: the peer target connects to port 1, refused | the peer sweep stopped by name, and the **next sweep's first bind run** reported `left ((registry -1) (tcp -1) (block -1))`: the refused client's close, completed inside it | the refused client's close is run to its end in `prepare`; the bind runs are clean |
+| P3: the server's `uv-listen!` refused (backlog −1) | the suite **exited 255** before any row | a precondition row fails by name, `(listen-raised … backlog-out-of-range)`, and the suite runs to its end |
+
+**`step-refusal` and `'wrong-thread`.** The clause read the handle's loop,
+and the constructors, the lookups, `uv-spawn!` and the loop verbs call
+`step-refusal` with no handle. Each of those refuses `'wrong-thread` for its
+loop before, so none reached the clause, but nothing held that. The clause
+now maps `'wrong-thread` only when it has a handle; without one it is WHO's
+own named refusal, carrying no owner. `uv-tcp-connect!` and `uv-accept!`
+dropped their own `'wrong-thread` intercepts, which now duplicated it, and
+test-loop's status table gained the clause.
+
+| Mutant | Change | Result |
+|---|---|---|
+| W1 | the clause reads the loop of a missing handle | **killed**: test-loop, "step-refusal names 'wrong-thread from a step with no handle …" |
+| W2 | the clause removed | **killed**: test-loop's status table, and the handoff sweeps of test-handle-steps, test-request-steps (connect) and test-constructors (accept); test-constructor-owner passes, its accept refusals coming from the entry check |
+
+**The landing's cost.** The cache fill now runs in reuse runs only, and
+neither it nor the block hunt runs under a memory tool. The suite took 10 s
+under Valgrind before and after: the change saves nothing measurable, and
+stays because it does no harm.
+
+Under Valgrind (Debian 12 aarch64) test-handle-steps (16 rows), test-loop,
+test-request-steps, test-constructors and test-tcp pass, each with nothing
+lost; test-loop's 936 B in 3 blocks is its escape allowance.
+
+**Filed, not fixed here:** the sweep helpers copied into five suites (#103), and
+`wrong-thread-refusal` reading the owner after the step (#102).

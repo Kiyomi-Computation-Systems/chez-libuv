@@ -635,6 +635,9 @@
 ;; or constructor refuses the same way whichever check catches it.
 (define (refusal-shape c)
   (cond ((uv-handle-closed? c) (list 'handle-closed (uv-handle-closed-kind c)))
+        ((uv-wrong-thread? c)
+         (list 'wrong-thread (uv-wrong-thread-who c)
+               (if (eqv? (uv-wrong-thread-expected c) (current-thread-id)) 'owner-is-me 'other)))
         ((uv-invalid-argument? c)
          (list 'invalid (uv-invalid-argument-who c) (uv-invalid-argument-reason c)))
         ((uv-errno-error? c) (list 'errno (condition-who c) (uv-errno-error-errno c)))
@@ -642,6 +645,7 @@
 
 (test-equal "step-refusal raises each status as the checks outside a step do"
   '((handle-closed timer)
+    (wrong-thread uv-test-verb! owner-is-me)
     (invalid uv-test-verb! null-handle-pointer)
     (handle-closed loop)
     (invalid uv-test-verb! null-loop-pointer)
@@ -653,11 +657,18 @@
          (t (make-uv-timer l))
          (shapes (map (lambda (status)
                         (refusal-shape (step-refusal status 'uv-test-verb! t)))
-                      (list 'not-open 'no-pointer 'loop-not-open 'no-loop-pointer
+                      (list 'not-open 'wrong-thread 'no-pointer 'loop-not-open 'no-loop-pointer
                             'no-memory 'pointer-already-registered
                             'span-out-of-range (errno-symbol->value 'EBADF)))))
     (uv-loop-teardown! l)
     shapes))
+
+;; A step with no handle to pass (a constructor's, a lookup's) refuses
+;; 'wrong-thread for its loop itself, before step-refusal. One that sends it
+;; here anyway is named, and raises nothing in the building.
+(test-equal "step-refusal names 'wrong-thread from a step with no handle as the verb's own refusal"
+  '(invalid uv-test-verb! wrong-thread)
+  (refusal-shape (step-refusal 'wrong-thread 'uv-test-verb! #f)))
 
 ;; --- the callback error policy (design spec S8) -------------------------
 ;; The dispatcher guard that CALLS loop-record-error! arrives with Task 7;

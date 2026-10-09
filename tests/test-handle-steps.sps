@@ -36,6 +36,7 @@
               uv-handle-size)
         (only (libuv private constants) uv-tcp-type)
         (uv-sweep)
+        (only (uv-testing) run-until/ticking)
         (only (uv-evidence) describe under-memory-tool?)
         ;; make-engine drives the sweeps; the interrupt pair checks that no
         ;; run leaves interrupts disabled; collect starts each run with no
@@ -143,7 +144,8 @@
 ;; its own, which accepts and closes each connection when finish! runs it.
 ;; Unconnected, the query raises ENOTCONN after its step, and the work of
 ;; that raise is where an engine could expire after the call, which the
-;; split oracle below rules out.
+;; split oracle below rules out. The server's setup can fail, so it answers
+;; what it saw, and a row below names it before any sweep relies on it.
 (define sv-loop (make-uv-loop))
 (define sv (make-uv-tcp sv-loop))
 
@@ -152,39 +154,48 @@
     (uv-tcp-bind! sv "127.0.0.1" 0)
     (uv-tcp-getsockname-port sv)))
 
-(uv-listen! sv 128
-            (lambda (err)
-              (unless err
-                (guard (e (#t #f))
-                  (uv-close! (uv-accept! sv))))))
+(define sv-listening
+  (guard (e (#t (list 'listen-raised (describe e))))
+    (uv-listen! sv 128
+                (lambda (err)
+                  (unless err
+                    (guard (e (#t #f))
+                      (uv-close! (uv-accept! sv))))))
+    'listening))
 
-;; connect! : uv-tcp -> (or 'connected list)
-;; Connects TCP to the server, running h-loop until the connect completes,
-;; at most 64 times.
+;; connect! : uv-tcp -> (or 'connected object)
+;; Connects TCP to the server and runs h-loop until the connect completes,
+;; ticking, so that a connect that never completes gives up after about 4 s
+;; instead of blocking 'once until the kernel's own timeout.
 (define (connect! tcp)
   (let ((status #f))
     (guard (e (#t (list 'connect-raised (describe e))))
       (uv-tcp-connect! tcp "127.0.0.1" sv-port
                        (lambda (err) (set! status (if err (describe err) 'connected))))
-      (let step ((i 0))
-        (cond (status status)
-              ((= i 64) 'connect-never-completed)
-              (else (uv-run h-loop 'once) (step (+ i 1))))))))
+      (if (eq? (run-until/ticking h-loop (lambda () status) 4000) 'satisfied)
+          status
+          'connect-never-completed))))
 
 ;; prepare : symbol -> (or uv-tcp list)
 ;; A new client of h-loop: unbound for the bind, which binds it, connected
 ;; for the peer query, and bound to a loopback port for every other verb,
-;; which needs a socket to ask.
+;; which needs a socket to ask. A client it cannot prepare is closed, and
+;; the close run to its end, so that no later run counts it in its balance
+;; and finds it gone.
 (define (prepare verb)
   (let ((tcp (make-uv-tcp h-loop)))
+    (define (refuse why)
+      (uv-close! tcp)
+      (poll! (lambda () (settled? tcp)))
+      why)
     (cond ((eq? verb 'uv-tcp-bind!) tcp)
           ((eq? verb 'uv-tcp-peer-address)
            (let ((connected (connect! tcp)))
              (if (eq? connected 'connected)
                  tcp
-                 (begin (uv-close! tcp) (list 'not-connected connected)))))
+                 (refuse (list 'not-connected connected)))))
           (else
-           (guard (e (#t (uv-close! tcp) (list 'bind-raised (describe e))))
+           (guard (e (#t (refuse (list 'bind-raised (describe e)))))
              (uv-tcp-bind! tcp "127.0.0.1" 0)
              tcp)))))
 
@@ -265,23 +276,28 @@
 
 ;; new-client-at! : uptr -> uv-tcp
 ;; A new client of h-loop, made where FREED was if the allocator allows.
+;; Under a memory tool, which never hands a freed block back, it is made
+;; wherever the tool puts it.
 (define (new-client-at! freed)
-  (let* ((held (occupy! freed))
-         (landed? (= (car held) freed)))
-    (when landed? (free-block! (car held)))
-    (let ((new (make-uv-tcp h-loop)))
-      (for-each free-block! (if landed? (cdr held) held))
-      new)))
+  (if under-memory-tool?
+      (make-uv-tcp h-loop)
+      (let* ((held (occupy! freed))
+             (landed? (= (car held) freed)))
+        (when landed? (free-block! (car held)))
+        (let ((new (make-uv-tcp h-loop)))
+          (for-each free-block! (if landed? (cdr held) held))
+          new))))
 
 (define (change! mode target)
   (case mode
     ((handoff) (set-loop-owner-thread! h-loop other-thread) #f)
     (else
-     (let ((old (handle-ptr target)))
-       (fill-cache!)
+     (let ((old (handle-ptr target))
+           (reuse? (eq? mode 'reuse)))
+       (when (and reuse? (not under-memory-tool?)) (fill-cache!))
        (uv-close! target)
        (poll! (lambda () (settled? target)))
-       (and (eq? mode 'reuse) (new-client-at! old))))))
+       (and reuse? (new-client-at! old))))))
 
 ;; The refusal a resumed verb owes each change.
 (define (refusal-for mode)
@@ -429,6 +445,12 @@
             sweeps))
 
 (define (good-split? v) (memq v '(refused untouched)))
+
+;; The peer query's sweeps connect to this server, and stop at their first
+;; run with (not-prepared ...) if they cannot.
+(test-equal "precondition: the peer query's server listens on a loopback port"
+  'listening
+  (if (integer? sv-port) sv-listening (list 'no-port sv-port)))
 
 ;; The sweeps that can only fail by name run first, the one a wrong run
 ;; could fault in last (AGENTS.md: emit a sweep's row as soon as it ends).
