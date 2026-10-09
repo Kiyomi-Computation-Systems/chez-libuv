@@ -229,6 +229,11 @@ None is obvious from reading the code.
   at 2,000 it hung inside Chez, with no crash and no message. A suite that
   escapes callbacks in bulk (test-loop-claim's exit race) runs them in
   batches on threads it lets end, and docs/api.md tells users the cost.
+  Each escape also strands a heap block, the `jmp_buf` Chez's `S_call_help`
+  mallocs for the call into Scheme (312 B on aarch64 glibc), which even a
+  thread's end does not free; so does an engine dropped inside a callback. Valgrind calls it reachable or definitely
+  lost by collection timing, so the gate suppresses exactly it
+  (`tests/valgrind-chez.supp`; #94, ADR-0003's amendment of 2026-10-09).
 
 ### The event loop and child processes
 
@@ -331,6 +336,13 @@ None is obvious from reading the code.
     The banner shows ASan is in Chez only when its `==PID==` is Chez's own.
     Better, ask through `check-memory-gate`: its `shim-overrun` mode now
     holds that answer.
+* **A suppression is a check's business, not a comment's.** The gate has
+  one, `tests/valgrind-chez.supp`, for the block Chez strands on each
+  callback escape, and it was only added once a check could prove it:
+  `make check-memory-gate`'s escape mode requires it to suppress exactly
+  the three blocks three escapes strand, and the leak modes require it to
+  hide none of theirs. A new suppression gets the same: a mode that counts
+  what it hides, and a planted leak it must not.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.

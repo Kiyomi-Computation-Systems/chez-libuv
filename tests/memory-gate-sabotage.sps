@@ -28,8 +28,8 @@
 ;;;                  in src/libuv-shim.c (chez_uv_copy_in). Valgrind sees it.
 ;;;                  ASan sees it only because that memcpy ends in libc's,
 ;;;                  which ASan interposes; a copy that bypassed libc would
-;;;                  be as invisible to it as a Scheme store. The only mode
-;;;                  that loads the binding, at run time, so that the others
+;;;                  be as invisible to it as a Scheme store. It loads the
+;;;                  binding at run time, as escape does, so that the others
 ;;;                  stay the programs their reports were measured on.
 ;;;   leak           777 bytes allocated and never freed. Valgrind only; the
 ;;;                  macOS arm makes no leak claim (no LeakSanitizer on arm64).
@@ -39,6 +39,15 @@
 ;;;                  "possibly lost". Not a defect the gate must catch: it
 ;;;                  checks that the gate never fails on a leak kind it does
 ;;;                  not print. Linux only.
+;;;   escape         three call-with-uv-loop bodies, each left from a timer
+;;;                  callback by a continuation captured outside it. Each
+;;;                  escape strands the jmp_buf Chez's S_call_help mallocs
+;;;                  for the call from libuv into Scheme (#94), which the
+;;;                  gate suppresses (tests/valgrind-chez.supp). Not a
+;;;                  defect the gate must catch: check-memory-gate requires
+;;;                  the gate to pass on it, with Valgrind counting three
+;;;                  blocks suppressed, so a suppression that no longer
+;;;                  matches fails by name. Loads the binding. Linux only.
 ;;;
 ;;; The sizes are sentinels. The tool's report names them, and nothing else in
 ;;; a run allocates blocks of exactly these sizes to overrun or lose.
@@ -107,8 +116,23 @@
    (let ((p (foreign-alloc 555)))
      (bytevector-uint-set! interior-pointer-holder 8 (+ p 8)
                            (native-endianness) (foreign-sizeof 'uptr))))
+  ((equal? mode "escape")
+   (let* ((libs (environment '(libuv loop) '(libuv timer)))
+          (call-with-uv-loop (eval 'call-with-uv-loop libs))
+          (uv-run (eval 'uv-run libs))
+          (make-uv-timer (eval 'make-uv-timer libs))
+          (uv-timer-start! (eval 'uv-timer-start! libs)))
+     (let escape ((i 0))
+       (when (< i 3)
+         (call/cc
+          (lambda (k)
+            (call-with-uv-loop
+             (lambda (loop)
+               (uv-timer-start! (make-uv-timer loop) (lambda (t) (k 'escaped)) 0 0)
+               (uv-run loop 'default)))))
+         (escape (+ i 1))))))
   (else
-   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, shim-overrun, leak or possible-leak\n"
+   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, shim-overrun, leak, possible-leak or escape\n"
             (current-error-port))
    (exit 2)))
 (say "planted")

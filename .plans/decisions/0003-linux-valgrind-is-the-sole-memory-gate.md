@@ -227,3 +227,49 @@ should it appear.
 > still reported. The prod shim (`-O2`) already imports plain `memcpy` and
 > `bzero`. Evidence: `.plans/memory-gate-mutation-log.md`, "The shim's own
 > copies (2026-10-06)".
+
+> **Amended 2026-10-09 (#94, found gating #85): the gate's first
+> suppression, for a block Chez strands on every callback escape.**
+> `S_call_help`, Chez's entry from C into Scheme, mallocs a `jmp_buf` for
+> each call and frees it only when that call returns. A continuation that
+> escapes a libuv callback never returns through it, and nor does an engine
+> dropped while inside one, so the block is never freed, even when its
+> thread ends. Measured with Valgrind 3.19 on Debian 12, aarch64: 312 B a
+> block, allocated by `malloc` called directly from `S_call_help`. 0, 1 and
+> 3 escapes left 0, 1 and 3 blocks; three engines dropped inside a timer
+> callback left 3, and three resumed there left none.
+> - **Where the gate meets it.** With the suppression in place, the full
+>   gate on #85's branch suppressed it in test-loop-claim (1, the escaped
+>   teardown), test-loop (3), test-async-fence (1) and test-loop-threads
+>   (1), whose sweeps drop engines inside callbacks, and in each of 82
+>   children that a spawn forked and that exited before exec, which report
+>   the one their parent held. Only test-loop-claim's had ever read
+>   "definitely lost"; the rest were "still reachable", and none gated.
+>
+> - **Why it gated only now.** Valgrind calls the block "still reachable"
+>   or "definitely lost" by whether a stray raw pointer to it survives,
+>   which depends on how collections ran. test-loop-claim's escaped
+>   teardown, an escape on a thread that then ends, read "still
+>   reachable" in 5 of 5 runs on main and "definitely lost" in 5 of 5 on
+>   #85's branch. Bisected by file, the flip came with a change to
+>   `handles.sls` that the suite never calls: the same allocation, the
+>   same stack, the same count of blocks allocated. Only the kind differed,
+>   and the gate fails on definite leaks.
+> - **Why a suppression, not skipped rows.** The block is Chez's, and
+>   nothing the binding does can free it. Skipping the escaping rows under
+>   Valgrind would leave the next suite to escape on a thread exposed to
+>   the same timing. The suppression (`tests/valgrind-chez.supp`) matches
+>   only a block whose allocation is `malloc` called directly from
+>   `S_call_help`. The binding allocates through its shim's `calloc`, and
+>   `foreign-alloc` through `s_malloc`, so no block of the binding's
+>   matches. It matches every leak kind so that a check can count it; only
+>   definite leaks gate.
+> - **The check.** `make check-memory-gate` gains an `escape` mode (Linux).
+>   It makes three escapes on the main thread, and requires the real
+>   recipe to pass with Valgrind reporting three blocks suppressed. Its
+>   `leak` and `possible-leak` modes go on requiring their planted blocks
+>   to be reported. Measured: with the suppression's `S_call_help` frame
+>   dropped, `leak` went vacuous (its 777 B block suppressed) and `escape`
+>   counted 10 blocks; with the kinds narrowed to definite, the frame
+>   misnamed, or the file not passed to Valgrind, `escape` failed by name.
+>   Evidence: `.plans/escape-suppression-mutation-log.md`.
