@@ -41,7 +41,7 @@
         (only (chezscheme) collect foreign-alloc foreign-free foreign-procedure
               make-engine bytevector-truncate!
               disable-interrupts enable-interrupts
-              fork-thread thread-join getenv))
+              fork-thread thread-join getenv get-thread-id))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -797,9 +797,13 @@
 ;; - The scheduler drops the task, as a timeout does, and never resumes it.
 ;;   Whatever the verb had allocated and not yet handed to libuv is lost: a
 ;;   block, or a request registered and counted that libuv never saw.
+;; - Another task hands the stream's loop to another thread, and the verb
+;;   resumes past its entry check, which asks for the loop's owner. The step
+;;   checked only that the stream was open, so the verb made its call on a
+;;   loop another thread now owned, racing that thread on the stream (#86).
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
-;; the verb's own open check, and the sweep stops at the first run no expiry
+;; the verb's own checks, and the sweep stops at the first run no expiry
 ;; reaches, so between them every point in the verb is visited. At the
 ;; expiry, the split sweep asks libuv whether the verb's native call has
 ;; been made, closes the stream, steps the loop until the close has freed
@@ -812,13 +816,21 @@
 ;; A verb that returns after the close without having been made made its
 ;; native call on the freed stream. The reuse sweeps open a new connection
 ;; after the free, before resuming, and its peer must receive nothing. The
-;; drop sweep drops the engine instead, and requires the registry, every
-;; counter and the blocks alive back where the run began once the
-;; connection is closed.
+;; handoff sweeps hand the loop to another thread instead of closing, and
+;; hand it back once the verb has run: a run not made before the handoff
+;; must be refused with &uv-wrong-thread, and one made before it returns
+;; ('made-before-handoff). The drop sweep drops the engine instead, and
+;; requires the registry, every counter and the blocks alive back where the
+;; run began once the connection is closed.
 
 (define (interrupts-enabled?)
   (disable-interrupts)
   (zero? (enable-interrupts)))
+
+;; Another thread's id, for a loop handed to it: no thread runs the loop,
+;; but its owner is no longer this one.
+(define me (get-thread-id))
+(define other-thread (+ me 1))
 
 (define sw-loop (make-uv-loop))
 (define sw-server (make-uv-tcp sw-loop))
@@ -1018,8 +1030,49 @@
     (lambda (lk fill) #t))))
 
 ;; split-run : variant exact-positive-integer symbol -> verdict
-;; MODE is 'free, or 'reuse to open a new connection after the free.
+;; MODE is 'free, 'reuse to open a new connection after the free, or
+;; 'handoff to hand the loop to another thread in place of the close.
 (define (split-run v fuel mode)
+  (if (eq? mode 'handoff)
+      (handoff-run v fuel)
+      (close-run v fuel mode)))
+
+;; The resumed verb's outcome: 'returned, 'closed or 'wrong-thread for the
+;; refusals a split run expects, or what else it raised.
+(define (start-engine v lk fill on-return)
+  (make-engine
+   (lambda ()
+     (guard (e ((uv-handle-closed? e) 'closed)
+               ((uv-wrong-thread? e) 'wrong-thread)
+               (#t (list 'raised (describe e))))
+       ((variant-start v) lk fill)
+       (on-return)
+       'returned))))
+
+;; run-ended : variant link exact-positive-integer object -> verdict
+;; An engine that ran out its fuel without an expiry: 'untouched, if the
+;; verb returned and its effect landed.
+(define (run-ended v lk fill outcome)
+  (cond ((not (eq? outcome 'returned)) (list 'untouched outcome))
+        ((not ((variant-made? v) lk fill)) '(untouched not-made))
+        ((not ((variant-landed? v) lk fill))
+         (list 'untouched 'never-landed (link-evidence lk)))
+        (else 'untouched)))
+
+;; with-residue : pair verdict -> verdict
+;; The verdict, or what the run left behind with it.
+(define (with-residue before verdict)
+  (let ((left (residue before)))
+    (cond ((not (interrupts-enabled?))
+           (enable-interrupts)
+           (list 'interrupts-left-disabled verdict))
+          ((pair? left) (list verdict 'left left))
+          (else verdict))))
+
+;; handoff-run : variant exact-positive-integer -> verdict
+;; At the expiry, hands sw-loop to another thread, resumes the verb, and
+;; hands the loop back. The stream stays open throughout.
+(define (handoff-run v fuel)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
@@ -1027,21 +1080,45 @@
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
                (returned #f)
-               (eng (make-engine
-                     (lambda ()
-                       (guard (e ((uv-handle-closed? e) 'refused)
-                                 (#t (list 'raised (describe e))))
-                         ((variant-start v) lk fill)
-                         (set! returned #t)
-                         'returned))))
+               (eng (start-engine v lk fill (lambda () (set! returned #t))))
                (verdict
                 (eng fuel
-                     (lambda (ticks outcome)
-                       (cond ((not (eq? outcome 'returned)) (list 'untouched outcome))
-                             ((not ((variant-made? v) lk fill)) '(untouched not-made))
-                             ((not ((variant-landed? v) lk fill))
-                              (list 'untouched 'never-landed (link-evidence lk)))
-                             (else 'untouched)))
+                     (lambda (ticks outcome) (run-ended v lk fill outcome))
+                     (lambda (resume)
+                       (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
+                                               returned))
+                              (landed (and made-before ((variant-landed? v) lk fill)))
+                              (outcome (begin
+                                         (set-loop-owner-thread! sw-loop other-thread)
+                                         (let ((o (resume 1000000 (lambda (ticks o) o)
+                                                          (lambda (more) 'still-running))))
+                                           (set-loop-owner-thread! sw-loop me)
+                                           o))))
+                         (cond ((and (eq? outcome 'wrong-thread) (not made-before)) 'refused)
+                               ((and (eq? outcome 'returned) landed) 'made-before-handoff)
+                               (else (list outcome
+                                           (cond ((not made-before) 'not-made-before-handoff)
+                                                 ((not landed)
+                                                  (list 'made-but-never-landed
+                                                        (link-evidence lk)))
+                                                 (else 'made-before-handoff))))))))))
+          (close-link! lk)
+          (with-residue before verdict)))))
+
+;; close-run : variant exact-positive-integer symbol -> verdict
+;; MODE is 'free, or 'reuse to open a new connection after the free.
+(define (close-run v fuel mode)
+  (let* ((before (balance))
+         (lk (connect-link!)))
+    (if (not lk)
+        '(connect-failed)
+        (let* ((fill (+ 1 (mod fuel 250)))
+               (prepared ((variant-prepare v) lk fill))
+               (returned #f)
+               (eng (start-engine v lk fill (lambda () (set! returned #t))))
+               (verdict
+                (eng fuel
+                     (lambda (ticks outcome) (run-ended v lk fill outcome))
                      (lambda (resume)
                        (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
                                                returned))
@@ -1062,7 +1139,7 @@
                            (cond (stray (list 'the-new-connection-got-bytes outcome))
                                  ((and (eq? mode 'reuse) (not new))
                                   (list 'no-new-connection outcome))
-                                 ((and (eq? outcome 'refused) (not made-before)) 'refused)
+                                 ((and (eq? outcome 'closed) (not made-before)) 'refused)
                                  ((and (eq? outcome 'returned) landed) 'made-before-close)
                                  (else (list outcome
                                              (cond ((not made-before) 'not-made-before-close)
@@ -1071,12 +1148,7 @@
                                                           (link-evidence lk)))
                                                    (else 'made-before-close)))))))))))
           (close-link! lk)
-          (let ((left (residue before)))
-            (cond ((not (interrupts-enabled?))
-                   (enable-interrupts)
-                   (list 'interrupts-left-disabled verdict))
-                  ((pair? left) (list verdict 'left left))
-                  (else verdict)))))))
+          (with-residue before verdict)))))
 
 ;; drop-run : variant exact-positive-integer -> verdict
 (define (drop-run v fuel)
@@ -1135,6 +1207,8 @@
   (named-sweeps (lambda (v fuel) (split-run v fuel 'reuse))
                 (filter (lambda (v) (memq (variant-name v) '(uv-write! uv-write*!)))
                         variants)))
+(define handoff-sweeps
+  (named-sweeps (lambda (v fuel) (split-run v fuel 'handoff)) variants))
 (define drop-sweeps (named-sweeps drop-run variants))
 
 ;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
@@ -1176,8 +1250,8 @@
                (display (car s)) (display ": ")
                (write (fuel-map (cdr s))) (newline))
              sweeps))
- '(split reuse drop)
- (list split-sweeps reuse-sweeps drop-sweeps))
+ '(split reuse handoff drop)
+ (list split-sweeps reuse-sweeps handoff-sweeps drop-sweeps))
 
 (test-equal "a stream verb split by a close is refused, or had made its call before the close"
   '()
@@ -1194,6 +1268,14 @@
 (test-equal "each reuse sweep caught its write before the close and ran it to the end"
   (expected-reach reuse-sweeps 'refused)
   (reach reuse-sweeps))
+
+(test-equal "a stream verb split by its loop's handoff is refused, or had made its call before the handoff"
+  '()
+  (bad-runs (lambda (v) (memq v '(refused made-before-handoff untouched))) handoff-sweeps))
+
+(test-equal "each handoff sweep caught its verb before its checks and ran it to the end"
+  (expected-reach handoff-sweeps 'refused)
+  (reach handoff-sweeps))
 
 (test-equal "a stream verb whose engine is dropped leaves no request, block or registry entry"
   '()

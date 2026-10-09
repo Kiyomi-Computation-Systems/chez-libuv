@@ -366,13 +366,17 @@
       (raise (make-uv-invalid-argument who 'not-a-uv-handle)))
     handle)
 
-  ;; The single central affinity site: every operational verb enters through
-  ;; require-open-handle, so the loop-thread check here covers them all with no
-  ;; per-verb sprinkling (design §6.3). The thread check comes first — a verb
-  ;; from the wrong thread is refused before its handle's open state is even
-  ;; consulted. uv-async-send! is the one verb that does NOT come through here
-  ;; (it is libuv's sole thread-safe call); it validates kind on its own path in
-  ;; (libuv async), and checks open state inside the send fence.
+  ;; The entry check of every operational verb on a handle (design §6.3). The
+  ;; thread check comes first — a verb from the wrong thread is refused before
+  ;; its handle's open state is even consulted. It does not cover the verb's
+  ;; native call, which an engine can suspend it before while the loop is
+  ;; handed on, so the verb's step checks both again: with owned-handle-ptr,
+  ;; or, in uv-accept! and uv-spawn!, the owner of the loop the step makes
+  ;; something on (tests/test-source-rules.sps's rule 8). uv-close! does not
+  ;; come through here, and is unchecked. uv-async-send! is the one verb that
+  ;; does NOT come through here (it is libuv's sole thread-safe call); it
+  ;; validates kind on its own path in (libuv async), and checks open state
+  ;; inside the send fence.
   (define (require-open-handle handle who)
     (require-handle handle who)
     (require-loop-thread (handle-loop handle) who)
@@ -566,7 +570,10 @@
   ;; open-handle-ptr : uv-handle -> (or uptr 'not-open 'no-pointer)
   ;; For a step: HANDLE's pointer, when it is open and has one. The open
   ;; check a verb makes on entry does not cover a native call an engine can
-  ;; suspend it before, so the step checks again.
+  ;; suspend it before, so the step checks again. A verb's step takes its
+  ;; handle's pointer from owned-handle-ptr, which asks for the owner too;
+  ;; only the definitions rule 8 of tests/test-source-rules.sps lists name
+  ;; this.
   (define (open-handle-ptr handle)
     (let ((ptr (handle-ptr handle)))
       (cond ((not (eq? (handle-state handle) 'open)) 'not-open)
@@ -603,10 +610,13 @@
             (else ptr))))
 
   ;; owned-handle-ptr : uv-handle -> (or uptr 'wrong-thread 'not-open 'no-pointer)
-  ;; open-handle-ptr for a step that makes something on HANDLE's loop, a
-  ;; request on the handle: it checks again that this thread owns the loop,
-  ;; first, as the verb's entry check does (require-open-handle). An open
-  ;; handle's loop is open: a teardown closes every handle first.
+  ;; open-handle-ptr for the step of a verb on HANDLE: it checks again that
+  ;; this thread owns the loop, first, as the verb's entry check does
+  ;; (require-open-handle). An engine can suspend the verb after that check
+  ;; while the loop is handed to another thread, and a call made then races
+  ;; that thread on the handle: a kill resumed there signalled its process
+  ;; (#86). An open handle's loop is open: a teardown closes every handle
+  ;; first.
   (define (owned-handle-ptr handle)
     (if (eqv? (loop-owner-thread (handle-loop handle)) (current-thread-id))
         (open-handle-ptr handle)
