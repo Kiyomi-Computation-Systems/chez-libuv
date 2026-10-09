@@ -10,8 +10,8 @@
 ;;; guard that did not match handed its caller &uv-handle-closed, and a guard
 ;;; with a uv-error? clause took a user's error for the binding's.
 ;;;
-;;; A re-entry into a body that was left while its raise was being handled
-;;; now raises that raise again. It is still a refusal, so nothing resumes
+;;; The first re-entry into a body that was left while its raise was being
+;;; handled now raises that raise again. It is still a refusal, so nothing resumes
 ;;; the body, but the condition that reaches the guards outside is the
 ;;; body's own.
 (import (rnrs)
@@ -158,55 +158,167 @@
              (raise-continuable 'first)
              (raise original))))))))
 
-;; The rule is any re-entry, not only a guard's: a continuation the body
-;; captured, called after a guard that matched has handled its raise. The
-;; continuation holds that guard too, so the guard handles the raise a
-;; second time, and the body never runs again.
-(test-equal "a body left by its raise refuses a later re-entry with that raise"
-  '(handled 2 entered 1)
-  (let ((resume-k #f) (handled 0) (entered 0))
-    (guard (e (#t (list 'escaped (describe e))))
-      (guard (e ((eq? e original) (set! handled (+ handled 1))))
+;; The rule is the first re-entry, a guard's or not: here a continuation the
+;; body captured, called after a guard that matched has handled its raise.
+;; The continuation holds that guard too, so the guard handles the raise a
+;; second time. Called again, it is refused as closed. PAST counts the
+;; body's code after the capture point: a re-entry let through runs it.
+(test-equal "only the first re-entry into a body left by its raise raises it, and the body never runs again"
+  '(handled 2 entered 1 past 1 then handle-closed)
+  (let ((resume-k #f) (handled 0) (entered 0) (past 0) (attempts 0))
+    (call/cc
+     (lambda (done)
+       (guard (e ((uv-handle-closed? e)
+                  (done (list 'handled handled 'entered entered 'past past
+                              'then 'handle-closed)))
+                 (#t (done (list 'escaped (describe e)))))
+         (guard (e ((eq? e original) (set! handled (+ handled 1))))
+           (call-with-uv-loop
+            (lambda (loop)
+              (set! entered (+ entered 1))
+              (call/cc (lambda (k) (set! resume-k k)))
+              (set! past (+ past 1))
+              (raise original))))
+         (set! attempts (+ attempts 1))
+         (when (and (<= attempts 2) (procedure? resume-k))
+           (resume-k 'back-in))
+         (done (list 'handled handled 'entered entered 'past past
+                     'attempts attempts)))))))
+
+;; A handler outside that answers a raise by re-entering the body, to retry
+;; it, is refused. Were every re-entry refused with the raise, it would see
+;; the same raise for good and retry for good; the cap of 5 makes that a
+;; failure here instead of a hang (#120's review).
+(test-equal "a handler that retries the body by re-entering it is refused once with the raise, then as closed"
+  '((outer-got handle-closed) retries 1 body-runs 1)
+  (let ((retries 0) (body-runs 0) (restart #f))
+    (let ((outcome
+           (guard (e (#t (list 'outer-got (if (uv-handle-closed? e) 'handle-closed (verdict e)))))
+             (with-exception-handler
+               (lambda (c)
+                 (if (and (eq? c original) (< retries 5) restart)
+                     (begin (set! retries (+ retries 1)) (restart 'retry))
+                     (raise-continuable c)))
+               (lambda ()
+                 (guard (e ((string? e) 'string))
+                   (call-with-uv-loop
+                    (lambda (loop)
+                      (set! body-runs (+ body-runs 1))
+                      (call/cc (lambda (k) (set! restart k)))
+                      (if (= retries 0) (raise original) 'retried)))))))))
+      (list outcome 'retries retries 'body-runs body-runs))))
+
+;; A handler that gives a raise up by jumping back into the body never
+;; returns, so its record is not cleared then. The body's own return clears
+;; it: a later re-entry is refused as closed, not with the old raise.
+(test-equal "a raise a handler gave up by jumping back into the body does not outlive the body's return"
+  '(handle-closed)
+  (let ((restart #f) (later #f) (tries 0))
+    (call/cc
+     (lambda (done)
+       (guard (e ((uv-handle-closed? e) (done '(handle-closed)))
+                 (#t (done (verdict e))))
+         (with-exception-handler
+           (lambda (c)
+             (if (and (eq? c original) (= tries 1))
+                 (restart 'retry)
+                 (raise-continuable c)))
+           (lambda ()
+             (call-with-uv-loop
+              (lambda (loop)
+                (call/cc (lambda (k) (set! restart k)))
+                (set! tries (+ tries 1))
+                (when (= tries 1) (raise original))
+                (call/cc (lambda (k) (set! later k)))
+                'returned))))
+         (if (< tries 3)
+             (begin (set! tries 3) (later 'back-in))
+             (done (list 'later-returned tries))))))))
+
+;; The costs docs/api.md states, held so that a change to them is made on
+;; purpose. A handler between the guard that does not match and the body
+;; sees the condition twice, as the guard's clauses do.
+(test-equal "a handler between a guard that does not match and the body sees the body's condition twice"
+  '(the-bodys-own (the-bodys-own the-bodys-own))
+  (let ((seen '()))
+    (let ((outcome
+           (guard (e (#t (verdict e)))
+             (guard (e ((string? e) 'string))
+               (with-exception-handler
+                 (lambda (c)
+                   (set! seen (cons (verdict c) seen))
+                   (raise-continuable c))
+                 (lambda () (call-with-uv-loop raise-original)))))))
+      (list outcome (reverse seen)))))
+
+;; A handler that returns from the body's raise: R6RS raises the
+;; &non-continuable from the handler that was returned to. That is now
+;; call-with-uv-loop's own, so the handler outside it is called once more,
+;; with the &non-continuable.
+(test-equal "a handler that returns from the body's raise is called again with the &non-continuable"
+  '(non-continuable (the-bodys-own non-continuable))
+  (let ((seen '()))
+    (define (name c)
+      (if (non-continuable-violation? c) 'non-continuable (verdict c)))
+    (let ((outcome
+           (guard (e (#t (name e)))
+             (with-exception-handler
+               (lambda (c) (set! seen (cons (name c) seen)) 'returned)
+               (lambda () (call-with-uv-loop raise-original))))))
+      (list outcome (reverse seen)))))
+
+(test-equal "a handler's several answers to the body's raise-continuable reach the body"
+  '(1 2)
+  (guard (e (#t (list 'raised (describe e))))
+    (with-exception-handler
+      (lambda (c) (values 1 2))
+      (lambda ()
         (call-with-uv-loop
          (lambda (loop)
-           (set! entered (+ entered 1))
-           (call/cc (lambda (k) (set! resume-k k)))
-           (raise original))))
-      (when (and (= handled 1) (procedure? resume-k))
-        (resume-k 'back-in))
-      (list 'handled handled 'entered entered))))
+           (call-with-values (lambda () (raise-continuable 'ask)) list)))))))
 
-;; blocked-raise-run : -> (list object integer)
-;; What a guard outside the body got, and how many times the engine
-;; expired, for an engine suspended by engine-block in a handler outside
-;; the body while it handles the body's raise, on its first call only.
-;; Resumed with a fixed budget, at most 10 times.
+(test-equal "the body's several values reach call-with-uv-loop's caller"
+  '(1 2)
+  (guard (e (#t (list 'raised (describe e))))
+    (call-with-values
+     (lambda () (call-with-uv-loop (lambda (loop) (values 1 2))))
+     list)))
+
+;; blocked-raise-run : -> (list object integer integer)
+;; What a guard outside the body got, how many times the engine expired,
+;; and how many times the handler outside the body was called, for an
+;; engine suspended by engine-block in that handler while it handles the
+;; body's raise, on its first call only. Resumed with a fixed budget, at
+;; most 10 times.
 (define (blocked-raise-run)
   (let* ((blocked #f)
          (expiries 0)
+         (calls 0)
          (engine
           (make-engine
            (lambda ()
              (guard (e (#t (verdict e)))
                (with-exception-handler
                  (lambda (c)
+                   (set! calls (+ calls 1))
                    (unless blocked (set! blocked #t) (engine-block))
                    (raise-continuable c))
                  (lambda () (call-with-uv-loop raise-original))))))))
     (let run ((engine engine) (rounds 0))
       (if (> rounds 10)
-          (list 'still-suspended expiries)
+          (list 'still-suspended expiries calls)
           (engine 1000000
-                  (lambda (ticks value) (list value expiries))
+                  (lambda (ticks value) (list value expiries calls))
                   (lambda (next)
                     (set! expiries (+ expiries 1))
                     (run next (+ rounds 1))))))))
 
 ;; An engine whose fuel runs out while a handler outside the body handles
 ;; its raise leaves the body as a guard does. Resumed, the re-entry raises
-;; the body's condition again.
+;; the body's condition again, so the handler is called a second time: a
+;; re-entry let through would carry on from the first call instead.
 (test-equal "an engine suspended while the body's raise was being handled raises it again when resumed"
-  '(the-bodys-own 1)
+  '(the-bodys-own 1 2)
   (blocked-raise-run))
 
 (test-equal "every row's loop was torn down"

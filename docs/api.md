@@ -108,16 +108,27 @@ exit like any other: the loop is torn down, and resuming the engine raises
 
 **A raise out of `call-with-uv-loop`'s body reaches the guards outside it
 as itself.** The body runs once, so every way back into a body that has
-been left is refused. A body left while one of its raises was being
-handled is refused with that raise, and any other with
-`&uv-handle-closed`. R6RS `guard` needs the first: it unwinds to itself
-before it tests its clauses, and when none matches, it re-raises from
-where the body raised, which re-enters the body. Two consequences:
+been left is refused. The first way back into a body left while one of
+its raises was being handled is refused with that raise. Every other is
+refused with `&uv-handle-closed`. R6RS `guard` needs the first: it
+unwinds to itself before it tests its clauses, and when none matches, it
+re-raises from where the body raised, which re-enters the body.
+
+Handlers outside the body run where it raised, as R6RS says, and one
+that returns from the body's `raise-continuable` resumes it as usual. The
+costs:
 - A guard whose clauses do not match the body's condition tests them a
-  second time.
-- A handler outside the body that returns from the body's
-  `raise-continuable` resumes the body as usual. It cannot resume a body
-  that a guard between them has already unwound.
+  second time, and any handler between that guard and the body sees the
+  condition twice.
+- A handler that answers the body's raise by re-entering the body, to
+  retry it, gets the raise once more and then `&uv-handle-closed`.
+- A handler that returns from the body's `raise` (not
+  `raise-continuable`) is called once more, with the `&non-continuable`
+  that R6RS raises for it. `call-with-uv-loop` passes the raise on with a
+  handler of its own, and R6RS raises the `&non-continuable` from the
+  handler that was returned to.
+- A handler between a guard and the body cannot resume a body that the
+  guard has already unwound.
 
 Callbacks on one thread nest: each is entered from C, and returns by
 jumping back to the C frame that entered it. That jump abandons every
