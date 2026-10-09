@@ -33,19 +33,21 @@
         (spawn-list-races)
         (only (uv-meter) fewest-bytes)
         (uv-level-3)
-        ;; The engine-sweep driver caps the changing-data sweeps' resumes.
-        (only (uv-sweep) run-capped)
+        ;; The engine-sweep driver caps the changing-data sweeps' resumes;
+        ;; a state sweep hands its loop to other-thread, and the drop sweeps
+        ;; check that no run leaves interrupts off.
+        (only (uv-sweep) run-capped other-thread interrupts-enabled?)
         (only (chezscheme) collect putenv mkdir
               get-string-all open-file-output-port port-file-descriptor
               ;; The changing-data sweeps drive a spawn in an engine, or race
               ;; it from another thread, and change the caller's lists and
               ;; strings mid-call.
               make-engine last-pair list-head set-car! set-cdr! string-set!
-              fork-thread thread-join getenv get-thread-id
+              fork-thread thread-join getenv
               ;; The state sweeps count this process's open descriptors.
               directory-list
-              ;; The drop sweeps check that no run leaves interrupts off.
-              disable-interrupts enable-interrupts))
+              ;; A drop run that left interrupts off turns them back on.
+              enable-interrupts))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -1402,7 +1404,7 @@
     (lambda (loop)
       (list (list 'ignore)
             (lambda (run)
-              (set-loop-owner-thread! loop (+ (get-thread-id) 1))
+              (set-loop-owner-thread! loop other-thread)
               'handed-off)
             (lambda () '())
             (lambda () '())))
@@ -1757,12 +1759,6 @@
                  (list (cons 'stdio (list (cons 'inherit-stream pipe))))
                  on-exit))
     '((errno EINVAL) not-yet))))
-
-;; interrupts-enabled? : -> boolean
-;; enable-interrupts answers the disable count it leaves.
-(define (interrupts-enabled?)
-  (disable-interrupts)
-  (zero? (enable-interrupts)))
 
 ;; drop-run : drop-variant exact-positive-integer -> (list fuel found verdict)
 ;; FOUND is 'run or 'not-run, whether the step had run at the expiry, or

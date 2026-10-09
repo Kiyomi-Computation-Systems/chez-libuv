@@ -45,6 +45,7 @@
         (only (libuv private native) live-counts)
         (uv-testing)
         (only (uv-evidence) describe print-actual-on-failure!)
+        (only (uv-sweep) residue me)
         ;; The thread forms run a verb on another thread and wait for it,
         ;; with a cap; directory-list counts this process's descriptors.
         (only (chezscheme) fork-thread get-thread-id make-mutex make-condition
@@ -59,7 +60,6 @@
 
 (test-begin "constructor-owner")
 
-(define me (get-thread-id))
 (define counts-at-start (live-counts))
 (define registry-at-start (registry-count))
 
@@ -106,25 +106,11 @@
   (guard (e (#t 0))
     (length (directory-list "/dev/fd"))))
 
-;; The registry, every debug counter (blocks included), and descriptors.
-(define (balance) (list (registry-count) (live-counts) (fd-count)))
-
-;; residue : list -> list
-;; What changed since BEFORE, as (name delta) pairs; '() when nothing did.
-(define (residue before)
-  (let ((after (balance)))
-    (append
-     (if (= (car before) (car after))
-         '()
-         (list (list 'registry (- (car after) (car before)))))
-     (filter (lambda (x) x)
-             (map (lambda (b a)
-                    (and (not (= (cdr b) (cdr a)))
-                         (list (car b) (- (cdr a) (cdr b)))))
-                  (cadr before) (cadr after)))
-     (if (= (caddr before) (caddr after))
-         '()
-         (list (list 'fds (- (caddr after) (caddr before))))))))
+;; The registry, every debug counter (blocks included), and descriptors,
+;; as (name . count).
+(define (balance)
+  (cons (cons 'registry (registry-count))
+        (append (live-counts) (list (cons 'fds (fd-count))))))
 
 ;; --- the verbs ------------------------------------------------------------------
 ;; A verb prepares a fresh loop, answering a context its call needs, or #f
@@ -271,7 +257,7 @@
         (list 'prepare-failed (finish! loop ctx))
         (let* ((before (balance))
                (seen (on-other-thread (lambda () (attempt v loop ctx))))
-               (left (residue before))
+               (left (residue before (balance)))
                (torn (if (answered? seen) (finish! loop ctx) 'left-to-its-thread)))
           (if (and (answered? seen)
                    (equal? (cadr seen) (list 'wrong-thread (verb-name v) me (car seen)))

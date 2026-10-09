@@ -18,14 +18,15 @@
         (only (libuv private constants) uv-process-type)
         (uv-testing)
         (only (uv-evidence) describe exact-block-sizes? under-memory-tool?)
-        ;; make-engine drives the sweeps; the interrupt pair checks that no
-        ;; run leaves interrupts disabled; foreign-procedure binds waitpid,
+        (uv-sweep)
+        ;; make-engine drives the sweeps; enable-interrupts restores them
+        ;; for a run that left them disabled; foreign-procedure binds waitpid,
         ;; which reaps a child whose handle a run closed, and sleep paces
         ;; it; foreign-ref and foreign-set! copy a handle into the block a
         ;; reuse run places at a freed address.
-        (only (chezscheme) make-engine disable-interrupts enable-interrupts
+        (only (chezscheme) make-engine enable-interrupts
               collect foreign-procedure foreign-ref foreign-set!
-              sleep make-time get-thread-id))
+              sleep make-time))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -91,10 +92,6 @@
 ;; and resumes only a run whose block at A's address holds B's handle, where
 ;; a stale call can reach only B.
 
-(define (interrupts-enabled?)
-  (disable-interrupts)
-  (zero? (enable-interrupts)))
-
 ;; A memory tool never hands a freed block back: Memcheck's freelist and
 ;; ASan's quarantine hold it, and the reuse rows then ask less.
 ;; under-memory-tool? asks the environment and the allocator both
@@ -103,11 +100,6 @@
 (define counts-at-start (live-counts))
 
 (define loop (make-uv-loop))
-
-;; Another thread's id, for a loop handed to it: no thread runs the loop,
-;; but its owner is no longer this one.
-(define me (get-thread-id))
-(define other-thread (+ me 1))
 
 ;; waitpid reaps a child whose handle a run closed: libuv waits only for the
 ;; children of open process handles. WNOHANG is 1 on macOS and Linux. The
@@ -213,13 +205,7 @@
         (list 'never-exited (reap! c)))))
 
 ;; What a run must leave as it found it: every debug counter, blocks
-;; included.
-(define (residue before)
-  (filter (lambda (x) x)
-          (map (lambda (b a)
-                 (and (not (= (cdr b) (cdr a)))
-                      (list (car b) (- (cdr a) (cdr b)))))
-               before (live-counts))))
+;; included. live-counts reads them as (name . count).
 
 ;; --- seeds ----------------------------------------------------------------------
 ;; The sweeps read a child's fate two ways: from on-exit while its handle is
@@ -409,7 +395,7 @@
                         (else (list o (if made 'returned-before-change 'not-returned-before-change)
                                     'a a-fate 'a-pid (child-pid a)
                                     'b b-fate 'b-pid b-pid)))))))
-      (let ((left (residue before)))
+      (let ((left (residue before (live-counts))))
         (cons (eq? (car result) 'expired)
               (cond ((not enabled) (list 'interrupts-left-disabled verdict))
                     ((pair? left) (list verdict 'left left))
@@ -439,7 +425,7 @@
                           (equal? a-fate (variant-made-fate v))))
                    'untouched)
                   (else (list 'untouched-but (cadr o) 'a a-fate))))
-           (left (residue before)))
+           (left (residue before (live-counts))))
       (cons (eq? o 'dropped)
             (cond ((not enabled) (list 'interrupts-left-disabled verdict))
                   ((pair? left) (list verdict 'left left))
@@ -459,65 +445,18 @@
           '(never-exited running-at-the-cap still-running)))
 
 ;; sweep : (exact-positive-integer -> (cons boolean verdict))
-;;         -> (list-of (cons fuel verdict))
+;;         -> (list-of (list fuel verdict expired?))
 ;; From fuel 1 to the first run no expiry reaches, whatever its verdict, to
 ;; the first stalled run, or to the cap. A wrong run is not a reason to
 ;; stop: no run here can reach anything but its own children, since the
 ;; split and drop sweeps send signal 0 and a reuse run is resumed only onto
-;; B. A raise between runs would abort the suite, so the sweep is caught
-;; and its evidence handed to the rows.
+;; B. The driver ends the sweep at a raise between runs, keeping the runs
+;; before it (tests/uv-sweep.sls).
 (define (sweep run)
-  (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
-    (let next ((fuel 1) (acc '()))
-      (let* ((r (run fuel))
-             (acc (cons (cons fuel (cdr r)) acc)))
-        (if (or (not (car r)) (stalled? (cdr r)) (= fuel sweep-fuel-cap))
-            (reverse acc)
-            (next (+ fuel 1) acc))))))
-
-;; bad-runs : sweeps (verdict -> boolean) -> (list-of (list name fuel verdict))
-(define (bad-runs sweeps good?)
-  (apply append
-         (map (lambda (s)
-                (map (lambda (run) (list (car s) (car run) (cdr run)))
-                     (filter (lambda (run) (not (good? (cdr run)))) (cdr s))))
-              sweeps)))
-
-;; every-fuel : (list-of (cons fuel verdict)) -> (or 'every-fuel list)
-;; Whether a sweep ran at fuel 1, 2, 3, ... with none skipped.
-(define (every-fuel runs)
-  (let check ((runs runs) (fuel 1))
-    (cond ((null? runs) 'every-fuel)
-          ((eqv? (caar runs) fuel) (check (cdr runs) (+ fuel 1)))
-          (else (list 'skipped-to (caar runs) 'at fuel)))))
-
-;; reach : sweeps -> (list-of (list name first every-fuel last))
-;; The bad-run rows must find none, which says nothing unless each sweep
-;; caught its verb at fuel 1, before the verb's own check, visited every
-;; fuel after it, and ran the verb to the end.
-(define (reach sweeps)
-  (map (lambda (s)
-         (let ((runs (cdr s)))
-           (list (car s) (cdar runs) (every-fuel runs)
-                 (cdr (list-ref runs (- (length runs) 1))))))
-       sweeps))
-
-;; fuel-map : runs -> list, e.g. ((refused 1 11) (untouched 12 12)).
-(define (fuel-map runs)
-  (let collect-runs ((runs runs) (acc '()))
-    (cond ((null? runs) (reverse acc))
-          ((and (pair? acc) (equal? (caar acc) (cdar runs)))
-           (collect-runs (cdr runs)
-                         (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
-          (else (collect-runs (cdr runs)
-                              (cons (list (cdar runs) (caar runs) (caar runs)) acc))))))
-
-(define (show-sweeps kind sweeps)
-  (for-each (lambda (s)
-              (display "  [informational] ") (display kind) (display " ")
-              (display (car s)) (display ": ")
-              (write (fuel-map (cdr s))) (newline))
-            sweeps))
+  (sweep-fuels (lambda (fuel)
+                 (let ((r (run fuel)))
+                   (values (cdr r) (car r))))
+               sweep-fuel-cap stalled?))
 
 ;; named-sweeps runs one sweep per variant, in the list's order: Chez's map
 ;; applies its procedure in no fixed order.
@@ -540,29 +479,29 @@
 
 (define split-sweeps
   (named-sweeps (lambda (v fuel) (split-run v 'free fuel)) (list kill-0 pid-query)))
-(show-sweeps 'split split-sweeps)
+(report! 'split split-sweeps)
 
 (test-equal "a uv-process-kill! or uv-process-pid split by its process's close is refused, or had returned before the close"
   '()
-  (bad-runs split-sweeps split-good?))
+  (bad-runs split-good? split-sweeps))
 
-(test-equal "each split sweep caught its verb at fuel 1, before its check, at every fuel after, and ran it to the end"
-  '((uv-process-kill!-0 refused every-fuel untouched)
-    (uv-process-pid refused every-fuel untouched))
+(test-equal "each split sweep caught its verb before its check and ran it to the end"
+  '((uv-process-kill!-0 refused untouched)
+    (uv-process-pid refused untouched))
   (reach split-sweeps))
 
 (define reuse-sweeps
   (named-sweeps (lambda (v fuel) (split-run v 'reuse fuel)) (list kill-sigterm pid-query)))
-(show-sweeps 'reuse reuse-sweeps)
+(report! 'reuse reuse-sweeps)
 
 (test-equal "a uv-process-kill! or uv-process-pid split by a close never reaches a new process given the old one's address"
   '()
-  (bad-runs reuse-sweeps reuse-good?))
+  (bad-runs reuse-good? reuse-sweeps))
 
-(test-equal "each reuse sweep caught its verb at fuel 1, before its check, at every fuel after, and ran it to the end"
+(test-equal "each reuse sweep caught its verb before its check and ran it to the end"
   (let ((first (if under-memory-tool? 'not-reused 'refused)))
-    (list (list 'uv-process-kill!-sigterm first 'every-fuel 'untouched)
-          (list 'uv-process-pid first 'every-fuel 'untouched)))
+    (list (list 'uv-process-kill!-sigterm first 'untouched)
+          (list 'uv-process-pid first 'untouched)))
   (reach reuse-sweeps))
 
 ;; The reuse sweeps say nothing unless B's handle was at A's freed address:
@@ -590,27 +529,27 @@
 ;; reaches only A, and SIGTERM tells a made kill from one never made.
 (define handoff-sweeps
   (named-sweeps (lambda (v fuel) (split-run v 'handoff fuel)) (list kill-sigterm pid-query)))
-(show-sweeps 'handoff handoff-sweeps)
+(report! 'handoff handoff-sweeps)
 
 (test-equal "a uv-process-kill! or uv-process-pid split by its loop's handoff is refused, or had returned before the handoff"
   '()
-  (bad-runs handoff-sweeps handoff-good?))
+  (bad-runs handoff-good? handoff-sweeps))
 
-(test-equal "each handoff sweep caught its verb at fuel 1, before its checks, at every fuel after, and ran it to the end"
-  '((uv-process-kill!-sigterm refused every-fuel untouched)
-    (uv-process-pid refused every-fuel untouched))
+(test-equal "each handoff sweep caught its verb before its checks and ran it to the end"
+  '((uv-process-kill!-sigterm refused untouched)
+    (uv-process-pid refused untouched))
   (reach handoff-sweeps))
 
 (define drop-sweeps (named-sweeps drop-run (list kill-0 pid-query)))
-(show-sweeps 'drop drop-sweeps)
+(report! 'drop drop-sweeps)
 
 (test-equal "a uv-process-kill! or uv-process-pid whose engine is dropped leaves every counter as it found it, and interrupts enabled"
   '()
-  (bad-runs drop-sweeps drop-good?))
+  (bad-runs drop-good? drop-sweeps))
 
-(test-equal "each drop sweep dropped its verb at fuel 1 and at every fuel after, and ran it to the end"
-  '((uv-process-kill!-0 dropped every-fuel untouched)
-    (uv-process-pid dropped every-fuel untouched))
+(test-equal "each drop sweep dropped its verb before its check and ran it to the end"
+  '((uv-process-kill!-0 dropped untouched)
+    (uv-process-pid dropped untouched))
   (reach drop-sweeps))
 
 ;; --- the suite's end ------------------------------------------------------------------
@@ -619,7 +558,7 @@
   (list (guard (e (#t (list 'teardown-raised (describe e))))
           (uv-loop-teardown! loop)
           'torn-down)
-        (residue counts-at-start)))
+        (residue counts-at-start (live-counts))))
 
 ;; A process left open with no native block, as a broken close would leave
 ;; it, is refused inside the step: open-handle-ptr answers a status, and the

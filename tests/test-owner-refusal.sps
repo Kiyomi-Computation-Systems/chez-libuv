@@ -61,10 +61,11 @@
         (libuv private conditions)
         (only (uv-testing) bind-loopback! connect-loopback! run-until/ticking)
         (only (uv-evidence) describe)
+        (uv-sweep)
         ;; make-engine drives the sweeps; collect starts each run with no
         ;; collection due, which would otherwise be taken where a step ends
         ;; and spend fuel there (#68).
-        (only (chezscheme) make-engine get-thread-id collect))
+        (only (chezscheme) make-engine collect))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -81,12 +82,6 @@
         (newline)))))
 
 (test-begin "owner-refusal")
-
-(define me (get-thread-id))
-
-;; Another thread's id, for a loop handed to it: no thread runs the loop,
-;; but its owner is no longer this one.
-(define other-thread (+ me 1))
 
 (define (nop . args) #f)
 
@@ -397,63 +392,29 @@
 
 ;; handback-sweep : symbol -> (list-of (list fuel verdict expired?))
 ;; From fuel 1 to the first run no expiry reaches, or the cap. A run whose
-;; fixture could not be made stops the sweep: the next would fail the same.
+;; fixture could not be made answers no expiry, so it ends the sweep: the
+;; next would fail the same.
 (define (handback-sweep verb)
-  (let next ((fuel 1) (acc '()))
-    (let-values (((v expired) (guard (e (#t (values (list 'sweep-raised (describe e)) #f)))
-                                (handback-run verb fuel))))
-      (let ((acc (cons (list fuel v expired) acc)))
-        (if (or (not expired) (= fuel sweep-fuel-cap))
-            (reverse acc)
-            (next (+ fuel 1) acc))))))
+  (sweep-fuels (lambda (fuel) (handback-run verb fuel)) sweep-fuel-cap (lambda (v) #f)))
 
 (define (good? v) (and (memq v '(refused returned untouched)) #t))
-
-;; bad-runs : sweeps -> (list-of (list verb fuel verdict))
-(define (bad-runs sweeps)
-  (apply append
-         (map (lambda (s)
-                (map (lambda (run) (list (car s) (car run) (cadr run)))
-                     (filter (lambda (run) (not (good? (cadr run)))) (cdr s))))
-              sweeps)))
-
-;; reach : sweeps -> (list-of (list verb refused? last))
-;; The row that looks for bad runs and finds none says nothing unless each
-;; sweep's verb was refused in some run and the sweep ran it to the end.
-(define (reach sweeps)
-  (map (lambda (s)
-         (let ((verdicts (map cadr (cdr s))))
-           (list (car s)
-                 (and (memq 'refused verdicts) #t)
-                 (list-ref verdicts (- (length verdicts) 1)))))
-       sweeps))
-
-;; fuel-map : runs -> list, e.g. ((returned 1 8) (refused 9 9) (untouched
-;; 10 10)): each run of equal verdicts with its first and last fuel.
-(define (fuel-map runs)
-  (let collect ((runs runs) (acc '()))
-    (cond ((null? runs) (reverse acc))
-          ((and (pair? acc) (equal? (caar acc) (cadar runs)))
-           (collect (cdr runs)
-                    (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
-          (else (collect (cdr runs)
-                         (cons (list (cadar runs) (caar runs) (caar runs)) acc))))))
 
 (define handback-sweeps
   (map (lambda (verb) (cons verb (handback-sweep verb))) verbs))
 
-(for-each (lambda (s)
-            (display "  [informational] handback ") (display (car s)) (display ": ")
-            (write (fuel-map (cdr s))) (newline))
-          handback-sweeps)
+(report! 'handback handback-sweeps)
 
 (test-equal "a verb refused after its loop was handed on and back names the owner its check saw, and this thread"
   '()
-  (bad-runs handback-sweeps))
+  (bad-runs good? handback-sweeps))
 
+;; The row above says nothing unless each sweep's verb was refused in some
+;; run, and the sweep ran it to the end. A run's first fuels end before the
+;; verb's checks, since the hand-back comes one tick after the handoff, so
+;; the first verdict is no witness.
 (test-equal "each hand-back sweep had its verb refused and ran it to the end"
   (map (lambda (verb) (list verb #t 'untouched)) verbs)
-  (reach handback-sweeps))
+  (reach-any 'refused handback-sweeps))
 
 (test-equal "every child the sweeps started has exited"
   0
