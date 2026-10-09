@@ -58,7 +58,7 @@
       (raise (make-uv-invalid-argument 'uv-timer-start! 'repeat-out-of-range)))
     (let ((rc (one-step
                (let ((ptr (owned-handle-ptr timer)))
-                 (if (symbol? ptr)
+                 (if (refused? ptr)
                      ptr
                      (let ((rc (uv-timer-start-native ptr timeout-ms repeat-ms)))
                        (when (eqv? rc 0) (set-timer-on-timeout! timer on-timeout))
@@ -86,8 +86,8 @@
     (require-open-timer timer 'uv-timer-repeat)
     (let ((repeat (one-step
                    (let ((ptr (owned-handle-ptr timer)))
-                     (if (symbol? ptr) ptr (uv-timer-get-repeat ptr))))))
-      (if (symbol? repeat)
+                     (if (refused? ptr) ptr (uv-timer-get-repeat ptr))))))
+      (if (refused? repeat)
           (raise (step-refusal repeat 'uv-timer-repeat timer))
           repeat)))
 
@@ -99,7 +99,7 @@
                                        'repeat-out-of-range)))
     (let ((ptr (one-step
                 (let ((ptr (owned-handle-ptr timer)))
-                  (unless (symbol? ptr) (uv-timer-set-repeat ptr repeat-ms))
+                  (unless (refused? ptr) (uv-timer-set-repeat ptr repeat-ms))
                   ptr))))
-      (when (symbol? ptr)
+      (when (refused? ptr)
         (raise (step-refusal ptr 'uv-timer-set-repeat! timer))))))

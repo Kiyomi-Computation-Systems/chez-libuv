@@ -82,7 +82,7 @@
               (started
                (one-step
                 (let ((ptr (owned-handle-ptr stream)))
-                  (cond ((symbol? ptr) ptr)
+                  (cond ((refused? ptr) ptr)
                         ((> end (bytevector-length bv)) 'span-out-of-range)
                         (else
                          (let ((block (alloc-block size)))
@@ -193,7 +193,7 @@
            (started
             (one-step
              (let ((ptr (owned-handle-ptr stream)))
-               (cond ((symbol? ptr) ptr)
+               (cond ((refused? ptr) ptr)
                      ((not (spans-fit? specs)) 'segment-span-out-of-range)
                      (else
                       (let ((block (alloc-block size)))
@@ -215,7 +215,7 @@
            (started
             (one-step
              (let ((ptr (owned-handle-ptr stream)))
-               (if (symbol? ptr)
+               (if (refused? ptr)
                    ptr
                    (let ((block (alloc-block size)))
                      (if (zero? block)
@@ -266,7 +266,7 @@
     (let ((started
            (one-step
             (let ((ptr (owned-handle-ptr stream)))
-              (if (symbol? ptr)
+              (if (refused? ptr)
                   ptr
                   (let ((buffer (ensure-read-buffer! stream buffer-size)))
                     (if (not (eq? buffer 'ready))
@@ -305,7 +305,7 @@
     (let ((stopped
            (one-step
             (let ((ptr (owned-handle-ptr stream)))
-              (if (symbol? ptr)
+              (if (refused? ptr)
                   ptr
                   (let ((rc (uv-read-stop ptr)))
                     (when (zero? rc) (set-stream-reading! stream #f))
@@ -319,9 +319,9 @@
     (require-open-stream stream 'uv-stream-write-queue-size)
     (let ((size (one-step
                  (let ((ptr (owned-handle-ptr stream)))
-                   (if (symbol? ptr)
+                   (if (refused? ptr)
                        ptr
                        (uv-stream-get-write-queue-size-native ptr))))))
-      (if (symbol? size)
+      (if (refused? size)
           (raise (step-refusal size 'uv-stream-write-queue-size stream))
           size))))

@@ -117,7 +117,7 @@
              (started
               (one-step
                (let ((loop-ptr (owned-loop-ptr loop)))
-                 (if (symbol? loop-ptr)
+                 (if (refused? loop-ptr)
                      loop-ptr
                      (let ((block (alloc-block size)))
                        (cond
@@ -136,10 +136,9 @@
                            (uv-getaddrinfo-native
                             loop-ptr block (car strings) (cdr strings)
                             (if (eq? writes 'absent) 0 (+ block hints-offset))))))))))))
-        (cond ((uv-req? started) started)
-              ((eq? started 'wrong-thread)
-               (raise (wrong-thread-refusal loop 'uv-getaddrinfo!)))
-              (else (raise (step-refusal started 'uv-getaddrinfo! #f)))))))
+        (if (uv-req? started)
+            started
+            (raise (step-refusal started 'uv-getaddrinfo! #f))))))
 
   ;; uv-dns-request? : object -> boolean
   (define (uv-dns-request? x)
@@ -190,7 +189,7 @@
                (started
                 (one-step
                  (let ((loop-ptr (owned-loop-ptr loop)))
-                   (if (symbol? loop-ptr)
+                   (if (refused? loop-ptr)
                        loop-ptr
                        (let ((block (alloc-block size)))
                          (if (zero? block)
@@ -205,10 +204,9 @@
                                     count-getnameinfo-req-new! count-getnameinfo-req-free!
                                     (uv-getnameinfo-native loop-ptr block addr flags-int))
                                    (begin (free-block! block) filled))))))))))
-          (cond ((uv-req? started) started)
-                ((eq? started 'wrong-thread)
-                 (raise (wrong-thread-refusal loop 'uv-getnameinfo!)))
-                (else (raise (step-refusal started 'uv-getnameinfo! #f))))))))
+          (if (uv-req? started)
+              started
+              (raise (step-refusal started 'uv-getnameinfo! #f)))))))
 
   ;; uv-cancel! : uv-dns-request -> boolean
   ;; A true result means cancellation won, but the completion callback still
@@ -231,13 +229,12 @@
     (let ((loop (req-loop req))
           (busy (errno-symbol->value 'EBUSY)))
       (let ((rc (one-step
-                 (if (eqv? (loop-owner-thread loop) (current-thread-id))
+                 (or (loop-owner-mismatch loop)
                      (let ((ptr (req-ptr req)))
-                       (if (zero? ptr) 'done (uv-cancel ptr)))
-                     'wrong-thread))))
+                       (if (zero? ptr) 'done (uv-cancel ptr)))))))
         (cond ((eqv? rc 0) #t)
               ((or (eq? rc 'done) (eqv? rc busy)) #f)
-              ((eq? rc 'wrong-thread) (raise (wrong-thread-refusal loop 'uv-cancel!)))
+              ((owner-mismatch? rc) (raise (step-refusal rc 'uv-cancel! #f)))
               (else (uv-check rc 'uv-cancel!))))))
 
   ;; addrinfo-chain->list : uptr -> (listof uv-addrinfo)

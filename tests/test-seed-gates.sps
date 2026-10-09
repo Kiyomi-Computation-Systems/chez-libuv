@@ -104,7 +104,8 @@
     ("tests/test-echo.sps")
     ("tests/test-constructors.sps")
     ("tests/test-constructor-owner.sps")
-    ("tests/test-handle-steps.sps")))
+    ("tests/test-handle-steps.sps")
+    ("tests/test-owner-refusal.sps")))
 
 ;; calls? : datum symbol -> boolean
 ;; Whether X calls NAME anywhere outside quoted data.
@@ -369,7 +370,7 @@
 (define verb-suites
   '("tests/test-address.sps" "tests/test-constructor-owner.sps" "tests/test-dns.sps"
     "tests/test-facade.sps" "tests/test-flow.sps" "tests/test-handle-steps.sps"
-    "tests/test-native.sps"
+    "tests/test-native.sps" "tests/test-owner-refusal.sps"
     "tests/test-request-steps.sps" "tests/test-tcp.sps"))
 
 (define address-verbs
@@ -703,7 +704,8 @@
     ("tests/test-echo.sps")
     ("tests/test-constructors.sps")
     ("tests/test-constructor-owner.sps")
-    ("tests/test-handle-steps.sps")))
+    ("tests/test-handle-steps.sps")
+    ("tests/test-owner-refusal.sps")))
 
 (define expected-seeded
   '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
@@ -717,7 +719,8 @@
     ("tests/test-echo.sps" accept-error peers)
     ("tests/test-constructors.sps")
     ("tests/test-constructor-owner.sps")
-    ("tests/test-handle-steps.sps")))
+    ("tests/test-handle-steps.sps")
+    ("tests/test-owner-refusal.sps" accepted)))
 
 (for-each
  (lambda (suite)

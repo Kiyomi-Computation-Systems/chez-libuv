@@ -63,7 +63,7 @@
   ;; engine dropped anywhere else leaves the loop unclaimed.
   (define (run-step! loop mode-int)
     (let ((ptr (claim-loop! loop #t)))
-      (if (symbol? ptr)
+      (if (refused? ptr)
           (values ptr 0 #f)
           (begin
             (set-loop-deferred-error-list! loop '())
@@ -102,7 +102,7 @@
        (when (loop-running? loop)
          (raise (make-uv-invalid-argument 'uv-run 'loop-running)))
        (let-values (((ptr rc error) (run-step! loop (run-mode->int mode 'uv-run))))
-         (when (symbol? ptr)
+         (when (refused? ptr)
            (raise (step-refusal ptr 'uv-run #f)))
          (raise-if-error! error)
          (not (zero? rc))))))
@@ -116,17 +116,17 @@
   ;; engine could suspend the query there while a teardown freed the loop:
   ;; resumed, it called libuv on the freed block, or on a new loop the
   ;; allocator gave its address (tests/test-handle-steps.sps). NATIVE must
-  ;; answer something other than a symbol.
+  ;; answer something refused? does not take for a refusal.
   (define-syntax loop-call
     (syntax-rules ()
       ((_ loop who ptr-of native)
        (let* ((l loop)
               (answer (one-step
                        (let ((ptr (ptr-of l)))
-                         (if (symbol? ptr) ptr (native ptr))))))
-         (cond ((not (symbol? answer)) answer)
-               ((eq? answer 'wrong-thread) (raise (wrong-thread-refusal l who)))
-               (else (raise (step-refusal answer who #f))))))))
+                         (if (refused? ptr) ptr (native ptr))))))
+         (if (refused? answer)
+             (raise (step-refusal answer who #f))
+             answer)))))
 
   ;; uv-stop! : uv-loop -> unspecified
   (define (uv-stop! loop)
@@ -196,7 +196,7 @@
   (define (close-step! loop)
     (one-step
      (let ((ptr (claim-loop! loop #f)))
-       (if (symbol? ptr)
+       (if (refused? ptr)
            ptr
            (let ((rc (uv-loop-close ptr)))
              (if (not (zero? rc))
@@ -262,7 +262,7 @@
   (define (start-teardown! loop held?)
     (one-step
      (let ((ptr (if held? (loop-ptr loop) (claim-loop! loop #t))))
-       (if (symbol? ptr)
+       (if (refused? ptr)
            ptr
            (let-values (((handles requests) (loop-entries loop)))
              (cancel-requests! requests)
@@ -276,7 +276,7 @@
   ;; 'drained, the run's pending callback error, or the claim's refusal.
   (define (drain-step! loop)
     (let-values (((ptr rc error) (run-step! loop (uv-run-default))))
-      (cond ((symbol? ptr) ptr)
+      (cond ((refused? ptr) ptr)
             (error error)
             ((zero? rc) 'drained)
             (else 'work))))

@@ -77,7 +77,7 @@
              (size (sizeof-sockaddr-storage))
              (rc (one-step
                   (let ((ptr (owned-handle-ptr tcp)))
-                    (if (symbol? ptr)
+                    (if (refused? ptr)
                         ptr
                         (let ((addr (alloc-block size)))
                           (if (zero? addr)
@@ -109,7 +109,7 @@
            (answer
             (one-step
              (let ((ptr (owned-handle-ptr tcp)))
-               (if (symbol? ptr)
+               (if (refused? ptr)
                    ptr
                    (let ((block (alloc-block (+ len-offset (c-int-size)))))
                      (if (zero? block)
@@ -168,7 +168,7 @@
     (require-callback on-connection 'uv-listen! 'on-connection-not-a-procedure)
     (let ((rc (one-step
                (let ((ptr (owned-handle-ptr tcp)))
-                 (if (symbol? ptr)
+                 (if (refused? ptr)
                      ptr
                      (let ((rc (uv-listen-native ptr backlog)))
                        (when (eqv? rc 0) (set-tcp-on-connection! tcp on-connection))
@@ -193,7 +193,7 @@
            (accepted
             (one-step
              (let ((server-ptr (open-handle-ptr server)))
-               (if (symbol? server-ptr)
+               (if (refused? server-ptr)
                    server-ptr
                    (let ((client (try-construct-handle loop size uv-tcp-init make-record
                                                        count-tcp-new!)))
@@ -227,7 +227,7 @@
              (started
               (one-step
                (let ((ptr (owned-handle-ptr tcp)))
-                 (if (symbol? ptr)
+                 (if (refused? ptr)
                      ptr
                      (let ((block (alloc-block size)))
                        (if (zero? block)

@@ -662,15 +662,21 @@
   (cond ((uv-handle-closed? c) (list 'handle-closed (uv-handle-closed-kind c)))
         ((uv-wrong-thread? c)
          (list 'wrong-thread (uv-wrong-thread-who c)
-               (if (eqv? (uv-wrong-thread-expected c) (current-thread-id)) 'owner-is-me 'other)))
+               (uv-wrong-thread-expected c) (uv-wrong-thread-actual c)))
         ((uv-invalid-argument? c)
          (list 'invalid (uv-invalid-argument-who c) (uv-invalid-argument-reason c)))
         ((uv-errno-error? c) (list 'errno (condition-who c) (uv-errno-error-errno c)))
         (else (list 'other c))))
 
+;; Two thread ids no thread here has, for owner checks that found them.
+(define found-owner (+ (current-thread-id) 1))
+(define found-caller (+ (current-thread-id) 2))
+
+;; The owner-mismatch's owner, not the timer's loop's, which this thread
+;; owns: built from a second read of that, the refusal named this thread.
 (test-equal "step-refusal raises each status as the checks outside a step do"
-  '((handle-closed timer)
-    (wrong-thread uv-test-verb! owner-is-me)
+  `((handle-closed timer)
+    (wrong-thread uv-test-verb! ,found-owner ,(current-thread-id))
     (invalid uv-test-verb! null-handle-pointer)
     (handle-closed loop)
     (invalid uv-test-verb! null-loop-pointer)
@@ -682,18 +688,20 @@
          (t (make-uv-timer l))
          (shapes (map (lambda (status)
                         (refusal-shape (step-refusal status 'uv-test-verb! t)))
-                      (list 'not-open 'wrong-thread 'no-pointer 'loop-not-open 'no-loop-pointer
+                      (list 'not-open (make-owner-mismatch found-owner (current-thread-id))
+                            'no-pointer 'loop-not-open 'no-loop-pointer
                             'no-memory 'pointer-already-registered
                             'span-out-of-range (errno-symbol->value 'EBADF)))))
     (uv-loop-teardown! l)
     shapes))
 
-;; A step with no handle to pass (a constructor's, a lookup's) refuses
-;; 'wrong-thread for its loop itself, before step-refusal. One that sends it
-;; here anyway is named, and raises nothing in the building.
-(test-equal "step-refusal names 'wrong-thread from a step with no handle as the verb's own refusal"
-  '(invalid uv-test-verb! wrong-thread)
-  (refusal-shape (step-refusal 'wrong-thread 'uv-test-verb! #f)))
+;; A step with no handle to pass (a constructor's, a lookup's) needs none
+;; for its owner refusal: the owner and the caller both come from what its
+;; check found (#102).
+(test-equal "step-refusal names the owner and the caller an owner check found, with no handle to pass"
+  `(wrong-thread uv-test-verb! ,found-owner ,found-caller)
+  (refusal-shape (step-refusal (make-owner-mismatch found-owner found-caller)
+                               'uv-test-verb! #f)))
 
 ;; --- the callback error policy (design spec S8) -------------------------
 ;; The dispatcher guard that CALLS loop-record-error! arrives with Task 7;

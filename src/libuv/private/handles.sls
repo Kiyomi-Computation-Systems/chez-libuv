@@ -16,7 +16,8 @@
           one-step open-handle-ptr open-loop-ptr owned-loop-ptr owned-handle-ptr
           step-refusal handle-call! submit-request!
           try-construct-handle construct-handle try-construct-loop
-          wrong-thread-refusal
+          refused? loop-owner-mismatch
+          make-owner-mismatch owner-mismatch? owner-mismatch-owner owner-mismatch-caller
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -190,7 +191,7 @@
               ((box-cas! mark #f me)
                (memory-order-acquire)
                (let ((ptr (open-loop-ptr loop)))
-                 (if (symbol? ptr)
+                 (if (refused? ptr)
                      (begin (release-mark! mark) ptr)
                      (begin (when take-owner? (set-loop-owner-thread! loop me))
                             ptr))))
@@ -218,6 +219,32 @@
     (memory-order-release)
     (set-box! mark #f))
 
+  ;; What an owner check found when another thread owned the loop: the owner
+  ;; it compared against and the caller. The check answers it, and the
+  ;; refusal is built from it (wrong-thread-refusal), never from a second
+  ;; read of the loop's owner: the loop can change hands between the check
+  ;; and the raise, and back to the caller, which a refusal built from a
+  ;; second read then named as the owner it was refused for (#102).
+  (define-record-type owner-mismatch (fields owner caller))
+
+  ;; loop-owner-mismatch : uv-loop -> (or owner-mismatch #f)
+  ;; #f when this thread owns LOOP, else what the check found. The one read
+  ;; of a loop's owner that decides whether a verb may go on
+  ;; (tests/test-source-rules.sps's rule 9). It raises nothing, so a step
+  ;; can make it, and it allocates only on a mismatch.
+  (define (loop-owner-mismatch loop)
+    (let ((owner (loop-owner-thread loop))
+          (caller (current-thread-id)))
+      (and (not (eqv? owner caller))
+           (make-owner-mismatch owner caller))))
+
+  ;; wrong-thread-refusal : owner-mismatch symbol -> condition
+  ;; What WHO raises for MISMATCH: the &uv-wrong-thread naming the owner the
+  ;; check compared against and the caller.
+  (define (wrong-thread-refusal mismatch who)
+    (make-uv-wrong-thread who (owner-mismatch-owner mismatch)
+                          (owner-mismatch-caller mismatch)))
+
   ;; require-loop-thread : uv-loop symbol -> unspecified
   ;; The affinity check on a verb's entry, so that a caller on the wrong
   ;; thread is told so before the verb reads its other arguments or makes
@@ -227,10 +254,18 @@
   ;; (owned-loop-ptr, owned-handle-ptr). Raised before any registry
   ;; mutation, so a wrong-thread verb is a named refusal.
   (define (require-loop-thread loop who)
-    (let ((owner (loop-owner-thread loop))
-          (caller (current-thread-id)))
-      (unless (eqv? owner caller)
-        (raise (make-uv-wrong-thread who owner caller)))))
+    (let ((mismatch (loop-owner-mismatch loop)))
+      (when mismatch
+        (raise (wrong-thread-refusal mismatch who)))))
+
+  ;; refused? : object -> boolean
+  ;; Whether a pointer check's answer is a refusal rather than a pointer: a
+  ;; symbol, or the owner-mismatch an owner check answers (owned-loop-ptr,
+  ;; owned-handle-ptr). A step tests its pointer, and a verb the step's
+  ;; answer, with this: tested with symbol?, an owner-mismatch would pass
+  ;; for a pointer and reach libuv (tests/test-source-rules.sps's rule 9).
+  (define (refused? answer)
+    (or (symbol? answer) (owner-mismatch? answer)))
 
   (define (loop-has-pending-error? loop)
     (not (eq? (loop-pending-error loop) no-pending)))
@@ -592,7 +627,7 @@
             (else ptr))))
 
   ;; owned-loop-ptr : uv-loop
-  ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer 'wrong-thread)
+  ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer owner-mismatch)
   ;; open-loop-ptr for a loop this thread owns: a step that makes something
   ;; on the loop also checks that this thread owns it, since the loop can be
   ;; handed to another thread between the verb's entry and its init. From
@@ -602,53 +637,51 @@
   ;; pointer from owned-handle-ptr, so none can skip the owner check, and so
   ;; does uv-update-time!'s, which writes the loop's clock. The step that
   ;; decides who owns the loop (uv-run's claim) takes it from open-loop-ptr
-  ;; instead.
+  ;; instead. A loop another thread owns answers what the check found
+  ;; (loop-owner-mismatch), for the refusal to name.
   (define (owned-loop-ptr loop)
     (let ((ptr (open-loop-ptr loop)))
-      (cond ((symbol? ptr) ptr)
-            ((not (eqv? (loop-owner-thread loop) (current-thread-id))) 'wrong-thread)
-            (else ptr))))
+      (if (refused? ptr)
+          ptr
+          (or (loop-owner-mismatch loop) ptr))))
 
-  ;; owned-handle-ptr : uv-handle -> (or uptr 'wrong-thread 'not-open 'no-pointer)
+  ;; owned-handle-ptr : uv-handle -> (or uptr owner-mismatch 'not-open 'no-pointer)
   ;; open-handle-ptr for the step of a verb on HANDLE: it checks again that
   ;; this thread owns the loop, first, as the verb's entry check does
   ;; (require-open-handle). An engine can suspend the verb after that check
   ;; while the loop is handed to another thread, and a call made then races
   ;; that thread on the handle: a kill resumed there signalled its process
   ;; (#86). An open handle's loop is open: a teardown closes every handle
-  ;; first.
+  ;; first. Another thread's loop answers what the check found
+  ;; (loop-owner-mismatch), for the refusal to name.
   (define (owned-handle-ptr handle)
-    (if (eqv? (loop-owner-thread (handle-loop handle)) (current-thread-id))
-        (open-handle-ptr handle)
-        'wrong-thread))
+    (or (loop-owner-mismatch (handle-loop handle))
+        (open-handle-ptr handle)))
 
-  ;; step-refusal : (or symbol exact-integer) symbol (or uv-handle #f)
-  ;;                -> condition
+  ;; step-refusal : (or symbol owner-mismatch exact-integer) symbol
+  ;;                (or uv-handle #f) -> condition
   ;; What verb WHO raises, once its step is over, for a step on HANDLE that
-  ;; answered STATUS instead of starting; a constructor has no handle to
-  ;; pass. A closed handle or loop and a missing pointer are the refusals
-  ;; the checked accessors raise outside a step; 'wrong-thread is HANDLE's
-  ;; loop's owner's (wrong-thread-refusal); a refused registration is
-  ;; registry-register!'s; an integer is libuv's errno. Any other symbol is a
-  ;; refusal of WHO's own argument, and names it. A step with no handle to
-  ;; pass refuses 'wrong-thread for its loop itself; one that sent it here
-  ;; is named as WHO's own refusal, which carries no owner.
+  ;; answered STATUS instead of starting; a step on a loop has no handle to
+  ;; pass. An owner-mismatch is the &uv-wrong-thread naming what the owner
+  ;; check found (wrong-thread-refusal). A closed handle or loop and a
+  ;; missing pointer are the refusals the checked accessors raise outside a
+  ;; step; a refused registration is registry-register!'s; an integer is
+  ;; libuv's errno. Any other symbol is a refusal of WHO's own argument, and
+  ;; names it.
   (define (step-refusal status who handle)
-    (case status
-      ((not-open) (make-uv-handle-closed (handle-kind handle)))
-      ((wrong-thread)
-       (if handle
-           (wrong-thread-refusal (handle-loop handle) who)
-           (make-uv-invalid-argument who status)))
-      ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
-      ((loop-not-open) (make-uv-handle-closed 'loop))
-      ((no-loop-pointer) (make-uv-invalid-argument who 'null-loop-pointer))
-      ((no-memory) (uv-errno-condition (errno-symbol->value 'ENOMEM) who))
-      ((null-or-invalid-pointer loop-not-a-uv-loop pointer-already-registered)
-       (make-uv-invalid-argument 'uv-registry-register! status))
-      (else (if (symbol? status)
-                (make-uv-invalid-argument who status)
-                (uv-errno-condition status who)))))
+    (if (owner-mismatch? status)
+        (wrong-thread-refusal status who)
+        (case status
+          ((not-open) (make-uv-handle-closed (handle-kind handle)))
+          ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
+          ((loop-not-open) (make-uv-handle-closed 'loop))
+          ((no-loop-pointer) (make-uv-invalid-argument who 'null-loop-pointer))
+          ((no-memory) (uv-errno-condition (errno-symbol->value 'ENOMEM) who))
+          ((null-or-invalid-pointer loop-not-a-uv-loop pointer-already-registered)
+           (make-uv-invalid-argument 'uv-registry-register! status))
+          (else (if (symbol? status)
+                    (make-uv-invalid-argument who status)
+                    (uv-errno-condition status who))))))
 
   ;; (handle-call! handle who native arg ...) calls (NATIVE ptr ARG ...) on
   ;; HANDLE's pointer in one interrupt-free step that checks again that this
@@ -662,7 +695,7 @@
        (let* ((h handle)
               (rc (one-step
                    (let ((ptr (owned-handle-ptr h)))
-                     (if (symbol? ptr) ptr (native ptr arg ...))))))
+                     (if (refused? ptr) ptr (native ptr arg ...))))))
          (unless (eqv? rc 0)
            (raise (step-refusal rc who h)))))))
 
@@ -886,20 +919,15 @@
   (define (attach-stream-descriptor! stream ptr)
     (uv-handle-set-data ptr (stream-descriptor stream)))
 
-    ;; wrong-thread-refusal : uv-loop symbol -> condition
-  ;; What WHO raises once its step has answered 'wrong-thread for LOOP.
-  (define (wrong-thread-refusal loop who)
-    (make-uv-wrong-thread who (loop-owner-thread loop) (current-thread-id)))
-
   ;; try-construct-handle : uv-loop exact-positive-integer procedure
   ;;                        procedure procedure
-  ;;                        -> (or uv-handle symbol exact-integer)
+  ;;                        -> (or uv-handle symbol owner-mismatch exact-integer)
   ;; Makes a handle on LOOP in one interrupt-free step: the loop's open and
   ;; owner checks and pointer (owned-loop-ptr), a block of SIZE bytes, the record MAKE-RECORD
   ;; makes of the block, its registration, libuv's init (INIT!, given the
   ;; loop's pointer and the block), a stream's descriptor, and the count
   ;; (COUNT-NEW!). It answers the handle, or what stood in the way:
-  ;; 'loop-not-open, 'no-loop-pointer, 'wrong-thread, 'no-memory, a refused
+  ;; 'loop-not-open, 'no-loop-pointer, an owner-mismatch, 'no-memory, a refused
   ;; registration, or INIT!'s errno, and a refused step leaves nothing
   ;; behind. MAKE-RECORD, INIT! and COUNT-NEW! must be total, as a step's
   ;; calls are (one-step).
@@ -919,7 +947,7 @@
     (one-step
      (let ((loop-ptr (owned-loop-ptr loop)))
        (cond
-        ((symbol? loop-ptr) loop-ptr)
+        ((refused? loop-ptr) loop-ptr)
         (else
          (let ((ptr (alloc-block size)))
            (if (zero? ptr)
@@ -982,9 +1010,9 @@
   ;; once the step is over.
   (define (construct-handle who loop size init! make-record count-new!)
     (let ((made (try-construct-handle loop size init! make-record count-new!)))
-      (cond ((uv-handle? made) made)
-            ((eq? made 'wrong-thread) (raise (wrong-thread-refusal loop who)))
-            (else (raise (step-refusal made who #f))))))
+      (if (uv-handle? made)
+          made
+          (raise (step-refusal made who #f)))))
 
   ;; install-read-buffer! : uv-stream object
   ;;                        -> (or 'installed 'not-open 'buffered 'no-memory)
@@ -1111,7 +1139,7 @@
   (define (begin-close! handle on-close)
     (define (close-if-open!)
       (let ((ptr (open-handle-ptr handle)))
-        (if (symbol? ptr)
+        (if (refused? ptr)
             ptr
             (begin (set-handle-on-close! handle on-close)
                    (set-handle-state! handle 'closing)

@@ -99,6 +99,39 @@
 ;;;    native.sls name a raw pointer that way. What the scan cannot see: an
 ;;;    accessor imported under another name.
 ;;;
+;;; 9. A refusal for the wrong thread names the owner its check compared
+;;;    against (#102). An owner check that finds another thread owning the
+;;;    loop answers an owner-mismatch holding that owner and the caller,
+;;;    and &uv-wrong-thread is built from it. Until #102 the check answered
+;;;    'wrong-thread, and the refusal read the owner again once the step
+;;;    was over: a loop handed on and back to the caller in between was
+;;;    named as owned by the very thread it refused. So this suite holds,
+;;;    named and counted as rule 8's routes are:
+;;;    - make-uv-wrong-thread to wrong-thread-refusal, which builds from an
+;;;      owner-mismatch, and its definition in conditions.sls;
+;;;    - the owner field's accessor, loop-owner-thread, to
+;;;      loop-owner-mismatch, which reads it once, and the record that
+;;;      defines it;
+;;;    - symbol? to refused?, to step-refusal, which tests a step's status
+;;;      with it only once it has ruled out an owner-mismatch, and to
+;;;      native.sls's signal-symbol->int. A pointer check's answer, and a
+;;;      step's, can be an owner-mismatch, which symbol? would take for a
+;;;      pointer and hand to libuv, so they are tested with refused?. #109
+;;;      turned eight steps' open-handle-ptr into owned-handle-ptr. A step
+;;;      that kept its symbol? through such a change fails the handoff
+;;;      sweeps only for a verb whose step, not its entry check, refuses
+;;;      once an engine has handed the loop on, as 25 of the 39 swept
+;;;      verbs' steps do: uv-tcp-bind!'s handed the record to uv_tcp_bind,
+;;;      which raised inside the step and left interrupts disabled. For the
+;;;      other 14 only this rule sees it.
+;;;    - the hand-back sweep's list (tests/test-owner-refusal.sps) to the
+;;;      verbs (libuv) exports that reach an owner check: those whose
+;;;      definition names require-loop-thread, owned-loop-ptr,
+;;;      owned-handle-ptr or loop-owner-mismatch, or a definition that does.
+;;;      A new verb that checks the owner fails here until the sweep lists
+;;;      it.
+;;;    What the scan cannot see: a name imported under another one.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1219,10 +1252,11 @@
         (else 0)))
 
 ;; definition-name : datum -> (or symbol #f)
-;; The name a define, define-syntax or define-record-type form defines.
+;; The name a define, define-syntax, define-record-type or
+;; define-condition-type form defines.
 (define (definition-name form)
   (and (pair? form)
-       (memq (car form) '(define define-syntax define-record-type))
+       (memq (car form) '(define define-syntax define-record-type define-condition-type))
        (pair? (cdr form))
        (let ((target (cadr form)))
          (cond ((symbol? target) target)
@@ -1282,6 +1316,92 @@
 (test-equal "rule 8: handle-pointer, the checked accessor outside a step, is named only by discard-failed-handle!"
   '(("src/libuv/private/handles.sls" discard-failed-handle! 1))
   (namers-in-src 'handle-pointer))
+
+(test-equal "rule 9: make-uv-wrong-thread is named only by its condition type and wrong-thread-refusal, once each"
+  '(("src/libuv/private/conditions.sls" &uv-wrong-thread 1)
+    ("src/libuv/private/handles.sls" wrong-thread-refusal 1))
+  (namers-in-src 'make-uv-wrong-thread))
+
+(test-equal "rule 9: a loop's owner is read only by its record and loop-owner-mismatch, once each"
+  '(("src/libuv/private/handles.sls" uv-loop-record 1)
+    ("src/libuv/private/handles.sls" loop-owner-mismatch 1))
+  (namers-in-src 'loop-owner-thread))
+
+(test-equal "rule 9: symbol? is named only by refused?, step-refusal after its owner-mismatch test, and signal-symbol->int, once each"
+  '(("src/libuv/private/handles.sls" refused? 1)
+    ("src/libuv/private/handles.sls" step-refusal 1)
+    ("src/libuv/private/native.sls" signal-symbol->int 1))
+  (namers-in-src 'symbol?))
+
+;; The owner checks a verb reaches: the entry check, the two in a step, and
+;; the one read they all make.
+(define owner-checks
+  '(require-loop-thread owned-loop-ptr owned-handle-ptr loop-owner-mismatch))
+
+;; symbols-of : datum -> (list-of symbol)
+(define (symbols-of x)
+  (cond ((symbol? x) (list x))
+        ((pair? x) (append (symbols-of (car x)) (symbols-of (cdr x))))
+        ((vector? x) (symbols-of (vector->list x)))
+        (else '())))
+
+;; Each top-level definition in src/, as (name . the names its form
+;; mentions).
+(define src-definitions
+  (apply append
+         (map (lambda (e)
+                (let ((body (list-tail (cdr e) 4)))  ; after library, name, export, import
+                  (map (lambda (form) (cons (definition-name form) (symbols-of form)))
+                       (filter definition-name body))))
+              libraries)))
+
+;; reaching : (list-of symbol) -> (list-of symbol)
+;; NAMES, and every definition in src/ that names one of them or a
+;; definition that does, called or passed as a value.
+(define (reaching names)
+  (let ((more (filter (lambda (d)
+                        (and (not (memq (car d) names))
+                             (exists (lambda (n) (memq n names)) (cdr d))))
+                      src-definitions)))
+    (if (null? more)
+        names
+        (reaching (append (map car more) names)))))
+
+(define (symbol-sort xs)
+  (list-sort (lambda (a b) (string<? (symbol->string a) (symbol->string b))) xs))
+
+;; The verbs (libuv) exports.
+(define facade-exports
+  (let ((e (assoc "src/libuv.sls" libraries)))
+    (if e (filter symbol? (cdr (caddr (cdr e)))) '())))
+
+;; The verbs the hand-back sweep lists, uv-tcp-keepalive!'s disabling form
+;; under the verb's own name.
+(define handback-verbs
+  (guard (e (#t (list 'unreadable "tests/test-owner-refusal.sps")))
+    (let ((defs (filter (lambda (f) (and (pair? f) (eq? (car f) 'define)
+                                         (pair? (cdr f)) (eq? (cadr f) 'verbs)))
+                        (call-with-input-file "tests/test-owner-refusal.sps"
+                          (lambda (port)
+                            (let next ((forms '()))
+                              (let ((f (read port)))
+                                (if (eof-object? f) (reverse forms) (next (cons f forms))))))))))
+      (if (null? defs)
+          (list 'no-verbs-definition)
+          (filter (lambda (v) (not (eq? v 'uv-tcp-keepalive!/off)))
+                  (cadr (caddr (car defs))))))))
+
+;; Every verb that checks its loop's owner is swept for what its refusal
+;; names (tests/test-owner-refusal.sps). Each side of the comparison is
+;; non-empty on its own: a scan that found nothing would leave every listed
+;; verb unfound.
+(test-equal "rule 9: the hand-back sweep lists every verb (libuv) exports that reaches an owner check, and no other"
+  '(unswept () not-owner-checked ())
+  (let ((checked (filter (lambda (v) (memq v facade-exports)) (reaching owner-checks))))
+    (list 'unswept (symbol-sort (filter (lambda (v) (not (member v handback-verbs))) checked))
+          'not-owner-checked
+          (symbol-sort (filter (lambda (v) (not (memq v checked)))
+                               (if (list? handback-verbs) handback-verbs '()))))))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"
