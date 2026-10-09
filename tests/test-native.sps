@@ -1144,22 +1144,25 @@
 ;; --- uv-getaddrinfo-native's node and service ----------------------------
 ;; libuv reads each as a C string, with strlen and then a copy, so the
 ;; wrapper takes the bytes and refuses any that are not one C string: one
-;; NUL, the last byte. The request pointer here is NULL, which libuv answers
-;; with UV_EINVAL before it reads anything else (getaddrinfo.c), so a
-;; wrapper that skipped its check would answer that errno instead.
+;; NUL, the last byte. It answers the refusal rather than raising it, as it
+;; is called inside uv-getaddrinfo!'s interrupt-free step (#85). The request
+;; pointer here is NULL, which libuv answers with UV_EINVAL before it reads
+;; anything else (getaddrinfo.c), so a wrapper that skipped its check would
+;; answer that errno instead.
 (define (getaddrinfo-native-answer node service)
-  (guard (e ((uv-invalid-argument? e)
-             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
-            (#t (list 'wrong-condition (describe e))))
-    (list 'returned (errno->symbol (uv-getaddrinfo-native 0 0 node service 0)))))
+  (guard (e (#t (list 'raised (describe e))))
+    (let ((rc (uv-getaddrinfo-native 0 0 node service 0)))
+      (if (symbol? rc)
+          (list 'refused rc)
+          (list 'returned (errno->symbol rc))))))
 
 (test-equal "uv-getaddrinfo-native refuses a node or service that is not one C string, before calling libuv"
-  '((uv-getaddrinfo-native not-a-c-string)    ; no terminator
-    (uv-getaddrinfo-native not-a-c-string)    ; the service, no terminator
-    (uv-getaddrinfo-native not-a-c-string)    ; a NUL inside
-    (uv-getaddrinfo-native not-a-c-string)    ; the service, a NUL inside
-    (uv-getaddrinfo-native not-a-c-string)    ; empty: no terminator either
-    (uv-getaddrinfo-native not-a-c-string))   ; a string, not its bytes
+  '((refused not-a-c-string)    ; no terminator
+    (refused not-a-c-string)    ; the service, no terminator
+    (refused not-a-c-string)    ; a NUL inside
+    (refused not-a-c-string)    ; the service, a NUL inside
+    (refused not-a-c-string)    ; empty: no terminator either
+    (refused not-a-c-string))   ; a string, not its bytes
   (map (lambda (args) (apply getaddrinfo-native-answer args))
        (list (list (u8-list->bytevector '(49 50)) #f)
              (list #f (u8-list->bytevector '(56 48)))
@@ -1710,6 +1713,56 @@
        (list (string->utf8 "127.0.0.1\x0;")
              (string->utf8 "::1\x0;")
              (string->utf8 "not-an-ip\x0;"))))
+
+;; try-fill-sockaddr! and try-c-int-set! are the forms an interrupt-free step
+;; calls (#85), where a raise would leave interrupts disabled for good. Each
+;; answers what it refuses, for any argument, and writes nothing then. The
+;; verbs check ports before their steps, so a port the parser's C int cannot
+;; hold reaches try-fill-sockaddr! only from a drifted check: one past the
+;; range, and one no fixnum, are refused here by name, never by the FFI.
+(define (try-fill-answer ip port)
+  (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
+    (let ((answer (guard (e (#t (list 'raised (describe e))))
+                    (let ((filled (try-fill-sockaddr! addr ip port)))
+                      (if (eq? filled 'filled)
+                          (list filled (sockaddr->address-string addr))
+                          filled)))))
+      (free! addr)
+      answer)))
+
+(test-equal "try-fill-sockaddr! answers each refusal, raising nothing"
+  '((filled "127.0.0.1") not-a-c-string port-out-of-range port-out-of-range
+    port-out-of-range bad-address)
+  (list (try-fill-answer (string->utf8 "127.0.0.1\x0;") 8080)
+        (try-fill-answer "127.0.0.1" 8080)
+        (try-fill-answer (string->utf8 "127.0.0.1\x0;") 65536)
+        (try-fill-answer (string->utf8 "127.0.0.1\x0;") (expt 2 70))
+        (try-fill-answer (string->utf8 "127.0.0.1\x0;") -1)
+        (try-fill-answer (string->utf8 "not-an-ip\x0;") 8080)))
+
+;; A seeded int, to see that a refused write leaves it alone.
+(define (try-c-int-answer value)
+  (let ((addr (alloc-zeroed (c-int-size))))
+    (c-int-set! addr 77)
+    (let ((answer (guard (e (#t (list 'raised (describe e))))
+                    (list (try-c-int-set! addr value) (c-int-ref addr)))))
+      (free! addr)
+      answer)))
+
+(test-equal "try-c-int-set! writes a C int, and refuses anything else, writing nothing"
+  '((#t -5) (#t 2147483647) (#t -2147483648) (#f 77) (#f 77) (#f 77) (#f 77))
+  (list (try-c-int-answer -5)
+        (try-c-int-answer 2147483647)
+        (try-c-int-answer -2147483648)
+        (try-c-int-answer 2147483648)
+        (try-c-int-answer -2147483649)
+        (try-c-int-answer 1.5)
+        (try-c-int-answer 'x)))
+
+(test-equal "try-c-int-set! refuses an address that is none, raising nothing"
+  '(#f #f #f)
+  (guard (e (#t (list 'raised (describe e))))
+    (list (try-c-int-set! 0 1) (try-c-int-set! -8 1) (try-c-int-set! 'x 1))))
 
 ;; --- fold-flags: a caller's flag list, read once ---------------------------
 ;; uv-tcp-bind! and uv-getnameinfo! fold their flag lists through fold-flags,

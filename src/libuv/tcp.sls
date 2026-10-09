@@ -188,25 +188,40 @@
   ;;                   -> uv-request
   ;; Co-allocate the sockaddr with the request because retention varies by OS.
   ;; The address is read once, by validate-address, and libuv parses that copy.
+  ;; One interrupt-free step checks again that this thread owns the loop and
+  ;; that the client is open, and allocates, fills, registers and counts the
+  ;; request and starts it (#85). So no engine can split the connect from
+  ;; those checks, or drop it holding a request libuv has not taken
+  ;; (tests/test-request-steps.sps).
   (define (uv-tcp-connect! tcp ip port on-connect)
     (require-open-tcp tcp 'uv-tcp-connect!)
     (let ((ip-bytes (validate-address ip 'uv-tcp-connect!)))
       (require-port port 'uv-tcp-connect!)
       (require-callback on-connect 'uv-tcp-connect! 'on-connect-not-a-procedure)
-      (let* ((addr-offset (align-16 (uv-req-size (uv-connect-req-type))))
-             (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
-             (addr (+ block addr-offset)))
-        (guard (e (#t (free! block) (raise e)))
-          (fill-sockaddr! addr ip-bytes port 'uv-tcp-connect!))
-        (let ((req (%make-uv-req-record block 'connect tcp on-connect)))
-          (registry-register! block 'connect-req (handle-loop tcp) req)
-          (count-connect-req-new!)
-          (guard (e (#t (abandon-request! req) (count-connect-req-free!)
-                        (raise e)))
-            (uv-check (uv-tcp-connect-native
-                       block (handle-pointer tcp 'uv-tcp-connect!) addr)
-                      'uv-tcp-connect!))
-          req))))
+      (let* ((loop (handle-loop tcp))
+             (addr-offset (align-16 (uv-req-size (uv-connect-req-type))))
+             (size (+ addr-offset (sizeof-sockaddr-storage)))
+             (started
+              (one-step
+               (let ((ptr (owned-handle-ptr tcp)))
+                 (if (symbol? ptr)
+                     ptr
+                     (let ((block (alloc-block size)))
+                       (if (zero? block)
+                           'no-memory
+                           (let* ((addr (+ block addr-offset))
+                                  (filled (try-fill-sockaddr! addr ip-bytes port)))
+                             (if (eq? filled 'filled)
+                                 (submit-request!
+                                  block (%make-uv-req-record block 'connect tcp on-connect)
+                                  'connect-req loop
+                                  count-connect-req-new! count-connect-req-free!
+                                  (uv-tcp-connect-native block ptr addr))
+                                 (begin (free-block! block) filled))))))))))
+        (cond ((uv-req? started) started)
+              ((eq? started 'wrong-thread)
+               (raise (wrong-thread-refusal loop 'uv-tcp-connect!)))
+              (else (raise (step-refusal started 'uv-tcp-connect! tcp)))))))
 
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
   ;; Require a boolean because Scheme's 0 is true while C's 0 is false.

@@ -24,7 +24,7 @@
           c-string->string
           alloc-zeroed zero-out! free! copy-in! try-copy-in! copy-out
           alloc-block free-block! copy-in-unchecked!
-          c-int-size c-int-ref c-int-set! c-uptr-ref read-net-u16
+          c-int-size c-int-ref c-int-set! try-c-int-set! c-uptr-ref read-net-u16
           c-uptr-size c-uptr-set! c-u32-set!
 
           ;; uv_buf_t
@@ -56,7 +56,7 @@
           sockaddr->address-string
 
           ;; shared validators and boundary helpers
-          fill-sockaddr! align-16
+          fill-sockaddr! try-fill-sockaddr! align-16
           validate-address require-port
           require-callback
           signal-symbol->int term-signal->value
@@ -615,6 +615,19 @@
       (raise (make-uv-invalid-argument 'uv-c-int-set! 'value-not-an-exact-integer)))
     (foreign-set! 'int addr 0 value))
 
+  ;; The range of a C int on this platform.
+  (define c-int-max (- (expt 2 (- (* 8 (foreign-sizeof 'int)) 1)) 1))
+  (define c-int-min (- -1 c-int-max))
+
+  ;; try-c-int-set! : object object -> boolean
+  ;; c-int-set! for an interrupt-free step, where nothing may raise: writes
+  ;; VALUE at ADDR and answers #t, or answers #f, writing nothing, when ADDR
+  ;; is no address or VALUE no C int.
+  (define (try-c-int-set! addr value)
+    (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616)
+         (integer? value) (exact? value) (<= c-int-min value c-int-max)
+         (begin (foreign-set! 'int addr 0 value) #t)))
+
   (define (c-uptr-size) (foreign-sizeof 'uptr))
 
   (define (c-uptr-set! addr value)
@@ -657,13 +670,29 @@
   ;; Parse IP, the bytes validate-address answered, into ADDR: IPv4, then
   ;; IPv6, both from the same bytes. libuv reads them as a C string, so they
   ;; must be one: a bytevector whose only NUL is its last byte. Neither
-  ;; parser retains them.
+  ;; parser retains them. try-fill-sockaddr!, raising its refusal.
   (define (fill-sockaddr! addr ip port who)
-    (unless (c-string? ip)
-      (raise (make-uv-invalid-argument 'uv-fill-sockaddr! 'not-a-c-string)))
-    (unless (or (zero? (raw-ip4-addr ip port addr))
-                (zero? (raw-ip6-addr ip port addr)))
-      (raise (make-uv-invalid-argument who 'bad-address))))
+    (let ((filled (try-fill-sockaddr! addr ip port)))
+      (case filled
+        ((filled) (if #f #f))
+        ((not-a-c-string)
+         (raise (make-uv-invalid-argument 'uv-fill-sockaddr! 'not-a-c-string)))
+        (else (raise (make-uv-invalid-argument who filled))))))
+
+  ;; try-fill-sockaddr! : uptr object object
+  ;;                      -> (or 'filled 'not-a-c-string 'port-out-of-range
+  ;;                             'bad-address)
+  ;; fill-sockaddr! for an interrupt-free step, where nothing may raise: it
+  ;; answers what it refuses. ADDR is the step's own block. The verbs check
+  ;; the port, and take IP from validate-address, before their steps, so the
+  ;; first two refusals come only from a check that has drifted from these.
+  (define (try-fill-sockaddr! addr ip port)
+    (cond ((not (c-string? ip)) 'not-a-c-string)
+          ((not (valid-port? port)) 'port-out-of-range)
+          ((or (zero? (raw-ip4-addr ip port addr))
+               (zero? (raw-ip6-addr ip port addr)))
+           'filled)
+          (else 'bad-address)))
 
   ;; align-16 : exact-nonnegative-integer -> exact-nonnegative-integer
   (define (align-16 n) (* 16 (div (+ n 15) 16)))
@@ -679,8 +708,13 @@
       (raise (make-uv-invalid-argument who 'address-not-a-string)))
     (c-string-bytes ip who 'address-contains-nul))
 
+  ;; The port check the verbs make on entry and try-fill-sockaddr! makes in
+  ;; their steps.
+  (define (valid-port? port)
+    (and (integer? port) (exact? port) (>= port 0) (<= port 65535)))
+
   (define (require-port port who)
-    (unless (and (integer? port) (exact? port) (>= port 0) (<= port 65535))
+    (unless (valid-port? port)
       (raise (make-uv-invalid-argument who 'port-out-of-range))))
 
   (define (require-callback proc who reason)
@@ -958,14 +992,16 @@
     (raw-read-start stream-ptr alloc-cb-entry read-cb-entry))
 
   ;; uv-getaddrinfo-native : uptr uptr (or bytevector #f) (or bytevector #f)
-  ;;                         uptr -> exact-integer
+  ;;                         uptr -> (or exact-integer 'not-a-c-string)
   ;; libuv reads node and service as C strings, so each must be one: a
-  ;; bytevector whose only NUL is its last byte. #f crosses as NULL.
+  ;; bytevector whose only NUL is its last byte. #f crosses as NULL. Anything
+  ;; else is answered, not raised, and libuv is not called: the call sits in
+  ;; uv-getaddrinfo!'s interrupt-free step, where nothing may raise.
   (define (uv-getaddrinfo-native loop-ptr req-ptr node service hints-ptr)
-    (unless (and (c-string-or-false? node) (c-string-or-false? service))
-      (raise (make-uv-invalid-argument 'uv-getaddrinfo-native 'not-a-c-string)))
-    (raw-getaddrinfo loop-ptr req-ptr getaddrinfo-cb-entry
-                     node service hints-ptr))
+    (if (and (c-string-or-false? node) (c-string-or-false? service))
+        (raw-getaddrinfo loop-ptr req-ptr getaddrinfo-cb-entry
+                         node service hints-ptr)
+        'not-a-c-string))
 
   (define (c-string-or-false? x)
     (or (not x) (c-string? x)))

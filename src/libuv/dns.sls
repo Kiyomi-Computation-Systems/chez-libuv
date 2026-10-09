@@ -72,8 +72,14 @@
                     (cons (offsetof-addrinfo-ai-flags) (flag-symbols->int value))))))
              hints)))
 
+  ;; write-hints! : uptr (or 'absent (list-of (offset . int))) -> boolean
+  ;; Inside the step: writes the hints into the request's zeroed tail at
+  ;; TAIL and answers #t. It raises nothing: a value that is no C int is not
+  ;; written, and it answers #f. hint-writes makes every value from the
+  ;; platform's constants, so only a hint-writes that has drifted comes here.
   (define (write-hints! tail writes)
-    (for-each (lambda (w) (c-int-set! (+ tail (car w)) (cdr w))) writes))
+    (or (eq? writes 'absent)
+        (for-all (lambda (w) (try-c-int-set! (+ tail (car w)) (cdr w))) writes)))
 
   ;; uv-getaddrinfo! : uv-loop (or string #f) (or string #f) procedure
   ;;                   -> uv-dns-request
@@ -90,11 +96,14 @@
   ;; Every argument is read once, by the validators, and everything from the
   ;; allocation on uses their copies: node and service as the bytes C reads,
   ;; the hints as the ints the block receives. So nothing the caller can
-  ;; still change reaches C, and nothing between the allocation and the
-  ;; guard can raise (tests/test-dns.sps's sweeps; Valgrind holds the free).
-  ;; Loop-thread-only, checked on entry: libuv counts the request in the
-  ;; loop with a plain increment the loop's thread decrements, so from
-  ;; another thread the loop could exit early or never (#79).
+  ;; still change reaches C (tests/test-dns.sps's sweeps).
+  ;; Loop-thread-only: libuv counts the request in the loop with a plain
+  ;; increment the loop's thread decrements, so from another thread the
+  ;; loop could exit early or never (#79). Checked on entry, and again in
+  ;; one interrupt-free step with the loop's pointer, the allocation, the
+  ;; hints, the registration, the count and uv_getaddrinfo (#85). So no
+  ;; engine can split the lookup from its checks, or drop it holding a
+  ;; request libuv has not taken (tests/test-request-steps.sps).
   (define (start-getaddrinfo! loop node service hints on-complete)
     (require-open-loop loop 'uv-getaddrinfo!)
     (require-loop-thread loop 'uv-getaddrinfo!)
@@ -104,23 +113,33 @@
         (raise (make-uv-invalid-argument 'uv-getaddrinfo!
                                          'on-complete-not-a-procedure)))
       (let* ((hints-offset (align-16 (uv-req-size (uv-getaddrinfo-req-type))))
-             (block (alloc-zeroed (+ hints-offset (sizeof-addrinfo))))
-             (hints-tail (+ block hints-offset)))
-        ;; Absent hints must cross as NULL, not as a zeroed struct: libc may
-        ;; assign different defaults to those two forms.
-        (unless (eq? writes 'absent)
-          (write-hints! hints-tail writes))
-        (let ((req (%make-uv-req-record block 'getaddrinfo #f on-complete loop)))
-          (registry-register! block 'getaddrinfo-req loop req)
-          (count-getaddrinfo-req-new!)
-          (guard (e (#t (abandon-request! req) (count-getaddrinfo-req-free!)
-                        (raise e)))
-            (uv-check (uv-getaddrinfo-native
-                       (loop-pointer loop 'uv-getaddrinfo!)
-                       block (car strings) (cdr strings)
-                       (if (eq? writes 'absent) 0 hints-tail))
-                      'uv-getaddrinfo!))
-          req))))
+             (size (+ hints-offset (sizeof-addrinfo)))
+             (started
+              (one-step
+               (let ((loop-ptr (owned-loop-ptr loop)))
+                 (if (symbol? loop-ptr)
+                     loop-ptr
+                     (let ((block (alloc-block size)))
+                       (cond
+                         ((zero? block) 'no-memory)
+                         ((not (write-hints! (+ block hints-offset) writes))
+                          (free-block! block)
+                          'hint-not-a-c-int)
+                         (else
+                          (submit-request!
+                           block (%make-uv-req-record block 'getaddrinfo #f on-complete loop)
+                           'getaddrinfo-req loop
+                           count-getaddrinfo-req-new! count-getaddrinfo-req-free!
+                           ;; Absent hints must cross as NULL, not as a zeroed
+                           ;; struct: libc may assign different defaults to
+                           ;; those two forms.
+                           (uv-getaddrinfo-native
+                            loop-ptr block (car strings) (cdr strings)
+                            (if (eq? writes 'absent) 0 (+ block hints-offset))))))))))))
+        (cond ((uv-req? started) started)
+              ((eq? started 'wrong-thread)
+               (raise (wrong-thread-refusal loop 'uv-getaddrinfo!)))
+              (else (raise (step-refusal started 'uv-getaddrinfo! #f)))))))
 
   ;; uv-dns-request? : object -> boolean
   (define (uv-dns-request? x)
@@ -155,8 +174,8 @@
        (start-getnameinfo! loop ip port flags on-complete))))
 
   ;; The address is read once, by validate-address, and libuv parses that
-  ;; copy (tests/test-address.sps). Loop-thread-only, checked on entry, as
-  ;; uv-getaddrinfo! is.
+  ;; copy (tests/test-address.sps). Loop-thread-only, and one interrupt-free
+  ;; step from the owner check to uv_getnameinfo, as uv-getaddrinfo! is.
   (define (start-getnameinfo! loop ip port flags on-complete)
     (require-open-loop loop 'uv-getnameinfo!)
     (require-loop-thread loop 'uv-getnameinfo!)
@@ -167,39 +186,59 @@
           (raise (make-uv-invalid-argument 'uv-getnameinfo!
                                            'on-complete-not-a-procedure)))
         (let* ((addr-offset (align-16 (uv-req-size (uv-getnameinfo-req-type))))
-               (block (alloc-zeroed (+ addr-offset (sizeof-sockaddr-storage))))
-               (addr (+ block addr-offset)))
-          (guard (e (#t (free! block) (raise e)))
-            (fill-sockaddr! addr ip-bytes port 'uv-getnameinfo!))
-          (let ((req (%make-uv-req-record block 'getnameinfo #f on-complete loop)))
-            (registry-register! block 'getnameinfo-req loop req)
-            (count-getnameinfo-req-new!)
-            (guard (e (#t (abandon-request! req) (count-getnameinfo-req-free!)
-                          (raise e)))
-              (uv-check (uv-getnameinfo-native
-                         (loop-pointer loop 'uv-getnameinfo!)
-                         block addr flags-int)
-                        'uv-getnameinfo!))
-            req)))))
+               (size (+ addr-offset (sizeof-sockaddr-storage)))
+               (started
+                (one-step
+                 (let ((loop-ptr (owned-loop-ptr loop)))
+                   (if (symbol? loop-ptr)
+                       loop-ptr
+                       (let ((block (alloc-block size)))
+                         (if (zero? block)
+                             'no-memory
+                             (let* ((addr (+ block addr-offset))
+                                    (filled (try-fill-sockaddr! addr ip-bytes port)))
+                               (if (eq? filled 'filled)
+                                   (submit-request!
+                                    block (%make-uv-req-record block 'getnameinfo #f
+                                                               on-complete loop)
+                                    'getnameinfo-req loop
+                                    count-getnameinfo-req-new! count-getnameinfo-req-free!
+                                    (uv-getnameinfo-native loop-ptr block addr flags-int))
+                                   (begin (free-block! block) filled))))))))))
+          (cond ((uv-req? started) started)
+                ((eq? started 'wrong-thread)
+                 (raise (wrong-thread-refusal loop 'uv-getnameinfo!)))
+                (else (raise (step-refusal started 'uv-getnameinfo! #f))))))))
 
   ;; uv-cancel! : uv-dns-request -> boolean
   ;; A true result means cancellation won, but the completion callback still
   ;; fires. False covers work already running or already completed.
   ;; Loop-thread-only, checked: from another thread, the loop's thread could
   ;; complete the request and free its block between the pointer's read and
-  ;; uv_cancel (#79).
+  ;; uv_cancel (#79). The owner check, the pointer's read and uv_cancel are
+  ;; one interrupt-free step (#85): an engine suspended between the read and
+  ;; the call, while its scheduler ran the loop, handed uv_cancel the freed
+  ;; block, and one suspended while the loop changed hands cancelled on the
+  ;; other thread's loop (tests/test-request-steps.sps). The step's check is
+  ;; the only one: nothing is read or made before it, so a check on entry
+  ;; too could never refuse a call the step would not (as for the
+  ;; constructors, ADR-0019's #79 amendment). After the step it only
+  ;; answers, calling nothing for 0 or EBUSY.
   (define (uv-cancel! req)
     (unless (uv-dns-request? req)
       (raise (make-uv-invalid-argument 'uv-cancel!
                                        'not-a-cancellable-request)))
-    (require-loop-thread (req-loop req) 'uv-cancel!)
-    (let ((ptr (req-ptr req)))
-      (if (zero? ptr)
-          #f
-          (let ((rc (uv-cancel ptr)))
-            (cond ((zero? rc) #t)
-                  ((eq? 'EBUSY (errno-value->symbol rc)) #f)
-                  (else (uv-check rc 'uv-cancel!)))))))
+    (let ((loop (req-loop req))
+          (busy (errno-symbol->value 'EBUSY)))
+      (let ((rc (one-step
+                 (if (eqv? (loop-owner-thread loop) (current-thread-id))
+                     (let ((ptr (req-ptr req)))
+                       (if (zero? ptr) 'done (uv-cancel ptr)))
+                     'wrong-thread))))
+        (cond ((eqv? rc 0) #t)
+              ((or (eq? rc 'done) (eqv? rc busy)) #f)
+              ((eq? rc 'wrong-thread) (raise (wrong-thread-refusal loop 'uv-cancel!)))
+              (else (uv-check rc 'uv-cancel!))))))
 
   ;; addrinfo-chain->list : uptr -> (listof uv-addrinfo)
   ;; Read fields through shim offsets, skip unsupported families, and copy all
