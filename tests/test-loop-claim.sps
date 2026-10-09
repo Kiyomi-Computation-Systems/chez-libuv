@@ -339,7 +339,7 @@
 (define (exit-with-another-threads-claim)
   (let ((m (make-mutex)) (cv (make-condition))
         (claimed #f) (go #f) (released #f) (other-id #f) (the-loop #f))
-    (define (other-thread)
+    (define (claim-and-hold)
       (let ((loop (with-mutex m (await m cv (lambda () the-loop)) the-loop)))
         (let ((claim (claim-loop! loop #f)))
           (with-mutex m
@@ -351,7 +351,7 @@
           (with-mutex m
             (set! released #t)
             (condition-broadcast cv)))))
-    (fork-thread other-thread)
+    (fork-thread claim-and-hold)
     (let* ((exit (guard (e (#t (evidence e)))
                    (call-with-uv-loop
                     (lambda (loop)
@@ -488,14 +488,14 @@
                      (if (= resumes exit-split-resumes)
                          (list 'stuck-after-resumes exit-split-resumes)
                          (run next 1 (+ resumes 1)))))))
-           (me (current-thread-id))
+           (this-thread (current-thread-id))
            (holder (and the-loop (loop-holder the-loop)))
            (left (cond (early 'early)
                        ((not (eq? answer 'escaped)) (list 'body answer))
                        ((not forged) 'never-forged)
                        ((not (uv-loop-open? the-loop)) 'torn-down)
                        (gone-at-clear (cons 'forgery-gone-at-clear gone-at-clear))
-                       ((eqv? holder me) 'claimed-by-this-thread)
+                       ((eqv? holder this-thread) 'claimed-by-this-thread)
                        ((not cleared)
                         (cond ((eqv? holder other)
                                (list 'forgery-held (uv-handle-state the-timer)))
@@ -1080,7 +1080,7 @@
   (map (lambda (n) (if (positive? n) 'refused 'never-refused))
        (vector->list (race-state-refused state))))
 
-(define (stuck? verdicts) (memq 'never-ended verdicts))
+(define (race-stuck? verdicts) (memq 'never-ended verdicts))
 
 ;; A race whose thread never ended leaves that thread inside the loop for
 ;; good. No race after it can be trusted, so the rest are skipped and their
@@ -1117,7 +1117,7 @@
     (let-values (((loop w) (make-witnessed-loop #f)))
       (let* ((state (make-race-state))
              (verdicts (run-pair state (run-rounds-work loop) (run-rounds-work loop))))
-        (if (stuck? verdicts)
+        (if (race-stuck? verdicts)
             (begin (set! stuck verdicts)
                    (list verdicts (seen w) 'stuck (moved-pair state) (refused-pair state)))
             (let* ((ran (guard (e (#t (evidence e))) (uv-run loop 'nowait) 'ran))
@@ -1201,7 +1201,7 @@
                                     (+ contended 1)
                                     contended)))
                 (cond
-                 ((stuck? verdicts) (set! stuck verdicts) (list raced contended))
+                 ((race-stuck? verdicts) (set! stuck verdicts) (list raced contended))
                  ((and (equal? (car verdicts) '(closed-out))
                        accepted?
                        (memv (car (cadr raced)) '(0 1))

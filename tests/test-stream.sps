@@ -32,16 +32,14 @@
         ;; The span race's liveness watch, shared and pure.
         (only (uv-race) watch-flipper)
         (uv-sweep)
-        ;; The engine-sweep driver runs the change sweeps; make-engine
-        ;; drives the split sweeps, and bytevector-truncate! shrinks the
-        ;; payload in one; the interrupt pair checks that no
-        ;; refusal leaves interrupts disabled; foreign-procedure binds the
-        ;; libuv queries the split sweeps' witnesses read. The thread
-        ;; primitives run the span race, and getenv skips it under Valgrind.
+        ;; The engine-sweep driver runs the sweeps; make-engine drives the
+        ;; split sweeps, and bytevector-truncate! shrinks the payload in
+        ;; one; foreign-procedure binds the libuv queries the split sweeps'
+        ;; witnesses read. The thread primitives run the span race, and
+        ;; getenv skips it under Valgrind.
         (only (chezscheme) collect foreign-alloc foreign-free foreign-procedure
               make-engine bytevector-truncate!
-              disable-interrupts enable-interrupts
-              fork-thread thread-join getenv get-thread-id))
+              fork-thread thread-join getenv))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -357,47 +355,33 @@
   (map (lambda (v) (cons (sweep-variant-name v) (shrink-sweep v)))
        sweep-variants))
 
-;; rows-in : sweeps (verdict -> boolean) -> (list-of (list name fuel verdict))
-(define (rows-in sweeps bad?)
-  (apply append
-         (map (lambda (sweep)
-                (map (lambda (row) (cons (car sweep) row))
-                     (filter (lambda (row) (bad? (cadr row))) (cdr sweep))))
-              sweeps)))
-
-;; sweep-reach : sweeps -> (list-of (list name first-row last-verdict))
-;; The rows that look for bad verdicts must find none, which says nothing
-;; unless each sweep began at the engine's first stop, before the verb's own
-;; check, and ran its verb to the end.
-(define (sweep-reach sweeps)
-  (map (lambda (sweep)
-         (let ((rows (cdr sweep)))
-           (list (car sweep)
-                 (list (car (car rows)) (cadr (car rows)))
-                 (cadr (list-ref rows (- (length rows) 1))))))
-       sweeps))
-
 (define (one-right-answer? verdict)
   (and (memq verdict '(refused written untouched)) #t))
 
-;; Anything but a right answer or a write the peer received wrongly, which
-;; its own row reports.
-(define (wrong-answer? verdict)
-  (not (or (one-right-answer? verdict)
-           ((verdict-is? 'written-but-sent) verdict))))
+(define sent-wrongly? (verdict-is? 'written-but-sent))
+(define (not-sent-wrongly? verdict) (not (sent-wrongly? verdict)))
 
-(test-equal "each sweep began at fuel 1 with a refusal and ended in a run no expiry reached"
-  (map (lambda (v) (list (sweep-variant-name v) '(1 refused) 'untouched))
+;; A right answer, or a write the peer received wrongly, which its own row
+;; reports.
+(define (right-or-sent-wrongly? verdict)
+  (or (one-right-answer? verdict) (sent-wrongly? verdict)))
+
+;; The rows that look for bad verdicts must find none, which says nothing
+;; unless each sweep's first run, at the engine's first stop (the driver
+;; starts at fuel 1), was refused by the verb's own check, and the sweep ran
+;; its verb to the end.
+(test-equal "each sweep began with a refusal and ended in a run no expiry reached"
+  (map (lambda (v) (list (sweep-variant-name v) 'refused 'untouched))
        sweep-variants)
-  (sweep-reach shrink-sweeps))
+  (reach shrink-sweeps))
 
 (test-equal "a write whose payload shrank during the call is refused by the verb itself, leaving no request"
   '()
-  (rows-in shrink-sweeps wrong-answer?))
+  (bad-runs right-or-sent-wrongly? shrink-sweeps))
 
 (test-equal "a write the sweep let through sent the peer exactly the bytes it was given"
   '()
-  (rows-in shrink-sweeps (verdict-is? 'written-but-sent)))
+  (bad-runs not-sent-wrongly? shrink-sweeps))
 
 ;; --- a segment list that changes during the call (#64) ---------------------
 ;; uv-write*! reads the caller's segment list before its step. It used to
@@ -504,20 +488,20 @@
               (list-sweep seg-list-with-span cut-span!
                           '(uv-write*! segment-not-a-bytevector)))))
 
-(test-equal "each segment-list sweep began at fuel 1 with a refusal and ended in a run no expiry reached"
-  '((segments-cut (1 refused) untouched)
-    (segments-made-circular (1 refused) untouched)
-    (segments-two-cycles (1 refused) untouched)
-    (span-cut (1 refused) untouched))
-  (sweep-reach list-sweeps))
+(test-equal "each segment-list sweep began with a refusal and ended in a run no expiry reached"
+  '((segments-cut refused untouched)
+    (segments-made-circular refused untouched)
+    (segments-two-cycles refused untouched)
+    (span-cut refused untouched))
+  (reach list-sweeps))
 
 (test-equal "a uv-write*! whose segment list changed during the call is refused by the verb itself, leaving no request"
   '()
-  (rows-in list-sweeps wrong-answer?))
+  (bad-runs right-or-sent-wrongly? list-sweeps))
 
 (test-equal "a uv-write*! the segment-list sweeps let through sent the peer exactly the segments it was given"
   '()
-  (rows-in list-sweeps (verdict-is? 'written-but-sent)))
+  (bad-runs not-sent-wrongly? list-sweeps))
 
 ;; --- a segment list changed into another proper list (#81) ----------------
 ;; uv-write*! reads its segment list with read-proper-list, which counts the
@@ -823,15 +807,6 @@
 ;; requires the registry, every counter and the blocks alive back where the
 ;; run began once the connection is closed.
 
-(define (interrupts-enabled?)
-  (disable-interrupts)
-  (zero? (enable-interrupts)))
-
-;; Another thread's id, for a loop handed to it: no thread runs the loop,
-;; but its owner is no longer this one.
-(define me (get-thread-id))
-(define other-thread (+ me 1))
-
 (define sw-loop (make-uv-loop))
 (define sw-server (make-uv-tcp sw-loop))
 (define sw-port (bind-loopback! sw-server))
@@ -914,20 +889,8 @@
                          (closed-or-absent? (link-peer lk))))))
 
 ;; What the run must leave as it found it: the registry, and every debug
-;; counter, blocks included.
-(define (balance) (cons (registry-count) (live-counts)))
-
-(define (residue before)
-  (let ((after (balance)))
-    (append
-     (if (= (car before) (car after))
-         '()
-         (list (list 'registry (- (car after) (car before)))))
-     (filter (lambda (x) x)
-             (map (lambda (b a)
-                    (and (not (= (cdr b) (cdr a)))
-                         (list (car b) (- (cdr a) (cdr b)))))
-                  (cdr before) (cdr after))))))
+;; counter, blocks included, as (name . count).
+(define (balance) (cons (cons 'registry (registry-count)) (live-counts)))
 
 ;; A variant names a verb, readies a link for it, and starts it on the
 ;; link's client. MADE? says, with the stream still open, whether the verb's
@@ -1029,8 +992,8 @@
     (lambda (lk fill) 'unobservable)
     (lambda (lk fill) #t))))
 
-;; split-run : variant exact-positive-integer symbol -> verdict
-;; MODE is 'free, 'reuse to open a new connection after the free, or
+;; split-run : variant exact-positive-integer symbol -> (values verdict boolean)
+;; The run's verdict, and whether an expiry reached it. MODE is 'free, 'reuse to open a new connection after the free, or
 ;; 'handoff to hand the loop to another thread in place of the close.
 (define (split-run v fuel mode)
   (if (eq? mode 'handoff)
@@ -1059,32 +1022,24 @@
          (list 'untouched 'never-landed (link-evidence lk)))
         (else 'untouched)))
 
-;; with-residue : pair verdict -> verdict
-;; The verdict, or what the run left behind with it.
-(define (with-residue before verdict)
-  (let ((left (residue before)))
-    (cond ((not (interrupts-enabled?))
-           (enable-interrupts)
-           (list 'interrupts-left-disabled verdict))
-          ((pair? left) (list verdict 'left left))
-          (else verdict))))
-
-;; handoff-run : variant exact-positive-integer -> verdict
+;; handoff-run : variant exact-positive-integer -> (values verdict boolean)
 ;; At the expiry, hands sw-loop to another thread, resumes the verb, and
 ;; hands the loop back. The stream stays open throughout.
 (define (handoff-run v fuel)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
                (returned #f)
+               (expired #f)
                (eng (start-engine v lk fill (lambda () (set! returned #t))))
                (verdict
                 (eng fuel
                      (lambda (ticks outcome) (run-ended v lk fill outcome))
                      (lambda (resume)
+                       (set! expired #t)
                        (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
                                                returned))
                               (landed (and made-before ((variant-landed? v) lk fill)))
@@ -1103,23 +1058,25 @@
                                                         (link-evidence lk)))
                                                  (else 'made-before-handoff))))))))))
           (close-link! lk)
-          (with-residue before verdict)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
-;; close-run : variant exact-positive-integer symbol -> verdict
+;; close-run : variant exact-positive-integer symbol -> (values verdict boolean)
 ;; MODE is 'free, or 'reuse to open a new connection after the free.
 (define (close-run v fuel mode)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
                (returned #f)
+               (expired #f)
                (eng (start-engine v lk fill (lambda () (set! returned #t))))
                (verdict
                 (eng fuel
                      (lambda (ticks outcome) (run-ended v lk fill outcome))
                      (lambda (resume)
+                       (set! expired #t)
                        (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
                                                returned))
                               (landed (and made-before ((variant-landed? v) lk fill))))
@@ -1148,16 +1105,17 @@
                                                           (link-evidence lk)))
                                                    (else 'made-before-close)))))))))))
           (close-link! lk)
-          (with-residue before verdict)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
-;; drop-run : variant exact-positive-integer -> verdict
+;; drop-run : variant exact-positive-integer -> (values verdict boolean)
 (define (drop-run v fuel)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
+               (expired #f)
                (eng (make-engine
                      (lambda ()
                        (guard (e (#t (list 'raised (describe e))))
@@ -1165,38 +1123,25 @@
                          'returned))))
                (outcome (eng fuel
                              (lambda (ticks o) (if (eq? o 'returned) 'untouched (list 'untouched o)))
-                             (lambda (resume) 'dropped))))
+                             (lambda (resume) (set! expired #t) 'dropped))))
           (close-link! lk)
-          (let ((left (residue before)))
-            (cond ((not (interrupts-enabled?))
-                   (enable-interrupts)
-                   (list 'interrupts-left-disabled outcome))
-                  ((pair? left) (list outcome 'left left))
-                  (else outcome)))))))
+          (values (checked-verdict outcome 'finished before balance) expired)))))
 
 (define sweep-fuel-cap 400)
-
-(define (untouched? verdict)
-  (or (eq? verdict 'untouched) (and (pair? verdict) (eq? (car verdict) 'untouched))))
 
 ;; A run whose connection failed: the next would wait the same handshake out
 ;; again, at every fuel up to the cap.
 (define (unconnected? verdict)
   (and (pair? verdict) (memq (car verdict) '(connect-failed no-new-connection)) #t))
 
-;; sweep : (exact-positive-integer -> verdict) -> (list-of (cons fuel verdict))
+;; sweep : (exact-positive-integer -> (values verdict boolean))
+;;         -> (list-of (list fuel verdict expired?))
 ;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
-;; to the first run whose connection failed, or to the cap. A raise between
-;; runs would abort the suite, so the sweep is caught and its evidence handed
-;; to the rows.
+;; to the first run whose connection failed, or to the cap. The driver ends
+;; the sweep at a raise between runs, keeping the runs before it
+;; (tests/uv-sweep.sls).
 (define (sweep run)
-  (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
-    (let next ((fuel 1) (acc '()))
-      (let* ((verdict (run fuel))
-             (acc (cons (cons fuel verdict) acc)))
-        (if (or (untouched? verdict) (unconnected? verdict) (= fuel sweep-fuel-cap))
-            (reverse acc)
-            (next (+ fuel 1) acc))))))
+  (sweep-fuels run sweep-fuel-cap unconnected?))
 
 (define (named-sweeps run vs)
   (map (lambda (v) (cons (variant-name v) (sweep (lambda (fuel) (run v fuel))))) vs))
@@ -1211,47 +1156,9 @@
   (named-sweeps (lambda (v fuel) (split-run v fuel 'handoff)) variants))
 (define drop-sweeps (named-sweeps drop-run variants))
 
-;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
-(define (bad-runs good? sweeps)
-  (apply append
-         (map (lambda (s)
-                (map (lambda (run) (list (car s) (car run) (cdr run)))
-                     (filter (lambda (run) (not (good? (cdr run)))) (cdr s))))
-              sweeps)))
-
-;; reach : sweeps symbol -> (list-of (list name first last))
-;; The rows below look for bad runs and must find none, which says nothing
-;; unless each sweep caught its verb before the step (FIRST) and ran it to
-;; the end (the last run untouched).
-(define (reach sweeps)
-  (map (lambda (s)
-         (let ((runs (cdr s)))
-           (list (car s) (cdar runs) (cdr (list-ref runs (- (length runs) 1))))))
-       sweeps))
-
-(define (expected-reach sweeps first)
-  (map (lambda (s) (list (car s) first 'untouched)) sweeps))
-
-;; fuel-map : sweep -> list, e.g. ((refused 1 9) (untouched 10 10)): each
-;; run of equal verdicts with its first and last fuel, for the record.
-(define (fuel-map runs)
-  (let collect ((runs runs) (acc '()))
-    (cond ((null? runs) (reverse acc))
-          ((and (pair? acc) (equal? (caar acc) (cdar runs)))
-           (collect (cdr runs)
-                    (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
-          (else (collect (cdr runs)
-                         (cons (list (cdar runs) (caar runs) (caar runs)) acc))))))
-
-(for-each
- (lambda (kind sweeps)
-   (for-each (lambda (s)
-               (display "  [informational] ") (display kind) (display " ")
-               (display (car s)) (display ": ")
-               (write (fuel-map (cdr s))) (newline))
-             sweeps))
- '(split reuse handoff drop)
- (list split-sweeps reuse-sweeps handoff-sweeps drop-sweeps))
+(for-each report!
+          '(split reuse handoff drop)
+          (list split-sweeps reuse-sweeps handoff-sweeps drop-sweeps))
 
 (test-equal "a stream verb split by a close is refused, or had made its call before the close"
   '()

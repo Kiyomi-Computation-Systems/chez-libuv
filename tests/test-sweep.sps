@@ -1,6 +1,7 @@
 #!r6rs
 ;;; SRFI-64 suite for (uv-sweep), the engine-sweep driver the suites share
-;;; (#81): run-capped, capped and sweep-fuels.
+;;; (#81): run-capped, capped and sweep-fuels, and what the step suites read
+;;; from their sweeps (#103).
 ;;;
 ;;; Pure: the library imports no native code, and make check-purity runs
 ;;; this suite with the shim poisoned (PURE_TESTS), so the pure suites can
@@ -8,8 +9,12 @@
 (import (rnrs)
         (srfi :64)
         (uv-sweep)
-        ;; The engine census reads the suites' sources.
-        (only (chezscheme) directory-list))
+        ;; The definition census reads the shared libraries' export forms.
+        (only (uv-source) library-exports)
+        ;; The engine census reads the suites' sources; the rows for what a
+        ;; run leaves behind set interrupts and print.
+        (only (chezscheme) directory-list with-output-to-string get-thread-id
+              disable-interrupts enable-interrupts))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -193,6 +198,102 @@
                (lambda (verdict)
                  (if (equal? verdict '(verdict 2)) (raise 'stop-raised) #f))))
 
+;; --- what a sweep's runs say (#103) --------------------------------------------
+;; Two sweeps whose first, second and last verdicts all differ, so a helper
+;; that read another run, or the expired? column, answers something else.
+;; beta has a list verdict at two fuels in a row, and a verdict again after
+;; another came between.
+(define sample-sweeps
+  '((alpha (1 refused #t) (2 wrong #t) (3 untouched #f))
+    (beta (1 dropped #t) (2 (left ((block 1))) #t) (3 (left ((block 1))) #t)
+          (4 dropped #t) (5 (untouched extra) #f))))
+
+(define (right? v) (and (memq v '(refused dropped untouched)) #t))
+
+(test-equal "bad-runs answers each run its predicate does not accept, by sweep and fuel, in order"
+  '((alpha 2 wrong) (beta 2 (left ((block 1)))) (beta 3 (left ((block 1))))
+    (beta 5 (untouched extra)))
+  (bad-runs right? sample-sweeps))
+
+(test-equal "reach answers each sweep's first verdict and its last"
+  '((alpha refused untouched) (beta dropped (untouched extra)))
+  (reach sample-sweeps))
+
+(test-equal "reach-any answers whether some run of each sweep had the verdict, lists included, and its last"
+  '(((alpha #t untouched) (beta #f (untouched extra)))
+    ((alpha #f untouched) (beta #t (untouched extra))))
+  (list (reach-any 'wrong sample-sweeps)
+        (reach-any '(left ((block 1))) sample-sweeps)))
+
+(test-equal "expected-reach is each sweep beginning with the verdict given and ending untouched"
+  '((alpha refused untouched) (beta refused untouched))
+  (expected-reach sample-sweeps 'refused))
+
+(test-equal "fuel-map joins each stretch of equal verdicts, lists included, and no others"
+  '((dropped 1 1) ((left ((block 1))) 2 3) (dropped 4 4) ((untouched extra) 5 5))
+  (fuel-map (cdr (assq 'beta sample-sweeps))))
+
+(test-equal "report! prints each sweep's fuel map under its kind and name"
+  (string-append
+   "  [informational] split alpha: ((refused 1 1) (wrong 2 2) (untouched 3 3))\n"
+   "  [informational] split beta: ((dropped 1 1) ((left ((block 1))) 2 3)"
+   " (dropped 4 4) ((untouched extra) 5 5))\n")
+  (with-output-to-string (lambda () (report! 'split sample-sweeps))))
+
+(test-equal "untouched? is true of untouched, alone or with evidence after it, and of nothing else"
+  '(#t #t #f #f #f)
+  (map untouched? '(untouched (untouched extra) refused (refused untouched) #f)))
+
+;; --- what a run must leave as it found it ------------------------------------
+(test-equal "interrupts-enabled? answers whether interrupts are enabled, and leaves them so"
+  '(#t #f #t)
+  (let* ((on (interrupts-enabled?))
+         (off (begin (disable-interrupts)
+                     (let ((answer (interrupts-enabled?)))
+                       (enable-interrupts)
+                       answer))))
+    (list on off (interrupts-enabled?))))
+
+(test-equal "residue answers what each count gained or lost, and nothing for a count that held"
+  '(((registry 1) (block -2)) ())
+  (let ((before '((registry . 3) (handle . 2) (block . 5))))
+    (list (residue before '((registry . 4) (handle . 2) (block . 3)))
+          (residue before before))))
+
+;; Paired by position, a balance read in another order would put one
+;; count's change under another's name, and one with a count more would
+;; raise from map.
+(test-equal "residue answers two balances that name their counts differently, rather than pair them"
+  '(((balance-names (registry block) (block registry)))
+    ((balance-names (registry block) (registry block fds))))
+  (let ((before '((registry . 3) (block . 5))))
+    (list (residue before '((block . 5) (registry . 3)))
+          (residue before '((registry . 3) (block . 5) (fds . 9))))))
+
+;; A balance before a run, and two a suite's (balance) could read after it.
+(define before-run '((registry . 3) (block . 5)))
+(define (as-before) before-run)
+(define (one-block-more) '((registry . 3) (block . 6)))
+
+(test-equal "checked-verdict answers the verdict, or why its run was not tidied before what it left"
+  '(v (v left ((block 1))) (v finish lock-held))
+  (list (checked-verdict 'v 'finished before-run as-before)
+        (checked-verdict 'v 'finished before-run one-block-more)
+        (checked-verdict 'v 'lock-held before-run one-block-more)))
+
+;; A run that leaves interrupts disabled would defer every expiry after it,
+;; so the verdict says so first, and the next run starts with them enabled.
+(test-equal "checked-verdict answers interrupts left disabled before anything else, and enables them"
+  '((interrupts-left-disabled v) #t)
+  (let ((verdict (begin (disable-interrupts)
+                        (checked-verdict 'v 'lock-held before-run one-block-more))))
+    (list verdict (interrupts-enabled?))))
+
+;; --- the threads a handoff names -----------------------------------------------
+(test-equal "me is the thread the suite runs on, and other-thread another"
+  '(#t #f #t)
+  (list (eqv? me (get-thread-id)) (eqv? other-thread me) (fixnum? other-thread)))
+
 ;; --- the engine census -------------------------------------------------------
 ;; A change sweep that resumes its engine itself can resume it without a cap,
 ;; and a cap shows only on a call that never ends, which a correct build has
@@ -292,23 +393,68 @@
   engine-sites-allowed
   (engine-sites))
 
-;; describe was copied into seven suites and libraries before #81; one copy
-;; now lives in tests/uv-describe.sls. A new copy fails this row by name.
-;; defines? : datum symbol -> boolean
-;; Whether X defines NAME as a procedure anywhere outside quoted data.
-(define (defines? x name)
+;; describe was copied into seven suites and libraries before #81, and the
+;; step suites' sweep helpers into eight suites before #103; each now lives
+;; in one library. A new copy of any name either library exports fails this
+;; row by name, as (name file ...): a definition, procedure or variable, or
+;; a binding in a let, let*, letrec or letrec*, or a named let's name,
+;; anywhere in a source directly under tests/. test-constructors bound its
+;; own `me` in a let* until #103. What the census cannot see: a lambda's
+;; parameters, a copy under another name, and one written out inline, as
+;; test-process wrote `(+ (get-thread-id) 1)` for other-thread.
+;; binds? : datum symbol -> boolean
+;; Whether X defines or let-binds NAME anywhere outside quoted data.
+(define (binds? x name)
   (and (pair? x)
        (not (eq? (car x) 'quote))
-       (or (and (eq? (car x) 'define) (pair? (cdr x)) (pair? (cadr x))
-                (eq? (car (cadr x)) name))
+       (or (and (eq? (car x) 'define) (pair? (cdr x))
+                (eq? (if (pair? (cadr x)) (car (cadr x)) (cadr x)) name))
+           (and (memq (car x) '(let let* letrec letrec*)) (pair? (cdr x))
+                (let* ((named (symbol? (cadr x)))
+                       (bindings (if named
+                                     (and (pair? (cddr x)) (caddr x))
+                                     (cadr x))))
+                  (or (and named (eq? (cadr x) name))
+                      (and (list? bindings)
+                           (exists (lambda (b) (and (pair? b) (eq? (car b) name)))
+                                   bindings)))))
            (let walk ((x x))
-             (and (pair? x) (or (defines? (car x) name) (walk (cdr x))))))))
+             (and (pair? x) (or (binds? (car x) name) (walk (cdr x))))))))
 
-(test-equal "describe is defined once, in tests/uv-describe.sls"
-  '("tests/uv-describe.sls")
-  (filter (lambda (path)
-            (exists (lambda (form) (defines? form 'describe)) (read-forms path)))
-          (test-sources)))
+;; exports : string -> (list-of symbol)
+;; The names a library source exports, from its library form.
+(define (exports path)
+  (library-exports (car (read-forms path))))
+
+;; definers : (list-of symbol) -> (list-of (cons symbol (list-of string)))
+;; Each name, with every source that defines or let-binds it. Each source
+;; is read once.
+(define (definers names)
+  (let ((sources (map (lambda (path) (cons path (read-forms path)))
+                      (test-sources))))
+    (map (lambda (name)
+           (cons name
+                 (map car
+                      (filter (lambda (source)
+                                (exists (lambda (form) (binds? form name))
+                                        (cdr source)))
+                              sources))))
+         names)))
+
+(test-equal "each name (uv-describe) and (uv-sweep) export is defined or let-bound in its own library alone"
+  '((describe "tests/uv-describe.sls")
+    (resume-fuel "tests/uv-sweep.sls") (resume-cap "tests/uv-sweep.sls")
+    (run-capped "tests/uv-sweep.sls") (run-capped* "tests/uv-sweep.sls")
+    (capped "tests/uv-sweep.sls") (stuck? "tests/uv-sweep.sls")
+    (sweep-fuels "tests/uv-sweep.sls") (bad-runs "tests/uv-sweep.sls")
+    (reach "tests/uv-sweep.sls") (reach-any "tests/uv-sweep.sls")
+    (expected-reach "tests/uv-sweep.sls") (fuel-map "tests/uv-sweep.sls")
+    (report! "tests/uv-sweep.sls") (untouched? "tests/uv-sweep.sls")
+    (interrupts-enabled? "tests/uv-sweep.sls") (residue "tests/uv-sweep.sls")
+    (checked-verdict "tests/uv-sweep.sls") (me "tests/uv-sweep.sls")
+    (other-thread "tests/uv-sweep.sls"))
+  (definers (append (exports "tests/uv-describe.sls")
+                    (exports "tests/uv-sweep.sls"))))
 
 (test-end "sweep")
 

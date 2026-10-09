@@ -23,15 +23,14 @@
         (only (libuv private constants) errno-symbol->value)
         (uv-testing)
         (only (uv-evidence) describe)
-        ;; make-engine and engine-block drive the sweeps; the interrupt pair
-        ;; checks that no run leaves interrupts disabled; the thread forms
+        (uv-sweep)
+        ;; make-engine and engine-block drive the sweeps; the thread forms
         ;; probe the init lock from another thread; directory-list counts
         ;; this process's open descriptors.
         (only (chezscheme) make-engine engine-block
-              disable-interrupts enable-interrupts
               fork-thread make-mutex make-condition with-mutex
               mutex-acquire mutex-release condition-wait condition-signal
-              get-thread-id directory-list foreign-procedure))
+              directory-list foreign-procedure))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -79,10 +78,6 @@
 ;; before any run counts descriptors, keeps that out of every run's count.
 (uv-loop-teardown! (make-uv-loop))
 
-(define (interrupts-enabled?)
-  (disable-interrupts)
-  (zero? (enable-interrupts)))
-
 ;; lock-free? : -> boolean
 ;; Whether another thread can take the init gate's lock now. The lock is
 ;; recursive, so the thread that holds it cannot see it held.
@@ -110,23 +105,11 @@
   (guard (e (#t 0))
     (length (directory-list "/dev/fd"))))
 
-;; The registry, every debug counter (blocks included), and descriptors.
-(define (balance) (list (registry-count) (live-counts) (fd-count)))
-
-(define (residue before)
-  (let ((after (balance)))
-    (append
-     (if (= (car before) (car after))
-         '()
-         (list (list 'registry (- (car after) (car before)))))
-     (filter (lambda (x) x)
-             (map (lambda (b a)
-                    (and (not (= (cdr b) (cdr a)))
-                         (list (car b) (- (cdr a) (cdr b)))))
-                  (cadr before) (cadr after)))
-     (if (= (caddr before) (caddr after))
-         '()
-         (list (list 'fds (- (caddr after) (caddr before))))))))
+;; The registry, every debug counter (blocks included), and descriptors,
+;; as (name . count).
+(define (balance)
+  (cons (cons 'registry (registry-count))
+        (append (live-counts) (list (cons 'fds (fd-count))))))
 
 ;; finish! : uv-loop -> (or 'torn-down 'would-hang list)
 ;; Tears LOOP down as uv-loop-teardown! does, without letting it hang the
@@ -146,16 +129,11 @@
         'would-hang
         (begin (uv-loop-teardown! loop) 'torn-down))))
 
-;; run-verdict : list verdict boolean -> verdict
-;; The verdict, or what the run left behind with it.
-(define (run-verdict before verdict lock)
-  (let ((left (residue before)))
-    (cond ((not (interrupts-enabled?))
-           (enable-interrupts)
-           (list 'interrupts-left-disabled verdict))
-          ((not lock) (release-lock!) (list verdict 'init-lock-held))
-          ((pair? left) (list verdict 'left left))
-          (else verdict))))
+;; lock-finished : boolean -> (or 'finished 'init-lock-held)
+;; How a run that found the init lock FREE, or held, left it: a held lock
+;; is released, so the next run starts clean.
+(define (lock-finished free)
+  (if free 'finished (begin (release-lock!) 'init-lock-held)))
 
 ;; --- the constructors ---------------------------------------------------------
 ;; A variant prepares a fresh loop, answering what its start needs, or #f
@@ -202,14 +180,16 @@
 ;; A constructor that returns an open handle on the torn-down loop made it
 ;; on the freed uv_loop_t.
 
-;; split-run : variant exact-positive-integer -> verdict
+;; split-run : variant exact-positive-integer -> (values verdict boolean)
+;; The run's verdict, and whether an expiry reached it.
 (define (split-run v fuel)
   (let* ((before (balance))
          (loop (make-uv-loop))
          (ctx ((variant-prepare v) loop)))
     (if (not ctx)
-        (begin (finish! loop) '(prepare-failed))
+        (begin (finish! loop) (values '(prepare-failed) #f))
         (let* ((fixtures (length (uv-loop-live-handles loop)))
+               (expired #f)
                (eng (make-engine
                      (lambda ()
                        (guard (e ((uv-handle-closed? e) 'refused)
@@ -222,6 +202,7 @@
                            'untouched
                            (list 'untouched o)))
                      (lambda (resume)
+                       (set! expired #t)
                        (let* ((made (> (length (uv-loop-live-handles loop)) fixtures))
                               (torn (finish! loop))
                               (o (resume 1000000 (lambda (ticks o) o)
@@ -237,7 +218,7 @@
                                       (if made 'made-before 'made-after-teardown)))
                                (else (list o (if made 'made-before 'not-made)))))))))
           (when (uv-loop-open? loop) (finish! loop))
-          (run-verdict before verdict #t)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
 ;; --- uv-accept! split by its server's close ---------------------------------------
 ;; A teardown closes the loop, which a constructor's own check refuses.
@@ -252,8 +233,9 @@
          (loop (make-uv-loop))
          (server (accept-prepare loop)))
     (if (not server)
-        (begin (finish! loop) '(prepare-failed))
+        (begin (finish! loop) (values '(prepare-failed) #f))
         (let* ((fixtures (length (uv-loop-live-handles loop)))
+               (expired #f)
                (eng (make-engine
                      (lambda ()
                        (guard (e ((uv-handle-closed? e) 'refused)
@@ -264,6 +246,7 @@
                      (lambda (ticks o)
                        (if (and (pair? o) (eq? (car o) 'returned)) 'untouched (list 'untouched o)))
                      (lambda (resume)
+                       (set! expired #t)
                        (let ((made (> (length (uv-loop-live-handles loop)) fixtures)))
                          (uv-close! server)
                          (when (eq? mode 'freed)
@@ -278,9 +261,10 @@
                                   'made-before-close)
                                  (else (list o (if made 'made-before 'not-made))))))))))
           (let ((torn (finish! loop)))
-            (run-verdict before
-                         (if (eq? torn 'torn-down) verdict (list verdict 'teardown torn))
-                         #t))))))
+            (values (checked-verdict
+                     (if (eq? torn 'torn-down) verdict (list verdict 'teardown torn))
+                     'finished before balance)
+                    expired))))))
 
 ;; --- a loop that changes hands -------------------------------------------------
 ;; Every constructor is loop-thread-only, and checks the owner on entry and
@@ -295,11 +279,11 @@
 (define (handoff-run v fuel)
   (let* ((before (balance))
          (loop (make-uv-loop))
-         (ctx ((variant-prepare v) loop))
-         (me (get-thread-id)))
+         (ctx ((variant-prepare v) loop)))
     (if (not ctx)
-        (begin (finish! loop) '(prepare-failed))
+        (begin (finish! loop) (values '(prepare-failed) #f))
         (let* ((fixtures (length (uv-loop-live-handles loop)))
+               (expired #f)
                (eng (make-engine
                      (lambda ()
                        (guard (e ((uv-wrong-thread? e) 'refused)
@@ -310,8 +294,9 @@
                      (lambda (ticks o)
                        (if (and (pair? o) (eq? (car o) 'returned)) 'untouched (list 'untouched o)))
                      (lambda (resume)
+                       (set! expired #t)
                        (let ((made (> (length (uv-loop-live-handles loop)) fixtures)))
-                         (set-loop-owner-thread! loop (+ me 1))
+                         (set-loop-owner-thread! loop other-thread)
                          (let ((o (resume 1000000 (lambda (ticks o) o)
                                           (lambda (more) 'still-running))))
                            (set-loop-owner-thread! loop me)
@@ -321,21 +306,22 @@
                                  (else (list (if (and (pair? o) (eq? (car o) 'returned)) 'returned o)
                                              (if made 'made-before 'made-after-handoff))))))))))
           (finish! loop)
-          (run-verdict before verdict #t)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
 ;; --- dropped ----------------------------------------------------------------------
 ;; The scheduler drops the engine at the expiry, and the loop is torn down
 ;; after. Right answers: 'dropped or 'untouched, with the teardown done,
 ;; nothing left behind, interrupts enabled, and the init lock free.
 
-;; drop-run : variant exact-positive-integer -> verdict
+;; drop-run : variant exact-positive-integer -> (values verdict boolean)
 (define (drop-run v fuel)
   (let* ((before (balance))
          (loop (make-uv-loop))
          (ctx ((variant-prepare v) loop)))
     (if (not ctx)
-        (begin (finish! loop) '(prepare-failed))
-        (let* ((eng (make-engine
+        (begin (finish! loop) (values '(prepare-failed) #f))
+        (let* ((expired #f)
+               (eng (make-engine
                      (lambda ()
                        (guard (e (#t (list 'raised (describe e))))
                          ((variant-start v) loop ctx)
@@ -343,18 +329,20 @@
                (outcome (eng fuel
                              (lambda (ticks o)
                                (if (eq? o 'returned) 'untouched (list 'untouched o)))
-                             (lambda (resume) 'dropped)))
+                             (lambda (resume) (set! expired #t) 'dropped)))
                (lock (lock-free?))
                (torn (finish! loop)))
-          (run-verdict before
-                       (if (eq? torn 'torn-down) outcome (list outcome 'teardown torn))
-                       lock)))))
+          (values (checked-verdict
+                   (if (eq? torn 'torn-down) outcome (list outcome 'teardown torn))
+                   (lock-finished lock) before balance)
+                  expired)))))
 
 ;; A dropped make-uv-loop has no loop to tear down. The loop it made, if it
 ;; reached the engine's thunk, is torn down here.
 (define (loop-drop-run fuel)
   (let* ((before (balance))
          (made #f)
+         (expired #f)
          (eng (make-engine
                (lambda ()
                  (guard (e (#t (list 'raised (describe e))))
@@ -363,12 +351,12 @@
          (outcome (eng fuel
                        (lambda (ticks o)
                          (if (eq? o 'returned) 'untouched (list 'untouched o)))
-                       (lambda (resume) 'dropped)))
+                       (lambda (resume) (set! expired #t) 'dropped)))
          (lock (lock-free?))
          (torn (if made (finish! made) 'torn-down)))
-    (run-verdict before
-                 (if (eq? torn 'torn-down) outcome (list outcome 'teardown torn))
-                 lock)))
+    (values (checked-verdict (if (eq? torn 'torn-down) outcome (list outcome 'teardown torn))
+                             (lock-finished lock) before balance)
+            expired)))
 
 ;; call-with-uv-loop tears its loop down however its body is left, an
 ;; engine's expiry included. The body here blocks its engine as soon as it
@@ -378,6 +366,7 @@
 (define (cwl-drop-run fuel)
   (let* ((before (balance))
          (entered #f)
+         (expired #f)
          (eng (make-engine
                (lambda ()
                  (guard (e (#t (list 'raised (describe e))))
@@ -386,39 +375,37 @@
                    'returned))))
          (outcome (eng fuel
                        (lambda (ticks o) (list 'completed o))
-                       (lambda (resume) (if entered 'reached-body 'dropped))))
+                       (lambda (resume)
+                         (set! expired #t)
+                         (if entered 'reached-body 'dropped))))
          (lock (lock-free?))
          (torn (if (and entered (uv-loop-open? entered))
                    (list 'left-open (finish! entered))
                    'torn-down)))
-    (run-verdict before
-                 (if (eq? torn 'torn-down) outcome (list outcome torn))
-                 lock)))
+    (values (checked-verdict (if (eq? torn 'torn-down) outcome (list outcome torn))
+                             (lock-finished lock) before balance)
+            expired)))
 
 ;; --- the sweeps -------------------------------------------------------------------
 (define sweep-fuel-cap 400)
-
-(define (last-run? verdict)
-  (or (memq verdict '(untouched reached-body))
-      (and (pair? verdict) (memq (car verdict) '(untouched completed)))))
 
 ;; A run whose fixture could not be made: the next would wait the same
 ;; handshake out again, at every fuel up to the cap.
 (define (unprepared? verdict) (equal? verdict '(prepare-failed)))
 
-;; sweep : (exact-positive-integer -> verdict) -> (list-of (cons fuel verdict))
-;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
-;; to the first run whose fixture could not be made, or to the cap. A raise
-;; between runs would abort the suite, so the sweep is caught and its
-;; evidence handed to the rows.
+;; A call-with-uv-loop drop run whose body was reached: past it, the body's
+;; own expiry does the teardown, so a later run would show nothing new.
+(define (past-the-body? verdict) (eq? verdict 'reached-body))
+
+;; sweep : (exact-positive-integer -> (values verdict boolean))
+;;         -> (list-of (list fuel verdict expired?))
+;; From fuel 1 to the first run no expiry reaches, whatever its verdict, to
+;; the first run whose fixture could not be made or that reached a body,
+;; or to the cap. The driver ends the sweep at a raise between runs,
+;; keeping the runs before it (tests/uv-sweep.sls).
 (define (sweep run)
-  (guard (e (#t (list (cons 0 (list 'sweep-raised (describe e))))))
-    (let next ((fuel 1) (acc '()))
-      (let* ((verdict (run fuel))
-             (acc (cons (cons fuel verdict) acc)))
-        (if (or (last-run? verdict) (unprepared? verdict) (= fuel sweep-fuel-cap))
-            (reverse acc)
-            (next (+ fuel 1) acc))))))
+  (sweep-fuels run sweep-fuel-cap
+               (lambda (verdict) (or (unprepared? verdict) (past-the-body? verdict)))))
 
 (define (named-sweeps run vs)
   (let next ((vs vs) (acc '()))
@@ -439,51 +426,16 @@
           (list (cons 'make-uv-loop (sweep loop-drop-run))
                 (cons 'call-with-uv-loop (sweep cwl-drop-run)))))
 
-;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
-(define (bad-runs good? sweeps)
-  (apply append
-         (map (lambda (s)
-                (map (lambda (run) (list (car s) (car run) (cdr run)))
-                     (filter (lambda (run) (not (good? (cdr run)))) (cdr s))))
-              sweeps)))
-
-;; reach : sweeps -> (list-of (list name first last))
-;; The rows below look for bad runs and must find none, which says nothing
-;; unless each sweep caught its constructor at its first fuel and ran it to
-;; the end.
-(define (reach sweeps)
-  (map (lambda (s)
-         (let ((runs (cdr s)))
-           (list (car s) (cdar runs) (cdr (list-ref runs (- (length runs) 1))))))
-       sweeps))
-
-;; fuel-map : sweep -> list, e.g. ((refused 1 12) (untouched 13 13)): each
-;; run of equal verdicts with its first and last fuel, for the record.
-(define (fuel-map runs)
-  (let collect ((runs runs) (acc '()))
-    (cond ((null? runs) (reverse acc))
-          ((and (pair? acc) (equal? (caar acc) (cdar runs)))
-           (collect (cdr runs)
-                    (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
-          (else (collect (cdr runs)
-                         (cons (list (cdar runs) (caar runs) (caar runs)) acc))))))
-
-(for-each
- (lambda (kind sweeps)
-   (for-each (lambda (s)
-               (display "  [informational] ") (display kind) (display " ")
-               (display (car s)) (display ": ")
-               (write (fuel-map (cdr s))) (newline))
-             sweeps))
- '(split server-close handoff drop)
- (list split-sweeps server-close-sweeps handoff-sweeps drop-sweeps))
+(for-each report!
+          '(split server-close handoff drop)
+          (list split-sweeps server-close-sweeps handoff-sweeps drop-sweeps))
 
 (test-equal "a constructor split by a teardown is refused, or had made its handle before it"
   '()
   (bad-runs (lambda (v) (memq v '(refused made-before-teardown untouched))) split-sweeps))
 
 (test-equal "each split sweep caught its constructor before its checks and ran it to the end"
-  (map (lambda (s) (list (car s) 'refused 'untouched)) split-sweeps)
+  (expected-reach split-sweeps 'refused)
   (reach split-sweeps))
 
 (test-equal "an accept split by its server's close is refused, or had accepted before it"
@@ -499,7 +451,7 @@
   (bad-runs (lambda (v) (memq v '(refused made-before-handoff untouched))) handoff-sweeps))
 
 (test-equal "each handoff sweep caught its constructor before its checks and ran it to the end"
-  (map (lambda (s) (list (car s) 'refused 'untouched)) handoff-sweeps)
+  (expected-reach handoff-sweeps 'refused)
   (reach handoff-sweeps))
 
 (test-equal "a constructor whose engine is dropped leaves no block, handle, descriptor or held lock"
@@ -553,7 +505,7 @@
   (let* ((loop (make-uv-loop))
          (before (balance))
          (made (step loop))
-         (left (residue before)))
+         (left (residue before (balance))))
     (list made left (finish! loop))))
 
 (test-equal "a handle whose init fails is refused with its errno, leaving nothing behind"
@@ -588,7 +540,7 @@
   (let* ((before (balance))
          (kept 'not-kept)
          (made (try-construct-loop failing-init (lambda (l) (set! kept l)))))
-    (list made (residue before) kept)))
+    (list made (residue before (balance)) kept)))
 
 (test-equal "a loop's step hands KEEP! the loop it answers"
   'kept

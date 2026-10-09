@@ -55,11 +55,9 @@
         (uv-sweep)
         (only (uv-testing) run-until/ticking)
         (only (uv-evidence) describe under-memory-tool?)
-        ;; make-engine drives the sweeps; the interrupt pair checks that no
-        ;; run leaves interrupts disabled; collect starts each run with no
+        ;; make-engine drives the sweeps; collect starts each run with no
         ;; collection due; foreign-procedure binds libuv's uv_is_active.
-        (only (chezscheme) make-engine disable-interrupts enable-interrupts
-              get-thread-id collect foreign-procedure))
+        (only (chezscheme) make-engine collect foreign-procedure))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -77,12 +75,6 @@
 
 (test-begin "handle-steps")
 
-(define me (get-thread-id))
-
-;; Another thread's id, for a loop handed to it: no thread runs the loop,
-;; but its owner is no longer this one.
-(define other-thread (+ me 1))
-
 ;; Every target is a new handle of this loop, which the run that made it
 ;; closes, so once its handles have closed, the loop is not alive.
 (define h-loop (make-uv-loop))
@@ -93,38 +85,8 @@
 
 ;; --- what a run must leave as it found it ------------------------------------
 
-(define (interrupts-enabled?)
-  (disable-interrupts)
-  (zero? (enable-interrupts)))
-
-;; The registry, and every debug counter, blocks included.
-(define (balance) (cons (registry-count) (live-counts)))
-
-;; residue : pair -> list
-;; What changed since BEFORE, as (name delta) pairs; '() when nothing did.
-(define (residue before)
-  (let ((after (balance)))
-    (append
-     (if (= (car before) (car after))
-         '()
-         (list (list 'registry (- (car after) (car before)))))
-     (filter (lambda (x) x)
-             (map (lambda (b a)
-                    (and (not (= (cdr b) (cdr a)))
-                         (list (car b) (- (cdr a) (cdr b)))))
-                  (cdr before) (cdr after))))))
-
-;; run-verdict : pair verdict object -> verdict
-;; The verdict, or what the run left behind with it. FINISHED is what
-;; finish! answered: 'finished, or why the run could not be tidied.
-(define (run-verdict before verdict finished)
-  (let ((left (residue before)))
-    (cond ((not (interrupts-enabled?))
-           (enable-interrupts)
-           (list 'interrupts-left-disabled verdict))
-          ((not (eq? finished 'finished)) (list verdict 'finish finished))
-          ((pair? left) (list verdict 'left left))
-          (else verdict))))
+;; The registry, and every debug counter, blocks included, as (name . count).
+(define (balance) (cons (cons 'registry (registry-count)) (live-counts)))
 
 ;; --- the verbs ------------------------------------------------------------------
 ;; Each attempt calls its verb by name, inside a guard that catches every
@@ -513,12 +475,8 @@
               (if (eq? verdict 'missed)
                   (begin (set! restarts (+ restarts 1))
                          (attempt-run (+ tries 1)))
-                  (values (run-verdict before verdict finished)
+                  (values (checked-verdict verdict finished before balance)
                           (not (untouched? verdict))))))))))
-
-(define (untouched? verdict)
-  (or (eq? verdict 'untouched)
-      (and (pair? verdict) (eq? (car verdict) 'untouched))))
 
 ;; --- dropped ----------------------------------------------------------------------
 ;; The scheduler drops the engine at the expiry, and the run then closes
@@ -593,7 +551,7 @@
                (verdict (if (or (equal? left found) (equal? left whole))
                             outcome
                             (list outcome 'half-made left))))
-          (values (run-verdict before verdict (finish! target #f))
+          (values (checked-verdict verdict (finish! target #f) before balance)
                   (eq? outcome 'dropped))))))
 
 ;; --- the sweeps -------------------------------------------------------------------
@@ -617,45 +575,6 @@
   (let ((w (whole verb)))
     (set! wholes (cons (cons verb w) wholes))
     (sweep-fuels (lambda (fuel) (drop-run verb w fuel)) sweep-fuel-cap (lambda (v) #f))))
-
-;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
-(define (bad-runs good? sweeps)
-  (apply append
-         (map (lambda (s)
-                (map (lambda (run) (list (car s) (car run) (cadr run)))
-                     (filter (lambda (run) (not (good? (cadr run)))) (cdr s))))
-              sweeps)))
-
-;; reach : sweeps -> (list-of (list name first last))
-;; The rows that look for bad runs and find none say nothing unless each
-;; sweep caught its verb before its checks (FIRST) and ran it to the end
-;; (the last run untouched).
-(define (reach sweeps)
-  (map (lambda (s)
-         (let ((runs (cdr s)))
-           (list (car s) (cadar runs) (cadr (list-ref runs (- (length runs) 1))))))
-       sweeps))
-
-(define (expected-reach sweeps first)
-  (map (lambda (s) (list (car s) first 'untouched)) sweeps))
-
-;; fuel-map : runs -> list, e.g. ((refused 1 9) (untouched 10 10)): each
-;; run of equal verdicts with its first and last fuel, for the record.
-(define (fuel-map runs)
-  (let collect ((runs runs) (acc '()))
-    (cond ((null? runs) (reverse acc))
-          ((and (pair? acc) (equal? (caar acc) (cadar runs)))
-           (collect (cdr runs)
-                    (cons (list (caar acc) (cadar acc) (caar runs)) (cdr acc))))
-          (else (collect (cdr runs)
-                         (cons (list (cadar runs) (caar runs) (caar runs)) acc))))))
-
-(define (report! kind sweeps)
-  (for-each (lambda (s)
-              (display "  [informational] ") (display kind) (display " ")
-              (display (car s)) (display ": ")
-              (write (fuel-map (cdr s))) (newline))
-            sweeps))
 
 (define (good-split? v) (memq v '(refused untouched)))
 
@@ -789,7 +708,7 @@
                        (call h)
                        'returned)
                      bound)))
-    (run-verdict before answer (finish! h #f))))
+    (checked-verdict answer (finish! h #f) before balance)))
 
 (test-equal "a bind to an address libuv cannot parse is refused, its block freed"
   '(refused uv-tcp-bind! bad-address)

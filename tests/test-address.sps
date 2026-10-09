@@ -517,19 +517,7 @@
 ;; The registry and every debug count, and how a run moved them: a run must
 ;; leave both as it found them. A snapshot per run keeps a leak attributed
 ;; to the run that made it.
-(define (balance) (cons (registry-count) (live-counts)))
-
-(define (residue before)
-  (let ((after (balance)))
-    (append
-     (if (= (car before) (car after))
-         '()
-         (list (list 'registry (- (car after) (car before)))))
-     (filter (lambda (x) x)
-             (map (lambda (b a)
-                    (and (not (= (cdr b) (cdr a)))
-                         (list (car b) (- (cdr a) (cdr b)))))
-                  (cdr before) (cdr after))))))
+(define (balance) (cons (cons 'registry (registry-count)) (live-counts)))
 
 ;; run-verdict : sweep-variant exact-positive-integer -> (list go-on? verdict)
 ;; go-on? holds only for a run an expiry reached that neither stalled nor
@@ -540,7 +528,7 @@
       (let* ((r (run-in-engine variant fuel))
              (expired (car r))
              (observed (cadr r))
-             (left (residue before)))
+             (left (residue before (balance))))
         (list (and expired (not (stalled? observed)))
               (cond ((stalled? observed) (list 'stalled observed left))
                     ((pair? left) (list 'left left observed))
