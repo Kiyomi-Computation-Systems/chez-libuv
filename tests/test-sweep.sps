@@ -199,10 +199,11 @@
 ;; none of: test-dns's sweep, test-process's two spawn sweeps and
 ;; test-native's truncation scan all resumed without one until #81, with
 ;; every row green. So every engine the tests make is the driver's, or one
-;; of the split and drop sweeps below, which stop an engine once and then
-;; resume it once with a fixed budget, or drop it. A new engine fails this
-;; row by name, as (file definition): port it to the driver, or list it here
-;; once it has a bound of its own.
+;; of the sweeps below, each bounded on its own: most stop an engine once
+;; and then resume it once with a fixed budget, or drop it, and
+;; test-loop-claim's exit-split-run resumes one tick at a time up to its
+;; own cap. A new engine fails this row by name, as (file definition): port
+;; it to the driver, or list it here once it has a bound of its own.
 (define engine-sites-allowed
   '(("tests/stranded-exit-child.sps" first-slice)
     ("tests/test-async-fence.sps" send-then-close)
@@ -215,6 +216,7 @@
     ("tests/test-constructors.sps" cwl-drop-run)
     ("tests/test-handle-steps.sps" split-run)
     ("tests/test-handle-steps.sps" drop-run)
+    ("tests/test-loop-claim.sps" exit-split-run)
     ("tests/test-loop-claim.sps" split-sweep)
     ("tests/test-loop-claim.sps" drop-sweep)
     ("tests/test-loop-threads.sps" lock-sweep)
