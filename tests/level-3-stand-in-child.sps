@@ -14,6 +14,12 @@
 ;;;   garbage  prints a non-datum, closes its stdout, and 500 ms later
 ;;;            prints a line on stderr and exits: a runner that stops at
 ;;;            stdout's end loses the line
+;;;   quiet-exit  prints nothing and exits with status 3
+;;;   abort    prints nothing and aborts: SIGABRT, as a Chez spawned with
+;;;            the wrong argv[0] dies (AGENTS.md)
+;;;   datum-then-exit  prints a whole datum, then exits with status 5
+;;;   hush     closes its stdout and stderr, then sleeps 60 s: both pipes
+;;;            end long before the child does
 (import (rnrs)
         (only (chezscheme) sleep make-time foreign-procedure
               load-shared-object))
@@ -28,13 +34,17 @@
 (define (pause ms)
   (sleep (make-time 'time-duration (* (mod ms 1000) 1000000) (div ms 1000))))
 
-;; close-stdout! : -> void
-;; Closes file descriptor 1. Closing Chez's port does not: the runner saw
-;; stdout end only when the child exited.
-(define (close-stdout!)
+;; load-libc! : -> void
+(define (load-libc!)
   (guard (e (#t (load-shared-object "libc.dylib")))
-    (load-shared-object "libc.so.6"))
-  ((foreign-procedure "close" (int) int) 1))
+    (load-shared-object "libc.so.6")))
+
+;; close-fd! : integer -> void
+;; Closes file descriptor FD. Closing Chez's port does not: the runner saw
+;; stdout end only when the child exited.
+(define (close-fd! fd)
+  (load-libc!)
+  ((foreign-procedure "close" (int) int) fd))
 
 (case (string->symbol (cadr (command-line)))
   ((flood)
@@ -51,6 +61,18 @@
    (pause 60000))
   ((garbage)
    (say out "garbage\n")
-   (close-stdout!)
+   (close-fd! 1)
    (pause 500)
-   (say err "garbage child: no datum\n")))
+   (say err "garbage child: no datum\n"))
+  ((quiet-exit)
+   (exit 3))
+  ((abort)
+   (load-libc!)
+   ((foreign-procedure "abort" () void)))
+  ((datum-then-exit)
+   (say out "((level . 3))\n")
+   (exit 5))
+  ((hush)
+   (close-fd! 1)
+   (close-fd! 2)
+   (pause 60000)))

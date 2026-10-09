@@ -10,7 +10,8 @@
         (srfi :64)
         (uv-level-3)
         (only (chezscheme) getenv current-time time-difference time-second
-              cpu-time))
+              cpu-time open-process-ports sleep make-time foreign-procedure
+              load-shared-object))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -73,6 +74,47 @@
     ((pair? x) (cons (brief (car x)) (brief (cdr x))))
     (else x)))
 
+;; The zombie probe, the suite's own and not the runner's: a runner whose
+;; waitpid is broken must not break the check of it too.
+(define libc
+  (guard (e (#t (load-shared-object "libc.dylib")))
+    (load-shared-object "libc.so.6")))
+(define waitpid (foreign-procedure "waitpid" (int u8* int) int))
+
+;; wait-any : -> integer
+;; Reaps one finished child of this process without waiting: its pid, 0
+;; while every child is still running, or -1 when there is none.
+(define (wait-any)
+  (waitpid -1 (make-bytevector 4 0) 1))
+
+;; wait-any-within : -> integer
+;; wait-any, polled every 10 ms for up to 5 s while it answers 0.
+(define (wait-any-within)
+  (let poll ((tries 500))
+    (let ((r (wait-any)))
+      (if (and (= r 0) (> tries 0))
+          (begin (sleep (make-time 'time-duration 10000000 0))
+                 (poll (- tries 1)))
+          r))))
+
+;; spawn-true : -> pid
+;; Runs `true` and reads its stdout to the end, leaving it unreaped.
+(define (spawn-true)
+  (let-values (((to-child from-child errors pid)
+                (open-process-ports "exec true" (buffer-mode block) #f)))
+    (close-port to-child)
+    (get-bytevector-all from-child)
+    (close-port from-child)
+    (close-port errors)
+    pid))
+
+;; Before any level-3 run, so the only child is the probe's own. Without
+;; it, the last row's -1 could come from a probe that sees no zombies.
+(test-equal "precondition: the zombie probe answers a finished child's pid"
+  'saw-it
+  (let* ((pid (spawn-true)) (r (wait-any-within)))
+    (if (= r pid) 'saw-it (list 'got r 'for pid))))
+
 (if (not chez)
     (test-equal "level-3 runner rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
@@ -88,7 +130,8 @@
       ;; the deadline counts against it; it sleeps 60.
       (let ((stalled (timed-run 'stall 10)))
         (test-equal "a child that prints half a datum and stalls is killed at the deadline, carrying what it printed"
-          '((killed-at-cap "((level . 3) (objects" "stall child: stalling\n")
+          '((killed-at-cap "((level . 3) (objects" "stall child: stalling\n"
+                           (signal 9))
             at-the-deadline)
           (in-time stalled 10))
 
@@ -107,15 +150,50 @@
 
       ;; A deadline that is not a number makes the wait raise once the
       ;; child is running: a fault after the spawn, which the runner must
-      ;; not report as one in it.
-      (test-equal "a raise while the child runs answers run-failed, not spawn-failed"
-        'run-failed
+      ;; not report as one in it. The child is killed and waited on.
+      (test-equal "a raise while the child runs answers run-failed, not spawn-failed, with the killed child's status"
+        '(run-failed (signal 9))
         (let ((report (level-3-run chez stand-in '(stall) 'not-a-number)))
-          (if (pair? report) (car report) report)))
+          (if (and (list? report) (= (length report) 3))
+              (list (car report) (caddr report))
+              report)))
 
-      (test-equal "a child that prints no datum answers unreadable, with its stdout and stderr"
-        '(unreadable "garbage\n" "garbage child: no datum\n")
-        (level-3-run chez stand-in '(garbage) 20))))
+      (test-equal "a child that prints no datum answers unreadable, with its stdout, stderr and status"
+        '(unreadable "garbage\n" "garbage child: no datum\n" (exit 0))
+        (level-3-run chez stand-in '(garbage) 20))
+
+      ;; Both pipes' end is not the child's: one that closed them and kept
+      ;; running was answered unreadable at once, and left running. 3 s,
+      ;; as the stand-in starts before it closes them.
+      (test-equal "a child that closes both pipes and keeps running is killed at the deadline"
+        '((killed-at-cap "" "" (signal 9)) at-the-deadline)
+        (in-time (timed-run 'hush 3) 3))
+
+      ;; #110: a child that dies before printing anything said nothing
+      ;; about why. Its status is the one datum that does.
+      (test-equal "a child that exits 3 with no output answers its exit status"
+        '(unreadable "" "" (exit 3))
+        (level-3-run chez stand-in '(quiet-exit) 20))
+
+      (test-equal "a child that aborts with no output answers its signal"
+        '(unreadable "" "" (signal 6))
+        (level-3-run chez stand-in '(abort) 20))
+
+      ;; A datum alone is not success: the child must also exit 0.
+      (test-equal "a child that prints its datum and exits 5 answers bad-exit, not the datum"
+        '(bad-exit "((level . 3))\n" "" (exit 5))
+        (level-3-run chez stand-in '(datum-then-exit) 20))))
+
+;; Last, after every run: a child the runner never waited on stays a zombie
+;; until this process exits (#110).
+(test-equal "no child is left unreaped: every run's child was waited on"
+  'none-left
+  (let collect ((zombies '()))
+    (let ((r (wait-any)))
+      (cond
+        ((> r 0) (collect (cons r zombies)))
+        ((and (= r -1) (null? zombies)) 'none-left)
+        (else (list 'zombies (reverse zombies) 'then r))))))
 
 (test-end "level-3")
 
