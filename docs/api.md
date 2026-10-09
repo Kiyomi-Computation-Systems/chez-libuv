@@ -114,6 +114,13 @@ and a thread made with `fork-thread` 1,000 to 2,000, after which it hung. A
 program that leaves callbacks by continuation as a habit should do it on a
 thread it can end.
 
+It costs heap as well, and that a thread's end does not give back. Chez
+allocates a block for each call from C into Scheme, a callback included,
+and frees it when the call returns; an escape never returns, so the block
+stays allocated until the process exits: 312 bytes an escape on Linux
+arm64. An engine dropped while it is inside a callback costs the same
+block; one that is resumed costs nothing.
+
 ## Handles — `(libuv handle)`
 
 | Export | |

@@ -572,6 +572,27 @@ test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `ma
 # `make test-memory ASAN_DYLIB_PATTERN=/nonexistent/x.dylib` must fail loudly.
 ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
 
+# The gate's Valgrind suppressions: Chez's own costs, never the binding's.
+# One today, the jmp_buf Chez strands for each continuation that escapes a
+# callback (#94); the file says why, and ADR-0003's amendment of 2026-10-09
+# records it. check-memory-gate's escape mode requires it to match, and its
+# leak and possible-leak modes require it to hide nothing they plant.
+VALGRIND_SUPPRESSIONS := $(CURDIR)/tests/valgrind-chez.supp
+
+# The suites whose own process may strand that jmp_buf, each by leaving a
+# callback without returning on purpose. A block suppressed in any other
+# suite means something left a callback that way unasked, the binding
+# included, and the suppression would hide it in every leak kind. So
+# test-memory fails such a suite by name, and check-memory-gate's
+# stray-escape mode watches it do so. A forked child is not held to this:
+# one that exits before exec reports the block its parent held at the fork.
+#   test-loop          its rows that escape a callback
+#   test-loop-claim    a teardown on another thread whose close callback escapes
+#   test-async-fence   engine sweeps, which drop engines inside callbacks
+#   test-loop-threads  the same
+MEMORY_ESCAPE_SUITES := tests/test-loop.sps tests/test-loop-claim.sps \
+  tests/test-async-fence.sps tests/test-loop-threads.sps
+
 test-memory: build deps check-pins $(STALE_SHIM) ## Run suites under Valgrind (Linux) or ASan (macOS, no leak claim)
 ifeq ($(UNAME_S),Linux)
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
@@ -622,7 +643,14 @@ ifeq ($(UNAME_S),Linux)
 # (ADR-0003's amendment). `make check-memory-gate` plants a defect and
 # requires this recipe to fail on it; that check, not this comment, is what
 # holds the order.
-	@for t in $(MEMORY_TESTS); do \
+#
+# Valgrind writes to a log, printed once the suite ends, so that the
+# recipe can read the suite's own leak summary: the first process in the
+# log is the suite's, and any after it are children it forked. A suite
+# missing from MEMORY_ESCAPE_SUITES must have nothing suppressed there.
+	@mkdir -p $(BUILD_DIR); \
+	for t in $(MEMORY_TESTS); do \
+	  vlog=$(BUILD_DIR)/valgrind-$$(basename $$t .sps).log; rm -f $$vlog; \
 	  UV_USE_IO_URING=0 \
 	  CHEZ_LIBUV_UNDER_VALGRIND=1 \
 	  CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) CHEZ_LIBUV_TEST_CHEZ=$(CHEZ) \
@@ -631,12 +659,31 @@ ifeq ($(UNAME_S),Linux)
 	    --leak-check=full --show-leak-kinds=definite \
 	    --errors-for-leak-kinds=definite \
 	    --undef-value-errors=no \
+	    --suppressions=$(VALGRIND_SUPPRESSIONS) \
+	    --log-file=$$vlog \
 	    $(CHEZ) --program $$t; \
 	  rc=$$?; \
+	  cat $$vlog >&2; \
 	  if [ $$rc -eq 124 ] && [ -n "$(TIMEOUT_BIN)" ]; then \
 	    echo "HUNG: $$t exceeded $(MEMORY_SUITE_TIMEOUT)s under valgrind and was killed" >&2; \
 	    exit 1; \
 	  elif [ $$rc -ne 0 ]; then exit 1; fi; \
+	  own=$$(sed -n 's/^==\([0-9][0-9]*\)==.*/\1/p' $$vlog | head -1); \
+	  if [ -z "$$own" ]; then \
+	    echo "test-memory: $$t exited 0 and $$vlog holds no Valgrind report" >&2; \
+	    exit 1; \
+	  fi; \
+	  supp=$$(sed -n "s/^==$$own== *suppressed: \([0-9,]* bytes in [0-9,]* blocks\)$$/\1/p" $$vlog); \
+	  case " $(MEMORY_ESCAPE_SUITES) " in \
+	    *" $$t "*) ;; \
+	    *) if [ -n "$$supp" ] && [ "$$supp" != "0 bytes in 0 blocks" ]; then \
+	         echo "UNEXPECTED ESCAPE: $$t had $$supp suppressed as the jmp_buf Chez" >&2; \
+	         echo "strands when a callback is left without returning (#94). The suite is" >&2; \
+	         echo "not in MEMORY_ESCAPE_SUITES: list it if a row means to escape, or find" >&2; \
+	         echo "the callback that no longer returns." >&2; \
+	         exit 1; \
+	       fi ;; \
+	  esac; \
 	done
 else
 	@echo "macOS: ASan preload only; LeakSanitizer is unsupported on arm64."
@@ -692,8 +739,8 @@ endif
 # shim-overrun's report must also name the shim function that made the
 # overrun (its site). The mode exists to show that the gate sees the
 # binding's own bulk copies, and a report of a 19-byte block overrun from
-# anywhere else would not show that. It is the one mode that loads the
-# binding, so its plain run needs the library path, and this target
+# anywhere else would not show that. It and the escape mode load the
+# binding, so their plain runs need the library path, and this target
 # builds the shim first.
 #
 # possible-leak (Linux) is the exception to those three: not a defect the
@@ -704,6 +751,21 @@ endif
 # a summary total. So the gate may pass on this block, or fail and print its
 # loss record; it must not fail without one. The summary must count the
 # block, too, or the mode proved nothing.
+#
+# escape (Linux) is the other exception: three callback escapes, each
+# stranding a block Chez allocates (#94), which tests/valgrind-chez.supp
+# suppresses. Run as one of MEMORY_ESCAPE_SUITES, the gate must pass on it,
+# and Valgrind's summary must count exactly three blocks suppressed: none
+# means the suppression no longer matches, more means it matches more than
+# Chez's blocks. The leak and possible-leak modes hold the other side, that
+# it hides none of theirs. These three blocks are still reachable, so the
+# count cannot show that the suppression matches a definitely lost one, the
+# kind that gated test-loop-claim; the mode also requires each of the
+# file's match-leak-kinds lines to name definite (or all).
+#
+# stray-escape (Linux) makes the same three escapes from a program missing
+# from MEMORY_ESCAPE_SUITES. The gate must fail on it and name the program,
+# or a callback the binding leaves without returning would be suppressed.
 #
 # And something must have been planted: until 2026-09-28,
 # `make check-memory-gate MEMORY_SABOTAGE_MODES=` looped over nothing and
@@ -717,7 +779,7 @@ endif
 # Scheme store's width is Chez's (one byte), so that marker stays exact.
 MEMORY_SABOTAGE := tests/memory-gate-sabotage.sps
 ifeq ($(UNAME_S),Linux)
-  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun shim-overrun leak possible-leak
+  MEMORY_SABOTAGE_MODES := store-overrun libc-overrun shim-overrun leak possible-leak escape stray-escape
 else
   MEMORY_SABOTAGE_MODES := libc-overrun shim-overrun
 endif
@@ -735,7 +797,7 @@ MEMORY_GATE_MAKE = $(MAKE)
 check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (the gate can go red)
 	@mkdir -p $(BUILD_DIR); fail=0; ran=0; \
 	for m in $(MEMORY_SABOTAGE_MODES); do \
-	  ran=$$((ran + 1)); site=; \
+	  ran=$$((ran + 1)); site=; escapers=; \
 	  case "$(UNAME_S):$$m" in \
 	    Linux:store-overrun) marker="0 bytes after a block of size 23 alloc'd" ;; \
 	    Linux:libc-overrun)  marker="a block of size 29 alloc'd" ;; \
@@ -743,6 +805,8 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	    Linux:leak)          marker="777 bytes in 1 blocks are definitely lost" ;; \
 	    Linux:possible-leak) marker="possibly lost: 555 bytes in 1 blocks"; \
 	                         record="555 bytes in 1 blocks are possibly lost" ;; \
+	    Linux:escape)        marker="bytes in 3 blocks"; escapers=$(MEMORY_SABOTAGE) ;; \
+	    Linux:stray-escape)  marker="UNEXPECTED ESCAPE: $(MEMORY_SABOTAGE) had" ;; \
 	    *:libc-overrun)      marker="0 bytes after 29-byte region" ;; \
 	    *:shim-overrun)      marker="0 bytes after 19-byte region"; site="chez_uv_copy_in" ;; \
 	    *) echo "check-memory-gate: no expected report for $$m on $(UNAME_S)" >&2; exit 1 ;; \
@@ -757,7 +821,7 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	    printf '%s\n' "$$plain" >&2; fail=1; continue; \
 	  fi; \
 	  CHEZ_LIBUV_SABOTAGE=$$m $(MEMORY_GATE_MAKE) --no-print-directory test-memory \
-	    MEMORY_TESTS=$(MEMORY_SABOTAGE) > $$log 2>&1; rc=$$?; \
+	    MEMORY_TESTS=$(MEMORY_SABOTAGE) MEMORY_ESCAPE_SUITES="$$escapers" > $$log 2>&1; rc=$$?; \
 	  if [ $$m = possible-leak ]; then \
 	    if ! grep -qF "$$marker" $$log; then \
 	      echo "check-memory-gate: Valgrind never counted the planted block as possibly lost" >&2; \
@@ -770,6 +834,24 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	      tail -n 30 $$log >&2; fail=1; \
 	    else \
 	      echo "gate consistent on $$m: exit $$rc, $$marker"; \
+	    fi; \
+	  elif [ $$m = escape ]; then \
+	    supp=$$(grep -E "suppressed: [0-9,]+ bytes in [0-9,]+ blocks" $$log | head -1 | sed 's/.*suppressed: //'); \
+	    if [ $$rc -ne 0 ]; then \
+	      echo "SUPPRESSION NOT LIVE: make test-memory failed on the jmp_buf three callback" >&2; \
+	      echo "escapes strand in Chez (#94). Tail of $$log:" >&2; \
+	      tail -n 30 $$log >&2; fail=1; \
+	    elif ! printf '%s\n' "$$supp" | grep -qF "$$marker"; then \
+	      echo "SUPPRESSION NOT LIVE: Valgrind suppressed \"$${supp:-nothing}\", not the three" >&2; \
+	      echo "blocks the escapes strand: tests/valgrind-chez.supp no longer matches. Tail:" >&2; \
+	      tail -n 30 $$log >&2; fail=1; \
+	    elif grep -E '^[[:space:]]*match-leak-kinds:' $(VALGRIND_SUPPRESSIONS) | grep -qvwE 'definite|all'; then \
+	      echo "SUPPRESSION MISSES DEFINITE: a match-leak-kinds line in $(VALGRIND_SUPPRESSIONS)" >&2; \
+	      echo "leaves out definite, the one kind the gate fails on. This mode's blocks are" >&2; \
+	      echo "still reachable, so they match regardless; test-loop-claim's was definitely lost:" >&2; \
+	      grep -nE 'match-leak-kinds:' $(VALGRIND_SUPPRESSIONS) >&2; fail=1; \
+	    else \
+	      echo "gate passes $$m, its jmp_bufs suppressed: $$supp"; \
 	    fi; \
 	  elif [ $$rc -eq 0 ]; then \
 	    echo "MEMORY GATE VACUOUS: make test-memory exited 0 with the $$m defect planted;" >&2; \
