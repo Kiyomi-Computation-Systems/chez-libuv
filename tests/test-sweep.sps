@@ -203,8 +203,9 @@
 ;; and then resume it once with a fixed budget, or drop it (test-loop's
 ;; refused-take-drop-sweep drops every run that expires, up to fuel 5000);
 ;; test-loop-claim's exit-split-run resumes one tick at a time up to its
-;; own cap; and test-owner-refusal's handback-run stops it twice, resuming
-;; it with one tick and then a fixed budget. A new engine fails this row by
+;; own cap; test-owner-refusal's handback-run stops it twice, resuming it
+;; with one tick and then a fixed budget; and test-loop-guard's
+;; blocked-raise-run resumes it with a fixed budget at most 10 times. A new engine fails this row by
 ;; name, as (file definition): port it to the driver, or list it here once
 ;; it has a bound of its own.
 (define engine-sites-allowed
@@ -222,6 +223,7 @@
     ("tests/test-loop-claim.sps" exit-split-run)
     ("tests/test-loop-claim.sps" split-sweep)
     ("tests/test-loop-claim.sps" drop-sweep)
+    ("tests/test-loop-guard.sps" blocked-raise-run)
     ("tests/test-loop-threads.sps" lock-sweep)
     ("tests/test-loop.sps" refused-take-drop-sweep)
     ("tests/test-loop.sps" first-slice)

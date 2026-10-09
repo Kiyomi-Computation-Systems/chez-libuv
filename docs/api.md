@@ -106,6 +106,19 @@ says. Inside `call-with-uv-loop` the suspension is an
 exit like any other: the loop is torn down, and resuming the engine raises
 `&uv-handle-closed`.
 
+**A raise out of `call-with-uv-loop`'s body reaches the guards outside it
+as itself.** The body runs once, so every way back into a body that has
+been left is refused. A body left while one of its raises was being
+handled is refused with that raise, and any other with
+`&uv-handle-closed`. R6RS `guard` needs the first: it unwinds to itself
+before it tests its clauses, and when none matches, it re-raises from
+where the body raised, which re-enters the body. Two consequences:
+- A guard whose clauses do not match the body's condition tests them a
+  second time.
+- A handler outside the body that returns from the body's
+  `raise-continuable` resumes the body as usual. It cannot resume a body
+  that a guard between them has already unwound.
+
 Callbacks on one thread nest: each is entered from C, and returns by
 jumping back to the C frame that entered it. That jump abandons every
 callback entered after it on the thread that has not yet returned. A
