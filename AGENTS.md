@@ -341,8 +341,14 @@ None is obvious from reading the code.
   callback escape, and it was only added once a check could prove it:
   `make check-memory-gate`'s escape mode requires it to suppress exactly
   the three blocks three escapes strand, and the leak modes require it to
-  hide none of theirs. A new suppression gets the same: a mode that counts
-  what it hides, and a planted leak it must not.
+  hide none of theirs. A suppression also hides what the binding could do
+  the same way, so `test-memory` fails any suite outside
+  `MEMORY_ESCAPE_SUITES` whose own process had a block suppressed, and the
+  stray-escape mode watches it fail. The three escapes' blocks are still
+  reachable, and the one that gated was definitely lost, so the escape
+  mode also requires the file's kinds to name definite. A new suppression
+  gets the same: a mode that counts what it hides, a planted leak it must
+  not, and a rule for where it may match at all.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.

@@ -48,6 +48,12 @@
 ;;;                  the gate to pass on it, with Valgrind counting three
 ;;;                  blocks suppressed, so a suppression that no longer
 ;;;                  matches fails by name. Loads the binding. Linux only.
+;;;   stray-escape   the same three escapes, from a program the gate does not
+;;;                  list as one that escapes (MEMORY_ESCAPE_SUITES). Every
+;;;                  other suite must end with nothing suppressed, so the
+;;;                  suppression cannot hide a callback the binding leaves
+;;;                  without returning, and check-memory-gate requires the
+;;;                  gate to fail here, naming this program. Linux only.
 ;;;
 ;;; The sizes are sentinels. The tool's report names them, and nothing else in
 ;;; a run allocates blocks of exactly these sizes to overrun or lose.
@@ -116,7 +122,7 @@
    (let ((p (foreign-alloc 555)))
      (bytevector-uint-set! interior-pointer-holder 8 (+ p 8)
                            (native-endianness) (foreign-sizeof 'uptr))))
-  ((equal? mode "escape")
+  ((member mode '("escape" "stray-escape"))
    (let* ((libs (environment '(libuv loop) '(libuv timer)))
           (call-with-uv-loop (eval 'call-with-uv-loop libs))
           (uv-run (eval 'uv-run libs))
@@ -132,7 +138,7 @@
                (uv-run loop 'default)))))
          (escape (+ i 1))))))
   (else
-   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, shim-overrun, leak, possible-leak or escape\n"
+   (display "memory-gate-sabotage: set CHEZ_LIBUV_SABOTAGE to store-overrun, libc-overrun, shim-overrun, leak, possible-leak, escape or stray-escape\n"
             (current-error-port))
    (exit 2)))
 (say "planted")

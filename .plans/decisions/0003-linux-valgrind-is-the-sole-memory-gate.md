@@ -273,3 +273,20 @@ should it appear.
 >   counted 10 blocks; with the kinds narrowed to definite, the frame
 >   misnamed, or the file not passed to Valgrind, `escape` failed by name.
 >   Evidence: `.plans/escape-suppression-mutation-log.md`.
+> - **What the suppression could hide, and the rule that stops it.** The
+>   binding leaving a callback without returning strands the same block,
+>   and before the suppression the gate saw that only when the block read
+>   "definitely lost". So `test-memory` now reads each suite's own leak
+>   summary, the first process in its Valgrind log, and fails a suite
+>   that had a block suppressed unless `MEMORY_ESCAPE_SUITES` lists it:
+>   test-loop, test-loop-claim, test-async-fence and test-loop-threads, the
+>   four that strand it on purpose. That covers more than before, since
+>   the other suites are held to none in every leak kind. A forked child is
+>   not held to it; test-process's 82 report the block their parent held
+>   at the fork. A `stray-escape` mode makes the escape mode's three
+>   escapes from a program the list leaves out, and requires the gate to
+>   fail naming it. The escape mode's blocks are still reachable, so it
+>   could not see `definite` dropped from the suppression's kinds, the kind
+>   that gated; it now requires each `match-leak-kinds` line to name
+>   `definite` or `all`. Its count of exactly three was measured on x86-64
+>   by this change's first CI run as well.
