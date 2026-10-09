@@ -344,7 +344,10 @@ drains a caller-side queue rather than assuming one item per send.
 >     amendment below.)
 >   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,
 >     `uv-loop-alive?` and `uv-update-time!` after a teardown: one or two
->     fuel values, between reading the pointer and the call.
+>     fuel values, between reading the pointer and the call. (The timer
+>     and signal verbs, `uv-listen!`, `uv-tcp-nodelay!` and
+>     `uv-tcp-keepalive!` are one step since #86's second amendment
+>     below.)
 
 > **Amended 2026-10-06 (the series' second part): every constructor is
 > one step.** Measured on main (eb5b719), with the sweeps now in
@@ -543,6 +546,51 @@ drains a caller-side queue rather than assuming one item per send.
 >   the `guard`s: `uv-tcp-getsockname-port` and the buffer-size verbs
 >   320 → 0 B, `uv-tcp-sockname-address` and `uv-tcp-peer-address`
 >   544 → 208 B, `uv-tcp-bind!` 432 → 112 B. Evidence and mutations:
+>   `.plans/handle-steps-mutation-log.md`.
+
+> **Amended 2026-10-09 (#86, the other handle verbs): the timer verbs, the
+> signal verbs, `uv-listen!`, `uv-tcp-nodelay!` and `uv-tcp-keepalive!`
+> are one step.** Each checked its handle, then read its pointer and called
+> libuv, with interrupts enabled between. A start stored its callback
+> before the call, and a signal start checked its mode before and fixed it
+> after. Measured on main (87337b9), with the sweeps added to
+> `tests/test-handle-steps.sps`:
+>
+> - **A new handle at the freed address.** A timer start, a signal start
+>   and a listen suspended between the pointer and the call made the call
+>   after the change: libuv counted the new handle at the freed address
+>   active once each was resumed, and each returned normally. A timer start
+>   resumed after a close, with no new handle there, faulted on the freed
+>   block.
+> - **A handoff.** The same runs resumed after a handoff started the
+>   handle on the loop another thread now owned.
+> - **The other mode.** A signal start resumed after another task had
+>   started its handle in the other mode returned normally, where it owed
+>   `'signal-mode-fixed`.
+> - **Dropped.** A timer start, a signal start or a listen dropped between
+>   its store and its call left its callback stored and nothing started.
+>
+> Each now checks the owner and the handle again (`owned-handle-ptr`),
+> calls libuv and, for a start, stores its callback (and a signal's mode,
+> checked again in the step) once libuv has accepted it, in one
+> `one-step`, and raises after it (`step-refusal`). The verbs with nothing
+> else to do share `handle-call!`. Two refusals moved ahead of the step,
+> where nothing may raise: a number its C parameter cannot take (a
+> timeout or repeat from 2^64, a backlog from 2^31, a keepalive delay from
+> 2^32), which Chez's own check of the foreign call's arguments would
+> otherwise raise inside it; and, for the timer verbs, another kind of
+> handle (`'not-a-uv-timer`), which before reached libuv as a timer:
+> `uv-timer-set-repeat!` wrote into a TCP handle's struct.
+>
+> - **Measured after:** every suspended run is refused, the new handle
+>   comes through untouched, and every dropped run leaves the handle as it
+>   found it or as a whole call leaves it. None of the verbs allocates,
+>   before or after (0 B a call).
+> - **What the sweeps cannot see.** Nothing in these verbs can trap
+>   between the entry check and the step, so the step's own owner and open
+>   checks, and where it stores the callback, cannot be split from the
+>   entry check today: mutants that drop them survive. Each is killed once
+>   a three-tick window is opened there. Evidence and mutations:
 >   `.plans/handle-steps-mutation-log.md`.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:

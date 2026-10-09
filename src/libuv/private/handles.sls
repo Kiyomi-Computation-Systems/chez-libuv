@@ -14,7 +14,7 @@
 
           ;; interrupt-free steps
           one-step open-handle-ptr open-loop-ptr owned-loop-ptr owned-handle-ptr
-          step-refusal submit-request!
+          step-refusal handle-call! submit-request!
           try-construct-handle construct-handle try-construct-loop
           wrong-thread-refusal
 
@@ -640,6 +640,22 @@
       (else (if (symbol? status)
                 (make-uv-invalid-argument who status)
                 (uv-errno-condition status who)))))
+
+  ;; (handle-call! handle who native arg ...) calls (NATIVE ptr ARG ...) on
+  ;; HANDLE's pointer in one interrupt-free step that checks again that this
+  ;; thread owns the loop and that HANDLE is open (owned-handle-ptr), and
+  ;; once the step is over raises WHO's refusal (step-refusal) for a check
+  ;; that failed or a nonzero status. NATIVE and each ARG must be total, as
+  ;; everything in a step is (one-step): the ARGs are evaluated inside it.
+  (define-syntax handle-call!
+    (syntax-rules ()
+      ((_ handle who native arg ...)
+       (let* ((h handle)
+              (rc (one-step
+                   (let ((ptr (owned-handle-ptr h)))
+                     (if (symbol? ptr) ptr (native ptr arg ...))))))
+         (unless (eqv? rc 0)
+           (raise (step-refusal rc who h)))))))
 
   ;; The lookup and the delete are one step under the lock; a missing entry
   ;; is raised after it.
