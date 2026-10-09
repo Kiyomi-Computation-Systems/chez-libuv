@@ -33,19 +33,31 @@
       (raise (make-uv-invalid-argument who 'not-a-uv-signal)))
     (require-open-handle sig who))
 
+  ;; One interrupt-free step checks again that this thread owns the loop,
+  ;; that the handle is open and that its mode is still WANTED-MODE or
+  ;; unfixed, starts it, and stores the callback and fixes the mode once
+  ;; libuv has started it (#86). A failed start fixes no mode. A signal is
+  ;; delivered only inside uv-run, so none can reach the handle between
+  ;; the start and the store, and no engine can split the start from those
+  ;; checks or drop it half made (tests/test-handle-steps.sps).
   (define (start-signal! sig watch-symbol on-signal wanted-mode
                          native-start who)
     (require-signal-handle sig who)
-    (let ((mode (signal-mode sig)))
-      (when (and mode (not (eq? mode wanted-mode)))
-        (raise (make-uv-invalid-argument who 'signal-mode-fixed))))
     (require-callback on-signal who 'on-signal-not-a-procedure)
-    (let ((signum (watch-symbol->int watch-symbol who)))
-      (set-signal-on-signal! sig on-signal)
-      ;; A pending signal may dispatch as soon as the handle is armed.
-      (uv-check (native-start (handle-pointer sig who) signum) who)
-      ;; Failed starts must not pin the mode.
-      (set-signal-mode! sig wanted-mode)))
+    (let* ((signum (watch-symbol->int watch-symbol who))
+           (rc (one-step
+                (let ((ptr (owned-handle-ptr sig))
+                      (mode (signal-mode sig)))
+                  (cond ((symbol? ptr) ptr)
+                        ((and mode (not (eq? mode wanted-mode))) 'signal-mode-fixed)
+                        (else
+                         (let ((rc (native-start ptr signum)))
+                           (when (eqv? rc 0)
+                             (set-signal-on-signal! sig on-signal)
+                             (set-signal-mode! sig wanted-mode))
+                           rc)))))))
+      (unless (eqv? rc 0)
+        (raise (step-refusal rc who sig)))))
 
   ;; uv-signal-start! : uv-signal symbol procedure -> unspecified
   (define (uv-signal-start! sig watch-symbol on-signal)
@@ -59,10 +71,10 @@
                    uv-signal-start-oneshot-native 'uv-signal-start-oneshot!))
 
   ;; uv-signal-stop! : uv-signal -> unspecified
+  ;; One interrupt-free step, as a start is (#86).
   (define (uv-signal-stop! sig)
     (require-signal-handle sig 'uv-signal-stop!)
-    (uv-check (uv-signal-stop (handle-pointer sig 'uv-signal-stop!))
-              'uv-signal-stop!))
+    (handle-call! sig 'uv-signal-stop! uv-signal-stop))
 
   ;; Never deliver a queued signal to a handle already closing.
   (define (signal-dispatch sig handle-ptr signum)

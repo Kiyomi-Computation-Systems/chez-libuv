@@ -149,6 +149,15 @@
     (uv-signal-start-oneshot! sv 'sigusr1 (lambda (s) s))
     'no-raise))
 
+;; The mode is checked in the start's step, after its arguments (#86), so a
+;; start that has both faults is refused for its callback.
+(test-equal "a start in the other mode whose callback is not a procedure is refused for the callback"
+  '(uv-signal-start-oneshot! on-signal-not-a-procedure)
+  (guard (e ((uv-invalid-argument? e)
+             (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e))))
+    (uv-signal-start-oneshot! sv 'sigusr1 'not-a-procedure)
+    'no-raise))
+
 (define os (make-uv-signal l2))
 (uv-signal-start-oneshot! os 'sigusr2 (lambda (s) (collect)))
 (test-equal "the continuous verb on a oneshot-mode handle raises 'signal-mode-fixed"

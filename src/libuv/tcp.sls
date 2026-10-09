@@ -154,15 +154,27 @@
       (values (car answer) (cdr answer))))
 
   ;; uv-listen! : uv-tcp exact-nonnegative-integer procedure -> unspecified
-  ;; Store the callback before listening because connections may arrive at once.
+  ;; The backlog is a C int. One interrupt-free step checks again that this
+  ;; thread owns the loop and that the server is open, listens, and stores
+  ;; the callback once libuv is listening (#86). A connection is delivered
+  ;; only inside uv-run, so none can arrive between the two, and no engine
+  ;; can split the listen from those checks or drop it half made
+  ;; (tests/test-handle-steps.sps).
   (define (uv-listen! tcp backlog on-connection)
     (require-open-tcp tcp 'uv-listen!)
-    (unless (and (integer? backlog) (exact? backlog) (>= backlog 0))
+    (unless (and (integer? backlog) (exact? backlog) (>= backlog 0)
+                 (< backlog 2147483648))
       (raise (make-uv-invalid-argument 'uv-listen! 'backlog-out-of-range)))
     (require-callback on-connection 'uv-listen! 'on-connection-not-a-procedure)
-    (set-tcp-on-connection! tcp on-connection)
-    (uv-check (uv-listen-native (handle-pointer tcp 'uv-listen!) backlog)
-              'uv-listen!))
+    (let ((rc (one-step
+               (let ((ptr (owned-handle-ptr tcp)))
+                 (if (symbol? ptr)
+                     ptr
+                     (let ((rc (uv-listen-native ptr backlog)))
+                       (when (eqv? rc 0) (set-tcp-on-connection! tcp on-connection))
+                       rc))))))
+      (unless (eqv? rc 0)
+        (raise (step-refusal rc 'uv-listen! tcp)))))
 
   ;; uv-accept! : uv-tcp -> uv-tcp
   ;; One interrupt-free step makes the client and accepts into it: the
@@ -234,14 +246,14 @@
             (raise (step-refusal started 'uv-tcp-connect! tcp))))))
 
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
-  ;; Require a boolean because Scheme's 0 is true while C's 0 is false.
+  ;; Require a boolean because Scheme's 0 is true while C's 0 is false. The
+  ;; call is one interrupt-free step that checks again that this thread owns
+  ;; the loop and that the client is open (#86), as uv-tcp-keepalive!'s is.
   (define (uv-tcp-nodelay! tcp enable?)
     (require-open-tcp tcp 'uv-tcp-nodelay!)
     (unless (boolean? enable?)
       (raise (make-uv-invalid-argument 'uv-tcp-nodelay! 'enable-not-a-boolean)))
-    (uv-check (uv-tcp-nodelay (handle-pointer tcp 'uv-tcp-nodelay!)
-                              (if enable? 1 0))
-              'uv-tcp-nodelay!))
+    (handle-call! tcp 'uv-tcp-nodelay! uv-tcp-nodelay (if enable? 1 0)))
 
   ;; uv-tcp-keepalive! : uv-tcp boolean -> unspecified
   ;; uv-tcp-keepalive! : uv-tcp boolean exact-positive-integer -> unspecified
@@ -251,6 +263,7 @@
   ;; (unix/tcp.c) -- so the delay is pinned to one contract here rather than
   ;; left to depend on whether the fd exists yet. Disabling ignores the delay,
   ;; exactly as libuv does. Require a boolean for the same reason as nodelay.
+  ;; The delay is a C unsigned int.
   (define uv-tcp-keepalive!
     (case-lambda
       ((tcp enable?)
@@ -260,14 +273,12 @@
        (when enable?
          (raise (make-uv-invalid-argument 'uv-tcp-keepalive!
                                           'delay-required-when-enabling)))
-       (uv-check (uv-tcp-keepalive (handle-pointer tcp 'uv-tcp-keepalive!) 0 0)
-                 'uv-tcp-keepalive!))
+       (handle-call! tcp 'uv-tcp-keepalive! uv-tcp-keepalive 0 0))
       ((tcp enable? delay)
        (require-open-tcp tcp 'uv-tcp-keepalive!)
        (unless (boolean? enable?)
          (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'enable-not-a-boolean)))
-       (unless (and (integer? delay) (exact? delay) (positive? delay))
+       (unless (and (integer? delay) (exact? delay) (positive? delay)
+                    (< delay 4294967296))
          (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'delay-out-of-range)))
-       (uv-check (uv-tcp-keepalive (handle-pointer tcp 'uv-tcp-keepalive!)
-                                   (if enable? 1 0) delay)
-                 'uv-tcp-keepalive!)))))
+       (handle-call! tcp 'uv-tcp-keepalive! uv-tcp-keepalive (if enable? 1 0) delay)))))

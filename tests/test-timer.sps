@@ -44,6 +44,8 @@
         ;; (an async closes by its own path, inside its send fence) and an
         ;; engine to interleave the two closes.
         (only (libuv async) make-uv-async)
+        ;; A signal handle is the other kind the timer verbs must refuse.
+        (only (libuv signal) make-uv-signal)
         (uv-evidence)
         (only (chezscheme) collect make-engine))
 
@@ -187,6 +189,32 @@
        (cons "uv-timer-repeat"     (lambda () (uv-timer-repeat 'nope)))
        (cons "uv-timer-set-repeat!" (lambda () (uv-timer-set-repeat! 'nope 1)))
        (cons "uv-close!"           (lambda () (uv-close! 'nope)))))
+
+;; --- another kind of handle is a caller bug too ---------------------------
+;; libuv's timer calls take any handle's address as a uv_timer_t's and read
+;; and write its fields. Before the timer verbs checked the kind, given a
+;; TCP handle uv-timer-set-repeat! wrote into its struct and uv-timer-stop!
+;; faulted. A signal handle that has never started is the gentlest other
+;; kind to ask with.
+(define other-kind (make-uv-signal l))
+
+(for-each
+ (lambda (entry)
+   (test-equal (string-append (car entry)
+                              " rejects another kind of handle, naming who and why")
+     (list (string->symbol (car entry)) 'not-a-uv-timer)
+     (non-handle-refusal (cdr entry))))
+ (list (cons "uv-timer-start!"      (lambda () (uv-timer-start! other-kind (lambda (h) h) 1 0)))
+       (cons "uv-timer-stop!"       (lambda () (uv-timer-stop! other-kind)))
+       (cons "uv-timer-again!"      (lambda () (uv-timer-again! other-kind)))
+       (cons "uv-timer-repeat"      (lambda () (uv-timer-repeat other-kind)))
+       (cons "uv-timer-set-repeat!" (lambda () (uv-timer-set-repeat! other-kind 1)))))
+
+;; The rows below count the registry from the suite's start.
+(test-equal "the signal handle the timer verbs refused closes"
+  'satisfied
+  (begin (uv-close! other-kind)
+         (run-until l (lambda () (eq? 'closed (uv-handle-state other-kind))) 64)))
 
 (test-equal "the state predicates answer #f for a non-handle instead of raising"
   '(#f #f)

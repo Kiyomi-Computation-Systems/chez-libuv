@@ -239,3 +239,234 @@ lost; test-loop's 936 B in 3 blocks is its escape allowance.
 
 **Filed, not fixed here:** the sweep helpers copied into five suites (#103), and
 `wrong-thread-refusal` reading the owner after the step (#102).
+
+# The other handle verbs as one step (#86, part two)
+
+2026-10-09. The timer verbs (`uv-timer-start!`, `uv-timer-stop!`,
+`uv-timer-again!`, `uv-timer-repeat`, `uv-timer-set-repeat!`), the signal
+verbs (`uv-signal-start!`, `uv-signal-start-oneshot!`, `uv-signal-stop!`),
+`uv-listen!`, `uv-tcp-nodelay!` and `uv-tcp-keepalive!` each become one
+interrupt-free step: owner and open checks, pointer, the native call, and,
+for a start, the callback stored once libuv has accepted it (and a signal's
+mode, checked again in the step). The verbs that do only that share
+`handle-call!`. Their sweeps join the scratch verbs' in
+`tests/test-handle-steps.sps`, with `uv-tcp-keepalive!`'s two forms swept
+apart.
+
+## What the suite gained
+
+- **Kinds.** A target is a TCP client, a timer or a signal handle, each
+  made on `h-loop`. A stop or an again gets a timer started an hour out,
+  with a repeat, and a signal stop a handle watching `SIGUSR2`; nothing
+  ever fires. The new handle of a reuse run is of the target's kind, and
+  the landing takes blocks of that kind's size.
+- **The other mode.** For the two signal starts, a fourth change starts the
+  target in the mode the verb does not ask for. The resumed verb owes
+  `'signal-mode-fixed`.
+- **Whole or not begun.** A dropped run must leave the handle as it found
+  it, or as a call nothing interrupts leaves it: what libuv says of the
+  handle (`uv_is_active`), the callback its record holds, and a timer's
+  repeat or a signal's mode.
+- **Rows of their own.** A listen libuv refuses (a client bound to the
+  server's port, `EADDRINUSE` held back by the bind until the listen) is
+  refused, storing no callback. A number its C parameter cannot take is
+  refused by name, and the largest each takes reaches libuv.
+- **test-timer.sps:** each timer verb refuses another kind of handle (a
+  signal handle never started), naming `'not-a-uv-timer`.
+
+## On main (87337b9)
+
+Run first against main's verbs, on macOS and on glibc 2.36 (the Valgrind
+image), twice on each: eight rows fail by name on both, with the same fuel
+maps. The scratch verbs' rows pass, #101 having fixed them.
+
+| Row | macOS and glibc |
+|---|---|
+| reuse: never reaches the new handle | fails: every new verb returns after the change, at one or two fuels, but the again, which raises libuv's EINVAL for the new timer (it has no callback); the signal starts raise `null-handle-pointer` at 11–13 first |
+| handoff: refused | fails: every new verb returns after the change |
+| other mode: refused | fails: both starts return at 11–15 |
+| drop: whole or not begun | fails: the listen and timer start at 10–11 and the signal starts at 14–15 left `(0 the-verbs …)`, the callback stored and nothing active |
+| close: refused | fails; each stale call on the freed block, below |
+| close reach | fails |
+| the listen libuv refuses | fails: `((refused EADDRINUSE) the-verbs)` |
+| the out-of-range numbers | fails: Chez's own `invalid foreign-procedure argument` for the timer's 2^64 and the keepalive's 2^32; the backlog of 2^31 reached libuv |
+
+The test-timer kind rows fail on main too: start, stop and again raised
+something else (start from its record mutator, stop with `invalid memory
+reference`), repeat and set-repeat returned.
+
+**The close sweep's stale calls on the freed block**, at fuel 10 (11 for
+the signal starts):
+
+| Verb | macOS | glibc |
+|---|---|---|
+| `uv-timer-start!` | `invalid memory reference` | the same |
+| `uv-timer-stop!` | `invalid memory reference` | returned |
+| `uv-timer-again!` | libuv's EINVAL | returned |
+| `uv-timer-repeat`, `uv-timer-set-repeat!` | returned, reading and writing the freed block | the same |
+| `uv-signal-stop!` | returned | the same |
+| `uv-listen!` | libuv's EINVAL | the same |
+| `uv-tcp-nodelay!`, `uv-tcp-keepalive!` | `ENOTSOCK` | returned |
+| the signal starts | `null-handle-pointer` at 11 | the same |
+
+**Made after the change, not before.** The strict oracle calls a verb that
+returns after the change wrong, though on main it could also have made its
+call before the expiry. A probe (scratchpad `g2/made-probe.sps`) asked
+libuv at each expiry whether the timer start, the signal start or the
+listen had already made its call (the target active), and after the
+resume whether the new handle at the freed address (reuse) or the target
+(handoff) was. On both platforms, every run that returned had not made its
+call before the change, and its handle was active after it: the new
+handle in the reuse runs, the handed-off target in the handoff runs. On
+the fixed verbs no run returned.
+
+## After the fix
+
+Every split run is refused, every dropped run leaves the handle whole or
+untouched and every counter as it found it, and the new handle took the
+freed address in every expired run. The same maps on macOS and glibc; each
+new verb is refused at fuels 1–9 and untouched at 10, the signal starts at
+1–13 and 14. macOS restarted one reuse run for a missed landing in each
+run, main's and the fix's; glibc none. Bytes per call (`uv-meter`'s
+fewest of 64, scratchpad `g2/meter.sps`): 0 for every one of these verbs,
+on main and after.
+
+## Mutants
+
+Driver and base as in part one (scratchpad `g2/mut/`: `mutants.py`,
+`window.py`, `window2.py`, `window3.py`, `harness.py`). The unmutated copy
+passes. Of the 33 source mutants, 19 are killed by name, 12 are
+equivalent in the committed code and killed once a window is opened
+(below), and 2 are uncovered.
+
+| Mutant | Change | Result |
+|---|---|---|
+| HC1 | `handle-call!`'s step uses `open-handle-ptr` | survived: **equivalent**, below |
+| HC2 | `handle-call!` reads the pointer just before the step | survived: **equivalent** |
+| HC3 | `handle-call!`'s `one-step` → `begin` | **killed**: reuse, handoff, close, close-reach |
+| HC4 | `handle-call!` ignores libuv's errno | **killed**: test-timer's "uv-timer-again! on a never-started timer surfaces libuv's EINVAL" |
+| TS1 | the timer start's step uses `open-handle-ptr` | survived: **equivalent** |
+| TS2 | the timer start reads the pointer just before the step | survived: **equivalent** |
+| TS3 | the timer start's `one-step` → `begin` | **killed**: reuse, handoff, close, close-reach |
+| TS4 | the timer start stores its callback before the step | survived: **equivalent** |
+| TS5 | the timer start stores its callback on a refusal too | survived: **uncovered**, below |
+| TS6 | no upper bound on a timer interval | **killed**: the out-of-range row |
+| TS7 | the bound inclusive | **killed**: the out-of-range row |
+| TS8 | the bound one too low | **killed**: the largest-number row |
+| TR1, TSR1 | the repeat's and set-repeat's steps use `open-handle-ptr` | survived: **equivalent** |
+| TR2, TSR2 | they read the pointer just before the step | survived: **equivalent** |
+| K1 | no kind check on the timer verbs | **killed**: test-timer's five kind rows (and its two close-sweep reach rows) |
+| K2 | the kind checked before `require-handle` | **killed**: test-timer's five non-handle rows |
+| SS1 | the signal start's step uses `open-handle-ptr` | **killed**: handoff |
+| SS2 | the signal start reads the pointer before the step | **killed**: reuse, handoff, close, close-reach |
+| SS3 | no mode check in the step | **killed**: other-mode, other-mode reach; test-signal's mode rows |
+| SS4 | the mode check inverted | **killed**: the same, and test-signal's EV-6 |
+| SS5 | the callback and mode stored before the step | **killed**: drop, other-mode, other-mode reach; test-signal's mode rows |
+| SS6 | the mode fixed after the step | survived: **equivalent** |
+| SS7 | the callback and mode stored on a refusal too | survived: **uncovered** |
+| L1 | the listen's step uses `open-handle-ptr` | survived: **equivalent** |
+| L2 | the listen reads the pointer just before the step | survived: **equivalent** |
+| L3 | the listen stores its callback before the step | **killed**: the listen-refusal row (the drop row only with a window, below) |
+| L4 | the listen stores its callback on a refusal too | **killed**: the listen-refusal row |
+| L5, KA1 | no upper bound on the backlog, on the keepalive delay | **killed**: the out-of-range row |
+| L6, KA2 | each bound one too low | **killed**: the largest-number row |
+
+SS1 and SS2 die where TS1 and TS2 survive because the signal start can
+trap between its entry check and its step, where it reads the signal
+(`watch-symbol->int`): its sweeps run four fuels longer than the others'.
+The listen's `require-callback` in the same place adds none (the listen and
+the timer stop are both refused at 1–9), and L1 and L2 survive.
+
+**The equivalent ones, checked with a window.** In every other verb here
+nothing between the entry check (`require-open-*`) and the step can trap,
+so no engine expires there: the step's own owner and open checks, a
+pointer read just before it, and a store just before or after it cannot be
+split from the entry check today. Each was run again with a loop of three
+engine ticks opened at that point (`window.py`, `window2.py`,
+`window3.py`). With the window alone the suite passes, each sweep three
+fuels longer. With the window:
+
+| Mutant | Result |
+|---|---|
+| W-HC1, W-TS1, W-TR1, W-TSR1, W-L1 (owner) | **killed**: handoff |
+| W-HC2, W-TS2, W-TR2, W-TSR2, W-L2 (pointer before the step) | **killed**: reuse, handoff, close, close-reach |
+| W-TS4, W-L3 (store before the step) | **killed**: drop (and W-L3 the listen-refusal row) |
+| W-SS6 (mode after the step) | **killed**: reuse, handoff, other-mode, drop, close, close-reach |
+
+So the steps hold these properties whatever comes to stand between the
+entry check and the step, and the sweeps catch their loss the moment
+something does.
+
+**The uncovered ones.** TS5 and SS7: libuv refuses `uv_timer_start` only
+for a closing handle or no callback, and `uv_signal_start` only for signal
+0 or a signal `sigaction` will not take. The step checks the first, the
+callback entry is never null, and the signal vocabulary has neither. No
+input reaches a refused start of either, so where its store sits cannot be
+seen. The listen's (L4) can, and is held.
+
+**The harness's own mutants.**
+
+| Mutant | Change | Result |
+|---|---|---|
+| H1 | the drop oracle accepts only the state the run found | **killed**: drop, drop reach (an untouched start leaves the whole state) |
+| H2 | nothing observed | survived on the committed suite: a guard. With SS5 as well, the drop row passes, which SS5 alone fails |
+| H3 | the mode change does nothing | **killed**: other-mode, other-mode reach |
+| H4 | the mode change starts the same mode | **killed**: the same |
+| H5 | a timer's landing takes TCP-sized blocks | survived on both platforms, twice on glibc: a freed timer block comes back to the next timer without the fill or the hunt |
+
+## Gates
+
+- macOS: `make test` (18.5 s), `make test-threading`, `make check-purity`,
+  `make test-memory` (ASan; handle-steps 21 rows).
+- Debian 12 aarch64 (the Valgrind image), vendored: `make test`, `make
+  check-memory-gate`, `make test-memory`.
+
+## Part two: the review's follow-ups
+
+PR #105's review (2026-10-09, /code-review xhigh) found nine things. Five
+are fixed here, one went to #102 as a comment, and three are left.
+
+- **The largest-backlog row listened on every interface.** Unbound, a
+  listening client is bound by the kernel to `0.0.0.0` (measured: its
+  sockname answered `0.0.0.0` and an ephemeral port). Both listen rows now
+  bind the client to `127.0.0.1` first, and its sockname answers
+  `127.0.0.1`.
+- **The suite's header claimed two defects main never showed**: a split
+  signal start starting the signal "in a mode no longer its own", and a
+  drop leaving a signal started with no mode fixed. It now says what the
+  sweeps saw: the start returned normally where it owed
+  `'signal-mode-fixed`, and a drop left the callback stored and nothing
+  started.
+- **A verb that does nothing passed the drop sweep.** Its `whole` state is
+  computed from the code under test, so a verb that silently did nothing
+  agreed with itself. A row now holds each verb's whole state to what the
+  verb promises (`promised-wholes`). A tighter verdict for untouched runs
+  (left must equal whole) was tried and dropped: an untouched run executes
+  the same code as the reference call, so no mutant could break it.
+
+  | Mutant | Committed suite | With the row |
+  |---|---|---|
+  | R2: the listen stores no callback | passes | **killed**: the promised-state row |
+  | R4: the set repeat writes nothing | passes | **killed**: the promised-state row |
+  | R1: the timer start never arms | not run | **killed**: the promised-state row, and the reuse, handoff and close rows with their reach rows (its sweep's fuels moved), and drop reach |
+  | R3: a oneshot start fixes `'continuous` | not run | **killed**: the promised-state row, other-mode, other-mode reach |
+
+- **The signal start's new error order was stated only in prose.**
+  tests/test-signal.sps now holds it: a start in the fixed-other mode
+  whose callback is no procedure is refused with
+  `'on-signal-not-a-procedure`. It fails on main, which answered
+  `'signal-mode-fixed`, and R5 (the entry mode check restored) fails it.
+- **The verbs now return nothing where they returned 0** (`uv-check`
+  answered its rc). docs/api.md types them as unspecified, as it does
+  #101's verbs, which return nothing too. The PR now says so.
+- **#102** gained a comment listing these verbs' refusals, which read the
+  owner after the step as well.
+
+Left, as the review's lowest: the store-on-success step written out three
+times beside `handle-call!`, `uv-timer-set-repeat!`'s bound missing from
+its row in docs/api.md, and the C type limits written as literals.
+
+Gates for the follow-ups: macOS `make test`, and `make test-memory` (ASan)
+on test-handle-steps and test-signal; on Debian 12 aarch64, both suites
+plain and under `make test-memory` (Valgrind, 0 bytes definitely lost in
+each suite's own process).

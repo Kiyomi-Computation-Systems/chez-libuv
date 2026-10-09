@@ -141,11 +141,11 @@ block; one that is resumed costs nothing.
 | `uv-tcp-bind!` | Bind to an address and port; IPv4 or IPv6 literal. Optional flag list: `'(reuseport)` binds with `SO_REUSEPORT` load balancing (libuv ≥ 1.49; the kernel distributes connections across sockets sharing the port). On a libuv without the flag it raises `&uv-constant-unavailable`; on a platform whose libuv lacks TCP reuseport (e.g. macOS) libuv answers an errno |
 | `uv-tcp-getsockname-port` | The real port the kernel chose, for a bind to port 0 |
 | `uv-tcp-sockname-address` | This end's own address and port, as `(values address-string-or-#f port)`. Unlike the peer side it needs no connection — a bound handle has a local name |
-| `uv-listen!` | Listen; `on-connection` is called with the error or `#f` |
+| `uv-listen!` | Listen; `on-connection` is called with the error or `#f`. The backlog is a C `int`: from 2^31 on, `'backlog-out-of-range` |
 | `uv-accept!` | A new open handle for the queued connection |
 | `uv-tcp-connect!` | Connect; answers the in-flight request record |
 | `uv-tcp-nodelay!` | `TCP_NODELAY`. Takes a boolean, not an int |
-| `uv-tcp-keepalive!` | `SO_KEEPALIVE`. `(tcp #f)` disables; `(tcp #t idle-seconds)` enables — the idle delay is in whole seconds and is required (and must be positive) when enabling. `uv_tcp_keepalive` |
+| `uv-tcp-keepalive!` | `SO_KEEPALIVE`. `(tcp #f)` disables; `(tcp #t idle-seconds)` enables — the idle delay is in whole seconds and is required (and must be positive, and below 2^32) when enabling. `uv_tcp_keepalive` |
 | `uv-tcp-peer-address` | `(values address-string-or-#f port)` for the remote end. `uv_tcp_getpeername` |
 
 **An address is read once, at the start of the call.** `uv-tcp-bind!`,
@@ -254,6 +254,23 @@ resumed after a handoff made its call on a handle the other thread now
 owned; and one
 whose engine was never resumed lost its block, or both of its blocks. Now
 it leaves nothing behind.
+
+The timer verbs (`uv-timer-start!`, `uv-timer-stop!`, `uv-timer-again!`,
+`uv-timer-repeat`, `uv-timer-set-repeat!`), the signal verbs
+(`uv-signal-start!`, `uv-signal-start-oneshot!`, `uv-signal-stop!`),
+`uv-listen!`, `uv-tcp-nodelay!` and `uv-tcp-keepalive!` make both promises
+too. Each checks its handle again and calls libuv in its step, and a start
+stores its callback there, once libuv has accepted it. One resumed after
+its handle was closed raises `&uv-handle-closed`, one resumed after its
+loop was handed to another thread raises `&uv-wrong-thread`, and a signal
+start resumed after its handle was started in the other mode raises
+`'signal-mode-fixed`. Before, one resumed after a close could call libuv
+on the freed handle, or on whatever handle had been given its address;
+one resumed after a handoff made its call on a handle the other thread
+now owned; and a signal start resumed after the other mode was fixed
+returned normally. A start whose engine was never resumed could leave its
+callback stored and nothing started. None of them allocates: one whose
+engine is never resumed had either not begun or finished.
 
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
@@ -663,10 +680,15 @@ behaviours worth knowing before the design spec:
 | Export | |
 |---|---|
 | `make-uv-timer` | A new timer on a loop |
-| `uv-timer-start!` | Arm it: `(timer on-timeout timeout-ms repeat-ms)`; `on-timeout` receives the timer record itself. The timeout counts from the loop's cached `uv-now`, not the wall clock: after a callback that held the loop, call `uv-update-time!` first or the timer is due early |
+| `uv-timer-start!` | Arm it: `(timer on-timeout timeout-ms repeat-ms)`; `on-timeout` receives the timer record itself. The timeout counts from the loop's cached `uv-now`, not the wall clock: after a callback that held the loop, call `uv-update-time!` first or the timer is due early. Each interval is below 2^64 (libuv's `uint64_t`), else `'timeout-out-of-range` or `'repeat-out-of-range` |
 | `uv-timer-stop!` | Disarm it |
 | `uv-timer-again!` | Restart a repeating timer |
 | `uv-timer-repeat` `uv-timer-set-repeat!` | Read and set the repeat interval |
+
+Each timer verb refuses another kind of handle with `&uv-invalid-argument`,
+reason `'not-a-uv-timer`, and anything that is not a handle with
+`'not-a-uv-handle`. Before, they took any handle as a timer: given a TCP
+handle, `uv-timer-set-repeat!` wrote into its struct.
 
 ## Async — `(libuv async)`
 
