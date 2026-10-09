@@ -185,6 +185,62 @@ constructor mutates the registry before a handle exists to check.
 > mark outright, out of `src/`. Evidence and mutations:
 > `.plans/loop-claim-mutation-log.md`.
 
+> **Amended 2026-10-09 (#102): a refusal names the owner its check
+> found.** Every verb that checks its loop's owner checks it in its step
+> (decision 3's amendments), and raises `&uv-wrong-thread` once the step
+> is over. The step answered a bare `'wrong-thread`, and the verb read the
+> loop's owner again to build the condition. A loop handed on between the
+> two, by `uv-run` on another thread or by a scheduler on this one, was
+> named in place of the owner the step had compared against. Handed back
+> to the caller, it made the condition say `expected` = `actual`: refused
+> for the wrong thread, the caller was named as the owner. Measured on
+> main (ad3bb47), the same on macOS and glibc 2.36, with
+> `tests/test-owner-refusal.sps`'s hand-back sweep. The sweep hands the
+> loop to another thread at the first expiry and back to the caller one
+> tick later:
+>
+> - **Fifteen verbs** were refused naming this thread as both, each at the
+>   last fuel before its step: `uv-accept!`, the seven scratch verbs,
+>   `uv-tcp-connect!`, both signal starts, `uv-write!`, `uv-write*!` and
+>   `uv-shutdown!`. Each builds its refusal in `step-refusal`, whose call
+>   is a point an expiry can come at.
+> - **No window today** for the other 24, the constructors, the lookups,
+>   `uv-cancel!` and `uv-spawn!` among them. Nothing between their step and
+>   the second read can trap, so only another thread's claim could come
+>   between, and no sweep runs one.
+>
+> An owner check now answers what it found. `loop-owner-mismatch`, the one
+> read of a loop's owner that decides whether a verb may go on, answers
+> `#f` or an `owner-mismatch` holding the owner it compared against and
+> the caller. `owned-loop-ptr`, `owned-handle-ptr`, `uv-cancel!`'s step and
+> `require-loop-thread` take their answer from it. `step-refusal` builds
+> `&uv-wrong-thread` from the record (`wrong-thread-refusal`). The six
+> places that wrote out their own mapping now pass it on: the
+> constructors' `construct-handle`, the loop queries' `loop-call`,
+> `uv-spawn!`'s refusal, both lookups and `uv-cancel!`. A step tests its
+> pointer, and a verb its step's answer, with `refused?`, which tells the
+> record from a pointer: `symbol?` would take it for one and hand it to
+> libuv. Rule 9 of `tests/test-source-rules.sps` holds this. It allows
+> `make-uv-wrong-thread` only in `wrong-thread-refusal`, the owner field's
+> accessor only in `loop-owner-mismatch`, and `symbol?` only in three
+> definitions that never test a step's answer.
+>
+> - **Measured after:** every refusal in the sweep names the other thread
+>   as `expected` and this one as `actual`. A call that is not refused
+>   allocates what it did before (0 B for the timer verbs, 144 B for
+>   `uv-write!`, 496 B for `make-uv-timer`, and so on: the fewest bytes of
+>   64 calls). A refusal allocates 32 B more for the record: 640 → 672 B
+>   from the entry check and 960 → 992 B from a constructor's step,
+>   counting the caller's own `guard`.
+> - **What the sweep cannot see.** The 24 verbs with no window: a mutant
+>   that reads the owner again at any of the six former sites, or in
+>   `require-loop-thread`, survives the sweep. Rule 9 kills it, and so does
+>   the sweep once a three-tick window opens before the second read. A
+>   refusal's caller is the current thread in every run, so a builder
+>   that took `actual` from `current-thread-id` instead of the record is
+>   caught only by test-loop's row handing `step-refusal` another caller.
+>   Evidence and mutations: `.plans/owner-refusal-mutation-log.md`.
+
 **3. `uv-async-send!` is the one exempt verb.** `uv_async_send` is libuv's sole
 thread-safe call, so it is the one way a worker thread hands work back to the
 loop thread. It touches no registry state; it validates handle kind and open

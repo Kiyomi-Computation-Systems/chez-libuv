@@ -200,10 +200,12 @@
 ;; test-native's truncation scan all resumed without one until #81, with
 ;; every row green. So every engine the tests make is the driver's, or one
 ;; of the sweeps below, each bounded on its own: most stop an engine once
-;; and then resume it once with a fixed budget, or drop it, and
+;; and then resume it once with a fixed budget, or drop it;
 ;; test-loop-claim's exit-split-run resumes one tick at a time up to its
-;; own cap. A new engine fails this row by name, as (file definition): port
-;; it to the driver, or list it here once it has a bound of its own.
+;; own cap; and test-owner-refusal's handback-run stops it twice, resuming
+;; it with one tick and then a fixed budget. A new engine fails this row by
+;; name, as (file definition): port it to the driver, or list it here once
+;; it has a bound of its own.
 (define engine-sites-allowed
   '(("tests/stranded-exit-child.sps" first-slice)
     ("tests/test-async-fence.sps" send-then-close)
@@ -222,6 +224,7 @@
     ("tests/test-loop-threads.sps" lock-sweep)
     ("tests/test-loop.sps" first-slice)
     ("tests/test-loop.sps" suspending-slice)
+    ("tests/test-owner-refusal.sps" handback-run)
     ("tests/test-process-steps.sps" split-run)
     ("tests/test-process-steps.sps" drop-run)
     ("tests/test-process.sps" drop-run)

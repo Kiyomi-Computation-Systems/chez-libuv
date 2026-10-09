@@ -78,7 +78,7 @@
     (let ((answer
            (one-step
             (let ((ptr (owned-handle-ptr handle)))
-              (if (symbol? ptr)
+              (if (refused? ptr)
                   ptr
                   (let ((cell (alloc-block (c-int-size))))
                     (if (zero? cell)

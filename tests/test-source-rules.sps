@@ -99,6 +99,28 @@
 ;;;    native.sls name a raw pointer that way. What the scan cannot see: an
 ;;;    accessor imported under another name.
 ;;;
+;;; 9. A refusal for the wrong thread names the owner its check compared
+;;;    against (#102). An owner check that finds another thread owning the
+;;;    loop answers an owner-mismatch holding that owner and the caller,
+;;;    and &uv-wrong-thread is built from it. Until #102 the check answered
+;;;    'wrong-thread, and the refusal read the owner again once the step
+;;;    was over: a loop handed on and back to the caller in between was
+;;;    named as owned by the very thread it refused. So this suite holds,
+;;;    named and counted as rule 8's routes are:
+;;;    - make-uv-wrong-thread to wrong-thread-refusal, which builds from an
+;;;      owner-mismatch, and its definition in conditions.sls;
+;;;    - the owner field's accessor, loop-owner-thread, to
+;;;      loop-owner-mismatch, which reads it once, and the record that
+;;;      defines it;
+;;;    - symbol? to the definitions listed. A pointer check's answer, and
+;;;      a step's, can be an owner-mismatch, which symbol? would take for a
+;;;      pointer and hand to libuv, so they are tested with refused?. #109
+;;;      turned eight steps' open-handle-ptr into owned-handle-ptr; a step
+;;;      that kept its symbol? through such a change would pass every sweep
+;;;      but the hand-back, and only for a verb an engine can stop between
+;;;      its entry check and its step.
+;;;    What the scan cannot see: a name imported under another one.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1219,10 +1241,11 @@
         (else 0)))
 
 ;; definition-name : datum -> (or symbol #f)
-;; The name a define, define-syntax or define-record-type form defines.
+;; The name a define, define-syntax, define-record-type or
+;; define-condition-type form defines.
 (define (definition-name form)
   (and (pair? form)
-       (memq (car form) '(define define-syntax define-record-type))
+       (memq (car form) '(define define-syntax define-record-type define-condition-type))
        (pair? (cdr form))
        (let ((target (cadr form)))
          (cond ((symbol? target) target)
@@ -1282,6 +1305,22 @@
 (test-equal "rule 8: handle-pointer, the checked accessor outside a step, is named only by discard-failed-handle!"
   '(("src/libuv/private/handles.sls" discard-failed-handle! 1))
   (namers-in-src 'handle-pointer))
+
+(test-equal "rule 9: make-uv-wrong-thread is named only by its condition type and wrong-thread-refusal, once each"
+  '(("src/libuv/private/conditions.sls" &uv-wrong-thread 1)
+    ("src/libuv/private/handles.sls" wrong-thread-refusal 1))
+  (namers-in-src 'make-uv-wrong-thread))
+
+(test-equal "rule 9: a loop's owner is read only by its record and loop-owner-mismatch, once each"
+  '(("src/libuv/private/handles.sls" uv-loop-record 1)
+    ("src/libuv/private/handles.sls" loop-owner-mismatch 1))
+  (namers-in-src 'loop-owner-thread))
+
+(test-equal "rule 9: symbol? is named only by the definitions listed, none of which tests a step's answer"
+  '(("src/libuv/private/handles.sls" refused? 1)
+    ("src/libuv/private/handles.sls" step-refusal 1)
+    ("src/libuv/private/native.sls" signal-symbol->int 1))
+  (namers-in-src 'symbol?))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"

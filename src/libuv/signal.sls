@@ -48,7 +48,7 @@
            (rc (one-step
                 (let ((ptr (owned-handle-ptr sig))
                       (mode (signal-mode sig)))
-                  (cond ((symbol? ptr) ptr)
+                  (cond ((refused? ptr) ptr)
                         ((and mode (not (eq? mode wanted-mode))) 'signal-mode-fixed)
                         (else
                          (let ((rc (native-start ptr signum)))

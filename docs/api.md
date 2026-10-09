@@ -775,7 +775,7 @@ discriminant is a symbol).
 | `&uv-constant-unavailable` | `name` | The shim has no constant under that name |
 | `&uv-invalid-argument` | `who` `reason` | A caller error, refused leaving nothing allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
-| `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the owner's thread id, `actual` the caller's ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
+| `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the id of the thread the verb's check found owning the loop, `actual` the caller's. The two always differ, even if the loop has changed hands again since the check ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 
 v0.3, v0.4, v0.5 and v0.7 added no new condition types, and v0.6 added one — every
 `(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv

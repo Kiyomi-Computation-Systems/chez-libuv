@@ -457,7 +457,7 @@
                        (spawn-step! loop on-exit layout request options))))
           (if (uv-process-record? made)
               made
-              (raise (spawn-refusal made loop)))))))
+              (raise (spawn-refusal made)))))))
 
   ;; --- the step that spawns ---------------------------------------------------
   ;; The checks above see the loop and the stdio handles as they were on
@@ -505,7 +505,7 @@
   (define (spawn-step! loop on-exit layout request options)
     (let* ((specs (spawn-options-stdio options))
            (loop-address (owned-loop-ptr loop))
-           (refusal (if (symbol? loop-address)
+           (refusal (if (refused? loop-address)
                         loop-address
                         (stdio-refusal specs))))
       (if refusal
@@ -556,22 +556,21 @@
               (let ((h (stdio-spec-handle spec)))
                 (and h
                      (let ((ptr (open-handle-ptr h)))
-                       (cond ((symbol? ptr) (cons ptr h))
+                       (cond ((refused? ptr) (cons ptr h))
                              ((and (eq? (stdio-spec-kind spec) 'pipe)
                                    (pipe-connected? h))
                               'pipe-already-used)
                              (else #f))))))
             specs))
 
-  ;; spawn-refusal : status uv-loop -> condition
-  ;; What uv-spawn! on LOOP raises for a status the step answered: what the
-  ;; checks on entry raise for the same state, ENOMEM, or libuv's errno. A handle's
-  ;; refusal comes paired with the handle (stdio-refusal). Options the fill
-  ;; could not write are the binding's own fault, not the caller's: the
-  ;; checks accepted them.
-  (define (spawn-refusal status loop)
+  ;; spawn-refusal : status -> condition
+  ;; What uv-spawn! raises for a status the step answered: what the checks
+  ;; on entry raise for the same state, the owner its loop's check found,
+  ;; ENOMEM, or libuv's errno. A handle's refusal comes paired with the
+  ;; handle (stdio-refusal). Options the fill could not write are the
+  ;; binding's own fault, not the caller's: the checks accepted them.
+  (define (spawn-refusal status)
     (cond ((pair? status) (step-refusal (car status) 'uv-spawn! (cdr status)))
-          ((eq? status 'wrong-thread) (wrong-thread-refusal loop 'uv-spawn!))
           ((eq? status 'options-not-written)
            (condition (make-uv-error)
                       (make-who-condition 'uv-spawn!)
@@ -621,7 +620,7 @@
     (let* ((signum (signal-symbol->int sig 'uv-process-kill!))
            (sent (one-step
                   (let ((ptr (owned-handle-ptr proc)))
-                    (if (symbol? ptr) ptr (uv-process-kill ptr signum))))))
+                    (if (refused? ptr) ptr (uv-process-kill ptr signum))))))
       (unless (eqv? sent 0)
         (raise (step-refusal sent 'uv-process-kill! proc)))))
 
@@ -638,8 +637,8 @@
     (require-open-process proc 'uv-process-pid)
     (let ((pid (one-step
                 (let ((ptr (owned-handle-ptr proc)))
-                  (if (symbol? ptr) ptr (uv-process-get-pid ptr))))))
-      (if (symbol? pid)
+                  (if (refused? ptr) ptr (uv-process-get-pid ptr))))))
+      (if (refused? pid)
           (raise (step-refusal pid 'uv-process-pid proc))
           pid)))
 
