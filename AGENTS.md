@@ -274,6 +274,36 @@ None is obvious from reading the code.
   thread's end does not free; so does an engine dropped inside a callback. Valgrind calls it reachable or definitely
   lost by collection timing, so the gate suppresses exactly it
   (`tests/valgrind-chez.supp`; #94, ADR-0003's amendment of 2026-10-09).
+* **A return from a callback abandons every callback entered after it on
+  the thread that has not returned.** Chez's `S_return` longjmps to the
+  frame that entered the callback and drops every newer context from the
+  thread's chain. A callback dropped that way can never return, so an
+  engine suspended inside a callback can be resumed only while that
+  callback still nests: on its own thread, after every callback entered
+  since has returned, and before any callback that was running when it
+  stopped has returned. Each way of breaking that was measured, and each
+  raises "attempt to return to stale foreign context" and leaves a loop
+  marked running for good:
+  - two engines, the earlier resumed first: the later one's resume raises;
+  - an engine started from a scheduler's timer callback that then
+    returned: the engine's resume raises, from anywhere;
+  - an engine resumed from inside a callback entered after it stopped: the
+    engine finishes, and that callback's `uv-run` raises.
+  A round-robin scheduler has the first shape, and a scheduler driven by
+  libuv's own timers has the other two. docs/api.md promised that resuming
+  always finishes the run. The first statement of this rule named only the
+  first shape, and two rounds of review found the others (PR #115).
+  - The same jump gives the stack back. 40,000 escapes, in batches of
+    1,000 above an engine resumed after each batch, never grew the stack
+    past one batch.
+  - It does not give the heap back. `S_call_help` sets `CCHAIN` to the
+    returning context *before* its walk "to unlock code objects that we're
+    escaping past" (schlib.c:257-258). The walk stops at once, so the
+    newer contexts' `jmp_buf`s are never freed, and their code objects
+    stay immobilized.
+  - test-loop's "two runs suspended inside callbacks" rows hold all
+    three shapes and the safe order
+    (`.plans/escape-costs-mutation-log.md`).
 
 ### The event loop and child processes
 

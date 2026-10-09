@@ -223,6 +223,7 @@
     ("tests/test-loop-claim.sps" drop-sweep)
     ("tests/test-loop-threads.sps" lock-sweep)
     ("tests/test-loop.sps" first-slice)
+    ("tests/test-loop.sps" suspend-in-callback)
     ("tests/test-loop.sps" suspending-slice)
     ("tests/test-owner-refusal.sps" handback-run)
     ("tests/test-process-steps.sps" split-run)

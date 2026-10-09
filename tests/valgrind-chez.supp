@@ -4,11 +4,14 @@
 # matches, and that none hides a leak the binding could make.
 #
 # A callback left without returning (#94). S_call_help, Chez's entry from C
-# into Scheme, mallocs a jmp_buf for each call (312 B on aarch64 glibc) and
-# frees it only when that call returns. A continuation that escapes a libuv
-# callback never returns through it, and nor does an engine dropped while
-# inside one, so the block is never freed, even when its thread ends. A
-# child forked before exec reports the block its parent held at the fork.
+# into Scheme, mallocs a jmp_buf for each call (312 B on aarch64 glibc,
+# 200 B on x86-64) and frees it only when that call returns. A
+# continuation that escapes a libuv callback never returns through it, and
+# nor does an engine dropped while inside one, so the block is never freed,
+# even when its thread ends. Nor is the block of a callback abandoned by a
+# return into an older one: Chez drops it from its chain unfreed
+# (.plans/escape-costs-mutation-log.md). A child forked before exec
+# reports the block its parent held at the fork.
 # Valgrind calls the block "still reachable" or "definitely lost" by how
 # collections happened to run: test-loop-claim's escaped teardown flipped
 # from one to the other on a change to an unrelated library. A block the
