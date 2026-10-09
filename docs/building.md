@@ -17,17 +17,20 @@ distribution (an Akku package included) can work without a build step:
 
 ## Where libuv comes from
 
-The floor is **libuv 1.44.0**; `make build` derives the packed version
-range written into `config.sls` from it. libuv guarantees ABI stability
-across 1.x, so this is a range check, not an equality test — a runtime
-library outside the range makes initialisation raise
-`&uv-version-incompatible` rather than run.
+The floor is **libuv 1.48.0**, Ubuntu 24.04 LTS's libuv, which CI tests
+against; `make build` derives the packed version range written into
+`config.sls` from it. libuv guarantees ABI stability across 1.x, so this
+is a range check, not an equality test — a runtime library outside the
+range makes initialisation raise `&uv-version-incompatible` rather than
+run.
 
-Which copy gets used depends on `pkg-config --exists libuv`:
+Which copy gets used depends on `pkg-config --atleast-version=1.48.0 libuv`:
 
-- **Succeeds** (e.g. `brew install libuv` on macOS): the shim is compiled
-  directly against that installed copy. Nothing under `vendor/` is touched.
-- **Fails** (the common case on a bare Linux box): the same `make build`
+- **Succeeds** (e.g. `brew install libuv` on macOS, or `libuv1-dev` on
+  Ubuntu 24.04 or 26.04): the shim is compiled directly against that
+  installed copy. Nothing under `vendor/` is touched.
+- **Fails**, because no system libuv is installed, or because the one
+  installed is older than the floor (Debian 12's is 1.44.2): the same `make build`
   first runs `git submodule update --init --recursive` and builds the
   pinned `vendor/libuv` submodule with CMake (shared library only), then
   links the shim against that. Force this path deliberately, even with a

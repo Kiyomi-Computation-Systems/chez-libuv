@@ -1,0 +1,150 @@
+name: Pinned Chez Scheme
+description: >-
+  Restore or build Chez Scheme at the declared floor, put it on PATH, assert
+  that it meets the floor, and export its binary's name as CHEZ. Both CI
+  jobs use it, so both test the same Chez.
+
+inputs:
+  chez-version:
+    description: The Chez Scheme release to build (the workflow's CHEZ_FLOOR_VERSION).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # apt's chezscheme on Ubuntu 26.04 is 10.0.0 (24.04's was 9.5.8) --
+    # below this project's declared floor (README.org). Built from source
+    # instead. The release tarball ships prebuilt "pb" (portable bytecode)
+    # boot files, so `configure && make` self-hosts the native boot files
+    # with no pre-existing Chez required -- and the result is cached on the
+    # pinned version and the runner image, so only a version bump or a new
+    # image ever pays the build cost again.
+    # -v2: the v1 key cached a build that never finished (see the disable
+    # flags below) -- bumping the suffix means the retry can't be served a
+    # poisoned cache entry from the failed run under the old key.
+    #
+    # restore/save rather than the combined actions/cache@v4: the combined
+    # action writes the cache from an implicit post-job step, and GitHub
+    # skips that step when the job fails. Every red run -- a failing suite,
+    # a Valgrind report, a flake -- therefore threw away a ~10-minute Chez
+    # build and made the NEXT run pay for it again, which is the opposite
+    # of what a cache is for on a repository that is out of minutes. Saving
+    # explicitly, immediately after the build succeeds, banks it no matter
+    # what the suites do afterwards.
+    #
+    # Scope note: caches written on a branch are visible to that branch and
+    # to anything based on it, but a cache written on `main` is visible to
+    # every PR. So the miss is paid once per floor bump on main, not once
+    # per branch, provided main runs at least once after a bump.
+    #
+    # The key names the image the build ran on, read from the runner
+    # itself, so a new runs-on builds Chez with the new image's compiler
+    # rather than restoring a build made with the old one, and the two jobs,
+    # on two images, keep two entries.
+    - name: Identify the runner image
+      id: image
+      shell: bash
+      run: |
+        . /etc/os-release
+        echo "id=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore built Chez Scheme
+      id: cache-chez
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/.chez-install
+        key: chez-${{ inputs.chez-version }}-${{ steps.image.outputs.id }}-${{ runner.arch }}-v2
+
+    - name: Build Chez Scheme (pinned; apt's is below the floor)
+      if: steps.cache-chez.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CHEZ_VERSION: ${{ inputs.chez-version }}
+      run: |
+        curl -fsSL -o /tmp/chez.tar.gz \
+          "https://github.com/cisco/ChezScheme/releases/download/v${CHEZ_VERSION}/csv${CHEZ_VERSION}.tar.gz"
+        tar xzf /tmp/chez.tar.gz -C /tmp
+        cd "/tmp/csv${CHEZ_VERSION}"
+        # --disable-x11 --disable-curses: the expeditor (Chez's REPL line
+        # editor) otherwise #includes X11/Xlib.h and curses.h/term.h at
+        # compile time -- headers this minimal runner's toolchain doesn't
+        # have (confirmed: v1 died at exactly that X11 include, error 2).
+        # Both flags turn into #define DISABLE_X11 / DISABLE_CURSES in the
+        # generated config.h, which routes expeditor.c around those
+        # #includes entirely (X11's is `#ifdef LIBX11`-gated, and version.h
+        # only sets LIBX11 when DISABLE_X11 is unset; curses falls back to
+        # the bundled nocurses.h) rather than merely deferring the
+        # dependency to link time. Safe here because this binding only ever
+        # runs Chez via `--program`, never the interactive REPL the
+        # expeditor serves.
+        ./configure --disable-x11 --disable-curses \
+          --prefix="${{ github.workspace }}/.chez-install"
+        # Serial, not -j: verified locally that parallel make races the pb
+        # bootstrap stage ("rule for target did not create it:
+        # .../nanopass.so") -- an intermittent failure a cache can't paper
+        # over, since it would resurface on every cache miss (a floor bump).
+        make
+        make install
+
+    # Gated on the same cache-miss condition as the build above, so it
+    # runs only when there is something new to store -- and, sitting
+    # directly after it, only if `make install` actually succeeded.
+    # `cache-primary-key` is the restore step's own key, so the two cannot
+    # drift apart if the key expression is ever edited.
+    - name: Save built Chez Scheme
+      if: steps.cache-chez.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/.chez-install
+        key: ${{ steps.cache-chez.outputs.cache-primary-key }}
+
+    - name: Add built Chez Scheme to PATH
+      shell: bash
+      run: echo "${{ github.workspace }}/.chez-install/bin" >> "$GITHUB_PATH"
+
+    # The build step above pins the binary to the floor, but this asserts it
+    # rather than trusting the pin: a cache hit could be serving a stale
+    # install from before a floor bump, and a version regression here should
+    # fail loudly rather than surface later as a mystifying native-feature
+    # error. It puts the install on its own PATH rather than rely on the
+    # step above, and resolves the binary itself.
+    - name: Assert Chez Scheme meets the declared floor
+      shell: bash
+      env:
+        CHEZ_VERSION: ${{ inputs.chez-version }}
+      run: |
+        PATH="${{ github.workspace }}/.chez-install/bin:$PATH"
+        bin=""
+        for c in chez chezscheme scheme; do
+          if command -v "$c" >/dev/null; then bin="$c"; break; fi
+        done
+        if [ -z "$bin" ]; then
+          echo "::error::no Chez Scheme binary found to version-check" >&2
+          exit 1
+        fi
+        raw="$("$bin" --version 2>&1)"
+        ver="$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        if [ -z "$ver" ]; then
+          echo "::error::could not parse a version out of '$bin --version' ($raw)" >&2
+          exit 1
+        fi
+        lowest="$(printf '%s\n%s\n' "$ver" "$CHEZ_VERSION" | sort -V | head -1)"
+        if [ "$lowest" != "$CHEZ_VERSION" ]; then
+          echo "::error::Chez Scheme $ver is below the declared floor $CHEZ_VERSION" >&2
+          exit 1
+        fi
+        echo "Chez Scheme $ver satisfies the $CHEZ_VERSION floor"
+
+    # The from-source install above names its binary `scheme` (Chez's own
+    # install default); apt's own package (were it ever usable) names it
+    # `chezscheme`. The Makefile defaults to `chez`. This tries all three
+    # so the resolution doesn't hardcode whichever one happens to be true
+    # of the current install method.
+    - name: Resolve the Chez binary
+      shell: bash
+      run: |
+        PATH="${{ github.workspace }}/.chez-install/bin:$PATH"
+        if command -v chez >/dev/null; then echo "CHEZ=chez" >> "$GITHUB_ENV"
+        elif command -v chezscheme >/dev/null; then echo "CHEZ=chezscheme" >> "$GITHUB_ENV"
+        elif command -v scheme >/dev/null; then echo "CHEZ=scheme" >> "$GITHUB_ENV"
+        else echo "no Chez Scheme binary found" >&2; exit 1; fi

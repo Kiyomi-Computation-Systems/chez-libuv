@@ -2868,14 +2868,13 @@
 ;;                succeeds -- recorded informationally below).
 ;; A dropped flag would bind plainly and read 'bound on every platform, so the
 ;; same-port duplicate is what makes the supported branch mean "the flag did
-;; something". On the vendored libuv (>= 1.49.0) that branch runs. On an older
-;; SYSTEM libuv this binding otherwise supports, the shim was compiled without
-;; the flag (libuv-shim.c gates UV_TCP_REUSEPORT on UV_VERSION_HEX), and
+;; something". On the vendored libuv (>= 1.49.0) that branch runs. On the
+;; floor's SYSTEM libuv, 1.48, the shim was compiled without the flag
+;; (libuv-shim.c gates UV_TCP_REUSEPORT on UV_VERSION_HEX), and
 ;; uv-tcp-reuseport raises &uv-constant-unavailable naming it at the point of
-;; use (ADR-0005's lazy constant-ref path). CI's pkg-config leg ran exactly
-;; that on Ubuntu 24.04, whose libuv is 1.48; on 26.04 it links 1.51, and no
-;; CI run links a libuv below 1.49 (#90). So the row asks the shim which libuv it
-;; was compiled against, and below 1.49 only the named refusal passes, never a
+;; use (ADR-0005's lazy constant-ref path). CI's floor job runs exactly that,
+;; on Ubuntu 24.04 (#90). So the row asks the shim which libuv it was
+;; compiled against, and below 1.49 only the named refusal passes, never a
 ;; plain bind with the flag dropped. Flags resolve to a bitmask before any
 ;; allocation, so the two malformed-flags rows leave nothing behind.
 (define rp-loop (make-uv-loop))

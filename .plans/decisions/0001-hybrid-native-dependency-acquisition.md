@@ -65,3 +65,28 @@ CI exercises both acquisition paths on every run.
   also the one Windows would rely on primarily whenever
   [ADR-0004](0004-windows-deferred-design-clean.md) lands — a fact that
   informs how much CMake configuration is worth getting right now.
+
+> **Amended 2026-10-09 (#90): the floor is libuv 1.48.0, and a system libuv
+> below it is passed over.** The floor was 1.44.0, a version no run had
+> tested. Measured on 27d84bb, against Debian 12's libuv 1.44.2 on the
+> pkg-config path: all 30 suites ran, and two test-lifecycle rows failed,
+> "the close the raising callback started is still pending when uv-run
+> returns" and its seed. Both assert the ordering newer libuv has, where
+> `uv_run` runs due timers before its loop, so a close that a raising
+> callback starts is still pending when `uv-run` returns; on 1.44.2 it has
+> finished. The Makefile's `test-memory-docker` comment had recorded the
+> same two failures on 2026-08-30. And once CI moved to Ubuntu 26.04 (#92),
+> the lowest libuv any run linked was 1.51.0.
+>
+> - The floor is now 1.48.0, Ubuntu 24.04 LTS's libuv. Every CI run that
+>   linked it passed, up to #92, and a second CI job now runs `make test`
+>   on `ubuntu-24.04` against it, asserting that it links exactly the
+>   floor's 1.48.
+> - Discovery is `pkg-config --atleast-version=<floor> libuv`, not
+>   `--exists`. A system libuv below the floor falls back to the vendored
+>   build, as a missing one always has, instead of building a shim that
+>   refuses itself at load with `&uv-version-incompatible`. `make
+>   check-pins` holds this with fake pkg-config entries just below the
+>   floor and at it.
+> - Building 1.44.0 itself in CI was considered and dropped: the suite
+>   already fails on 1.44.2.
