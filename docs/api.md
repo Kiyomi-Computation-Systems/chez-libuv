@@ -272,6 +272,20 @@ returned normally. A start whose engine was never resumed could leave its
 callback stored and nothing started. None of them allocates: one whose
 engine is never resumed had either not begun or finished.
 
+The loop queries (`uv-stop!`, `uv-now`, `uv-loop-alive?`,
+`uv-update-time!`) make both promises too. Each checks its loop again and
+calls libuv in its step. One resumed after its loop was torn down raises
+`&uv-handle-closed` for the loop, and `uv-update-time!` resumed after its
+loop was handed to another thread raises `&uv-wrong-thread`; the other
+three are loop-thread-only by contract, unchecked. Before, one resumed
+after a teardown called libuv on the freed loop, or on a new loop given
+its address: `uv-stop!` set that loop's stop flag, `uv-update-time!`
+moved its clock, and `uv-now` and `uv-loop-alive?` answered from it.
+`uv-update-time!` resumed at one point raised `null-loop-pointer`
+instead, and resumed after a handoff it wrote the clock of a loop the
+other thread now owned. None of them allocates: one whose engine is never
+resumed had either not begun or finished.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from

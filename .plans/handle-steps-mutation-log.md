@@ -470,3 +470,162 @@ Gates for the follow-ups: macOS `make test`, and `make test-memory` (ASan)
 on test-handle-steps and test-signal; on Debian 12 aarch64, both suites
 plain and under `make test-memory` (Valgrind, 0 bytes definitely lost in
 each suite's own process).
+
+# The loop queries as one step (#86, part three)
+
+2026-10-09. `uv-stop!`, `uv-now`, `uv-loop-alive?` and `uv-update-time!`
+each become one interrupt-free step: the loop's open check (and, for
+`uv-update-time!`, its owner check) again, the pointer, and the native
+call (`loop-call` in loop.sls, over `open-loop-ptr` or `owned-loop-ptr`).
+On entry each now checks only that its argument is a loop, since the step
+reads the loop's record. `loop-pointer`, which no verb used any more, is
+gone. Their sweeps join the handle verbs' in `tests/test-handle-steps.sps`.
+
+## What the suite gained
+
+- **Kinds.** A loop query's target is a new loop with nothing on it, made
+  by the run. Its close is a teardown, its reuse a teardown and then a new
+  loop that takes the freed block (the landing hunts with blocks of
+  `uv_loop_size`), and its handoff hands the target loop itself, not
+  `h-loop`. The run's finish tears down both loops.
+- **Sweeps.** Reuse and close for all four, and handoff for
+  `uv-update-time!` only: the other three are loop-thread-only by
+  contract, unchecked (docs/api.md, ADR-0019's scope boundary). The loop
+  reuse sweeps run before the landing witness row, which now covers them.
+- **No drop sweep.** A query holds nothing and makes one native call, so a
+  drop leaves it not begun or finished whatever the code; no mutant could
+  fail one.
+- **test-loop.sps:** `uv-stop!`, `uv-now` and `uv-loop-alive?` refuse a
+  non-loop by name (only `uv-update-time!` had that row), and
+  `uv-update-time!` on a closed loop another thread owns is refused as
+  closed, holding the order the step now decides.
+
+## On main (63b3164)
+
+Run first against main's `src/`, on macOS and on glibc 2.36 (the Valgrind
+image): four rows fail by name on both, with the same fuel maps.
+
+| Row | macOS and glibc |
+|---|---|
+| loop reuse: never reaches the new loop | fails: each query returns after the change at fuel 9; `uv-update-time!` raises `null-loop-pointer` at 9 and returns at 10 |
+| loop handoff: `uv-update-time!` refused | fails: returns at fuel 10 |
+| loop close: refused | fails: each returns at fuel 9 (`uv-update-time!` raises `null-loop-pointer` there) |
+| loop close reach | fails |
+
+The loop reuse reach row and the landing witness pass on main: every
+query is refused at 1–8 and the new loop took the freed address.
+
+**What the stale calls did** (scratchpad `g3/split-probe.sps`, macOS, the
+same fuels): after a reuse, `uv-stop!` left the new loop's stop flag at 1
+(`uv_loop_t` offset 48) and `uv-update-time!` moved the new loop's cached
+now, so each made its call on the new loop after the change, not before
+the expiry; `uv-now` and `uv-loop-alive?` returned without raising. After
+a teardown alone, `uv-loop-alive?` answered `#t` for a loop with nothing
+on it.
+
+## After the fix
+
+Every split run is refused, `&uv-handle-closed` for the loop or
+`&uv-wrong-thread` after the handoff, and the new loop took the freed
+address in every expired run. Each query is refused at fuels 1–8 and
+untouched at 9, on both platforms. On macOS the first loop reuse run
+(`uv-stop!`, fuel 1) misses its landing once and lands on its restart, in
+every suite run, so the restart count reads 2 (the handle sweeps' one, as
+in part two, and this one); glibc restarts none. Bytes per call (fewest of
+64, scratchpad `g3/meter.sps`, with a 16 B cons as the meter's live
+control): 0 for each query, on main and after.
+
+## Mutants
+
+Driver as in part two (scratchpad `g3/mut/`: `mutants.py`, `window.py`,
+and `l2b.py` for L2b and W-L2b), on a copy of the committed `src/` and
+`tests/`. Of the 20 source mutants,
+14 are killed by name, 5 are equivalent in the committed code, each
+killed once a window is opened, and 1 is equivalent in any build.
+
+| Mutant | Change | Result |
+|---|---|---|
+| L1 | `loop-call`'s `one-step` → `begin` | **killed**: loop reuse, handoff, close, close reach |
+| L2 | `loop-call` takes the pointer (`ptr-of`) just before the step | **killed**: loop reuse, close, close reach |
+| L2b | the step checks the loop, but uses the pointer field read just before it | survived, with a window too: **equivalent in any build**, below |
+| L3a–d | each query's open check on entry (`require-open-loop`) and none in the step, main's shape (`uv-update-time!` keeps its owner check in the step) | survived: **equivalent**, below |
+| L4a | `uv-update-time!`'s step uses `open-loop-ptr` | **killed**: loop handoff and its reach; test-loop's wrong-thread rows |
+| L4b | `uv-update-time!`'s owner and open checks on entry, as main, and `open-loop-ptr` in the step | survived: **equivalent** |
+| L5 | `'wrong-thread` falls through to `step-refusal` | **killed**: loop handoff and its reach; test-loop's "naming who, owner and caller" |
+| L6a–d | no `require-loop` on entry, one query each | **killed**: test-loop's non-loop rows (the step raises from the record accessor with interrupts disabled, so later engine rows fail after it) |
+| L7 | `uv-update-time!` asks for the owner before the open check | **killed**: test-loop's "on a closed loop another thread owns is refused as closed" |
+| L8 | `loop-call` answers a refusal instead of raising it | **killed**: every loop sweep and reach row; test-loop's use-after-close rows, its wrong-thread row and the closed-before-owner row |
+| L9a–d | the step takes the pointer without the open check, entry unchanged | **killed**: test-loop's use-after-close row for that query (`null-loop-pointer`), and for `uv-update-time!` the closed-before-owner row |
+
+L2 dies where part two's pointer-before-the-step mutants survived: an
+engine can expire between `open-loop-ptr`'s open check and the step,
+where nothing could trap between part two's entry checks and their steps.
+L2b reads the field early but checks the loop in the step, and survives
+even with a three-tick window between the read and the step: the step
+uses the early pointer only when it finds the loop open, and an open
+loop's pointer never changes.
+
+**The equivalent ones, checked with a window.** Nothing between
+`require-open-loop` (or `require-loop-thread`) returning and the step can
+trap, so a check kept there is in effect inside the step today. Each
+survivor was run again with a loop of three engine ticks opened between
+the entry check and `loop-call` (`window.py`). With the window alone, in
+all four queries (W0), test-handle-steps and test-loop pass. With the
+window:
+
+| Mutant | Result |
+|---|---|
+| W-L3a–d (open check on entry only) | **killed**: loop reuse, close, close reach |
+| W-L4b (owner check on entry only) | **killed**: loop handoff |
+
+**The harness's own mutants.**
+
+| Mutant | Change | Result |
+|---|---|---|
+| HL1 | a loop's landing hunts with TCP-sized blocks | survived on macOS (a freed loop block comes back to the next loop without the hunt); **killed** on glibc: the landing witness, with 3 restarts |
+| HL1b | a decoy takes the loop size's freed block before the new loop | **killed** on both: the landing witness (96 restarts on glibc) |
+| HL2 | the run's finish leaves the new loop open | **killed**: loop reuse and its reach (the loop counted as left behind) |
+| HL3 | the loop handoff hands `h-loop`, not the target | **killed**: loop handoff and its reach; the suite then exits 255 from rows that find `h-loop` owned elsewhere |
+
+## Gates
+
+- macOS: `make test`, `make test-threading`, `make check-purity`, `make
+  test-memory` (ASan, 25 suites).
+- Debian 12 aarch64 (the Valgrind image), vendored: `make test`, `make
+  check-memory-gate`, `make test-memory`.
+
+## Part three: the review's follow-ups
+
+PR #107's review (2026-10-09, /code-review xhigh) found seven things. Two
+are fixed here, one went to #102 as a comment, one was refuted by
+measurement, and three are left.
+
+- **`uv-update-time!` now builds its wrong-thread refusal after its
+  step**, reading the owner again (#102's defect), where
+  `require-loop-thread` built it from the owner it had just compared. #102
+  gained a comment adding it, with the six copies of the
+  `'wrong-thread`/`step-refusal` mapping its fix will have to change.
+- **`require-loop-thread`'s comment called it "the single affinity
+  predicate".** It is the entry check now, and the comment says so, and
+  that the steps check again.
+- **This log named only `mutants.py` and `window.py`;** L2b and W-L2b ran
+  from `l2b.py`, which it now names.
+- **Refuted: "the fill does nothing for loops".** The review took a loop
+  block (1072 B on macOS) to be above glibc's tcache limit (1032 B), so
+  that only the hunt could land it. On Linux `uv_loop_size` is 856 B, and
+  the fill counts (scratchpad `g3/nofill/`, the loop fill skipped, with
+  each restart printed):
+
+  | Platform | With the fill | Without it |
+  |---|---|---|
+  | glibc 2.36, 2 and 3 runs | no restart | the first loop reuse run (`uv-stop!`, fuel 1) restarts once, every run |
+  | macOS, 3 and 5 runs | `uv-stop!` restarts once at fuel 1 | it restarts once at fuel 2 |
+
+  So the fill stays, for loops as for handles.
+
+Left: the `'wrong-thread`/`step-refusal` mapping written out a sixth time
+(#102's fix is where to fold it); the loop sweeps living in a suite named
+for handles, since moving them means copying its harness (#103); and
+`loop-call`'s rule that its native never answers a symbol, held only by a
+comment, which no native today can break (each answers void, an int or an
+unsigned-64).

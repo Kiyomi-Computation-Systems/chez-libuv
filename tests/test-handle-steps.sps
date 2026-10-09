@@ -9,11 +9,13 @@
 ;;; - the timer verbs: uv-timer-start!, uv-timer-stop!, uv-timer-again!,
 ;;;   uv-timer-repeat, uv-timer-set-repeat!;
 ;;; - the signal verbs: uv-signal-start!, uv-signal-start-oneshot!,
-;;;   uv-signal-stop!.
+;;;   uv-signal-stop!;
+;;; - the loop queries, which take a loop: uv-stop!, uv-now, uv-loop-alive?
+;;;   and uv-update-time!.
 ;;;
 ;;; A green-thread scheduler on the loop thread runs each task in an engine,
 ;;; and a task's fuel can run out anywhere inside one of these verbs. Each
-;;; checked its handle, then read the handle's pointer and called libuv,
+;;; checked its handle or loop, then read its pointer and called libuv,
 ;;; with interrupts enabled between. A scratch verb allocated its scratch in
 ;;; between and freed it in a guard; a start stored its callback before its
 ;;; call, and a signal start checked its mode before and fixed it after. So:
@@ -22,10 +24,14 @@
 ;;;   past its checks. It called libuv with the freed handle, or with
 ;;;   whatever handle took its address, or raced the new owner's thread on
 ;;;   the handle; a signal start returned normally where it owed
-;;;   'signal-mode-fixed.
+;;;   'signal-mode-fixed. A loop query split by its loop's teardown called
+;;;   libuv on the freed loop, or on a new loop given its address, and
+;;;   uv-update-time! split by a handoff wrote the clock of a loop another
+;;;   thread owned.
 ;;; - Dropped, as a timeout drops a task: no guard runs after the
 ;;;   suspension, so the scratch was lost, or a start was left half made,
-;;;   its callback stored and nothing started.
+;;;   its callback stored and nothing started. A loop query holds nothing
+;;;   and makes one native call, so it has no drop sweep.
 ;;;
 ;;; Each sweep runs a verb in an engine at rising fuel (uv-sweep's
 ;;; sweep-fuels). Fuel 1 expires before the verb's own checks, and a sweep
@@ -44,7 +50,7 @@
         (libuv private handles)
         (libuv private conditions)
         (only (libuv private native) live-counts alloc-block free-block!
-              uv-handle-size uv-timer-get-repeat)
+              uv-handle-size uv-loop-size uv-timer-get-repeat)
         (only (libuv private constants) uv-tcp-type uv-timer-type uv-signal-type)
         (uv-sweep)
         (only (uv-testing) run-until/ticking)
@@ -147,9 +153,14 @@
 
 (define swept-verbs (append scratch-verbs tcp-verbs timer-verbs signal-verbs))
 
+;; The loop queries take a loop, not a handle: each run's target is a new
+;; loop with nothing on it.
+(define loop-verbs '(uv-stop! uv-now uv-loop-alive? uv-update-time!))
+
 (define (verb-kind verb)
   (cond ((memq verb timer-verbs) 'timer)
         ((memq verb signal-verbs) 'signal)
+        ((memq verb loop-verbs) 'loop)
         (else 'tcp)))
 
 ;; The callback each start passes, the one a target that must already be
@@ -200,7 +211,11 @@
         ((eq? verb 'uv-signal-start!) (uv-signal-start! h 'sigusr2 the-callback))
         ((eq? verb 'uv-signal-start-oneshot!)
          (uv-signal-start-oneshot! h 'sigusr2 the-callback))
-        (else (uv-signal-stop! h))))
+        ((eq? verb 'uv-signal-stop!) (uv-signal-stop! h))
+        ((eq? verb 'uv-stop!) (uv-stop! h))
+        ((eq? verb 'uv-now) (uv-now h))
+        ((eq? verb 'uv-loop-alive?) (uv-loop-alive? h))
+        (else (uv-update-time! h))))
 
 (define (attempt verb h)
   (guard (e (#t (refusal e)))
@@ -243,21 +258,31 @@
           status
           'connect-never-completed))))
 
-;; make-handle : symbol -> uv-handle
-;; A new handle of h-loop of KIND: 'tcp, 'timer or 'signal.
+;; make-handle : symbol -> (or uv-handle uv-loop)
+;; A new handle of h-loop of KIND, 'tcp, 'timer or 'signal, or for 'loop a
+;; new loop.
 (define (make-handle kind)
   (case kind
     ((timer) (make-uv-timer h-loop))
     ((signal) (make-uv-signal h-loop))
+    ((loop) (make-uv-loop))
     (else (make-uv-tcp h-loop))))
 
-;; prepare : symbol -> (or uv-handle list)
-;; A new handle of h-loop for VERB:
-;; - a TCP client: unbound for the bind, which binds it, connected for the
-;;   peer query, and bound to a loopback port for every other verb, which
-;;   needs a socket to ask;
-;; - a timer, started for the stop and the again, which need one running;
-;; - a signal handle, started for the stop.
+;; A run's target is a handle, or a loop for a loop query.
+(define (target? x) (or (uv-handle? x) (uv-loop? x)))
+
+(define (target-ptr target)
+  (if (uv-loop? target) (loop-ptr target) (handle-ptr target)))
+
+;; prepare : symbol -> (or uv-handle uv-loop list)
+;; A new target for VERB:
+;; - a TCP client of h-loop: unbound for the bind, which binds it,
+;;   connected for the peer query, and bound to a loopback port for every
+;;   other verb, which needs a socket to ask;
+;; - a timer of h-loop, started for the stop and the again, which need one
+;;   running;
+;; - a signal handle of h-loop, started for the stop;
+;; - a new loop for a loop query.
 ;; A handle it cannot prepare is closed, and the close run to its end, so
 ;; that no later run counts it in its balance and finds it gone.
 (define (prepare verb)
@@ -270,7 +295,8 @@
       (guard (e (#t (refuse (list 'start-raised (describe e)))))
         (start!)
         h))
-    (cond ((memq verb '(uv-tcp-bind! uv-timer-start! uv-timer-repeat
+    (cond ((uv-loop? h) h)
+          ((memq verb '(uv-tcp-bind! uv-timer-start! uv-timer-repeat
                         uv-timer-set-repeat! uv-signal-start!
                         uv-signal-start-oneshot!))
            h)
@@ -303,17 +329,26 @@
   (and (for-all closed-or-absent? handles)
        (not (uv-loop-alive? h-loop))))
 
-;; finish! : uv-tcp (or uv-tcp #f) -> object
+;; finish! : target (or target #f) -> object
 ;; Gives the loop back to this thread, then closes whatever the run made,
-;; and answers 'finished, or what was left.
+;; or for a loop query tears down the loops it made, and answers 'finished,
+;; or what was left.
 (define (finish! target new)
-  (set-loop-owner-thread! h-loop me)
-  (for-each (lambda (h) (when (and h (uv-handle-open? h)) (uv-close! h)))
-            (list target new))
-  (drain-server!)
-  (if (poll! (lambda () (settled? target new)))
-      'finished
-      (list 'loop-still-alive (uv-loop-live-handles h-loop))))
+  (if (uv-loop? target)
+      (begin
+        (set-loop-owner-thread! target me)
+        (guard (e (#t (list 'teardown-raised (describe e))))
+          (for-each (lambda (l) (when (and l (uv-loop-open? l)) (uv-loop-teardown! l)))
+                    (list target new))
+          'finished))
+      (begin
+        (set-loop-owner-thread! h-loop me)
+        (for-each (lambda (h) (when (and h (uv-handle-open? h)) (uv-close! h)))
+                  (list target new))
+        (drain-server!)
+        (if (poll! (lambda () (settled? target new)))
+            'finished
+            (list 'loop-still-alive (uv-loop-live-handles h-loop))))))
 
 ;; drain-server! : -> unspecified
 ;; Runs sv-loop until it has accepted and closed every connection made of
@@ -327,10 +362,11 @@
 ;; --- the changes ------------------------------------------------------------------
 ;; At the engine's first expiry the scheduler, still on this thread, does
 ;; one of these to the target, then resumes the verb:
-;;   'close       closes it and runs the loop until the close has freed it;
-;;   'reuse       closes it as above, then makes a new handle of its kind,
-;;                which the allocator gives the freed address: a call that
-;;                kept the old pointer acts on the new handle;
+;;   'close       closes it and runs the loop until the close has freed it,
+;;                or tears a target loop down, which frees it;
+;;   'reuse       frees it as above, then makes a new handle of its kind or
+;;                a new loop, which the allocator gives the freed address: a
+;;                call that kept the old pointer acts on the new one;
 ;;   'handoff     hands the loop to another thread, which leaves the loop's
 ;;                memory alone;
 ;;   'other-mode  starts a signal target in the mode its verb does not ask
@@ -353,6 +389,7 @@
   (case kind
     ((timer) (uv-handle-size (uv-timer-type)))
     ((signal) (uv-handle-size (uv-signal-type)))
+    ((loop) (uv-loop-size))
     (else (stream-block-size (uv-handle-size (uv-tcp-type))))))
 
 (define (fill-cache! size)
@@ -369,10 +406,10 @@
             ((= i 63) (cons b made))
             (else (next (cons b made) (+ i 1)))))))
 
-;; new-handle-at! : symbol uptr -> uv-handle
-;; A new handle of h-loop of KIND, made where FREED was if the allocator
-;; allows. Under a memory tool, which never hands a freed block back, it is
-;; made wherever the tool puts it.
+;; new-handle-at! : symbol uptr -> (or uv-handle uv-loop)
+;; A new handle of h-loop of KIND, or a new loop, made where FREED was if
+;; the allocator allows. Under a memory tool, which never hands a freed
+;; block back, it is made wherever the tool puts it.
 (define (new-handle-at! kind freed)
   (if under-memory-tool?
       (make-handle kind)
@@ -385,7 +422,9 @@
 
 (define (change! mode verb target)
   (case mode
-    ((handoff) (set-loop-owner-thread! h-loop other-thread) #f)
+    ((handoff)
+     (set-loop-owner-thread! (if (uv-loop? target) target h-loop) other-thread)
+     #f)
     ((other-mode)
      (guard (e (#t (list 'change-raised (describe e))))
        (if (eq? verb 'uv-signal-start-oneshot!)
@@ -394,12 +433,15 @@
        #f))
     (else
      (let ((kind (verb-kind verb))
-           (old (handle-ptr target))
+           (old (target-ptr target))
            (reuse? (eq? mode 'reuse)))
        (when (and reuse? (not under-memory-tool?)) (fill-cache! (block-size kind)))
-       (uv-close! target)
-       (poll! (lambda () (settled? target)))
-       (and reuse? (new-handle-at! kind old))))))
+       (guard (e (#t (list 'change-raised (describe e))))
+         (if (uv-loop? target)
+             (uv-loop-teardown! target)
+             (begin (uv-close! target)
+                    (poll! (lambda () (settled? target)))))
+         (and reuse? (new-handle-at! kind old)))))))
 
 ;; The refusal a resumed verb owes each change.
 (define (refusal-for mode)
@@ -440,7 +482,7 @@
     (let attempt-run ((tries 1))
       (collect)
       (let ((target (prepare verb)))
-        (if (not (uv-handle? target))
+        (if (not (target? target))
             (values (list 'not-prepared target) #f)
             (let* ((new #f)
                    (eng (make-engine (lambda () (attempt verb target))))
@@ -449,17 +491,17 @@
                          (lambda (ticks outcome)
                            (if (eq? outcome 'returned) 'untouched (list 'untouched outcome)))
                          (lambda (resume)
-                           (let ((old (handle-ptr target)))
+                           (let ((old (target-ptr target)))
                              (set! new (change! mode verb target))
                              (cond ((pair? new)
                                     (let ((why new))
                                       (set! new #f)
                                       (list 'change-failed why)))
-                                   ((and new (not (eqv? (handle-ptr new) old))
+                                   ((and new (not (eqv? (target-ptr new) old))
                                          (not under-memory-tool?) (< tries 4))
                                     'missed)
                                    (else
-                                    (when (and new (not (eqv? (handle-ptr new) old)))
+                                    (when (and new (not (eqv? (target-ptr new) old)))
                                       (set! missed-landings
                                             (cons (list verb fuel) missed-landings)))
                                     (let ((outcome (resume 1000000 (lambda (ticks o) o)
@@ -635,13 +677,23 @@
   (expected-reach reuse-sweeps 'refused)
   (reach reuse-sweeps))
 
-;; The witness: the new handle took the freed handle's address in every
-;; run the engine expired in. A run where it did not could not have shown
-;; a stale call reaching the new client. Memory tools never hand a freed
-;; block back, so there the witness lands in no run.
+(define loop-reuse-sweeps
+  (map (lambda (verb) (cons verb (split-sweep verb 'reuse))) loop-verbs))
+(report! 'reuse loop-reuse-sweeps)
+(test-equal "a loop query resumed after its loop was torn down and made anew never reaches the new loop"
+  '()
+  (bad-runs good-split? loop-reuse-sweeps))
+(test-equal "each loop query's reuse sweep caught it before its checks and ran it to the end"
+  (expected-reach loop-reuse-sweeps 'refused)
+  (reach loop-reuse-sweeps))
+
+;; The witness: the new handle or loop took the freed address in every run
+;; the engine expired in. A run where it did not could not have shown a
+;; stale call reaching the new one. Memory tools never hand a freed block
+;; back, so there the witness lands in no run.
 (display "  [informational] reuse runs started again for a missed landing: ")
 (display restarts) (newline)
-(test-equal "the reuse sweeps' new handle took the freed handle's address in every expired run"
+(test-equal "the reuse sweeps' new handle or loop took the freed address in every expired run"
   '()
   (if under-memory-tool? '() (reverse missed-landings)))
 
@@ -654,6 +706,18 @@
 (test-equal "each handoff sweep caught its verb before its checks and ran it to the end"
   (expected-reach handoff-sweeps 'refused)
   (reach handoff-sweeps))
+
+;; Of the loop queries only uv-update-time! is loop-thread-only by a check:
+;; the other three are by contract, unchecked (docs/api.md).
+(define loop-handoff-sweeps
+  (list (cons 'uv-update-time! (split-sweep 'uv-update-time! 'handoff))))
+(report! 'handoff loop-handoff-sweeps)
+(test-equal "uv-update-time! resumed after its loop changed hands is refused"
+  '()
+  (bad-runs good-split? loop-handoff-sweeps))
+(test-equal "uv-update-time!'s handoff sweep caught it before its checks and ran it to the end"
+  (expected-reach loop-handoff-sweeps 'refused)
+  (reach loop-handoff-sweeps))
 
 (define mode-sweeps
   (map (lambda (verb) (cons verb (split-sweep verb 'other-mode)))
@@ -688,6 +752,16 @@
 (test-equal "each close sweep caught its verb before its checks and ran it to the end"
   (expected-reach close-sweeps 'refused)
   (reach close-sweeps))
+
+(define loop-close-sweeps
+  (map (lambda (verb) (cons verb (split-sweep verb 'close))) loop-verbs))
+(report! 'close loop-close-sweeps)
+(test-equal "a loop query split by its loop's teardown is refused"
+  '()
+  (bad-runs good-split? loop-close-sweeps))
+(test-equal "each loop query's close sweep caught it before its checks and ran it to the end"
+  (expected-reach loop-close-sweeps 'refused)
+  (reach loop-close-sweeps))
 
 ;; --- refused inside the step ------------------------------------------------------
 ;; A refusal the step comes to after its allocation frees the block: an

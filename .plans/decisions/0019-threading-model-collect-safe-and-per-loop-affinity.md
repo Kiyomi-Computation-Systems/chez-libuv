@@ -347,7 +347,8 @@ drains a caller-side queue rather than assuming one item per send.
 >     fuel values, between reading the pointer and the call. (The timer
 >     and signal verbs, `uv-listen!`, `uv-tcp-nodelay!` and
 >     `uv-tcp-keepalive!` are one step since #86's second amendment
->     below.)
+>     below, and the four loop queries since its third. `uv-run` takes
+>     its pointer in the step that claims the loop (#78).)
 
 > **Amended 2026-10-06 (the series' second part): every constructor is
 > one step.** Measured on main (eb5b719), with the sweeps now in
@@ -592,6 +593,48 @@ drains a caller-side queue rather than assuming one item per send.
 >   entry check today: mutants that drop them survive. Each is killed once
 >   a three-tick window is opened there. Evidence and mutations:
 >   `.plans/handle-steps-mutation-log.md`.
+
+> **Amended 2026-10-09 (#86, the loop queries): `uv-stop!`, `uv-now`,
+> `uv-loop-alive?` and `uv-update-time!` are one step.** Each checked that
+> its loop was open, `uv-update-time!` also that this thread owned it,
+> then read the loop's pointer and called libuv, with interrupts enabled
+> between. Measured on main (63b3164), with the sweeps added to
+> `tests/test-handle-steps.sps`, the same on macOS and glibc 2.36:
+>
+> - **A new loop at the freed address.** Each query suspended between its
+>   checks and its call, then resumed after a teardown and a new loop
+>   given the freed address, made its call on the new loop and returned
+>   normally. A probe saw `uv-stop!` set the new loop's stop flag and
+>   `uv-update-time!` move its clock. `uv-update-time!` resumed one fuel
+>   earlier raised `null-loop-pointer` instead of `&uv-handle-closed`.
+> - **A teardown alone.** The same runs called libuv on the freed block
+>   and returned; on macOS `uv-loop-alive?` answered `#t` for the
+>   torn-down loop, which had nothing on it.
+> - **A handoff.** `uv-update-time!` resumed after its loop was handed to
+>   another thread wrote the clock of a loop that thread now owned.
+>
+> Each now takes its pointer in one `one-step` that checks the loop again,
+> with `open-loop-ptr`, or for `uv-update-time!` with `owned-loop-ptr`,
+> which asks for the owner too, and makes its call there, raising after
+> it (`loop-call` in loop.sls). The check on entry is now only that the
+> argument is a loop (`require-loop`), since the step reads its record and
+> nothing may raise in a step. A closed loop is still refused before its
+> owner is asked. `loop-pointer`, which no verb used any more, is gone.
+> The other three queries stay loop-thread-only by contract, unchecked.
+>
+> - **Measured after:** every suspended run is refused, as
+>   `&uv-handle-closed` for the loop, or after a handoff as
+>   `&uv-wrong-thread`. None of them allocates, before or after (0 B a
+>   call). There is no drop sweep: a query holds nothing and makes one
+>   native call, so one whose engine is never resumed has either not
+>   begun or finished.
+> - **What the sweeps cannot see.** Nothing between the entry check and
+>   the step can trap, so main's checks, kept on entry with only the
+>   pointer and the call in the step, survive the sweeps: five mutants,
+>   each killed once a three-tick window is opened there. A pointer read
+>   just before the step, through `open-loop-ptr`, can be split from it
+>   and is killed. Evidence and mutations:
+>   `.plans/handle-steps-mutation-log.md`, part three.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety

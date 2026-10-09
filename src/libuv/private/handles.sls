@@ -27,7 +27,7 @@
           loop-has-pending-error? clear-loop-pending-error!
           loop-deferred-error-list set-loop-deferred-error-list!
           loop-owner-thread set-loop-owner-thread! require-loop-thread
-          loop-open? require-open-loop require-loop loop-pointer
+          loop-open? require-open-loop require-loop
 
           ;; handle records
           %make-uv-handle-record uv-handle? %make-uv-timer-record uv-timer?
@@ -219,9 +219,13 @@
     (set-box! mark #f))
 
   ;; require-loop-thread : uv-loop symbol -> unspecified
-  ;; The single affinity predicate. Raised BEFORE any registry mutation, so a
-  ;; wrong-thread verb is a named refusal, never the registry corruption it
-  ;; would otherwise cause.
+  ;; The affinity check on a verb's entry, so that a caller on the wrong
+  ;; thread is told so before the verb reads its other arguments or makes
+  ;; anything (require-open-handle, make-uv-async, the lookups, uv-spawn!).
+  ;; It does not guard the native call: an engine can suspend the verb after
+  ;; it while the loop is handed on, so the step checks again
+  ;; (owned-loop-ptr, owned-handle-ptr). Raised before any registry
+  ;; mutation, so a wrong-thread verb is a named refusal.
   (define (require-loop-thread loop who)
     (let ((owner (loop-owner-thread loop))
           (caller (current-thread-id)))
@@ -247,13 +251,6 @@
     (unless (eq? (loop-state loop) 'open)
       (raise (make-uv-handle-closed 'loop)))
     loop)
-
-  ;; The checked accessor is the only route from a loop record to native code.
-  (define (loop-pointer loop who)
-    (let ((ptr (loop-ptr loop)))
-      (unless (and (integer? ptr) (exact? ptr) (positive? ptr))
-        (raise (make-uv-invalid-argument who 'null-loop-pointer)))
-      ptr))
 
   ;; Common handle fields support one open -> closing -> closed protocol.
   (define-record-type (uv-handle-record %make-uv-handle-record uv-handle?)
@@ -577,9 +574,10 @@
             (else ptr))))
 
   ;; open-loop-ptr : uv-loop -> (or uptr 'loop-not-open 'no-loop-pointer)
-  ;; open-handle-ptr for a loop: a constructor's step checks again that the
-  ;; loop it was given is open, since a teardown can free the loop between
-  ;; the constructor's open check and its init.
+  ;; open-handle-ptr for a loop: a constructor's step, or a loop query's
+  ;; (loop.sls's loop-call), checks again that the loop it was given is
+  ;; open, since a teardown can free the loop between the verb's entry and
+  ;; its call.
   (define (open-loop-ptr loop)
     (let ((ptr (loop-ptr loop)))
       (cond ((not (eq? (loop-state loop) 'open)) 'loop-not-open)
@@ -594,9 +592,10 @@
   ;; another thread, libuv's init raced the loop's own thread on its handle
   ;; queue, and corrupted it with no error (#79). Every step that makes
   ;; something on a loop takes the loop's pointer here, or its handle's
-  ;; pointer from owned-handle-ptr, so none can skip the owner check. The
-  ;; step that decides who owns the loop (uv-run's claim) takes it from
-  ;; open-loop-ptr instead.
+  ;; pointer from owned-handle-ptr, so none can skip the owner check, and so
+  ;; does uv-update-time!'s, which writes the loop's clock. The step that
+  ;; decides who owns the loop (uv-run's claim) takes it from open-loop-ptr
+  ;; instead.
   (define (owned-loop-ptr loop)
     (let ((ptr (open-loop-ptr loop)))
       (cond ((symbol? ptr) ptr)
