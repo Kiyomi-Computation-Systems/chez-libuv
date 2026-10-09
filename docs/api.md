@@ -229,12 +229,24 @@ had been given the closed handle's address, and returned normally, and
 `uv-process-pid` answered that process's pid. Neither verb allocates, so
 one whose engine is never resumed leaves nothing behind.
 
+`uv-tcp-connect!`, `uv-getaddrinfo!`, `uv-getnameinfo!` and `uv-cancel!`
+make both promises as well. A connect resumed after its client was closed
+raises `&uv-handle-closed` for the client, and a lookup resumed after its
+loop was torn down raises it for the loop; any of the four resumed after
+its loop was handed to another thread raises `&uv-wrong-thread`. A cancel
+resumed after its request completed answers `#f` without touching it.
+Before, each of the four could call libuv on what the change had freed, or
+on the other thread's loop. A connect or a lookup whose engine is never
+resumed either had not begun, or libuv holds its request, which the
+request's completion frees, as the client's close or the loop's teardown
+brings about; `uv-cancel!` allocates nothing.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
 the task that is using it, and do not abandon an engine inside
-`uv-tcp-connect!`, a DNS request, `call-with-uv-loop`'s teardown on the way
-out of its body, or a verb that borrows a scratch block for its answer:
+`call-with-uv-loop`'s teardown on the way out of its body, or a verb that
+borrows a scratch block for its answer:
 `uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
 `uv-tcp-peer-address`, and the four buffer-size verbs
 (`uv-send-buffer-size`, `uv-send-buffer-size!`, `uv-recv-buffer-size`,

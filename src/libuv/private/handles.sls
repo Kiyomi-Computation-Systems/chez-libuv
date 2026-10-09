@@ -13,7 +13,8 @@
           registry-lock with-step-lock
 
           ;; interrupt-free steps
-          one-step open-handle-ptr open-loop-ptr owned-loop-ptr step-refusal
+          one-step open-handle-ptr open-loop-ptr owned-loop-ptr owned-handle-ptr
+          step-refusal submit-request!
           try-construct-handle construct-handle try-construct-loop
           wrong-thread-refusal
 
@@ -510,6 +511,32 @@
   (define (registry-remove! ptr)
     (with-registry-lock (hashtable-delete! registry ptr)))
 
+  ;; (submit-request! block req-expr kind loop count-new! count-free! native-call)
+  ;; Inside a request verb's step (one-step), once BLOCK, an identifier, holds
+  ;; the filled request: registers REQ-EXPR's record under BLOCK as KIND on
+  ;; LOOP, counts it, and evaluates NATIVE-CALL, which hands it to libuv.
+  ;; Answers the record, or, with BLOCK freed and nothing left registered or
+  ;; counted, the registry's refusal or what NATIVE-CALL answered instead of
+  ;; 0: libuv's errno, or a refusal of its own. Nothing in it raises. A macro,
+  ;; so a verb pays no closure for its native call.
+  (define-syntax submit-request!
+    (syntax-rules ()
+      ((_ block req-expr kind loop count-new! count-free! native-call)
+       (let* ((req req-expr)
+              (registered (registry-add! block kind loop req)))
+         (if (eq? registered 'registered)
+             (begin
+               (count-new!)
+               (let ((rc native-call))
+                 (if (eqv? rc 0)
+                     req
+                     (begin (registry-remove! block)
+                            (count-free!)
+                            (free-block! block)
+                            (set-req-ptr! req 0)
+                            rc))))
+             (begin (free-block! block) registered))))))
+
   ;; (one-step body ...) runs BODY as one interrupt-free step and answers its
   ;; value. Neither an engine's timer nor a collect request is taken inside
   ;; it, so nothing else runs on this thread between a verb's checks and the
@@ -566,14 +593,25 @@
   ;; handed to another thread between the verb's entry and its init. From
   ;; another thread, libuv's init raced the loop's own thread on its handle
   ;; queue, and corrupted it with no error (#79). Every step that makes
-  ;; something on a loop takes the loop's pointer here, so none can skip the
-  ;; owner check. The step that decides who owns the loop (uv-run's claim)
-  ;; takes it from open-loop-ptr instead.
+  ;; something on a loop takes the loop's pointer here, or its handle's
+  ;; pointer from owned-handle-ptr, so none can skip the owner check. The
+  ;; step that decides who owns the loop (uv-run's claim) takes it from
+  ;; open-loop-ptr instead.
   (define (owned-loop-ptr loop)
     (let ((ptr (open-loop-ptr loop)))
       (cond ((symbol? ptr) ptr)
             ((not (eqv? (loop-owner-thread loop) (current-thread-id))) 'wrong-thread)
             (else ptr))))
+
+  ;; owned-handle-ptr : uv-handle -> (or uptr 'wrong-thread 'not-open 'no-pointer)
+  ;; open-handle-ptr for a step that makes something on HANDLE's loop, a
+  ;; request on the handle: it checks again that this thread owns the loop,
+  ;; first, as the verb's entry check does (require-open-handle). An open
+  ;; handle's loop is open: a teardown closes every handle first.
+  (define (owned-handle-ptr handle)
+    (if (eqv? (loop-owner-thread (handle-loop handle)) (current-thread-id))
+        (open-handle-ptr handle)
+        'wrong-thread))
 
   ;; step-refusal : (or symbol exact-integer) symbol (or uv-handle #f)
   ;;                -> condition

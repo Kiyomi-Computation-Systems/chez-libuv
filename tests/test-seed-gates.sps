@@ -368,7 +368,7 @@
 (define verb-suites
   '("tests/test-address.sps" "tests/test-constructor-owner.sps" "tests/test-dns.sps"
     "tests/test-facade.sps" "tests/test-flow.sps" "tests/test-native.sps"
-    "tests/test-tcp.sps"))
+    "tests/test-request-steps.sps" "tests/test-tcp.sps"))
 
 (define address-verbs
   '(uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-tcp-bind! uv-tcp-connect!

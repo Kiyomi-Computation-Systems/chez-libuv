@@ -321,7 +321,8 @@ drains a caller-side queue rather than assuming one item per send.
 >     `make-uv-async` the teardown hangs, and `make-uv-loop` also leaks its
 >     backend fd. (Each is one step since the next amendment.)
 >   - `uv-tcp-connect!`, `uv-getaddrinfo!` and `uv-getnameinfo!`: a block
->     lost, or a request registered and never submitted.
+>     lost, or a request registered and never submitted. (Each is one
+>     step since #85's amendment below, and so is `uv-cancel!`.)
 >   - `uv-spawn!`: one or two blocks lost, or `EBUSY`.
 >     - Later on 2026-10-06 its splits were closed, and the `EBUSY` with
 >       them: the step that spawns checks the stdio handles and the loop
@@ -456,6 +457,54 @@ drains a caller-side queue rather than assuming one item per send.
 >   of 30 on glibc 2.36 or 2.39. So the reuse sweep places a copy of the
 >   new process's handle at the freed address, and resumes a run only once
 >   libuv reads the new process's pid there.
+
+> **Amended 2026-10-09 (#85): `uv-tcp-connect!`, `uv-getaddrinfo!`,
+> `uv-getnameinfo!` and `uv-cancel!` are one step.** Each checked its
+> handle or loop, read its pointer, allocated, filled, registered and
+> counted its request and called libuv with interrupts enabled between, and
+> `uv-cancel!` read its request's pointer and called `uv_cancel` the same
+> way. Measured on macOS with the sweeps now in
+> `tests/test-request-steps.sps`: the three request verbs on main
+> (27d84bb), and `uv-cancel!` as main has it, with the other three
+> already one step:
+>
+> - **Split by a handoff:** every run suspended past the entry check made
+>   its call after the loop changed hands, all four verbs. The lookups
+>   raced the new owner's `uv_run` on the loop's request count, #79's
+>   defect.
+> - **A new client or loop at the freed address:** a connect suspended at
+>   fuel 53–54, a getaddrinfo at 70–80 and a getnameinfo at 65–66 started
+>   its request on the NEW client or loop. Suspended earlier, each was
+>   refused as `null-handle-pointer` or `null-loop-pointer` rather than
+>   `&uv-handle-closed`.
+> - **A completed request:** a cancel suspended between its read and its
+>   call (fuel 9), while the loop completed the lookup and a zeroed block
+>   took the freed request's address, handed `uv_cancel` that block, and
+>   libuv answered EINVAL.
+> - **Dropped:** each of the three request verbs left a block, then also a
+>   registry entry, then also a counted request that libuv never saw.
+>
+> Each now makes its checks, its allocation, its fill, its registration,
+> its count and its native call in one `one-step`, and raises after it.
+> - **The owner, again in the step.** A connect checks its client with
+>   `owned-handle-ptr` (the owner, then the client), a lookup its loop
+>   with `owned-loop-ptr`. `uv-cancel!` checks the owner only in its step:
+>   nothing is read or made before the step, so an entry check could
+>   never refuse a call the step would not, as for the constructors (the
+>   #79 amendment). The lookups and connect keep their entry checks, which
+>   decide what a caller is told first.
+> - **Nothing in the step raises.** `try-fill-sockaddr!` and
+>   `try-c-int-set!` answer what they refuse, `uv-getaddrinfo-native`
+>   answers `'not-a-c-string` instead of raising it, and
+>   `submit-request!` registers, counts and starts a request, answering
+>   the registry's refusal or libuv's errno with the block freed.
+>
+> - **Measured after:** every suspended run is refused, the new client or
+>   loop comes through untouched, a resumed cancel answers `#f`, and every
+>   dropped run leaves the registry and every counter as it found them. No
+>   run was suspended after a step: none of the four has a trap check
+>   after its step on the paths the sweeps take. Evidence and mutations:
+>   `.plans/request-steps-mutation-log.md`.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
