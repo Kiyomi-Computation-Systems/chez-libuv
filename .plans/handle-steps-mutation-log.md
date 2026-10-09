@@ -420,3 +420,53 @@ seen. The listen's (L4) can, and is held.
   `make test-memory` (ASan; handle-steps 21 rows).
 - Debian 12 aarch64 (the Valgrind image), vendored: `make test`, `make
   check-memory-gate`, `make test-memory`.
+
+## Part two: the review's follow-ups
+
+PR #105's review (2026-10-09, /code-review xhigh) found nine things. Five
+are fixed here, one went to #102 as a comment, and three are left.
+
+- **The largest-backlog row listened on every interface.** Unbound, a
+  listening client is bound by the kernel to `0.0.0.0` (measured: its
+  sockname answered `0.0.0.0` and an ephemeral port). Both listen rows now
+  bind the client to `127.0.0.1` first, and its sockname answers
+  `127.0.0.1`.
+- **The suite's header claimed two defects main never showed**: a split
+  signal start starting the signal "in a mode no longer its own", and a
+  drop leaving a signal started with no mode fixed. It now says what the
+  sweeps saw: the start returned normally where it owed
+  `'signal-mode-fixed`, and a drop left the callback stored and nothing
+  started.
+- **A verb that does nothing passed the drop sweep.** Its `whole` state is
+  computed from the code under test, so a verb that silently did nothing
+  agreed with itself. A row now holds each verb's whole state to what the
+  verb promises (`promised-wholes`). A tighter verdict for untouched runs
+  (left must equal whole) was tried and dropped: an untouched run executes
+  the same code as the reference call, so no mutant could break it.
+
+  | Mutant | Committed suite | With the row |
+  |---|---|---|
+  | R2: the listen stores no callback | passes | **killed**: the promised-state row |
+  | R4: the set repeat writes nothing | passes | **killed**: the promised-state row |
+  | R1: the timer start never arms | not run | **killed**: the promised-state row, and the reuse, handoff and close rows with their reach rows (its sweep's fuels moved), and drop reach |
+  | R3: a oneshot start fixes `'continuous` | not run | **killed**: the promised-state row, other-mode, other-mode reach |
+
+- **The signal start's new error order was stated only in prose.**
+  tests/test-signal.sps now holds it: a start in the fixed-other mode
+  whose callback is no procedure is refused with
+  `'on-signal-not-a-procedure`. It fails on main, which answered
+  `'signal-mode-fixed`, and R5 (the entry mode check restored) fails it.
+- **The verbs now return nothing where they returned 0** (`uv-check`
+  answered its rc). docs/api.md types them as unspecified, as it does
+  #101's verbs, which return nothing too. The PR now says so.
+- **#102** gained a comment listing these verbs' refusals, which read the
+  owner after the step as well.
+
+Left, as the review's lowest: the store-on-success step written out three
+times beside `handle-call!`, `uv-timer-set-repeat!`'s bound missing from
+its row in docs/api.md, and the C type limits written as literals.
+
+Gates for the follow-ups: macOS `make test`, and `make test-memory` (ASan)
+on test-handle-steps and test-signal; on Debian 12 aarch64, both suites
+plain and under `make test-memory` (Valgrind, 0 bytes definitely lost in
+each suite's own process).

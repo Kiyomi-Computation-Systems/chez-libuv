@@ -21,11 +21,11 @@
 ;;;   thread, or started the signal in the other mode, and the verb resumed
 ;;;   past its checks. It called libuv with the freed handle, or with
 ;;;   whatever handle took its address, or raced the new owner's thread on
-;;;   the handle, or started the signal in a mode no longer its own.
+;;;   the handle; a signal start returned normally where it owed
+;;;   'signal-mode-fixed.
 ;;; - Dropped, as a timeout drops a task: no guard runs after the
-;;;   suspension, so the scratch was lost, or the start left half made: its
-;;;   callback stored and nothing started, or a signal started with no mode
-;;;   fixed.
+;;;   suspension, so the scratch was lost, or a start was left half made,
+;;;   its callback stored and nothing started.
 ;;;
 ;;; Each sweep runs a verb in an engine at rising fuel (uv-sweep's
 ;;; sweep-fuels). Fuel 1 expires before the verb's own checks, and a sweep
@@ -483,7 +483,8 @@
 ;; the handle. Right answers: 'dropped or 'untouched, with nothing left
 ;; behind, blocks included, interrupts enabled, and the verb's effect whole
 ;; or not begun: the handle as the run found it, or as a call nothing
-;; interrupts leaves one.
+;; interrupts leaves one (whole, which a row holds to what the verb
+;; promises).
 
 ;; observe : symbol uv-handle -> list
 ;; What a verb's effect changes in its open handle, as libuv and the
@@ -498,9 +499,31 @@
                       (signal-mode h)))
       (else (list (uv-is-active ptr) (callback-name (tcp-on-connection h)))))))
 
+;; promised-whole : symbol -> list
+;; How VERB promises to leave the handle prepare made for it: a start
+;; active with its callback (a timer's repeat 0, a signal's mode fixed), a
+;; stop inactive with the callback kept, an again active, a set repeat at
+;; 5000, a listen active with its callback, and every other TCP verb with
+;; nothing active and no callback.
+(define promised-wholes
+  '((uv-timer-start! 1 the-verbs 0)
+    (uv-timer-stop! 0 prepared 3600000)
+    (uv-timer-again! 1 prepared 3600000)
+    (uv-timer-repeat 0 none 0)
+    (uv-timer-set-repeat! 0 none 5000)
+    (uv-signal-start! 1 the-verbs continuous)
+    (uv-signal-start-oneshot! 1 the-verbs oneshot)
+    (uv-signal-stop! 0 prepared continuous)
+    (uv-listen! 1 the-verbs)))
+
+(define (promised-whole verb)
+  (let ((entry (assq verb promised-wholes)))
+    (if entry (cdr entry) '(0 none))))
+
 ;; whole : symbol -> list
 ;; How a call of VERB that nothing interrupts leaves its handle, or why
-;; that could not be seen.
+;; that could not be seen. A row below holds each to promised-whole, so
+;; that a verb which does nothing cannot pass for one done whole.
 (define (whole verb)
   (let ((h (prepare verb)))
     (if (uv-handle? h)
@@ -544,8 +567,13 @@
                    (lambda (v) (not (memq v '(refused untouched))))
                    (lambda (v) #f))))
 
+;; Each verb's whole state, as (verb . state). map applies its procedure
+;; in no fixed order, so the row below looks each verb up.
+(define wholes '())
+
 (define (drop-sweep verb)
   (let ((w (whole verb)))
+    (set! wholes (cons (cons verb w) wholes))
     (sweep-fuels (lambda (fuel) (drop-run verb w fuel)) sweep-fuel-cap (lambda (v) #f))))
 
 ;; bad-runs : (verdict -> boolean) sweeps -> (list-of (list name fuel verdict))
@@ -647,6 +675,9 @@
 (test-equal "each drop sweep dropped its verb and ran it to the end"
   (expected-reach drop-sweeps 'dropped)
   (reach drop-sweeps))
+(test-equal "a call of each verb that nothing interrupts leaves its handle as the verb promises"
+  (map (lambda (verb) (cons verb (promised-whole verb))) swept-verbs)
+  (map (lambda (verb) (or (assq verb wholes) (list verb 'no-drop-sweep))) swept-verbs))
 
 (define close-sweeps
   (map (lambda (verb) (cons verb (split-sweep verb 'close))) swept-verbs))
@@ -727,7 +758,9 @@
 ;; A number its C parameter cannot take would raise from Chez's own check
 ;; of a foreign call's arguments, inside the step, with interrupts
 ;; disabled. Each verb refuses one by name on entry instead, and the
-;; largest each parameter takes still reaches libuv.
+;; largest each parameter takes still reaches libuv. A listening client is
+;; bound to loopback first: unbound, the kernel would bind it to every
+;; interface.
 
 ;; past-entry : object -> object
 ;; 'reached-libuv for a call that returned or that libuv refused; any other
@@ -748,7 +781,7 @@
   (list (refused-run 'timer #f (lambda (t) (uv-timer-start! t the-callback (expt 2 64) 0)))
         (refused-run 'timer #f (lambda (t) (uv-timer-start! t the-callback 0 (expt 2 64))))
         (refused-run 'timer #f (lambda (t) (uv-timer-set-repeat! t (expt 2 64))))
-        (refused-run 'tcp #f (lambda (tcp) (uv-listen! tcp (expt 2 31) the-callback)))
+        (refused-run 'tcp #t (lambda (tcp) (uv-listen! tcp (expt 2 31) the-callback)))
         (refused-run 'tcp #f (lambda (tcp) (uv-tcp-keepalive! tcp #t (expt 2 32))))))
 
 (test-equal "the largest timeout, repeat, backlog and delay their C parameters take reach libuv"
@@ -759,7 +792,7 @@
              (refused-run 'timer #f
                           (lambda (t) (uv-timer-start! t the-callback an-hour (- (expt 2 64) 1))))
              (refused-run 'timer #f (lambda (t) (uv-timer-set-repeat! t (- (expt 2 64) 1))))
-             (refused-run 'tcp #f (lambda (tcp) (uv-listen! tcp (- (expt 2 31) 1) the-callback)))
+             (refused-run 'tcp #t (lambda (tcp) (uv-listen! tcp (- (expt 2 31) 1) the-callback)))
              (refused-run 'tcp #f (lambda (tcp) (uv-tcp-keepalive! tcp #t (- (expt 2 32) 1)))))))
 
 (test-equal "h-loop and the server's loop tear down"
