@@ -19,12 +19,12 @@ a caller who knows libuv recognises the Scheme surface immediately.
 It is transport only: it parses nothing, understands no protocol above raw
 bytes, and provides no connection-state or backpressure policy of its own —
 those belong to the layers built on top of these primitives. The full
-design, with nineteen accepted decision records, lives under
+design, with twenty accepted decision records, lives under
 [[file:.plans/][.plans/]].
 
 * Status
 
-*v0.7.4* — event loop (with ~uv-update-time!~ to refresh its cached clock
+*v0.8.0* — event loop (with ~uv-update-time!~ to refresh its cached clock
 after a callback that held it, before arming a deadline), TCP (bind with an
 optional reuseport flag, listen, accept, connect, reads with backpressure,
 scalar and vectored writes, shutdown, nodelay, keepalive, local and peer

@@ -3,6 +3,146 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.8.0 — 2026-10-09
+
+This release finishes the work 0.7.4 began on calls an engine stops part
+way. Every verb that 0.7.4 listed as not yet safe to abandon now checks
+its handle or loop and calls libuv in one step that no engine can split.
+A verb that checks its handle's owner on entry now checks it again in
+that step. The libuv floor rises to 1.48.0, which is why this is a minor
+release, and seven verbs return nothing where they returned 0. The
+shim's C is unchanged, but run `make build` after upgrading. The build
+now passes over a system libuv below 1.48.0 for the vendored one. The
+configuration it generates refuses a libuv below 1.48.0 at load with
+`&uv-version-incompatible`.
+
+### Fixed
+
+- **Verbs an engine stops.** An engine's timer can stop a verb anywhere. A
+  scheduler can then close the handle, tear the loop down or hand it to
+  another thread before resuming the engine, or never resume it. These
+  verbs now make their checks, their allocation and their native call in
+  one step. One resumed after its handle or loop was closed raises
+  `&uv-handle-closed` without touching it. One resumed after its loop was
+  handed to another thread raises `&uv-wrong-thread`. One whose engine is
+  never resumed leaves nothing behind (`docs/api.md`, "Inside an engine"):
+  - `uv-tcp-connect!`, `uv-getaddrinfo!`, `uv-getnameinfo!` and
+    `uv-cancel!` (#85). Resumed, each called libuv on what a close or a
+    teardown had freed, or on the loop another thread now owned. Dropped,
+    a connect or a lookup lost a block, or left a request registered and
+    counted that libuv never saw. A cancel resumed after its lookup completed handed
+    libuv the request's freed block;
+  - `uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+    `uv-tcp-peer-address` and the four buffer-size verbs (#86). Resumed,
+    each called libuv on whatever client had taken the closed one's
+    address (a bind bound the new client and returned normally), or,
+    after a handoff, on a handle another thread now owned. Dropped, each
+    lost one or two blocks;
+  - the timer verbs, the signal verbs, `uv-listen!`, `uv-tcp-nodelay!` and
+    `uv-tcp-keepalive!` (#86). A timer start, a signal start or a listen
+    resumed after a close started whatever handle had taken the freed
+    address, and resumed after a handoff, it started its handle on the
+    loop another thread now owned. A timer start resumed on the freed
+    block faulted. A signal start resumed after another task had fixed the
+    other mode returned normally. A start dropped part way left its
+    callback stored and nothing started;
+  - `uv-stop!`, `uv-now`, `uv-loop-alive?` and `uv-update-time!` (#86).
+    Resumed after a teardown, each called libuv on the freed loop, or on
+    a new loop given its address: `uv-stop!` set that loop's stop flag,
+    `uv-update-time!` moved its clock, and on macOS `uv-loop-alive?`
+    answered `#t` for a loop with nothing on it. `uv-update-time!` resumed
+    at one point raised `'null-loop-pointer` instead, and resumed after a
+    handoff it wrote the clock of a loop another thread owned;
+  - the stream verbs, `uv-process-kill!` and `uv-process-pid`, which 0.7.4
+    made one step, now check the loop's owner there too (#86). Resumed
+    after a handoff, `uv-write!`, `uv-write*!` and `uv-shutdown!` made
+    their call on the loop another thread owned and returned normally, and
+    `uv-process-kill!` signalled its process.
+
+- **The timer verbs on another kind of handle** (#86). They took any
+  handle as a timer: given a TCP handle, `uv-timer-set-repeat!` wrote
+  into its struct and `uv-timer-stop!` faulted. They now refuse it as
+  `'not-a-uv-timer`.
+- **Numbers a C parameter cannot hold** (#86). A timeout or repeat from
+  2^64, given to `uv-timer-start!` or `uv-timer-set-repeat!`, and a
+  keepalive delay from 2^32 raised a malformed condition from Chez's own
+  check of the foreign call's arguments. A backlog from 2^31 was accepted.
+  Each is now refused by name with `&uv-invalid-argument`:
+  `'timeout-out-of-range`, `'repeat-out-of-range`, `'delay-out-of-range`
+  and `'backlog-out-of-range`.
+
+### Changed
+
+- **The libuv floor is 1.48.0**, Ubuntu 24.04 LTS's libuv (#90). It was
+  1.44.0, and no run had tested it: against Debian 12's 1.44.2, two
+  `test-lifecycle` rows fail. A system libuv below the floor is passed
+  over for the vendored build, as a missing one is, where a shim was
+  built that refused itself at load. A second CI job on `ubuntu-24.04`
+  links exactly 1.48 and runs `make test`.
+- **Return values.** `uv-timer-start!`, `uv-timer-stop!`,
+  `uv-timer-again!`, `uv-signal-stop!`, `uv-listen!`, `uv-tcp-nodelay!`
+  and `uv-tcp-keepalive!` return nothing where they returned 0 (#86).
+- **Refusal order.** A signal start in the mode its handle is not fixed
+  in, given a callback that is not a procedure, reports the callback
+  (`'on-signal-not-a-procedure`) where it reported `'signal-mode-fixed`
+  (#86).
+- **Calls allocate less** (#85, #86). Measured on macOS arm64, bytes on
+  the Scheme heap per call, the fewest of 64:
+
+  | Call | 0.7.4 | 0.8.0 |
+  |---|---|---|
+  | `uv-tcp-connect!` | 848 | 240 |
+  | `uv-getaddrinfo!`, no hints | 576 | 256 |
+  | `uv-getnameinfo!` | 864 | 240 |
+  | `uv-tcp-bind!` | 432 | 112 |
+  | `uv-tcp-sockname-address`, `uv-tcp-peer-address` | 512 | 176 |
+  | `uv-tcp-getsockname-port` | 320 | 0 |
+  | a buffer-size verb, getting or setting | 320 | 0 |
+
+  The others measured allocate as in 0.7.4: `uv-timer-start!`,
+  `uv-timer-stop!`, `uv-tcp-nodelay!`, `uv-tcp-keepalive!`, `uv-now` and
+  `uv-update-time!` nothing, `uv-write!` 144 B and a one-segment
+  `uv-write*!` 192 B.
+- **A development container for Guix hosts** (#106, ADR-0020).
+  `scripts/guix-env` runs a build or a test in a container pinned to a
+  Guix channel commit, with Chez 10.4.1 and libuv 1.52.1, no network but
+  loopback, and nothing of `HOME`. `make check-guix` verifies it. `make
+  build`, `deps`, `vendor` and `test-memory` now stop early, naming what
+  is missing, when the compiler, Chez or the vendored build's tools are.
+- **The memory gate** (#94, #99, #104). Valgrind's report suppresses one
+  block Chez allocates and never frees: the `jmp_buf` for a call into
+  Scheme that a continuation escapes, or an engine drops (312 B on
+  aarch64, 200 B on x86-64). It matches only a `malloc` made directly by
+  Chez's `S_call_help`, so none of the binding's blocks. `test-memory`
+  fails any suite outside four named ones whose own process had a block
+  suppressed. The suites that load no native code no longer run under
+  Valgrind.
+- **CI** (#104). The vendored Valgrind job takes 6m11s, where it took
+  19m14s: a suite waited out a 20,000-tick cap after each call it
+  expected refused.
+
+### Notes
+
+- `docs/api.md`'s "Inside an engine" covers each verb above.
+- ADR-0019's decision 3 is amended for each change to the verbs, ADR-0001
+  for the floor, and ADR-0003 for the suppression and the narrower
+  Valgrind lane. ADR-0020 is new, for the container.
+- New checks hold these changes:
+  - new suites `test-request-steps` and `test-handle-steps`, and handoff
+    sweeps in `test-stream` and `test-process-steps`. Rows in each
+    failed by name on the code it replaced;
+  - `tests/test-source-rules.sps`'s rule 8: every route from a handle
+    record to its pointer is taken only where the rule says why;
+  - `make check-pins` checks which libuv a build at and just below the
+    floor would use;
+  - `make check-memory-gate` gains escape modes that hold the suppression
+    to exactly the blocks it is for.
+- The level-3 test runner drains the child's stderr and keeps its
+  deadline (#88), with its own suite, `test-level-3`.
+- A wrong-thread refusal built after a step reads the loop's owner then,
+  so a loop handed on again in between is named wrongly (#102).
+- The evidence is in `.plans/*-mutation-log.md`, one log per change.
+
 ## 0.7.4 — 2026-10-08
 
 This release closes the ways a call could reach freed or wrong memory while
