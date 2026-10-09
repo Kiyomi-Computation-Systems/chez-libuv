@@ -132,6 +132,24 @@
 ;;;      it.
 ;;;    What the scan cannot see: a name imported under another one.
 ;;;
+;;; 10. A completing callback's entry leaves the registry in its seam, and
+;;;    only there (#87). The seams of a close and of a request's completion
+;;;    find their pointer's entry and delete it in one use of the lock
+;;;    (registry-take-accepted!), and put back an entry their dispatcher
+;;;    refuses. A dispatcher that deleted it again would take the lock twice
+;;;    or raise, and one that freed a block its seam left registered would
+;;;    leave the registry naming freed memory. So this suite holds, named and
+;;;    counted as rule 8's routes are:
+;;;    - registry-deregister! to no definition in src/: the suites use it;
+;;;    - complete-taken-request! and abandon-taken-request!, which free a
+;;;      block whose entry is already gone, to the dispatchers behind a
+;;;      taking seam;
+;;;    - registry-take-accepted! to the seam macro, and registry-pop!, the
+;;;      delete, to registry-take! and registry-take-accepted!;
+;;;    - a new registry entry to registry-add!, the only definition that
+;;;      makes one, and every write of the table to registry-add! and the
+;;;      put-back in registry-take-accepted!.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1402,6 +1420,59 @@
           'not-owner-checked
           (symbol-sort (filter (lambda (v) (not (memq v checked)))
                                (if (list? handback-verbs) handback-verbs '()))))))
+
+;; registry-writes : -> (listof (list string symbol exact-positive-integer))
+;; Each top-level form of a library in src/ that sets a key of the registry
+;; itself, as (file definition count): a (hashtable-set! registry ...).
+(define (registry-set-count x)
+  (if (pair? x)
+      (+ (if (and (eq? (car x) 'hashtable-set!) (pair? (cdr x)) (eq? (cadr x) 'registry)) 1 0)
+         (let elements ((x x) (n 0))
+           (if (pair? x) (elements (cdr x) (+ n (registry-set-count (car x)))) n)))
+      0))
+
+(define (registry-writes)
+  (apply append
+         (map (lambda (e)
+                (map (lambda (form)
+                       (list (car e) (or (definition-name form) 'top-level)
+                             (registry-set-count form)))
+                     (filter (lambda (form) (positive? (registry-set-count form)))
+                             (list-tail (cdr e) 4))))
+              libraries)))
+
+(test-equal "rule 10: registry-deregister! is named by no definition in src/"
+  '() (namers-in-src 'registry-deregister!))
+
+(test-equal "rule 10: complete-taken-request! is named only by the dispatchers behind a taking seam"
+  '(("src/libuv/dns.sls" getaddrinfo-dispatch 2)
+    ("src/libuv/dns.sls" getnameinfo-dispatch 2)
+    ("src/libuv/private/handles.sls" write-done-dispatch 1)
+    ("src/libuv/private/handles.sls" connect-dispatch 1)
+    ("src/libuv/private/handles.sls" shutdown-dispatch 1))
+  (namers-in-src 'complete-taken-request!))
+
+(test-equal "rule 10: abandon-taken-request! is named only by the getaddrinfo dispatcher"
+  '(("src/libuv/dns.sls" getaddrinfo-dispatch 1))
+  (namers-in-src 'abandon-taken-request!))
+
+(test-equal "rule 10: registry-take-accepted! is named only by the seam macro, and registry-pop! only by the takes"
+  '((("src/libuv/private/handles.sls" seam 1))
+    (("src/libuv/private/handles.sls" registry-take! 1)
+     ("src/libuv/private/handles.sls" registry-take-accepted! 1)))
+  (list (namers-in-src 'registry-take-accepted!) (namers-in-src 'registry-pop!)))
+
+(test-equal "rule 10: a registry entry is made only by registry-add!, and the table set only there and in the put-back"
+  '((("src/libuv/private/handles.sls" registry-entry 1)
+     ("src/libuv/private/handles.sls" registry-add! 1))
+    (("src/libuv/private/handles.sls" registry-add! 1)
+     ("src/libuv/private/handles.sls" registry-take-accepted! 1)))
+  (list (namers-in-src '%make-registry-entry) (registry-writes)))
+
+(test-equal "rule 10 counts each (hashtable-set! registry ...) in a form, and no other table's"
+  '(2 0)
+  (list (registry-set-count '(define (f p e) (when p (hashtable-set! registry p e)) (hashtable-set! registry 1 e)))
+        (registry-set-count '(define (g p e) (hashtable-set! other p e) (hashtable-ref registry p #f)))))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"

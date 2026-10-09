@@ -2463,7 +2463,20 @@
         (cons 'connect (handle-ptr dtcp)))
   (list-tail (orphan-callback-events) dispatch-orphans-before))
 
-(uv-loop-teardown! dl)
+;; Each request seam takes its pointer's entry in the step that finds it
+;; (#87), and puts back an entry whose object is not a request. The teardown
+;; below finds the handle only through its entry.
+(test-equal "the request seams left the handle's registry entry in place"
+  'still-registered
+  (if (eq? dtcp (registry-ref (handle-ptr dtcp))) 'still-registered 'entry-disturbed))
+
+;; A row, not plumbing: a seam that lost the handle's entry leaves the
+;; teardown a handle it cannot find, and its EBUSY must not end the suite.
+(test-equal "the dispatch loop tears down with its handle"
+  'torn-down
+  (guard (e (#t (list 'raised (condition-who e))))
+    (uv-loop-teardown! dl)
+    'torn-down))
 
 ;; =========================================================================
 ;; --- VECTORED WRITE (uv-write*!, the name ADR-0009 reserved) -------------

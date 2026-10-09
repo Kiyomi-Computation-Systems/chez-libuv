@@ -1,0 +1,268 @@
+# #87: a close or a completion takes the registry lock once: mutation log
+
+Branch `perf/registry-lock-once-87`, built on main 27520e3, 2026-10-09.
+macOS arm64 (Darwin 25.6), Chez 10.4.1, vendored libuv 1.52.1.
+
+## What was slow
+
+Every request completion (write, connect, shutdown, getaddrinfo,
+getnameinfo) and every handle close took `registry-lock` twice. The seam
+looked the callback's pointer up under it. Then `complete-taken-request!` or
+`close-dispatch` called `registry-deregister!`, which took it again to
+delete the entry the seam had just found. Every loop's thread shares the
+lock (#70).
+
+## The change
+
+As first pushed; "After #116's review" below records what changed.
+
+- `registry-take-accepted! ptr accepts?` finds PTR's entry and deletes it
+  in one body under the lock. Then, after the release, it asks ACCEPTS? of
+  the entry's object, and puts a refused entry back in a second use.
+- `seam-lambda` takes its lookup as an argument, and `seams` pairs each
+  callback with one:
+  - `take-handle-entry!` (by `uv-handle?`) for close;
+  - `take-request-entry!` (by `uv-req?`) for write-done, shutdown and
+    connect;
+  - `take-getaddrinfo-entry!` and `take-getnameinfo-entry!` for the DNS
+    completions, by `getaddrinfo-req?` and `getnameinfo-req?`, which the
+    DNS dispatchers now test with as well;
+  - `registry-find` for the rest, which leave their pointer registered.
+- `complete-request!`, `close-dispatch` and `abandon-request!` delete
+  nothing.
+
+Why the put-back, rather than checking the kind under the lock: rule 6 of
+`tests/test-source-rules.sps` keeps every lock body to table operations
+and `cons`, and a record accessor is neither. The issue allowed either
+shape. Only the refusals pay the second use, and a refusal is a bug state:
+a completion for a pointer registered as something else.
+
+## Rows
+
+New or changed:
+
+- test-loop, "the close seam leaves a request's entry in place, and records
+  an orphan": the close seam on a registered non-handle.
+- test-loop, "the handle-less completion counted and zeroed the block, and
+  left the registry to the seam": this was "…deregistered, counted, and
+  zeroed the block". Called directly, `complete-taken-request!` no longer touches
+  the registry. It failed by name on main's source before the change.
+- test-loop, "abandon-taken-request! zeroes the request, delivers nothing, and
+  leaves the registry to the seam".
+- test-tcp, "the request seams left the handle's registry entry in place",
+  and "the dispatch loop tears down with its handle". The second replaces
+  a bare `(uv-loop-teardown! dl)`, which aborted the suite under M1 and M5.
+- test-dns, "a getnameinfo request at the getaddrinfo seam: raised by name,
+  entry kept, nothing completed", and the getnameinfo mirror.
+
+Cleanup made safe, so a failing build runs the rest of the suite: test-loop's
+`(registry-deregister! (car fake-req))` and test-timer's
+`(registry-deregister! seam-block)` now run only when the entry is there.
+Under M1 both raised and ended their suites before.
+
+## Mutants
+
+Each was applied to a copy of the tree outside the repository, then run
+against test-loop, test-tcp, test-dns, test-timer, test-callback-alloc and
+test-loop-threads. M0 is the unmutated copy, and it passed all six.
+
+| Mutant | What it breaks | Caught by (first rows, by name) |
+|---|---|---|
+| M1 | no put-back: a refused entry stays deleted | test-loop "the close seam leaves a request's entry in place…"; test-tcp "the request seams left the handle's registry entry in place", "the dispatch loop tears down with its handle"; test-dns "kind-mismatch arm: the wrong-kind registry entry is untouched", "getnameinfo kind-mismatch arm: the wrong-kind registry entry is untouched", both other-kind rows |
+| M2 | the getaddrinfo seam accepts any `uv-req?` | test-dns "a getnameinfo request at the getaddrinfo seam…" |
+| M3 | the getnameinfo seam accepts any `uv-req?` | test-dns "a getaddrinfo request at the getnameinfo seam…" |
+| M4 | the close seam accepts anything | test-loop "the close seam leaves a request's entry in place…" |
+| M5 | the request seams accept anything | test-tcp "the request seams left the handle's registry entry in place", "the dispatch loop tears down with its handle" |
+| M6 | `complete-taken-request!` deletes again | test-loop "…left the registry to the seam", "the raise was recorded on the loop the registry entry named"; test-callback-alloc's completion rows |
+| M7 | `close-dispatch` deletes again | test-timer "the close dispatcher zeroed the stored handle pointer" and five more; test-loop-threads' races; test-callback-alloc's close row |
+| M8 | the write-done seam only looks | test-tcp "the write request was already deregistered when on-complete ran"; test-callback-alloc "delivering a write's completion…", "the registry is back to its starting size" |
+| M9 | the close seam only looks | test-timer "the close dispatcher deregistered the handle"; test-tcp "the construction loop tore down cleanly"; test-loop-threads "the registry is back to its starting size" |
+| M10 | `abandon-taken-request!` deletes again | test-loop "abandon-taken-request! zeroes the request…" (added for it: on the first pass M10 survived) |
+| M11 | the getaddrinfo seam only looks | test-dns "v4: the lookup starts"; test-callback-alloc "delivering a getaddrinfo's completion…" |
+
+M10 survived the first pass because `abandon-taken-request!`'s one caller, the
+getaddrinfo dispatcher's conversion-failure arm, cannot be reached by any
+input (`.plans/dns-stage-4-mutation-log.md`). The new row drives
+`abandon-taken-request!` directly, as the `complete-taken-request!` row does.
+
+What no row holds: that a take uses the lock once rather than twice. M8
+and M9 are the old shape with the deletes removed, and they fail. But the
+old shape itself, a seam that looks and a dispatcher that deletes, is
+correct. It is only slower, and the timing below is its evidence.
+
+## After #116's review
+
+The review found eight things; all were fixed.
+
+1. **An engine could drop a refused take between its steps.** The take and
+   the put-back were two locked steps with a call between them, so a
+   dropped engine there would have lost the entry for good. They are now
+   one `one-step`. test-loop's "a close dropped by its engine at any point
+   keeps a refused entry registered" runs the refused close at fuel 1, 2,
+   3, …, drops each run that expires, and looks for the entry after every
+   drop (12 drops, then a run that finishes).
+   - M12a, removing the `one-step` alone, **survives**: measured, the
+     compiled take has no trap point between its steps. A thread-parameter
+     call planted there added none either.
+   - M12b, removing it and planting a non-tail recursive call between the
+     steps, fails the row by name. A probe found that drops at fuels 6, 7
+     and 8 lost the entry. With the same call planted inside the
+     `one-step`, the row passes. So the step guarantees what today's
+     inlining gives by accident.
+2. **The seam's and dispatcher's predicates agreed only by comment.** Each
+   seam is now `(seam name accepts?)`, naming the predicate where the seams
+   are built. test-dns's request-seam matrix sends a request of each of the
+   five kinds to each of the five request seams, and requires every cell to
+   be either (kept, not completed, not freed) or (taken, completed, freed),
+   whatever the predicates are. A second row pins the outcomes: the stream
+   and connect seams complete any request, and the DNS seams only their
+   own kind.
+   - M13 makes `complete-taken-request!` refuse connect requests while
+     their seams still take them, and fails the invariant row (and the
+     epilogue's orphan count).
+   - M14 makes the write-done seam take only getaddrinfo requests while its
+     dispatcher completes any, and fails the invariant row and the outcome
+     row.
+3. **`complete-request!` and `abandon-request!` silently relied on a
+   take.** They are renamed `complete-taken-request!` and
+   `abandon-taken-request!`. Rule 10 names their only callers: the
+   dispatchers behind a taking seam.
+4. **"The registry's sole write site" was false.** The comment now names
+   the put-back, and rule 10 holds both claims: a registry entry is made
+   only in `registry-add!` (and its record type), and the table is set
+   only there and in `registry-take-accepted!`.
+5. **The other-kind DNS rows shared a completion flag.** Each run now
+   resets it.
+6. **`registry-deregister!` had no caller left in `src/`.** Rule 10 holds
+   it to none, and its comment says the suites use it.
+7. **`registry-find` repeated the lookup.** `registry-ref` and
+   `registry-loop-of` now use it, and `registry-pop!` is the one delete
+   shared by `registry-take!` and `registry-take-accepted!`.
+8. **Four take wrappers.** They are gone: `(seam name accepts?)` expands
+   to `(registry-take-accepted! accepts? ptr)`.
+
+Rule 10's rows were checked against a planted accessor in a lock body,
+which fails rule 6 by name; its write counter has a row of its own on a
+seeded form.
+
+## Allocation
+
+`tests/test-callback-alloc.sps` printed the same 24 figures on main's source
+and on the branch, byte for byte.
+
+## Timing
+
+`bench.sps` (below) runs on each thread's own loop. Each repetition:
+
+- makes 2,000 timers ("make": one registry add each);
+- fires them at timeout 0 ("fire": one seam lookup each);
+- closes them ("close": a seam take, formerly a lookup and a delete);
+- completes 2,000 synthetic requests through the shutdown seam
+  ("complete": an `alloc-zeroed` block, a registration, and a seam take).
+
+Each figure is the median, over 5 alternated rounds, of the threads'
+median of each thread's best of 30 repetitions, in ns an operation. Both
+builds used the release shim (`make prod`) with
+`collect-trip-bytes` 2^29, at load 5–7.
+
+| Threads | Build | make | fire | close | complete |
+|---|---|---|---|---|---|
+| 1 | main | 160 (154–164) | 385 (380–398) | 395 (392–406) | 219 (215–226) |
+| 1 | #87 | 156 (154–164) | 389 (381–404) | 360 (356–380) | 184 (174–188) |
+| 4 | main | 276 (215–484) | 1,500 (904–1,817) | 2,340 (1,188–3,204) | 538 (276–740) |
+| 4 | #87 | 363 (338–470) | 2,062 (1,068–2,514) | 2,136 (1,829–2,542) | 490 (238–526) |
+
+At one thread a close is 35 ns cheaper and a completion 35 ns cheaper,
+with no overlap between the builds' ranges. #77 measured about 35 ns for a
+lock use, so this is one use. make and fire, which this change does not
+touch, agree within their ranges. At four threads every column's ranges
+overlap between the builds, including make and fire, so these runs settle
+nothing there. #77 saw the same spread and put it down to something else
+shared.
+
+After #116's review put the take in a `one-step`, the one-thread rows were
+run again in the same way (5 alternated rounds, load 5–8): main 152 / 374 /
+382 / 210 ns, #87 152 / 374 / 352 / 178 ns. Close and complete still save
+30–32 ns, with ranges that do not overlap (close 378–388 against 352–356;
+complete 208–212 against 176–180).
+
+```scheme
+;; bench.sps THREADS REPS
+(import (chezscheme)
+        (libuv loop) (libuv handle) (libuv timer)
+        (libuv private handles)
+        (only (libuv private native) alloc-zeroed dispatcher-ref))
+
+(define n 2000)
+(define threads (string->number (cadr (command-line))))
+(define reps (string->number (caddr (command-line))))
+
+(define (now-ns)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* (time-second t) 1000000000) (time-nanosecond t))))
+
+(define (run-until loop done?)
+  (let spin ((i 0))
+    (unless (done?)
+      (when (> i 10000000) (error 'bench "loop never finished"))
+      (uv-run loop 'once)
+      (spin (+ i 1)))))
+
+(define (one-rep loop)
+  (let* ((fired 0) (closed 0)
+         (t0 (now-ns))
+         (timers (let make ((i 0) (acc '()))
+                   (if (= i n) acc (make (+ i 1) (cons (make-uv-timer loop) acc)))))
+         (t1 (now-ns)))
+    (for-each (lambda (t) (uv-timer-start! t (lambda (h) (set! fired (+ fired 1))) 0 0)) timers)
+    (let ((t2 (now-ns)))
+      (run-until loop (lambda () (= fired n)))
+      (let ((t3 (now-ns)))
+        (for-each (lambda (t) (uv-close! t (lambda () (set! closed (+ closed 1))))) timers)
+        (run-until loop (lambda () (= closed n)))
+        (let ((t4 (now-ns)) (slot (dispatcher-ref 'shutdown)) (done 0))
+          (let complete ((i 0))
+            (when (< i n)
+              (let ((block (alloc-zeroed 64)))
+                (registry-register! block 'shutdown-req loop
+                                    (%make-uv-req-record block 'shutdown #f
+                                                         (lambda (err) (set! done (+ done 1)))))
+                (slot block 0))
+              (complete (+ i 1))))
+          (let ((t5 (now-ns)))
+            (unless (= done n) (error 'bench "completions missing" done))
+            (vector (/ (- t1 t0) n) (/ (- t3 t2) n) (/ (- t4 t3) n) (/ (- t5 t4) n))))))))
+
+(define (thread-best)
+  (let ((loop (make-uv-loop)))
+    (let rep ((i 0) (best #f))
+      (if (= i reps)
+          (begin (uv-loop-teardown! loop) best)
+          (let ((r (one-rep loop)))
+            (rep (+ i 1) (if best (vector-map min best r) r)))))))
+
+(define (median xs)
+  (let ((v (list->vector (sort < xs))))
+    (vector-ref v (quotient (vector-length v) 2))))
+
+(collect)
+(collect-trip-bytes (expt 2 29))
+(define m (make-mutex))
+(define c (make-condition))
+(define results '())
+(define go #f)
+(do ((i 0 (+ i 1))) ((= i threads))
+  (fork-thread
+   (lambda ()
+     (with-mutex m (let wait () (unless go (condition-wait c m) (wait))))
+     (let ((r (thread-best)))
+       (with-mutex m (set! results (cons r results)) (condition-broadcast c))))))
+(with-mutex m (set! go #t) (condition-broadcast c))
+(with-mutex m (let wait () (unless (= (length results) threads) (condition-wait c m) (wait))))
+(let ((cols (map (lambda (k) (median (map (lambda (r) (vector-ref r k)) results))) '(0 1 2 3))))
+  (printf "~a ~{~a ~}~%" threads (map (lambda (x) (exact (round x))) cols)))
+```
+
+The rounds ran each build from a copy of the tree, with main's `src/`
+taken from `git archive origin/main src` and the same release shim,
+alternating main and #87 at 1 and then 4 threads in each round.

@@ -866,6 +866,48 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 > through `count_add`. Evidence and mutations:
 > `.plans/registry-lock-mutation-log.md`.
 
+> **Amended 2026-10-09 (#87): a close or a completion takes the lock
+> once.** The "two uses" in the table above were the seam's lookup and the
+> dispatcher's delete of the entry the seam had just found. The seams of
+> the six callbacks whose dispatchers complete what is registered (close,
+> write-done, shutdown, connect, getaddrinfo and getnameinfo) now find the
+> entry and delete it in one body under the lock
+> (`registry-take-accepted!`), and their dispatchers delete nothing.
+>
+> A dispatcher refuses some entries: an object that is not a handle, not
+> a request, or a DNS request of the other kind. It raises or records an
+> orphan, frees nothing, and leaves the entry where it was. Rule 6 keeps
+> every lock body to table operations, so the seam cannot ask the object's
+> kind under the lock. It asks after the release, with the predicate its
+> dispatcher uses, and puts a refused entry back in a second use. Only the
+> refusals, which are bug states, pay a second use. The take, the check
+> and the put-back are one interrupt-free step, so no engine dropped
+> between them can lose the entry (#116's review). No other entry can
+> claim the pointer in between: its block is still allocated, and only the
+> loop's own thread, which is running the callback, closes or tears down
+> what is registered on that loop.
+>
+> Each completing seam names its predicate where the seams are built, and
+> its dispatcher must make the same test. What holds them to it is a
+> check, not the shared name: test-dns's request-seam matrix sends a
+> request of every kind to every request seam, and requires each seam to
+> keep exactly the entries its dispatcher leaves and to take exactly
+> those whose block it frees. Rule 10 of `tests/test-source-rules.sps`
+> keeps the deletes in the seams. `complete-taken-request!` and
+> `abandon-taken-request!` free a block whose entry is already gone, and
+> may be named only by the dispatchers behind a taking seam.
+> `registry-deregister!` is named by nothing in `src/`.
+>
+> Measured on macOS arm64 with the release shim, collections held off,
+> each figure the median of five alternated rounds of each thread's best
+> of 30. At one thread a close went from 395 to 360 ns (ranges 392–406 and
+> 356–380) and a request completion from 219 to 184 ns (215–226 and
+> 174–188), while a constructor and a timer firing were unchanged. At four
+> threads single runs scattered as widely as before, overlapping between
+> the two builds. Allocation is unchanged to the byte
+> (`tests/test-callback-alloc.sps`). Evidence and mutations:
+> `.plans/registry-lock-once-mutation-log.md`.
+
 **5. Opt-in, and free on a non-threaded Chez.** Identity uses `get-thread-id`
 behind `current-thread-id`, which returns a constant on a non-threaded build, so
 the affinity check is a tautology there and `uv-async-send!` still works.
