@@ -200,7 +200,8 @@
 ;; test-native's truncation scan all resumed without one until #81, with
 ;; every row green. So every engine the tests make is the driver's, or one
 ;; of the sweeps below, each bounded on its own: most stop an engine once
-;; and then resume it once with a fixed budget, or drop it;
+;; and then resume it once with a fixed budget, or drop it (test-loop's
+;; refused-take-drop-sweep drops every run that expires, up to fuel 5000);
 ;; test-loop-claim's exit-split-run resumes one tick at a time up to its
 ;; own cap; and test-owner-refusal's handback-run stops it twice, resuming
 ;; it with one tick and then a fixed budget. A new engine fails this row by
@@ -222,6 +223,7 @@
     ("tests/test-loop-claim.sps" split-sweep)
     ("tests/test-loop-claim.sps" drop-sweep)
     ("tests/test-loop-threads.sps" lock-sweep)
+    ("tests/test-loop.sps" refused-take-drop-sweep)
     ("tests/test-loop.sps" first-slice)
     ("tests/test-loop.sps" suspending-slice)
     ("tests/test-owner-refusal.sps" handback-run)

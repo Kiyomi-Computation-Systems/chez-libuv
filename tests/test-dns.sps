@@ -48,7 +48,13 @@
         ;; wrong-kind pointer.
         (only (libuv private native)
               live-counts alloc-zeroed free! copy-in! c-int-set! c-int-ref
-              fill-sockaddr! dispatcher-ref align-16 uv-req-size)
+              fill-sockaddr! dispatcher-ref align-16 uv-req-size
+              ;; The request-seam matrix balances the counters a completion
+              ;; it provokes moves.
+              count-write-req-new! count-write-req-free!
+              count-connect-req-new! count-connect-req-free!
+              count-getaddrinfo-req-new! count-getaddrinfo-req-free!
+              count-getnameinfo-req-new! count-getnameinfo-req-free!)
         ;; Shim-snapshotted values (ADR-0005), for the ADR-0013 watchdog
         ;; and the synthetic-chain field writes.
         (only (libuv private constants)
@@ -601,8 +607,8 @@
 ;; An empty hostname reaches libuv (NO Scheme-side empty-string validation,
 ;; deliberately -- S5.5: adding one would make this guard untestable) and
 ;; fails DETERMINISTICALLY in uv__idna_toascii with UV_EINVAL, after our
-;; register/count, before any possible callback. The abandon-request!
-;; guard must undo exactly that much. This row also drives the THREE-
+;; register/count, before any possible callback. submit-request!'s undo must
+;; reverse exactly that much. This row also drives the THREE-
 ;; ARGUMENT arity (hints omitted => NULL hints pointer) all the way to the
 ;; native call, without any resolver consultation.
 (define i-fired 'callback-never-fired)
@@ -1671,6 +1677,7 @@
 ;; (#87): this is the case where a seam that asked only uv-req? would keep
 ;; the entry its dispatcher raised over.
 (define (other-kind-dns-run slot-name registered-kind req-kind call)
+  (set! other-kind-completed 'not-completed)
   (let* ((block (alloc-zeroed 64))
          (req (%make-uv-req-record block req-kind #f
                                    (lambda args (set! other-kind-completed 'completed))
@@ -1699,6 +1706,80 @@
   '(uv-getnameinfo-dispatch still-registered not-completed)
   (other-kind-dns-run 'getnameinfo 'getaddrinfo-req 'getaddrinfo
                       (lambda (slot block) (slot block 0 0 0))))
+
+;; THE REQUEST-SEAM MATRIX. Each request seam takes its entry by the test
+;; its dispatcher makes before completing (handles.sls's seam forms), and
+;; nothing makes the two agree but this: whatever the predicates, a seam
+;; must keep exactly the entries its dispatcher leaves, and take exactly
+;; those whose block it frees. A seam that took an entry its dispatcher
+;; then left would lose it; one that kept an entry whose block its
+;; dispatcher freed would leave the registry naming freed memory. So a
+;; request of every kind goes to every request seam, and each cell reports
+;; whether the entry stayed and whether the request completed (its pointer
+;; zeroed and its block freed). Requests only: an object that is not one
+;; records an orphan at three of these seams, which this suite's epilogue
+;; counts, and tests/test-tcp.sps puts a handle to them instead.
+;;
+;; seam-cell : symbol (-> any) (-> any) symbol procedure -> (list symbol symbol symbol symbol)
+;; COUNT-NEW! and COUNT-FREE! are the seam's own counter, which a completion
+;; there moves down; the cell moves it up first and back if nothing completed.
+(define (seam-cell seam count-new! count-free! req-kind deliver)
+  (let* ((block (alloc-zeroed 64))
+         (completed 'not-completed)
+         (req (%make-uv-req-record block req-kind #f
+                                   (lambda args (set! completed 'completed))
+                                   l)))
+    (registry-register! block 'getaddrinfo-req l req)
+    (count-new!)
+    (deliver (dispatcher-ref seam) block)
+    (guard (e (#t 'cleared)) (uv-run l 'nowait))
+    (let* ((freed (if (eqv? (req-ptr req) 0) 'freed 'not-freed))
+           (entry (if (eq? req (registry-ref block)) 'kept 'taken)))
+      (when (eq? entry 'kept) (registry-deregister! block))
+      (when (eq? freed 'not-freed) (count-free!) (free! block))
+      (list seam req-kind entry completed freed))))
+
+(define matrix-seams
+  (list (list 'write-done count-write-req-new! count-write-req-free!
+              (lambda (slot block) (slot block 0)))
+        (list 'shutdown (lambda () #f) (lambda () #f) (lambda (slot block) (slot block 0)))
+        (list 'connect count-connect-req-new! count-connect-req-free!
+              (lambda (slot block) (slot block 0)))
+        (list 'getaddrinfo count-getaddrinfo-req-new! count-getaddrinfo-req-free!
+              (lambda (slot block) (slot block 0 0)))
+        (list 'getnameinfo count-getnameinfo-req-new! count-getnameinfo-req-free!
+              (lambda (slot block) (slot block 0 0 0)))))
+
+(define matrix-kinds '(write shutdown connect getaddrinfo getnameinfo))
+
+(define matrix
+  (apply append
+         (map (lambda (s)
+                (map (lambda (kind)
+                       (seam-cell (car s) (cadr s) (caddr s) kind (cadddr s)))
+                     matrix-kinds))
+              matrix-seams)))
+
+(test-equal "every request seam keeps exactly the entries its dispatcher leaves, and takes exactly those it completes"
+  '()
+  (filter (lambda (cell)
+            (not (member (cddr cell)
+                         '((kept not-completed not-freed) (taken completed freed)))))
+          matrix))
+
+;; The outcomes themselves: the stream and connect dispatchers complete a
+;; request of any kind, and each DNS dispatcher only its own kind.
+(test-equal "the request seams complete any request, and the DNS seams only their own kind"
+  '((write-done taken taken taken taken taken)
+    (shutdown taken taken taken taken taken)
+    (connect taken taken taken taken taken)
+    (getaddrinfo kept kept kept taken kept)
+    (getnameinfo kept kept kept kept taken))
+  (map (lambda (s)
+         (cons (car s)
+               (map (lambda (cell) (caddr cell))
+                    (filter (lambda (cell) (eq? (car cell) (car s))) matrix))))
+       matrix-seams))
 
 ;; --- pool-pinned queued-tail teardown (S6; ADR-0011; Stage 3's M3 caveat)
 ;; A second loop per attempt: four numeric blockers head the single

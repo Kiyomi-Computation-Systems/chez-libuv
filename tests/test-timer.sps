@@ -837,9 +837,9 @@
 ;; -- fire a stub and watch the seam contain its raise -- is available
 ;; again, and it is once more the one pre-guard raise reachable through
 ;; shipped code: v0.1's replacement route (a req record whose handle field
-;; is not a handle, making complete-request!'s record-accessor read raise
+;; is not a handle, making complete-taken-request!'s record-accessor read raise
 ;; before it reached user code) no longer raises at all, because ADR-0011's
-;; complete-request! resolves the owning loop from the REGISTRY ENTRY and
+;; complete-taken-request! resolves the owning loop from the REGISTRY ENTRY and
 ;; never touches the handle field -- that record now completes normally,
 ;; the entry being the authority on ownership. This suite keeps no row on
 ;; that shape; the handle-less completion itself is pinned in

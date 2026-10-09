@@ -41,7 +41,7 @@
               install-callback-dispatchers!
               ;; v0.2 Stage 3: the synthetic handle-less request blocks the
               ;; ADR-0011 rows below build are real foreign allocations, so
-              ;; complete-request!'s free! sees the same kind of pointer the
+              ;; complete-taken-request!'s free! sees the same kind of pointer the
               ;; Stage 4 dispatchers will hand it.
               alloc-zeroed
               ;; The uv-update-time! affinity rows compare against it.
@@ -578,6 +578,43 @@
   (list (if (eq? fake-req (registry-ref (car fake-req))) 'same 'disturbed)
         (list-tail (orphan-callback-events) close-orphans-before)))
 
+;; The take, the kind check and the put-back are one interrupt-free step
+;; (#116's review). Were they not, an engine whose fuel ran out between the
+;; take and the put-back, and that was then dropped, would lose the entry
+;; for good: teardown would never find what it held. So the close is run in
+;; an engine at fuel 1, 2, 3, ..., each run that expires is dropped there,
+;; and the entry is looked for after each drop. A run that finishes ends
+;; the sweep. The answer names the fuel of each drop that lost the entry,
+;; and puts it back for the next run. Today's take has no trap point
+;; between its steps: removing the step alone fails nothing. A call placed
+;; there without the step does, at three fuels
+;; (.plans/registry-lock-once-mutation-log.md, M12).
+(define (refused-take-drop-sweep)
+  (let sweep ((fuel 1) (lost '()) (dropped 0))
+    (if (> fuel 5000)
+        (list 'never-finished (reverse lost) dropped)
+        ((make-engine (lambda () ((dispatcher-ref 'close) (car fake-req)) 'returned))
+         fuel
+         (lambda (left value) (list 'finished (reverse lost) dropped fuel))
+         (lambda (resume)
+           (let ((kept (eq? fake-req (registry-ref (car fake-req)))))
+             (unless kept (registry-add! (car fake-req) 'write-req l0 fake-req))
+             (sweep (+ fuel 1) (if kept lost (cons fuel lost)) (+ dropped 1))))))))
+
+(define refused-take-sweep (refused-take-drop-sweep))
+
+(test-equal "a close dropped by its engine at any point keeps a refused entry registered"
+  '(finished ())
+  (if (pair? refused-take-sweep)
+      (list (car refused-take-sweep) (cadr refused-take-sweep))
+      refused-take-sweep))
+
+(test-equal "precondition: the drop sweep dropped some runs before one finished"
+  'dropped-some
+  (if (and (pair? refused-take-sweep) (> (list-ref refused-take-sweep 2) 0))
+      'dropped-some
+      (list 'no-drops refused-take-sweep)))
+
 (when (registry-ref (car fake-req)) (registry-deregister! (car fake-req)))
 
 (test-equal "registering the same pointer twice is refused, naming who and why"
@@ -1107,7 +1144,7 @@
 
 ;; --- the cancel sweep and the completion machinery (ADR-0011) -----------
 ;; v0.2 Stage 3: uv-loop-teardown! runs cancel-requests-for-loop! before
-;; its close sweep, and complete-request! resolves the owning loop from the
+;; its close sweep, and complete-taken-request! resolves the owning loop from the
 ;; REGISTRY ENTRY rather than through the record's handle field, delivering
 ;; any extras behind the err argument. No DNS request can exist yet --
 ;; (libuv dns) is Stage 4 -- so what is assertable HERE is:
@@ -1115,7 +1152,7 @@
 ;;   * the sweep's no-op contract on a loop with no DNS request entries:
 ;;     nothing deregistered, handle entries untouched, the loop and its
 ;;     counters exactly as they were;
-;;   * the generalized complete-request!, driven synthetically the same way
+;;   * the generalized complete-taken-request!, driven synthetically the same way
 ;;     the registry rows above drive registry-register!: a plain
 ;;     alloc-zeroed block, a handle-less req record (handle = #f, the shape
 ;;     ADR-0011 documents), Stage 4's registry kinds, and a direct call --
@@ -1168,10 +1205,10 @@
 (test-equal "seed: the handle-less request entry is in the registry"
   'same (if (eq? synth-req (registry-ref synth-block)) 'same 'different))
 
-(test-equal "complete-request! completes a handle-less request without raising"
+(test-equal "complete-taken-request! completes a handle-less request without raising"
   'completed
   (guard (e (#t (list 'raised e)))
-    (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+    (complete-taken-request! 'getaddrinfo 'uv-getaddrinfo!
                        (lambda () (set! synth-freed (+ synth-freed 1)))
                        synth-req synth-block 0 'record-a 'record-b)
     'completed))
@@ -1180,7 +1217,7 @@
   '(#f record-a record-b) synth-delivered)
 
 ;; The seam takes a completing request's entry out of the registry before it
-;; calls the dispatcher (#87), so complete-request! leaves the registry
+;; calls the dispatcher (#87), so complete-taken-request! leaves the registry
 ;; alone: called directly, as here, it finds the entry still registered.
 (test-equal "the handle-less completion counted and zeroed the block, and left the registry to the seam"
   (list 'still-registered 1 0)
@@ -1190,7 +1227,7 @@
 
 (when (registry-ref synth-block) (registry-deregister! synth-block))
 
-;; abandon-request! is complete-request!'s release without a callback, for
+;; abandon-taken-request! is complete-taken-request!'s release without a callback, for
 ;; the getaddrinfo dispatcher's conversion-failure arm, which no input can
 ;; reach (.plans/dns-stage-4-mutation-log.md). Its seam has taken the entry
 ;; already, so it too leaves the registry alone; driven directly, here. The
@@ -1203,10 +1240,10 @@
                        (lambda args (set! abandon-delivered 'delivered))))
 (registry-register! abandon-block 'getaddrinfo-req sweep-loop abandon-req)
 
-(test-equal "abandon-request! zeroes the request, delivers nothing, and leaves the registry to the seam"
+(test-equal "abandon-taken-request! zeroes the request, delivers nothing, and leaves the registry to the seam"
   '(released 0 still-registered not-delivered)
   (let* ((released (guard (e (#t (list 'raised e)))
-                     (abandon-request! abandon-req)
+                     (abandon-taken-request! abandon-req)
                      'released))
          (ptr (req-ptr abandon-req))
          (entry (if (eq? abandon-req (registry-ref abandon-block))
@@ -1220,7 +1257,7 @@
 ;; answer is where a raising on-complete lands. Since #45 the seam reads it,
 ;; before the dispatcher runs, and the seam is the only place a raise is
 ;; contained, so this completion goes through an installed slot. The
-;; shutdown slot completes its request through complete-request!, as the DNS
+;; shutdown slot completes its request through complete-taken-request!, as the DNS
 ;; slots do, and handles.sls installs it in every process. The raise must be
 ;; recorded on the loop the REGISTRY ENTRY named -- a loop no
 ;; (handle-loop (req-handle req)) read could have found, since the handle
@@ -1244,7 +1281,7 @@
       (loop-pending-error sweep-loop)
       'no-pending-error))
 
-;; complete-request! calls on-complete last, so a raise there skips none of
+;; complete-taken-request! calls on-complete last, so a raise there skips none of
 ;; its own steps (#45).
 (test-equal "...and the request was deregistered and zeroed before on-complete raised"
   '(deregistered 0)

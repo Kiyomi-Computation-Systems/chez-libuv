@@ -7,12 +7,14 @@ macOS arm64 (Darwin 25.6), Chez 10.4.1, vendored libuv 1.52.1.
 
 Every request completion (write, connect, shutdown, getaddrinfo,
 getnameinfo) and every handle close took `registry-lock` twice. The seam
-looked the callback's pointer up under it. Then `complete-request!` or
+looked the callback's pointer up under it. Then `complete-taken-request!` or
 `close-dispatch` called `registry-deregister!`, which took it again to
 delete the entry the seam had just found. Every loop's thread shares the
 lock (#70).
 
 ## The change
+
+As first pushed; "After #116's review" below records what changed.
 
 - `registry-take-accepted! ptr accepts?` finds PTR's entry and deletes it
   in one body under the lock. Then, after the release, it asks ACCEPTS? of
@@ -43,9 +45,9 @@ New or changed:
   an orphan": the close seam on a registered non-handle.
 - test-loop, "the handle-less completion counted and zeroed the block, and
   left the registry to the seam": this was "…deregistered, counted, and
-  zeroed the block". Called directly, `complete-request!` no longer touches
+  zeroed the block". Called directly, `complete-taken-request!` no longer touches
   the registry. It failed by name on main's source before the change.
-- test-loop, "abandon-request! zeroes the request, delivers nothing, and
+- test-loop, "abandon-taken-request! zeroes the request, delivers nothing, and
   leaves the registry to the seam".
 - test-tcp, "the request seams left the handle's registry entry in place",
   and "the dispatch loop tears down with its handle". The second replaces
@@ -71,22 +73,77 @@ test-loop-threads. M0 is the unmutated copy, and it passed all six.
 | M3 | the getnameinfo seam accepts any `uv-req?` | test-dns "a getaddrinfo request at the getnameinfo seam…" |
 | M4 | the close seam accepts anything | test-loop "the close seam leaves a request's entry in place…" |
 | M5 | the request seams accept anything | test-tcp "the request seams left the handle's registry entry in place", "the dispatch loop tears down with its handle" |
-| M6 | `complete-request!` deletes again | test-loop "…left the registry to the seam", "the raise was recorded on the loop the registry entry named"; test-callback-alloc's completion rows |
+| M6 | `complete-taken-request!` deletes again | test-loop "…left the registry to the seam", "the raise was recorded on the loop the registry entry named"; test-callback-alloc's completion rows |
 | M7 | `close-dispatch` deletes again | test-timer "the close dispatcher zeroed the stored handle pointer" and five more; test-loop-threads' races; test-callback-alloc's close row |
 | M8 | the write-done seam only looks | test-tcp "the write request was already deregistered when on-complete ran"; test-callback-alloc "delivering a write's completion…", "the registry is back to its starting size" |
 | M9 | the close seam only looks | test-timer "the close dispatcher deregistered the handle"; test-tcp "the construction loop tore down cleanly"; test-loop-threads "the registry is back to its starting size" |
-| M10 | `abandon-request!` deletes again | test-loop "abandon-request! zeroes the request…" (added for it: on the first pass M10 survived) |
+| M10 | `abandon-taken-request!` deletes again | test-loop "abandon-taken-request! zeroes the request…" (added for it: on the first pass M10 survived) |
 | M11 | the getaddrinfo seam only looks | test-dns "v4: the lookup starts"; test-callback-alloc "delivering a getaddrinfo's completion…" |
 
-M10 survived the first pass because `abandon-request!`'s one caller, the
+M10 survived the first pass because `abandon-taken-request!`'s one caller, the
 getaddrinfo dispatcher's conversion-failure arm, cannot be reached by any
 input (`.plans/dns-stage-4-mutation-log.md`). The new row drives
-`abandon-request!` directly, as the `complete-request!` row does.
+`abandon-taken-request!` directly, as the `complete-taken-request!` row does.
 
 What no row holds: that a take uses the lock once rather than twice. M8
 and M9 are the old shape with the deletes removed, and they fail. But the
 old shape itself, a seam that looks and a dispatcher that deletes, is
 correct. It is only slower, and the timing below is its evidence.
+
+## After #116's review
+
+The review found eight things; all were fixed.
+
+1. **An engine could drop a refused take between its steps.** The take and
+   the put-back were two locked steps with a call between them, so a
+   dropped engine there would have lost the entry for good. They are now
+   one `one-step`. test-loop's "a close dropped by its engine at any point
+   keeps a refused entry registered" runs the refused close at fuel 1, 2,
+   3, …, drops each run that expires, and looks for the entry after every
+   drop (12 drops, then a run that finishes).
+   - M12a, removing the `one-step` alone, **survives**: measured, the
+     compiled take has no trap point between its steps. A thread-parameter
+     call planted there added none either.
+   - M12b, removing it and planting a non-tail recursive call between the
+     steps, fails the row by name. A probe found that drops at fuels 6, 7
+     and 8 lost the entry. With the same call planted inside the
+     `one-step`, the row passes. So the step guarantees what today's
+     inlining gives by accident.
+2. **The seam's and dispatcher's predicates agreed only by comment.** Each
+   seam is now `(seam name accepts?)`, naming the predicate where the seams
+   are built. test-dns's request-seam matrix sends a request of each of the
+   five kinds to each of the five request seams, and requires every cell to
+   be either (kept, not completed, not freed) or (taken, completed, freed),
+   whatever the predicates are. A second row pins the outcomes: the stream
+   and connect seams complete any request, and the DNS seams only their
+   own kind.
+   - M13 makes `complete-taken-request!` refuse connect requests while
+     their seams still take them, and fails the invariant row (and the
+     epilogue's orphan count).
+   - M14 makes the write-done seam take only getaddrinfo requests while its
+     dispatcher completes any, and fails the invariant row and the outcome
+     row.
+3. **`complete-request!` and `abandon-request!` silently relied on a
+   take.** They are renamed `complete-taken-request!` and
+   `abandon-taken-request!`. Rule 10 names their only callers: the
+   dispatchers behind a taking seam.
+4. **"The registry's sole write site" was false.** The comment now names
+   the put-back, and rule 10 holds both claims: a registry entry is made
+   only in `registry-add!` (and its record type), and the table is set
+   only there and in `registry-take-accepted!`.
+5. **The other-kind DNS rows shared a completion flag.** Each run now
+   resets it.
+6. **`registry-deregister!` had no caller left in `src/`.** Rule 10 holds
+   it to none, and its comment says the suites use it.
+7. **`registry-find` repeated the lookup.** `registry-ref` and
+   `registry-loop-of` now use it, and `registry-pop!` is the one delete
+   shared by `registry-take!` and `registry-take-accepted!`.
+8. **Four take wrappers.** They are gone: `(seam name accepts?)` expands
+   to `(registry-take-accepted! accepts? ptr)`.
+
+Rule 10's rows were checked against a planted accessor in a lock body,
+which fails rule 6 by name; its write counter has a row of its own on a
+seeded form.
 
 ## Allocation
 
@@ -122,6 +179,12 @@ touch, agree within their ranges. At four threads every column's ranges
 overlap between the builds, including make and fire, so these runs settle
 nothing there. #77 saw the same spread and put it down to something else
 shared.
+
+After #116's review put the take in a `one-step`, the one-thread rows were
+run again in the same way (5 alternated rounds, load 5–8): main 152 / 374 /
+382 / 210 ns, #87 152 / 374 / 352 / 178 ns. Close and complete still save
+30–32 ns, with ranges that do not overlap (close 378–388 against 352–356;
+complete 208–212 against 176–180).
 
 ```scheme
 ;; bench.sps THREADS REPS

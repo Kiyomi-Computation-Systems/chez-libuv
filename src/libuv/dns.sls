@@ -287,7 +287,7 @@
     (cond
       ((not req)
        (uv-freeaddrinfo res)
-       (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+       (complete-taken-request! 'getaddrinfo 'uv-getaddrinfo!
                           count-getaddrinfo-req-free! req block-ptr status))
       ((not (getaddrinfo-req? req))
        (raise (condition
@@ -301,19 +301,19 @@
                        (values 'converted (addrinfo-chain->list res)))))
          (uv-freeaddrinfo res)
          (if (eq? tag 'converted)
-             (complete-request! 'getaddrinfo 'uv-getaddrinfo!
+             (complete-taken-request! 'getaddrinfo 'uv-getaddrinfo!
                                 count-getaddrinfo-req-free!
                                 req block-ptr status payload)
-             (begin (abandon-request! req)
+             (begin (abandon-taken-request! req)
                     (count-getaddrinfo-req-free!)
                     (loop-record-error! (req-loop req) payload)))))))
 
   ;; hostname and service point inside the request block; copy both before
-  ;; complete-request! frees that block.
+  ;; complete-taken-request! frees that block.
   (define (getnameinfo-dispatch req block-ptr status hostname-ptr service-ptr)
     (cond
       ((not req)
-       (complete-request! 'getnameinfo 'uv-getnameinfo!
+       (complete-taken-request! 'getnameinfo 'uv-getnameinfo!
                           count-getnameinfo-req-free! req block-ptr status))
       ((not (getnameinfo-req? req))
        (raise (condition
@@ -324,7 +324,7 @@
       (else
        (let ((hostname (c-string->string hostname-ptr))
              (service  (c-string->string service-ptr)))
-         (complete-request! 'getnameinfo 'uv-getnameinfo!
+         (complete-taken-request! 'getnameinfo 'uv-getnameinfo!
                             count-getnameinfo-req-free!
                             req block-ptr status hostname service)))))
 

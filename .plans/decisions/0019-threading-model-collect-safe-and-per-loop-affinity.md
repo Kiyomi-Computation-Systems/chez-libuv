@@ -880,10 +880,23 @@ off-thread — so the affinity check, not a lock, is the mechanism.
 > every lock body to table operations, so the seam cannot ask the object's
 > kind under the lock. It asks after the release, with the predicate its
 > dispatcher uses, and puts a refused entry back in a second use. Only the
-> refusals, which are bug states, pay a second use. No other entry can
+> refusals, which are bug states, pay a second use. The take, the check
+> and the put-back are one interrupt-free step, so no engine dropped
+> between them can lose the entry (#116's review). No other entry can
 > claim the pointer in between: its block is still allocated, and only the
 > loop's own thread, which is running the callback, closes or tears down
 > what is registered on that loop.
+>
+> Each completing seam names its predicate where the seams are built, and
+> its dispatcher must make the same test. What holds them to it is a
+> check, not the shared name: test-dns's request-seam matrix sends a
+> request of every kind to every request seam, and requires each seam to
+> keep exactly the entries its dispatcher leaves and to take exactly
+> those whose block it frees. Rule 10 of `tests/test-source-rules.sps`
+> keeps the deletes in the seams. `complete-taken-request!` and
+> `abandon-taken-request!` free a block whose entry is already gone, and
+> may be named only by the dispatchers behind a taking seam.
+> `registry-deregister!` is named by nothing in `src/`.
 >
 > Measured on macOS arm64 with the release shim, collections held off,
 > each figure the median of five alternated rounds of each thread's best
