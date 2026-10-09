@@ -197,12 +197,16 @@ the verb's step, which checks each span against its bytevector again: one
 that shrank meanwhile is refused with `'segment-span-out-of-range`.
 
 **Inside an engine.** An engine's fuel can run out anywhere in a stream
-verb, and a scheduler may close the stream before resuming it, or never
-resume it at all. Each verb makes its checks, its allocation and its native
-call in one step that no engine timer interrupts. A verb resumed after its
-stream was closed raises `&uv-handle-closed` without touching it. A verb
-whose engine is never resumed leaves nothing behind: either it had not
-begun, or libuv holds its request and the request's completion frees it.
+verb, and a scheduler may close the stream before resuming it, hand its
+loop to another thread, or never resume it at all. Each verb makes its
+checks, its allocation and its native call in one step that no engine timer
+interrupts. A verb resumed after its stream was closed raises
+`&uv-handle-closed` without touching it, and one resumed after its loop was
+handed to another thread raises `&uv-wrong-thread`. Before, a write or a
+shutdown resumed after a handoff made its call on a stream the other
+thread now owned, and returned normally. A verb whose engine is never
+resumed leaves nothing behind: either it had not begun, or libuv holds its
+request and the request's completion frees it.
 
 The constructors (`make-uv-loop`, `make-uv-timer`, `make-uv-tcp`,
 `make-uv-pipe`, `make-uv-signal`, `make-uv-async`) and `uv-accept!` make
@@ -224,10 +228,13 @@ process, or a failed spawn has been cleaned up.
 
 `uv-process-kill!` and `uv-process-pid` make both promises too. One resumed
 after its process was closed raises `&uv-handle-closed` without touching
-it. Before, a kill resumed there signalled whatever process a later spawn
-had been given the closed handle's address, and returned normally, and
-`uv-process-pid` answered that process's pid. Neither verb allocates, so
-one whose engine is never resumed leaves nothing behind.
+it, and one resumed after its loop was handed to another thread raises
+`&uv-wrong-thread`. Before, a kill resumed after a close signalled whatever
+process a later spawn had been given the closed handle's address, and
+returned normally, and `uv-process-pid` answered that process's pid; a kill
+resumed after a handoff signalled its process from a thread that no longer
+owned the loop. Neither verb allocates, so one whose engine is never
+resumed leaves nothing behind.
 
 `uv-tcp-connect!`, `uv-getaddrinfo!`, `uv-getnameinfo!` and `uv-cancel!`
 make both promises as well. A connect resumed after its client was closed

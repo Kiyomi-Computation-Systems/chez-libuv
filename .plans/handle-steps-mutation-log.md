@@ -629,3 +629,113 @@ for handles, since moving them means copying its harness (#103); and
 `loop-call`'s rule that its native never answers a symbol, held only by a
 comment, which no native today can break (each answers void, an int or an
 unsigned-64).
+
+# The stream and process verbs' owner (#86, part four)
+
+2026-10-09. The steps of the six stream verbs (`uv-write!`, `uv-write*!`,
+`uv-shutdown!`, `uv-read-start!`, `uv-read-stop!`,
+`uv-stream-write-queue-size`), `uv-process-kill!` and `uv-process-pid`
+take their pointer from `owned-handle-ptr` instead of `open-handle-ptr`,
+so each checks again that this thread owns the loop, as its entry check
+(`require-open-handle`) does. Their sweeps stay in their own suites:
+`tests/test-stream.sps` (#53) and `tests/test-process-steps.sps` (#71).
+
+## What the suites gained
+
+- **test-stream.sps:** a handoff sweep for each of the six verbs. At the
+  expiry the run hands `sw-loop` to another thread id, resumes the verb,
+  and hands the loop back; the stream stays open. A run not made before
+  the handoff must raise `&uv-wrong-thread` (`'refused`), and one made
+  before it must return with its effect landed (`'made-before-handoff`).
+  The split run became `close-run` and `handoff-run`, sharing the engine,
+  the no-expiry verdict and the residue check.
+- **test-process-steps.sps:** a handoff mode in `split-run`, swept for
+  `uv-process-kill!` with SIGTERM and `uv-process-pid`. The process stays
+  open, so a kill made after the handoff reaches only its own child, and
+  SIGTERM tells a kill that was made from one that was not: a refused run
+  must leave the child's fate `(0 #f)`.
+- **test-source-rules.sps, rule 8:** the top-level definitions in `src/`
+  that call `open-handle-ptr` are exactly `owned-handle-ptr`,
+  `begin-close!` (`uv-close!`'s step, loop-thread-only by contract and
+  unchecked), `stdio-refusal` (`uv-spawn!`'s step checks its loop's owner
+  first, and its stdio handles are on that loop) and `uv-accept!` (its
+  client's construction checks the owner of the server's loop). It holds
+  the claim that every step on a handle checks the owner, where a comment
+  would have stated it.
+
+## On main (6e848d3)
+
+Run first against main's `src/`, on macOS and on glibc 2.36 (the Valgrind
+image, aarch64): the same rows fail by name on both, with the same fuel
+maps.
+
+| Row | macOS and glibc |
+|---|---|
+| test-stream: a stream verb split by its loop's handoff is refused | fails: `uv-write!` returns at fuel 12–17, `uv-write*!` at 13–31, `uv-shutdown!` at 10–12 |
+| test-process-steps: split by its loop's handoff | fails: `uv-process-kill!` returns at fuel 10–12, and its child dies of SIGTERM |
+| test-source-rules: rule 8 | fails, naming the eight verbs' definitions (`uv-read-start!`'s step is in `start-reading!`) |
+
+The reach rows pass on main: each sweep is refused at fuel 1 and runs its
+verb to the end. `uv-read-start!` (refused 1–10), `uv-read-stop!`,
+`uv-stream-write-queue-size` and `uv-process-pid` (each refused 1–9) show
+no window: nothing between their entry check and their step can trap.
+
+## After the fix
+
+Every handoff run is refused with `&uv-wrong-thread` until the step, and
+untouched after it: `uv-write!` refused 1–17, `uv-write*!` 1–31,
+`uv-shutdown!` 1–12, `uv-read-start!` 1–10, `uv-read-stop!` and
+`uv-stream-write-queue-size` 1–9, `uv-process-kill!` 1–12 with its child
+unsignalled, `uv-process-pid` 1–9. The same on both platforms. Bytes per
+call (fewest of 64, scratchpad `g4/meter.sps`, with a 16 B cons as the
+live control), the same on main and after: `uv-write!` 144, a one-segment
+`uv-write*!` 192, `uv-shutdown!` 128, a read start and stop together 0,
+and 0 for `uv-read-stop!`, `uv-stream-write-queue-size`,
+`uv-process-kill!` and `uv-process-pid`.
+
+## Mutants
+
+Driver as in part three (scratchpad `g4/mut/`: `mutants.py`,
+`run_mutants.py`), on a copy of the branch's `src/` and `tests/`. A
+source-rule suite runs from the copy's root, since it reads `src/` from
+its working directory: run from the repo, rule 8 first read the repo's
+own `src/` and let every mutant through. On macOS; the four equivalent
+mutants and their windows also on glibc 2.36, with the same results.
+
+| Mutant | Change | Result |
+|---|---|---|
+| S1 | `uv-write!`'s step takes `open-handle-ptr` | **killed**: test-stream's handoff row; rule 8 |
+| S2 | the same for `uv-write*!` | **killed**: the handoff row; rule 8 |
+| S3 | the same for `uv-shutdown!` | **killed**: the handoff row; rule 8 |
+| S4 | the same for `uv-read-start!` | survived the sweeps: **equivalent today**, below; **killed** by rule 8 |
+| S5 | the same for `uv-read-stop!` | the same as S4 |
+| S6 | the same for `uv-stream-write-queue-size` | the same as S4 |
+| P1 | the same for `uv-process-kill!` | **killed**: test-process-steps's handoff row; rule 8 |
+| P2 | the same for `uv-process-pid` | the same as S4 |
+
+**The equivalent ones, checked with a window.** A loop of three engine
+ticks opened after the entry check (`(let spin ((i 0)) (when (< i 3) (spin
+(+ i 1))))`, as in parts two and three). With the windows alone, in all
+four verbs (W0), test-stream (42 rows) and test-process-steps (14) pass.
+With the window and `open-handle-ptr` again, W-S4, W-S5, W-S6 and W-P2
+are each **killed** by their suite's handoff row.
+
+**The harness's own mutants.**
+
+| Mutant | Change | Result |
+|---|---|---|
+| H1 | test-stream's handoff run never hands the loop over | **killed**: the handoff row and its reach |
+| H2 | test-process-steps's handoff mode never hands the loop over | **killed**: the handoff row and its reach |
+| H3 | rule 8 counts `open-handle-ptr`'s own definition as a caller | **killed**: rule 8 |
+
+## Gates
+
+- macOS: `make test`, `make test-threading`, `make check-purity`, `make
+  test-memory` (ASan, 25 suites).
+- Debian 12 aarch64 (the Valgrind image), vendored: `make test`, `make
+  check-memory-gate`, `make test-memory`. test-stream's and
+  test-process-steps's own processes have 0 bytes definitely lost and
+  nothing suppressed.
+- The engine census in `tests/test-sweep.sps` failed `make test` first:
+  test-stream's split runs now make their engine in `start-engine`, which
+  the census lists in place of `split-run`.

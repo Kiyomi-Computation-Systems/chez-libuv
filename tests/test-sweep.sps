@@ -226,7 +226,7 @@
     ("tests/test-request-steps.sps" split-run)
     ("tests/test-request-steps.sps" drop-run)
     ("tests/test-request-steps.sps" cancel-run)
-    ("tests/test-stream.sps" split-run)
+    ("tests/test-stream.sps" start-engine)
     ("tests/test-stream.sps" drop-run)
     ("tests/test-tcp.sps" start-then-start)
     ("tests/test-tcp.sps" start-then-close)

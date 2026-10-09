@@ -1,15 +1,16 @@
 #!r6rs
 ;;; Stream operations shared by TCP and pipe handles. Each verb validates its
 ;;; arguments, then makes its native call in one interrupt-free step
-;;; (one-step): the step checks again that the stream is open, reads its
-;;; pointer, checks again what it reads of the caller's data, allocates,
-;;; registers and counts the request, and calls libuv. An engine can then
-;;; suspend or drop a verb only before its step, when it holds nothing, or
-;;; after, when libuv holds what it was given (test-stream.sps's engine
-;;; sweeps). Nothing in a step raises: it answers a status, and the verb
-;;; raises after the step (step-refusal). When libuv refuses a start, the
-;;; step takes its request back itself; a guard around the native call
-;;; allocated ~300 B on every write (#45).
+;;; (one-step): the step checks again that this thread owns the stream's
+;;; loop and that the stream is open (owned-handle-ptr), reads its pointer,
+;;; checks again what it reads of the caller's data, allocates, registers
+;;; and counts the request, and calls libuv. An engine can then suspend or
+;;; drop a verb only before its step, when it holds nothing, or after, when
+;;; libuv holds what it was given (test-stream.sps's engine sweeps). Nothing
+;;; in a step raises: it answers a status, and the verb raises after the
+;;; step (step-refusal). When libuv refuses a start, the step takes its
+;;; request back itself; a guard around the native call allocated ~300 B on
+;;; every write (#45).
 (library (libuv stream)
   (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -80,7 +81,7 @@
               (size (+ payload-offset (max len 1)))
               (started
                (one-step
-                (let ((ptr (open-handle-ptr stream)))
+                (let ((ptr (owned-handle-ptr stream)))
                   (cond ((symbol? ptr) ptr)
                         ((> end (bytevector-length bv)) 'span-out-of-range)
                         (else
@@ -191,7 +192,7 @@
            (size (+ payload-offset (max total 1)))
            (started
             (one-step
-             (let ((ptr (open-handle-ptr stream)))
+             (let ((ptr (owned-handle-ptr stream)))
                (cond ((symbol? ptr) ptr)
                      ((not (spans-fit? specs)) 'segment-span-out-of-range)
                      (else
@@ -213,7 +214,7 @@
     (let* ((size (uv-req-size (uv-shutdown-req-type)))
            (started
             (one-step
-             (let ((ptr (open-handle-ptr stream)))
+             (let ((ptr (owned-handle-ptr stream)))
                (if (symbol? ptr)
                    ptr
                    (let ((block (alloc-block size)))
@@ -264,7 +265,7 @@
                                          'buffer-size-out-of-range))))
     (let ((started
            (one-step
-            (let ((ptr (open-handle-ptr stream)))
+            (let ((ptr (owned-handle-ptr stream)))
               (if (symbol? ptr)
                   ptr
                   (let ((buffer (ensure-read-buffer! stream buffer-size)))
@@ -303,7 +304,7 @@
     (require-open-stream stream 'uv-read-stop!)
     (let ((stopped
            (one-step
-            (let ((ptr (open-handle-ptr stream)))
+            (let ((ptr (owned-handle-ptr stream)))
               (if (symbol? ptr)
                   ptr
                   (let ((rc (uv-read-stop ptr)))
@@ -317,7 +318,7 @@
   (define (uv-stream-write-queue-size stream)
     (require-open-stream stream 'uv-stream-write-queue-size)
     (let ((size (one-step
-                 (let ((ptr (open-handle-ptr stream)))
+                 (let ((ptr (owned-handle-ptr stream)))
                    (if (symbol? ptr)
                        ptr
                        (uv-stream-get-write-queue-size-native ptr))))))

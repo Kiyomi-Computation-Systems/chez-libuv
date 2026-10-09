@@ -424,7 +424,9 @@ drains a caller-side queue rather than assuming one item per send.
 >     the loop verbs, the series' last part.
 >   - The stream verbs' steps (#53) re-check the handle but not the loop's
 >     owner. This change re-checks the owner for `make-uv-async` only, the
->     one constructor inside the enforced surface.
+>     one constructor inside the enforced surface. (They re-check it since
+>     #86's fourth amendment below, and so do `uv-process-kill!` and
+>     `uv-process-pid`.)
 
 > **Amended 2026-10-07 (#71): `uv-process-kill!` and `uv-process-pid` are
 > one step.** Each checked that its process was open, read the handle's
@@ -445,8 +447,9 @@ drains a caller-side queue rather than assuming one item per send.
 >   own process group, so the sweeps send signal 0 wherever a stale call
 >   could reach a freed block.
 >
-> Each verb now checks its process again (`open-handle-ptr`), reads the
-> pointer and calls libuv in one `one-step`, and raises after the step
+> Each verb now checks its process again (`open-handle-ptr`; the owner too
+> since #86's fourth amendment below), reads the pointer and calls libuv in
+> one `one-step`, and raises after the step
 > (`step-refusal`), as the stream verbs do. A process closed while the verb
 > is suspended is refused with `&uv-handle-closed`, unless the verb had
 > made its call before the suspension. Neither verb has a trap check after
@@ -635,6 +638,44 @@ drains a caller-side queue rather than assuming one item per send.
 >   just before the step, through `open-loop-ptr`, can be split from it
 >   and is killed. Evidence and mutations:
 >   `.plans/handle-steps-mutation-log.md`, part three.
+
+> **Amended 2026-10-09 (#86, the stream and process verbs' owner): the
+> steps of the six stream verbs, `uv-process-kill!` and `uv-process-pid`
+> check the loop's owner again.** Each checks on entry that this thread
+> owns its handle's loop (`require-open-handle`), but its step checked
+> again only that the handle was open (`open-handle-ptr`). Measured on main
+> (6e848d3), the same on macOS and glibc 2.36, with handoff sweeps added to
+> `tests/test-stream.sps` and `tests/test-process-steps.sps`:
+>
+> - **A handoff.** `uv-write!` suspended at fuel 12–17, `uv-write*!` at
+>   13–31, `uv-shutdown!` at 10–12 and `uv-process-kill!` at 10–12, and
+>   resumed after the loop was handed to another thread, made its call on
+>   a loop that thread now owned and returned normally. The kill signalled
+>   its process.
+> - **No window today** for `uv-read-start!`, `uv-read-stop!`,
+>   `uv-stream-write-queue-size` and `uv-process-pid`: nothing between
+>   their entry check and their step can trap, so every run suspended
+>   before the step was refused by the entry check.
+>
+> Each step now takes its pointer from `owned-handle-ptr`, which checks
+> the owner first, as the entry check does, and the verb raises
+> `&uv-wrong-thread` after the step (`step-refusal`). So every step on a
+> handle checks its loop's owner. `tests/test-source-rules.sps`'s rule 8
+> holds `open-handle-ptr` to `owned-handle-ptr` and three steps that need
+> no owner check of their own: `uv-close!`'s, loop-thread-only by contract
+> and unchecked; `uv-accept!`'s, whose client's construction checks the
+> owner of the server's loop; and `uv-spawn!`'s, which checks its loop's
+> owner first, every stdio handle being on that loop.
+>
+> - **Measured after:** every suspended run is refused with
+>   `&uv-wrong-thread`, and the process's kill is never sent. Bytes per
+>   call are unchanged: 144 B for `uv-write!`, 192 B for a one-segment
+>   `uv-write*!`, 128 B for `uv-shutdown!` and 0 for the other five.
+> - **What the sweeps cannot see.** The four verbs with no window: a
+>   mutant giving any of them `open-handle-ptr` again survives its sweep,
+>   and is killed by rule 8, and by the sweep once a three-tick window is
+>   opened after the entry check. Evidence and mutations:
+>   `.plans/handle-steps-mutation-log.md`, part four.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety

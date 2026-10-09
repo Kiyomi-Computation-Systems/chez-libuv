@@ -185,9 +185,16 @@ None is obvious from reading the code.
     (`EBUSY` for good; for an async, a drain that never returns). Each is
     now one step too (`try-construct-handle`, `try-construct-loop`), and
     `tests/test-constructors.sps` sweeps them.
-  - The other verb families are still exposed (ADR-0019's decision 3
-    amendments list them). A new verb, or a change to one, takes the same
-    shape and the same three sweeps.
+  - The other families ADR-0019's decision 3 amendments listed followed
+    (#85, #86): the request verbs, the scratch and other handle verbs, and
+    the loop queries. A step on a handle also checks that this thread
+    still owns its loop (`owned-handle-ptr`): the stream verbs' and the
+    process kill's checked only that the handle was open, and a kill
+    resumed after a handoff signalled its process from a thread that no
+    longer owned the loop. Rule 8 of `tests/test-source-rules.sps` holds
+    it. A new verb, or a change to one, takes the same shape and the same
+    sweeps: split, reuse and drop, and handoff for a verb that checks the
+    owner on entry.
 * **Affinity keeps each loop to one thread, not the process.** ADR-0019
   left the handle registry unlocked because only a loop's own thread uses
   that loop's handles. But the registry is one table for every loop, and

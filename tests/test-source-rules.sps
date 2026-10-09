@@ -67,6 +67,21 @@
 ;;;    clear a claim another thread holds, as call-with-uv-loop's exit did
 ;;;    until #78's review, or leave one no call will give back.
 ;;;
+;;; 8. A step on a handle checks that this thread owns its loop. Every verb
+;;;    entering through require-open-handle checks the owner on entry, and
+;;;    an engine can suspend it after that while the loop is handed to
+;;;    another thread. So its step takes the handle's pointer from
+;;;    owned-handle-ptr, which checks again. open-handle-ptr, which asks
+;;;    only whether the handle is open, is called by owned-handle-ptr and by
+;;;    three steps that need no owner check of their own. begin-close! is
+;;;    uv-close!'s step, loop-thread-only by contract and unchecked.
+;;;    uv-accept!'s step builds its client with try-construct-handle, which
+;;;    checks the owner of the server's loop. And uv-spawn!'s step checks
+;;;    its loop's owner first (spawn-step!), every stdio handle being on that
+;;;    loop. The stream verbs and the process kill and pid took
+;;;    open-handle-ptr until #86, and a kill resumed after a handoff
+;;;    signalled its process from a thread that no longer owned the loop.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1176,6 +1191,40 @@
 (test-equal "rule 7: no library in src/ sets a loop's claim outright with set-loop-holder!"
   '(("src/libuv/private/handles.sls" . 1))
   (calls-in-src 'set-loop-holder!))
+
+;; definition-name : datum -> (or symbol #f)
+;; The name a (define ...) or (define-syntax ...) form defines.
+(define (definition-name form)
+  (and (pair? form)
+       (memq (car form) '(define define-syntax))
+       (pair? (cdr form))
+       (let ((target (cadr form)))
+         (cond ((symbol? target) target)
+               ((and (pair? target) (symbol? (car target))) (car target))
+               (else #f)))))
+
+;; callers-in-src : symbol -> (listof (list string symbol))
+;; Each top-level form of a library in src/ that calls NAME, as (file
+;; definition), in file and source order: 'top-level for a form that defines
+;; nothing. NAME's own definition, whose header is a list headed by NAME, is
+;; not its caller.
+(define (callers-in-src name)
+  (apply append
+         (map (lambda (e)
+                (let ((body (list-tail (cdr e) 4)))  ; after library, name, export, import
+                  (map (lambda (form) (list (car e) (or (definition-name form) 'top-level)))
+                       (filter (lambda (form)
+                                 (and (not (eq? (definition-name form) name))
+                                      (positive? (calls-of name form))))
+                               body))))
+              libraries)))
+
+(test-equal "rule 8: every step on a handle takes its pointer from owned-handle-ptr, except three that check the owner another way or not at all"
+  '(("src/libuv/private/handles.sls" owned-handle-ptr)
+    ("src/libuv/private/handles.sls" begin-close!)
+    ("src/libuv/process.sls" stdio-refusal)
+    ("src/libuv/tcp.sls" uv-accept!))
+  (callers-in-src 'open-handle-ptr))
 
 ;; Live: native.sls resolves dozens of shim entries through the two forms.
 (test-equal "the entry rule is live: native.sls resolves its shim entries through the checked forms"

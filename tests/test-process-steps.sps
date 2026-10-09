@@ -1,7 +1,7 @@
 #!r6rs
 ;;; SRFI-64 suite for the process verbs an engine splits or drops:
-;;; uv-process-kill! and uv-process-pid (issue #71; ADR-0019's decision 3
-;;; amendment of 2026-10-07). uv-spawn!'s own sweeps are in test-process.sps.
+;;; uv-process-kill! and uv-process-pid (issues #71 and #86; ADR-0019's
+;;; decision 3 amendments). uv-spawn!'s own sweeps are in test-process.sps.
 ;;;
 ;;; NOT pure: it spawns children. Never add this to the Makefile's
 ;;; PURE_TESTS.
@@ -25,7 +25,7 @@
         ;; reuse run places at a freed address.
         (only (chezscheme) make-engine disable-interrupts enable-interrupts
               collect foreign-procedure foreign-ref foreign-set!
-              sleep make-time))
+              sleep make-time get-thread-id))
 
 (define runner (test-runner-simple))
 (test-runner-current runner)
@@ -53,7 +53,10 @@
 ;; process's handle had been given the freed address meanwhile, a resumed
 ;; kill signalled the NEW process and returned normally, and a resumed pid
 ;; answered the new process's pid (#71). Now each verb checks, reads and
-;; calls in one interrupt-free step (one-step).
+;; calls in one interrupt-free step (one-step). The step checked only that
+;; the process was open, so a verb resumed after its loop was handed to
+;; another thread made its call anyway, on a loop that thread now owned
+;; (#86).
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
 ;; the verb's own open check, and the sweep stops at the first run no expiry
@@ -74,9 +77,13 @@
 ;; (collect): a run allocates far too little to bring the next one due.
 ;;
 ;; The reuse sweep puts child B's handle at A's freed address before
-;; resuming, and B must come through untouched. The drop sweep drops the
-;; engine instead, and requires every counter as the run found it, blocks
-;; included, and interrupts enabled.
+;; resuming, and B must come through untouched. The handoff sweep hands the
+;; loop to another thread in place of the close, and hands it back once the
+;; verb has run: a run not returned before the handoff must be refused with
+;; &uv-wrong-thread, A left unsignalled, and one returned before it is
+;; 'made-before-handoff. The drop sweep drops the engine instead, and
+;; requires every counter as the run found it, blocks included, and
+;; interrupts enabled.
 ;;
 ;; A kill resumed on a freed handle signals whatever pid it reads there, and
 ;; 0 there is kill(0, sig): this process's own group. So the split and drop
@@ -96,6 +103,11 @@
 (define counts-at-start (live-counts))
 
 (define loop (make-uv-loop))
+
+;; Another thread's id, for a loop handed to it: no thread runs the loop,
+;; but its owner is no longer this one.
+(define me (get-thread-id))
+(define other-thread (+ me 1))
 
 ;; waitpid reaps a child whose handle a run closed: libuv waits only for the
 ;; children of open process handles. WNOHANG is 1 on macOS and Linux. The
@@ -315,7 +327,8 @@
 ;; verb, and the run's verdict.
 
 ;; split-run : variant symbol exact-positive-integer -> (cons boolean verdict)
-;; MODE is 'free, or 'reuse to put B's handle at A's address after the free.
+;; MODE is 'free, 'reuse to put B's handle at A's address after the free, or
+;; 'handoff to hand the loop to another thread in place of the close.
 ;; A reuse run counts its expiry, and whether its block landed there; a run
 ;; whose block did not is never resumed, since a stale call would read a
 ;; pid from whatever holds A's address. What the expiry does to A and B is
@@ -334,7 +347,8 @@
          (squatter #f)
          (eng (make-engine
                (lambda ()
-                 (guard (e ((uv-handle-closed? e) 'refused)
+                 (guard (e ((uv-handle-closed? e) 'closed)
+                           ((uv-wrong-thread? e) 'wrong-thread)
                            (#t (list 'raised (describe e))))
                    (let ((answer ((variant-call v) a)))
                      (set! returned #t)
@@ -347,8 +361,10 @@
                        (plumbing #f))
                    (guard (e (#t (set! plumbing (describe e))))
                      (when (eq? mode 'reuse) (fill-before-free!))
-                     (uv-close! (child-proc a))
-                     (poll! (lambda () (closed? (child-proc a))))
+                     (if (eq? mode 'handoff)
+                         (set-loop-owner-thread! loop other-thread)
+                         (begin (uv-close! (child-proc a))
+                                (poll! (lambda () (closed? (child-proc a))))))
                      (when (eq? mode 'reuse)
                        (set! reuse-expiries (+ reuse-expiries 1))
                        (set! squatter (squat! address))
@@ -358,12 +374,13 @@
                          (if (eqv? (uv-process-get-pid squatter) (child-pid b))
                              (set! reused-runs (+ reused-runs 1))
                              (begin (free-block! squatter) (set! squatter #f))))))
-                   (list 'expired made
-                         (cond (plumbing (list 'plumbing-raised plumbing))
-                               ((or (eq? mode 'free) squatter made)
-                                (resume 1000000 (lambda (ticks o) o)
-                                        (lambda (more) 'still-running)))
-                               (else 'not-resumed)))))))
+                   (let ((o (cond (plumbing (list 'plumbing-raised plumbing))
+                                  ((or (memq mode '(free handoff)) squatter made)
+                                   (resume 1000000 (lambda (ticks o) o)
+                                           (lambda (more) 'still-running)))
+                                  (else 'not-resumed))))
+                     (set-loop-owner-thread! loop me)
+                     (list 'expired made o))))))
          (enabled (interrupts-enabled?)))
     (unless enabled (enable-interrupts))
     (when squatter (free-block! squatter))
@@ -382,14 +399,14 @@
                 (let ((made (cadr result)) (o (caddr result)))
                   (cond ((eq? o 'not-resumed)
                          (if b-untouched 'not-reused (list 'not-reused 'b b-fate)))
-                        ((and (eq? o 'refused) (not made)
-                              (equal? a-fate '(0 #f)) b-untouched)
+                        ((and (eq? o (if (eq? mode 'handoff) 'wrong-thread 'closed))
+                              (not made) (equal? a-fate '(0 #f)) b-untouched)
                          'refused)
                         ((and made (pair? o) (eq? (car o) 'returned)
                               ((variant-answer-ok? v) a (cadr o))
                               (equal? a-fate (variant-made-fate v)) b-untouched)
-                         'made-before-close)
-                        (else (list o (if made 'returned-before-close 'not-returned-before-close)
+                         (if (eq? mode 'handoff) 'made-before-handoff 'made-before-close))
+                        (else (list o (if made 'returned-before-change 'not-returned-before-change)
                                     'a a-fate 'a-pid (child-pid a)
                                     'b b-fate 'b-pid b-pid)))))))
       (let ((left (residue before)))
@@ -515,6 +532,7 @@
 
 (define (split-good? v) (and (memq v '(refused made-before-close untouched)) #t))
 (define (reuse-good? v) (and (memq v '(refused made-before-close untouched not-reused)) #t))
+(define (handoff-good? v) (and (memq v '(refused made-before-handoff untouched)) #t))
 (define (drop-good? v) (and (memq v '(dropped untouched)) #t))
 
 ;; Each sweep's rows run as soon as the sweep ends, so a later sweep that
@@ -567,6 +585,21 @@
       (if (and (positive? reuse-expiries) (= reused-runs reuse-expiries))
           'every-run
           (list reused-runs 'of reuse-expiries))))
+
+;; The process stays open through a handoff, so a kill made after it
+;; reaches only A, and SIGTERM tells a made kill from one never made.
+(define handoff-sweeps
+  (named-sweeps (lambda (v fuel) (split-run v 'handoff fuel)) (list kill-sigterm pid-query)))
+(show-sweeps 'handoff handoff-sweeps)
+
+(test-equal "a uv-process-kill! or uv-process-pid split by its loop's handoff is refused, or had returned before the handoff"
+  '()
+  (bad-runs handoff-sweeps handoff-good?))
+
+(test-equal "each handoff sweep caught its verb at fuel 1, before its checks, at every fuel after, and ran it to the end"
+  '((uv-process-kill!-sigterm refused every-fuel untouched)
+    (uv-process-pid refused every-fuel untouched))
+  (reach handoff-sweeps))
 
 (define drop-sweeps (named-sweeps drop-run (list kill-0 pid-query)))
 (show-sweeps 'drop drop-sweeps)
