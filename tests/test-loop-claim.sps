@@ -379,6 +379,193 @@
   '((uv-loop-teardown! loop-running) held-by-that-thread owner-kept released torn-down)
   (exit-with-another-threads-claim))
 
+;; --- the exit's re-claim, split by an engine (#96) ---------------------------
+
+;; A teardown refused because another call took the claim between its
+;; steps leaves the loop to that call: the exit must not claim it again. An
+;; exit that re-claims after any refusal (N3) leaves the loop claimed by
+;; this thread once that call is done, with no run in it, refused by every
+;; verb for good. The exit race below catches that only when another
+;; thread's run ends in the instant between the refusal and the re-claim:
+;; 5 of 5 races on macOS and 1 of 10 on an arm64 Linux mirror (#91's
+;; log), though 10 of 10 on x86_64 Linux (2026-10-09).
+;;
+;; Here the interleaving is forced on one thread, in an engine. A body
+;; leaves call-with-uv-loop from inside a timer callback, so its exit tears
+;; down holding the claim. The engine's first expiry must come inside that
+;; exit: Chez runs a dynamic-wind exit at an engine's suspension, so an
+;; expiry anywhere inside the body tears the loop down there and then, and
+;; no later expiry can split that exit. The body is about 70 ticks, and its
+;; first 46 or so are before the exit, so each run is given a first slice
+;; of FUEL ticks, and one tick at a time after it. At the first expiry with
+;; the claim free, which is the gap the teardown's first step leaves when
+;; it gives the claim back, the claim is forged to another thread, so the
+;; drain's claim is refused 'loop-running. CLEAR-AT expiries later the
+;; forgery is cleared, as that thread's call would end. Swept over
+;; CLEAR-AT up to the exit's end, the clears land at every expiry from the
+;; forgery on: a correct exit leaves the loop unclaimed in every run.
+;;
+;; On a correct build no expiry comes between the drain's refusal and the
+;; exit's return: the clears before the refusal let the teardown finish,
+;; and the next run ends with the forgery still held. A re-claim brings
+;; expiries of its own ahead of its claim, so N3's runs clear the forgery
+;; between the refusal and the re-claim, and the re-claim succeeds.
+;; Measured on Linux, 2026-10-09: the first expiry inside the exit at
+;; tick 47 of the body; four clears before the drain's claim, and none
+;; after it on a correct build, one under N3.
+
+;; The most runs the sweep makes, and the most resumes a run may take
+;; before it is given up: the engine's bound (the engine census in
+;; tests/test-sweep.sps).
+(define exit-split-cap 2000)
+(define exit-split-resumes 100000)
+
+;; exit-split-run : exact-positive-integer exact-positive-integer -> object
+;; One run, with a first slice of FUEL ticks, clearing the forgery CLEAR-AT
+;; expiries after it was placed: how the run left the loop.
+;; - early: the first expiry came before the exit, which then ran at the
+;;   suspension, so nothing split it;
+;; - torn-down: the drain claimed after the clear, and the teardown ended;
+;; - unclaimed: the teardown was refused and the exit left the loop alone;
+;; - (forgery-held timer-state): the run ended before CLEAR-AT came, with
+;;   the forged claim still in place, and the state of the body's timer.
+;;   The drain is what finishes the timer's close, so 'closing means the
+;;   drain was refused, and 'closed that the forgery came after it;
+;; - claimed-by-this-thread: the exit claimed the loop after the refusal;
+;; - (forgery-gone-at-clear holder): the clear found the forged claim
+;;   replaced, by this thread's or erased, and left it as it was;
+;; - forgery-erased: the run ended with no claim, though nothing cleared
+;;   the forgery;
+;; - (cleanup …): the loop left open did not tear down once taken back;
+;; - never-forged, (body …) or (held-by …), when the run went otherwise
+;;   than the row needs.
+;; Only a claim still the forgery is cleared, and only a run whose final
+;; holder is the forged thread counts as forgery-held: an exit that took
+;; or cleared the other call's claim would otherwise pass as one that left
+;; it alone (#96's review).
+(define (exit-split-run fuel clear-at)
+  (let ((the-loop #f) (the-timer #f) (escaping #f) (early #f) (expiries 0)
+        (forged #f) (since-forged 0) (cleared #f) (gone-at-clear #f)
+        (other (+ (current-thread-id) 1)))
+    (define (body)
+      (guard (e (#t (list 'raised (evidence e))))
+        (call/cc
+         (lambda (k)
+           (call-with-uv-loop
+            (lambda (loop)
+              (set! the-loop loop)
+              (set! the-timer (make-uv-timer loop))
+              (uv-timer-start! the-timer
+                               (lambda (t) (set! escaping #t) (k 'escaped))
+                               0 0)
+              (uv-run loop 'default)
+              'returned))))))
+    (define (at-expiry)
+      (set! expiries (+ expiries 1))
+      (when (and (= expiries 1)
+                 (not (and escaping (uv-loop-open? the-loop))))
+        (set! early #t))
+      (cond
+       (early #f)
+       ((not forged)
+        (when (and (uv-loop-open? the-loop) (not (loop-holder the-loop)))
+          (set-loop-holder! the-loop other)
+          (set! forged #t)))
+       ((not (or cleared gone-at-clear))
+        (set! since-forged (+ since-forged 1))
+        (when (= since-forged clear-at)
+          (let ((holder (loop-holder the-loop)))
+            (if (eqv? holder other)
+                (begin (set-loop-holder! the-loop #f)
+                       (set! cleared #t))
+                (set! gone-at-clear (list holder))))))))
+    (let* ((answer
+            (let run ((eng (make-engine body)) (ticks fuel) (resumes 0))
+              (eng ticks
+                   (lambda (ticks value) value)
+                   (lambda (next)
+                     (at-expiry)
+                     (if (= resumes exit-split-resumes)
+                         (list 'stuck-after-resumes exit-split-resumes)
+                         (run next 1 (+ resumes 1)))))))
+           (me (current-thread-id))
+           (holder (and the-loop (loop-holder the-loop)))
+           (left (cond (early 'early)
+                       ((not (eq? answer 'escaped)) (list 'body answer))
+                       ((not forged) 'never-forged)
+                       ((not (uv-loop-open? the-loop)) 'torn-down)
+                       (gone-at-clear (cons 'forgery-gone-at-clear gone-at-clear))
+                       ((eqv? holder me) 'claimed-by-this-thread)
+                       ((not cleared)
+                        (cond ((eqv? holder other)
+                               (list 'forgery-held (uv-handle-state the-timer)))
+                              ((not holder) 'forgery-erased)
+                              (else (list 'held-by holder))))
+                       ((not holder) 'unclaimed)
+                       (else (list 'held-by holder))))
+           (cleanup (if (and the-loop (uv-loop-open? the-loop))
+                        (take-back-and-tear-down the-loop)
+                        'torn-down)))
+      (if (eq? cleanup 'torn-down)
+          left
+          (list 'cleanup cleanup left)))))
+
+;; exit-split : -> (list wrong torn-down end fuel)
+;; exit-split-run at CLEAR-AT 1, 2, ..., starting at a first slice of one
+;; tick and taking one more each time a run's first expiry comes too early,
+;; for the same CLEAR-AT. It answers the runs that went wrong, with their
+;; fuel and clear point; how many runs the teardown finished; how the sweep
+;; ended: (reached timer-state) once a run ended with the forgery still
+;; held, past the exit's last expiry, with that run's timer state; and the
+;; first slice it ended at. A run left claimed by this thread is listed and
+;; the sweep goes on. Any other run ends it, listed, since every later run
+;; would go the same way: one never forged, one whose body did not escape,
+;; one given up. A raise ends the sweep with (sweep-raised message),
+;; keeping what came before.
+(define (exit-split)
+  (let sweep ((runs 1) (fuel 1) (clear-at 1) (wrong '()) (torn-down 0))
+    (define (stop wrong end) (list (reverse wrong) torn-down end fuel))
+    (define (noted left) (cons (list fuel clear-at left) wrong))
+    (if (> runs exit-split-cap)
+        (stop wrong 'cap-reached)
+        (let ((left (guard (e (#t (list 'sweep-raised (describe e))))
+                      (exit-split-run fuel clear-at)))
+              (next (lambda (wrong torn-down)
+                      (sweep (+ runs 1) fuel (+ clear-at 1) wrong torn-down))))
+          (cond
+           ((eq? left 'early) (sweep (+ runs 1) (+ fuel 1) clear-at wrong torn-down))
+           ((eq? left 'torn-down) (next wrong (+ torn-down 1)))
+           ((eq? left 'unclaimed) (next wrong torn-down))
+           ((and (pair? left) (eq? (car left) 'forgery-held))
+            (stop wrong (cons 'reached (cdr left))))
+           ((eq? left 'claimed-by-this-thread) (next (noted left) torn-down))
+           ((and (pair? left) (eq? (car left) 'sweep-raised)) (stop wrong left))
+           (else (stop (noted left) 'ended-early)))))))
+
+(define exit-splits (exit-split))
+
+;; reached: the last run ended with the forgery held and the loop open,
+;; so every clear point before it was tried.
+(test-equal "an exit refused between its teardown's steps, split by an engine: at every point the other call's claim ends, the exit leaves the loop unclaimed"
+  '(() reached)
+  (list (car exit-splits)
+        (let ((end (caddr exit-splits)))
+          (if (and (pair? end) (eq? (car end) 'reached)) 'reached end))))
+
+;; The forgery must come before the drain's claim, or the row splits some
+;; other step. Then the clears before that claim let the teardown finish,
+;; and in the last run, refused, the drain never finished the timer's
+;; close: the timer is still closing. A forgery placed after the drain, in
+;; the gap before the close's claim, leaves it closed.
+(test-equal "precondition: the forgery came before the drain's claim: some runs' teardowns finished, and in the last the drain was refused"
+  '(torn-down-somewhere drain-refused)
+  (list (if (positive? (cadr exit-splits))
+            'torn-down-somewhere
+            (list 'torn-down (cadr exit-splits)))
+        (if (equal? (caddr exit-splits) '(reached closing))
+            'drain-refused
+            (caddr exit-splits))))
+
 ;; The exit takes its own claim straight into the teardown, with no moment
 ;; unclaimed in between. Before #78's review it cleared the claim and then
 ;; let the teardown claim again: another thread's uv-run could take the loop
@@ -405,8 +592,10 @@
 ;; teardown and the exit's next move. An exit that re-claims after any
 ;; refusal (N3 in .plans/loop-claim-mutation-log.md) strands a loop exactly
 ;; there. With 100 runs the main row caught it in 5 of 5 races on macOS
-;; and 1 of 10 on Linux, where 2,000 bodies on one thread caught it in
-;; none. The 100 runs took 1 to 5 s.
+;; and 1 of 10 on an arm64 Linux mirror, where 2,000 bodies on one thread
+;; caught it in none. The 100 runs took 1 to 5 s. The engine split above
+;; now catches N3 in every run (#96); the race stays for what a forged
+;; claim cannot be, a real other thread's run inside the loop.
 ;;
 ;; Each body leaves its callback by a continuation, and that strands the
 ;; C frames of the uv_run it left on its thread's stack for as long as the

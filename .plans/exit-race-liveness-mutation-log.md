@@ -87,3 +87,6 @@ not buy proportionally more: 100 is the target, at about 1 s.
 **Weakly held, and why:** N3 on Linux, 1 in 10 at the target. Catching it
 reliably would need a deterministic interleaving (two engine expiries inside
 one exit), which this change does not attempt. On macOS it is caught 5 of 5.
+
+**Since #96:** test-loop-claim's engine split of the exit catches N3 in
+every run (`.plans/exit-reclaim-split-mutation-log.md`).
