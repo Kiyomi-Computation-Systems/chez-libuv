@@ -213,6 +213,8 @@
     ("tests/test-constructors.sps" drop-run)
     ("tests/test-constructors.sps" loop-drop-run)
     ("tests/test-constructors.sps" cwl-drop-run)
+    ("tests/test-handle-steps.sps" split-run)
+    ("tests/test-handle-steps.sps" drop-run)
     ("tests/test-loop-claim.sps" split-sweep)
     ("tests/test-loop-claim.sps" drop-sweep)
     ("tests/test-loop-threads.sps" lock-sweep)

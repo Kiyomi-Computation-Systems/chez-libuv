@@ -65,24 +65,44 @@
       (raise (make-uv-invalid-argument who 'buffer-size-out-of-range)))
     n)
 
-  ;; libuv selects get versus set by whether the caller's int cell is zero.
+  ;; buffer-size-step : procedure uv-handle exact-integer symbol
+  ;;                    -> exact-nonnegative-integer
+  ;; NATIVE's answer for HANDLE: libuv selects get versus set by whether the
+  ;; caller's int cell is zero, so N is 0 to get, and the size to set. One
+  ;; interrupt-free step checks again that this thread owns the loop and
+  ;; that the handle is open, and allocates the cell, writes N, calls libuv,
+  ;; reads the cell back and frees it (#86). So no engine can split the call
+  ;; from those checks, or drop it holding the cell
+  ;; (tests/test-handle-steps.sps).
+  (define (buffer-size-step native handle n who)
+    (let ((answer
+           (one-step
+            (let ((ptr (owned-handle-ptr handle)))
+              (if (symbol? ptr)
+                  ptr
+                  (let ((cell (alloc-block (c-int-size))))
+                    (if (zero? cell)
+                        'no-memory
+                        (let ((answer
+                               (if (try-c-int-set! cell n)
+                                   (let ((rc (native ptr cell)))
+                                     (if (eqv? rc 0) (c-int-ref cell) rc))
+                                   'buffer-size-out-of-range)))
+                          (free-block! cell)
+                          answer))))))))
+      (if (and (fixnum? answer) (fx>=? answer 0))
+          answer
+          (raise (step-refusal answer who handle)))))
+
   (define (get-buffer-size! native handle who)
     (require-socket-handle handle who)
-    (let ((cell (alloc-zeroed (c-int-size))))
-      (guard (e (#t (free! cell) (raise e)))
-        (uv-check (native (handle-pointer handle who) cell) who)
-        (let ((v (c-int-ref cell)))
-          (free! cell)
-          v))))
+    (buffer-size-step native handle 0 who))
 
   (define (set-buffer-size! native handle n who)
     (require-socket-handle handle who)
     (require-buffer-size n who)
-    (let ((cell (alloc-zeroed (c-int-size))))
-      (guard (e (#t (free! cell) (raise e)))
-        (c-int-set! cell n)
-        (uv-check (native (handle-pointer handle who) cell) who)
-        (free! cell))))
+    (buffer-size-step native handle n who)
+    (if #f #f))
 
   ;; uv-send-buffer-size : uv-handle -> exact-nonnegative-integer
   ;; uv-send-buffer-size! : uv-handle exact-positive-integer -> unspecified

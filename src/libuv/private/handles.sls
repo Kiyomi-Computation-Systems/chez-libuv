@@ -618,12 +618,14 @@
   ;; What verb WHO raises, once its step is over, for a step on HANDLE that
   ;; answered STATUS instead of starting; a constructor has no handle to
   ;; pass. A closed handle or loop and a missing pointer are the refusals
-  ;; the checked accessors raise outside a step; a refused registration is
+  ;; the checked accessors raise outside a step; 'wrong-thread, from
+  ;; owned-handle-ptr, is HANDLE's loop's owner's; a refused registration is
   ;; registry-register!'s; an integer is libuv's errno. Any other symbol is a
   ;; refusal of WHO's own argument, and names it.
   (define (step-refusal status who handle)
     (case status
       ((not-open) (make-uv-handle-closed (handle-kind handle)))
+      ((wrong-thread) (wrong-thread-refusal (handle-loop handle) who))
       ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
       ((loop-not-open) (make-uv-handle-closed 'loop))
       ((no-loop-pointer) (make-uv-invalid-argument who 'null-loop-pointer))

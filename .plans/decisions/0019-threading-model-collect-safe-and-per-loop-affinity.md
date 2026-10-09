@@ -340,7 +340,8 @@ drains a caller-side queue rather than assuming one item per send.
 >       one table for every loop, and two loops run on two threads
 >       corrupted it (#70, decision 4's amendment).
 >   - The scratch verbs (bind, the address and port queries, the buffer
->     sizes): one or two blocks lost.
+>     sizes): one or two blocks lost. (Each is one step since #86's
+>     amendment below.)
 >   - Every other handle verb, and `uv-run`, `uv-stop!`, `uv-now`,
 >     `uv-loop-alive?` and `uv-update-time!` after a teardown: one or two
 >     fuel values, between reading the pointer and the call.
@@ -505,6 +506,44 @@ drains a caller-side queue rather than assuming one item per send.
 >   run was suspended after a step: none of the four has a trap check
 >   after its step on the paths the sweeps take. Evidence and mutations:
 >   `.plans/request-steps-mutation-log.md`.
+
+> **Amended 2026-10-09 (#86, the scratch verbs): `uv-tcp-bind!`,
+> `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+> `uv-tcp-peer-address` and the four buffer-size verbs are one step.** Each
+> checked its handle, allocated its scratch, read the handle's pointer and
+> called libuv, and freed the scratch in a `guard`, with interrupts enabled
+> between. Measured on main (3d3ffe6), on macOS and on glibc 2.36, with the
+> sweeps now in `tests/test-handle-steps.sps`:
+>
+> - **A new client at the freed address.** Every verb suspended between
+>   reading the pointer and its call, at one fuel each, made the call on
+>   the new client. A bind resumed there returned normally, having bound
+>   the new client; each of the others raised libuv's EBADF for it, the
+>   new client being unbound. Suspended earlier, after the entry check, each was
+>   refused as `null-handle-pointer` rather than `&uv-handle-closed`.
+> - **A handoff.** Every run suspended between the entry check and the
+>   call made its call after the loop changed hands.
+> - **Dropped.** Each lost its scratch: one block for the bind and the
+>   buffer sizes, one or two for the address and port queries.
+>
+> Each now checks the owner and the handle again (`owned-handle-ptr`),
+> allocates its block, fills it, calls libuv, reads the answer out of the
+> block and frees it in one `one-step`, and raises after it (`step-refusal`,
+> which now maps `'wrong-thread` to the handle's loop's owner). The address
+> queries share one step (`query-sockaddr`), whose block holds the sockaddr
+> and its in/out length together, and the buffer sizes another
+> (`buffer-size-step`). Nothing in a step raises: `try-fill-sockaddr!` and
+> `try-c-int-set!` answer their refusals, and the address is read out of
+> the block by calls that are total for a block the step has just made.
+>
+> - **Measured after:** every suspended run is refused, the new client
+>   comes through untouched, and every dropped run leaves every counter,
+>   blocks included, as it found it. No run was suspended after a step,
+>   where the verbs do no more than answer. Allocation per call fell with
+>   the `guard`s: `uv-tcp-getsockname-port` and the buffer-size verbs
+>   320 → 0 B, `uv-tcp-sockname-address` and `uv-tcp-peer-address`
+>   544 → 208 B, `uv-tcp-bind!` 432 → 112 B. Evidence and mutations:
+>   `.plans/handle-steps-mutation-log.md`.
 
 **4. No mutex on the registry.** D2 makes the registry safe by construction:
 only the owning thread mutates it, enforced. A lock there would be false safety
