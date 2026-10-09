@@ -162,7 +162,8 @@ TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test
 PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
                            tests/test-require-threaded.sps \
                            tests/test-source-rules.sps tests/test-seed-gates.sps \
-                           tests/test-c-string.sps tests/test-sweep.sps)
+                           tests/test-c-string.sps tests/test-sweep.sps \
+                           tests/test-level-3.sps)
 
 # test-memory runs every suite but the pure ones. A pure suite loads no
 # native code, as check-purity proves, so under Valgrind or ASan it checks
