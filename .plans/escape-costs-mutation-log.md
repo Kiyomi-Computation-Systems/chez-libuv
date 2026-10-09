@@ -65,7 +65,16 @@ engine. 6 escapes left 6 blocks. An engine suspended and resumed with no
 escapes left none.
 
 A raise needs no measuring to explain: the seam's `guard` catches it inside
-the callback (#46), which then returns. 40,000 confirm it.
+the callback (#46), which then returns. 40,000 confirm it. The probe's first
+version caught every raise, so a setup that failed would also have read as
+"costs nothing" (the code review's finding). It now catches only a
+`&uv-callback-error` whose cause is the callback's own `'boom`. An escape
+counts only when it returns `'escaped`, and the thread mode reports how its
+run ended instead of waiting without end. Rerun that way: `raise 40000` and
+`raise 40000 thread` stayed at 132 kB, and `escape 4000` reached 1,652 kB.
+Each check was watched to fail: a callback that does not raise, or does not
+escape, ends the probe with a non-zero exit, on the main thread and on a
+forked one.
 
 **Heap on x86-64.** The escape `jmp_buf` is 200 B here, against 312 B on
 aarch64: #99's and #100's CI legs counted test-loop's three escapes as
@@ -94,6 +103,20 @@ stale-context error, and a second `uv-run` of C is refused
 (`&uv-invalid-argument`). PR review found this case, and a probe confirmed
 it.
 
+**Two more scheduler shapes**, which the code review of PR #115 found and a
+probe then confirmed:
+- An engine started from inside a scheduler's timer callback stops inside
+  its own loop's callback. If the scheduler's callback then returns, its
+  run returns normally (`#f`). But that return dropped the engine's
+  callback, and resuming the engine later, outside every callback, raises
+  the stale-context error. The engine's loop stays marked running.
+- An engine started and resumed within one call of the scheduler's
+  callback finishes, and so does the scheduler's run. Its callback nests
+  inside the scheduler's, so this order is safe.
+
+The rule is therefore nesting, not "latest first": an engine's callback
+must still nest when the engine is resumed.
+
 **Heap.** Under Valgrind (`--show-leak-kinds=all`), `fifo` leaves one
 200 B block from `malloc` in `S_call_help` that `lifo` does not, besides
 B's loop, which the probe cannot close. It is B's `jmp_buf`, dropped
@@ -114,16 +137,29 @@ fuel inside their callbacks, using the suite's `run-slice` and
   running. The later one's resume raises the stale-context error. Its loop
   stays marked running, and `uv-run` refuses it. Both tear down once the
   suite clears the mark.
-- **The scheduler's case.** An engine resumed from inside another loop's
-  timer callback finishes its run. The scheduler's `uv-run` raises the
-  stale-context error, and its loop stays marked running. Both tear down
-  once the suite clears the scheduler's mark.
+- **Resumed from inside a scheduler's callback.** The engine finishes its
+  run. The scheduler's `uv-run` raises the stale-context error, and its
+  loop stays marked running. Both tear down once the suite clears the
+  scheduler's mark.
+- **Started inside a scheduler's callback that then returned.** The
+  scheduler's run returns. Resumed outside every callback, the engine is
+  refused by Chez. Its loop stays marked running, but the scheduler's does
+  not. Both tear down once the suite clears the engine's mark.
+- **Started and resumed in one call of a scheduler's callback.** Both
+  finish, and both loops tear down as they are.
 
-The suite passes, 202 rows under `make test`. Under the gate
-(`make HAVE_PKG=no test-memory MEMORY_TESTS=tests/test-loop.sps`) it exits
-0, with `definitely lost: 0 bytes` and `suppressed: 1,000 bytes in 5
-blocks`. That is the three escapes' 600 B, plus one block each for the
-earlier-first case and the scheduler's case. test-loop is already one of
+Every timer these rows start goes through `start-timer`, which answers
+`'started` or the raise's evidence. A setup that raises therefore fails a
+seed row by name instead of ending the suite (the code review's finding;
+the older #45 block still starts its timer at top level).
+
+The suite passes, 208 rows under `make test`. The full gate
+(`make HAVE_PKG=no test-memory`, 25 suites) exits 0, and
+`check-memory-gate` says MEMORY GATE CAN FAIL. test-loop's own process has
+`definitely lost: 0 bytes` and `suppressed: 1,200 bytes in 6 blocks`. That
+is the three escapes' 600 B, plus one block for each case that abandons a
+callback: the earlier-first order, the resume from a scheduler's callback,
+and the engine its scheduler's return left behind. test-loop is already one of
 `MEMORY_ESCAPE_SUITES`. The full gate (`make HAVE_PKG=no test-memory`, 25
 suites) exits 0.
 
@@ -131,7 +167,8 @@ suites) exits 0.
 
 Each was made in `src/libuv/loop.sls`'s `run-step!`, in a copy of the tree
 outside the repository, and test-loop was run against it. The copy passed
-196 rows before each mutant and after it was reverted. The child-process
+202 rows before each mutant and after it was reverted (196 for the rows'
+second version, before the code review added two cases). The child-process
 rows need `make test`'s environment, so they did not run there.
 
 M2's exact change, in `run-step!`:
@@ -147,13 +184,14 @@ M2's exact change, in `run-step!`:
 | Mutant | Change | Result |
 |---|---|---|
 | M1 | release the claim on any exit from the native run that is not a return (#45's old `dynamic-wind`) | **killed** by 16 rows, the earlier-first "stays marked running" and "`uv-run` refuses it" among them. Run against the first version of the rows, before the scheduler's case was added. Broad: the expiry itself then fails, so the seeds fail too. The existing #45 rows already hold this. |
-| M2 | release the thread's most recent claim rather than this run's loop (diff above) | **killed** by every new row that reads a mark, each by name. "Neither loop is marked running", "tear down as they are", "the earlier engine finishes its run", "stays marked running", "`uv-run` refuses it", "an engine resumed from inside another loop's callback finishes its run", "the scheduler's loop stays marked running", and the scheduler's teardown. The suite's three balance rows fail after it, because the scheduler's teardown failed. No existing row saw M2: a single suspended engine cannot tell two loops apart. |
-| M3 | a `guard` around the native run that turns a raise into a return | **killed** by exactly five rows, all new: both stale-context rows, both "stays marked running" rows, and "`uv-run` refuses it". The resumes reported `(finished #f)`, and the stale loops were released. |
+| M2 | release the thread's most recent claim rather than this run's loop (diff above) | **killed** by every new row that reads a mark or tears down as it is: 11 rows, each by name. "Neither loop is marked running"; "both loops resumed in that order tear down as they are"; "the earlier engine finishes its run"; "its loop stays marked running, as an escape leaves it"; "`uv-run` refuses it from then on"; "an engine resumed from inside another loop's callback finishes its run"; "the scheduler's loop stays marked running"; "both loops tear down once the suite clears the scheduler's mark"; "its loop stays marked running, but not the scheduler's"; "both loops tear down once the suite clears the engine's mark"; "and both loops tear down as they are". The suite's three balance rows fail after it, because a teardown failed. No existing row saw M2: a single suspended engine cannot tell two loops apart. |
+| M3 | a `guard` around the native run that turns a raise into a return | **killed** by exactly seven rows, all new: the three stale-context rows, the three "stays marked running" rows, and "`uv-run` refuses it". The resumes reported `(finished #f)`, and the stale loops were released. |
 
-**Uncovered.** "Resumed later one first, both engines finish their
-callbacks and runs" is broken by no binding mutant through its own property.
-It holds Chez's in-order return and the engine plumbing, and the binding
-makes no decision there. M1 breaks it only by breaking the seeds. The two
+**Uncovered.** Two rows are broken by no binding mutant through their own
+property. They are "resumed later one first, both engines finish their
+callbacks and runs" and "an engine started and resumed in one call of a
+scheduler's callback finishes". Each holds Chez's in-order return and the
+engine plumbing, and the binding makes no decision there. M1 breaks it only by breaking the seeds. The two
 teardown rows that clear the mark first are cleanup, and no mutant covers
 them either.
 
@@ -169,3 +207,8 @@ through would fail them by name, and one that crashed would end the suite.
 - Whether the binding should count escapes per thread and raise a named
   condition before the stack runs out.
 - macOS x86-64 and Windows are unmeasured.
+- The code review also asked for a check on how many blocks each escape
+  suite has suppressed (test-loop's rose from 3 to 6 here, and nothing
+  pins it). The Makefile and suppression comments now name the new
+  sources, but a count check is follow-up work. So is folding the #45
+  block's fixture into `suspend-in-callback`.

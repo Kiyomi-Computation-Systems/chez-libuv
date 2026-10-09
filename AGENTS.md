@@ -267,15 +267,22 @@ None is obvious from reading the code.
 * **A return from a callback abandons every callback entered after it on
   the thread that has not returned.** Chez's `S_return` longjmps to the
   frame that entered the callback and drops every newer context from the
-  thread's chain. So engines suspended inside callbacks resume latest
-  first, and never from inside a callback entered after them. Of two
-  engines suspended in callbacks on one thread, resuming the earlier one
-  finishes its run, and the later one then raises "attempt to return to
-  stale foreign context". Its loop is left marked running for good. A
-  scheduler that resumes an engine from its own timer callback finishes
-  the engine, and then its own `uv-run` raises the same error. A
-  round-robin engine scheduler on one thread has the first order, and
-  docs/api.md promised that resuming always finishes the run.
+  thread's chain. A callback dropped that way can never return, so an
+  engine suspended inside a callback can be resumed only while that
+  callback still nests: on its own thread, after every callback entered
+  since has returned, and before any callback that was running when it
+  stopped has returned. Each way of breaking that was measured, and each
+  raises "attempt to return to stale foreign context" and leaves a loop
+  marked running for good:
+  - two engines, the earlier resumed first: the later one's resume raises;
+  - an engine started from a scheduler's timer callback that then
+    returned: the engine's resume raises, from anywhere;
+  - an engine resumed from inside a callback entered after it stopped: the
+    engine finishes, and that callback's `uv-run` raises.
+  A round-robin scheduler has the first shape, and a scheduler driven by
+  libuv's own timers has the other two. docs/api.md promised that resuming
+  always finishes the run. The first statement of this rule named only the
+  first shape, and two rounds of review found the others (PR #115).
   - The same jump gives the stack back. 40,000 escapes, in batches of
     1,000 above an engine resumed after each batch, never grew the stack
     past one batch.
@@ -284,8 +291,8 @@ None is obvious from reading the code.
     escaping past" (schlib.c:257-258). The walk stops at once, so the
     newer contexts' `jmp_buf`s are never freed, and their code objects
     stay immobilized.
-  - test-loop's "two runs suspended inside callbacks" rows hold both
-    orders and the scheduler's case
+  - test-loop's "two runs suspended inside callbacks" rows hold all
+    three shapes and the safe order
     (`.plans/escape-costs-mutation-log.md`).
 
 ### The event loop and child processes

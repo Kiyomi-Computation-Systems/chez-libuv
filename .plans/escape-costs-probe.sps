@@ -1,7 +1,9 @@
 ;;; #94 probes, run from the repository root:
 ;;;   CHEZSCHEMELIBDIRS=src:tests scheme --program .plans/escape-costs-probe.sps MODE N [thread]
 ;;; .plans/escape-costs-mutation-log.md records what each mode measured.
-(import (chezscheme) (libuv loop) (libuv timer) (libuv handle))
+(import (chezscheme) (libuv loop) (libuv timer) (libuv handle)
+        (only (libuv private conditions)
+              uv-callback-error? uv-callback-error-cause))
 
 (define mode (string->symbol (cadr (command-line))))
 (define n (string->number (caddr (command-line))))
@@ -17,23 +19,30 @@
                 ((and (>= (string-length l) 6) (string=? (substring l 0 6) "VmStk:")) l)
                 (else (loop))))))))
 
-;; One escape: a call-with-uv-loop body left from a timer callback.
+;; One escape: a call-with-uv-loop body left from a timer callback. Anything
+;; but the escape's own value ends the probe, so a setup that raised is never
+;; counted as an escape.
 (define (escape-once)
-  (guard (e (#t #f))
-    (call/cc
-     (lambda (k)
-       (call-with-uv-loop
-        (lambda (loop)
-          (uv-timer-start! (make-uv-timer loop) (lambda (t) (k 'escaped)) 0 0)
-          (uv-run loop 'default)))))))
+  (let ((v (call/cc
+            (lambda (k)
+              (call-with-uv-loop
+               (lambda (loop)
+                 (uv-timer-start! (make-uv-timer loop) (lambda (t) (k 'escaped)) 0 0)
+                 (uv-run loop 'default)
+                 'returned))))))
+    (unless (eq? v 'escaped) (error 'probe "no escape" v))))
 
-;; One raise from a timer callback, caught outside the run.
+;; One raise from a timer callback, caught outside the run. Only the
+;; callback's own raise, as the seam delivers it, is caught; anything else
+;; ends the probe.
 (define (raise-once)
-  (guard (e (#t 'caught))
+  (guard (e ((and (uv-callback-error? e) (eq? (uv-callback-error-cause e) 'boom))
+             'caught))
     (call-with-uv-loop
      (lambda (loop)
        (uv-timer-start! (make-uv-timer loop) (lambda (t) (raise 'boom)) 0 0)
-       (uv-run loop 'default)))))
+       (uv-run loop 'default)
+       (error 'probe "the run returned without the callback's raise")))))
 
 ;; An engine that runs a raw loop whose timer callback blocks the engine,
 ;; so it expires inside the callback. Answers the engine's continuation.
@@ -98,8 +107,18 @@
     (else (error 'probe "unknown mode" mode))))
 
 (if on-thread?
+    ;; The thread reports how run ended, a raise included, so a failed run
+    ;; never leaves this wait without an end. A crash ends the process.
     (let ((m (make-mutex)) (c (make-condition)) (fin #f))
-      (fork-thread (lambda () (run) (with-mutex m (set! fin #t) (condition-signal c))))
+      (fork-thread
+       (lambda ()
+         (let ((how (guard (e (#t (list 'raised (if (message-condition? e)
+                                                    (condition-message e)
+                                                    e))))
+                      (run)
+                      'survived)))
+           (with-mutex m (set! fin how) (condition-signal c)))))
       (with-mutex m (let w () (unless fin (condition-wait c m) (w))))
-      (printf "thread survived\n"))
+      (printf "thread ~s\n" fin)
+      (unless (eq? fin 'survived) (exit 1)))
     (run))

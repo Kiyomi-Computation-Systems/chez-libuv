@@ -1470,20 +1470,30 @@
 ;; later one's callback has no frame left to return to: Chez raises instead,
 ;; and its run is left as an escape leaves it.
 
+;; start-timer : uv-loop procedure -> object
+;; Starts a 0 ms timer on LOOP that calls CB. Answers 'started, or the
+;; raise's evidence, so that a setup that raises fails the seed row after
+;; it by name instead of ending the suite.
+(define (start-timer loop cb)
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (uv-timer-start! (make-uv-timer loop) cb 0 0)
+    'started))
+
 ;; suspend-in-callback : uv-loop -> (list first-slice counts)
 ;; Starts a run of `loop` in an engine and lets the engine run out of fuel
 ;; inside the run's timer callback. `counts` is #(entries inside?): how many
 ;; times the callback was entered, and whether it is still inside.
 (define (suspend-in-callback loop)
-  (let ((counts (vector 0 #f)))
-    (uv-timer-start! (make-uv-timer loop)
-                     (lambda (t)
-                       (vector-set! counts 1 #t)
-                       (vector-set! counts 0 (+ (vector-ref counts 0) 1))
-                       (spin 200000)
-                       (vector-set! counts 1 #f))
-                     0 0)
-    (list (run-slice (make-engine (lambda () (uv-run loop 'default))) slice-fuel)
+  (let* ((counts (vector 0 #f))
+         (started (start-timer loop
+                               (lambda (t)
+                                 (vector-set! counts 1 #t)
+                                 (vector-set! counts 0 (+ (vector-ref counts 0) 1))
+                                 (spin 200000)
+                                 (vector-set! counts 1 #f)))))
+    (list (if (eq? started 'started)
+              (run-slice (make-engine (lambda () (uv-run loop 'default))) slice-fuel)
+              started)
           counts)))
 
 (define (suspended-inside? s)
@@ -1568,13 +1578,14 @@
 (define scheduled (suspend-in-callback resumed-loop))
 (define scheduler-loop (make-uv-loop))
 (define resumed-from-callback 'never-resumed)
-(uv-timer-start! (make-uv-timer scheduler-loop)
-                 (lambda (t)
-                   (set! resumed-from-callback (resume-suspended scheduled)))
-                 0 0)
+(define scheduler-start
+  (start-timer scheduler-loop
+               (lambda (t)
+                 (set! resumed-from-callback (resume-suspended scheduled)))))
 
 (test-equal "seed: the engine ran out of fuel inside its callback, once more"
-  '(suspended #t) (suspended-inside? scheduled))
+  '((suspended #t) started)
+  (list (suspended-inside? scheduled) scheduler-start))
 
 (define scheduler-run
   (guard (e (#t (list 'raised (raise-evidence e))))
@@ -1594,6 +1605,67 @@
 (test-equal "both loops tear down once the suite clears the scheduler's mark"
   '(torn-down torn-down)
   (list (tear-down-as-is resumed-loop) (tear-down-row-loop scheduler-loop)))
+
+;; A scheduler that starts an engine from inside its own callback, and lets
+;; that callback return while the engine is suspended, abandons the
+;; engine's callback: that return jumps past it.
+(define outlived-loop (make-uv-loop))
+(define outliving-loop (make-uv-loop))
+(define outlived 'never-started)
+(define outliving-start
+  (start-timer outliving-loop
+               (lambda (t) (set! outlived (suspend-in-callback outlived-loop)))))
+(define outliving-run
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (uv-run outliving-loop 'default)))
+
+(test-equal "seed: an engine started in a scheduler's callback stopped inside its own, and the scheduler's run returned"
+  '(started (suspended #t) #f)
+  (list outliving-start
+        (if (pair? outlived) (suspended-inside? outlived) outlived)
+        outliving-run))
+
+(define outlived-resumed
+  (if (pair? outlived) (resume-suspended outlived) 'never-started))
+
+(test-equal "resumed outside every callback, it is refused its return by Chez"
+  '(raised "Exception: attempt to return to stale foreign context")
+  outlived-resumed)
+
+(test-equal "...and its loop stays marked running, but not the scheduler's"
+  '(running not-running)
+  (list (marked outlived-loop) (marked outliving-loop)))
+
+(test-equal "both loops tear down once the suite clears the engine's mark"
+  '(torn-down torn-down)
+  (list (tear-down-row-loop outlived-loop) (tear-down-as-is outliving-loop)))
+
+;; Started and resumed within one call of the scheduler's callback, the
+;; engine's callback nests inside it, and both return.
+(define nested-loop (make-uv-loop))
+(define nesting-loop (make-uv-loop))
+(define nested 'never-started)
+(define nested-resumed 'never-resumed)
+(define nesting-start
+  (start-timer nesting-loop
+               (lambda (t)
+                 (set! nested (suspend-in-callback nested-loop))
+                 (set! nested-resumed (resume-suspended nested)))))
+(define nesting-run
+  (guard (e (#t (list 'raised (raise-evidence e))))
+    (uv-run nesting-loop 'default)))
+
+(test-equal "an engine started and resumed in one call of a scheduler's callback finishes, and so does the scheduler's run"
+  '(started suspended (finished #f) #(1 #f) #f)
+  (list nesting-start
+        (if (pair? nested) (car (car nested)) nested)
+        nested-resumed
+        (if (pair? nested) (cadr nested) nested)
+        nesting-run))
+
+(test-equal "...and both loops tear down as they are"
+  '(torn-down torn-down)
+  (map tear-down-as-is (list nested-loop nesting-loop)))
 
 ;; --- call-with-uv-loop after a run left from inside a callback (#45) ----
 ;; call-with-uv-loop's loop does not outlive it. Its exit tears the loop down

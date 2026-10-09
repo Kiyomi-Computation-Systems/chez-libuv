@@ -613,8 +613,8 @@ test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `ma
 ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
 
 # The gate's Valgrind suppressions: Chez's own costs, never the binding's.
-# One today, the jmp_buf Chez strands for each continuation that escapes a
-# callback (#94); the file says why, and ADR-0003's amendment of 2026-10-09
+# One today, the jmp_buf Chez strands for each callback left without
+# returning (#94); the file says why, and ADR-0003's amendment of 2026-10-09
 # records it. check-memory-gate's escape mode requires it to match, and its
 # leak and possible-leak modes require it to hide nothing they plant.
 VALGRIND_SUPPRESSIONS := $(CURDIR)/tests/valgrind-chez.supp
@@ -626,7 +626,9 @@ VALGRIND_SUPPRESSIONS := $(CURDIR)/tests/valgrind-chez.supp
 # test-memory fails such a suite by name, and check-memory-gate's
 # stray-escape mode watches it do so. A forked child is not held to this:
 # one that exits before exec reports the block its parent held at the fork.
-#   test-loop          its rows that escape a callback
+#   test-loop          its rows that escape a callback, and its rows that
+#                      resume engines out of nesting order, which abandon
+#                      a callback each (#94)
 #   test-loop-claim    a teardown on another thread whose close callback escapes
 #   test-async-fence   engine sweeps, which drop engines inside callbacks
 #   test-loop-threads  the same

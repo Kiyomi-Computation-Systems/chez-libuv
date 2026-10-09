@@ -106,22 +106,33 @@ says. Inside `call-with-uv-loop` the suspension is an
 exit like any other: the loop is torn down, and resuming the engine raises
 `&uv-handle-closed`.
 
-Resume such an engine on the thread whose fuel ran out, and not from inside
-a callback entered after it. A callback returns by jumping back to the C
-frame that called it, and that jump abandons every callback entered after
-it on the thread that has not yet returned. Two cases follow:
-- Of two engines suspended inside callbacks on one thread, resume the later
-  one first. Resumed the other way, the earlier one finishes its run, but
-  the later one's callback has no frame left to return to. Resuming it
-  raises Chez's "attempt to return to stale foreign context", and its loop
-  is left as an escape leaves it: marked running for good.
-- A scheduler that resumes engines from inside a callback of its own loop,
-  a timer's or an idle handle's, abandons that callback. The engine finishes
-  its run, but the scheduler's callback cannot return: its `uv-run` raises
-  the same error, and the scheduler's loop is left marked running.
+Callbacks on one thread nest: each is entered from C, and returns by
+jumping back to the C frame that entered it. That jump abandons every
+callback entered after it on the thread that has not yet returned. A
+callback abandoned this way can never return. Whatever run it was part of
+raises Chez's "attempt to return to stale foreign context" instead, and its
+loop is left as an escape leaves it: marked running for good. So an engine
+suspended inside a callback can be resumed only on the thread whose fuel
+ran out, and only while its callback still nests. Three cases break that:
+- **Two engines suspended inside callbacks.** Resume the later one first.
+  Resumed the other way, the earlier one finishes its run, but the later
+  one's callback is abandoned, and resuming it raises the error.
+- **An engine started inside a callback that has since returned.** A
+  scheduler that starts an engine from its own timer or idle callback, and
+  lets that callback return while the engine is suspended inside one of
+  its loop's callbacks, has abandoned the engine's callback. Resuming the
+  engine raises the error, from wherever it is resumed.
+- **An engine resumed from inside a callback entered after it suspended.**
+  The engine finishes its run, but the callback it was resumed from is
+  abandoned: the `uv-run` that callback was part of raises the error.
 
-Resumed on another thread, an engine raises the same error, since that
-thread's chain of C frames never held the callback's.
+Starting and resuming an engine within one call of the same callback is
+safe: the engine's callback nests inside it.
+
+Resumed on another thread, an engine runs the rest of its callback there,
+and the return then raises the same error, since that thread's chain of C
+frames never held the callback's. A verb the callback calls there raises
+`&uv-wrong-thread`, which the seam catches like any raise from a callback.
 
 An escape also costs its thread stack. The C frames of the `uv_run` a
 continuation leaves stay on the thread's stack for as long as the thread
@@ -143,8 +154,9 @@ a block for each call from C into Scheme, a callback included, and frees it
 when the call returns; an escape never returns, so the block stays
 allocated until the process exits: 312 bytes an escape on Linux arm64, 200
 on x86-64. An engine dropped while it is inside a callback costs the same
-block, and so does one whose callback a resume out of order abandoned,
-whether it is resumed or not. One that is resumed in order costs nothing.
+block. So does each callback a resume abandons, as above: an engine's,
+whether it is resumed or not, or the callback a resume was made from. An
+engine resumed while its callback still nests costs nothing.
 
 ## Handles — `(libuv handle)`
 
