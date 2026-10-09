@@ -46,16 +46,20 @@
           (- (cpu-time) cpu-start))))
 
 ;; How long past its deadline the runner may take to answer: it polls every
-;; 10 ms, and the kill is a shell's `kill -9`.
+;; 10 ms, the kill is a shell's `kill -9`, and the pipes are drained for up
+;; to a second after it.
 (define slack-seconds 5)
 
-;; in-time : (list report seconds milliseconds) seconds -> (list report symbol-or-list)
-;; The report, and within-the-deadline if it came within DEADLINE plus the
-;; slack, else how long it took.
+;; in-time : (list report seconds milliseconds) seconds
+;;           -> (list report symbol-or-list)
+;; The report, and at-the-deadline if it came no sooner than DEADLINE and
+;; within the slack after it, else how long it took. The lower bound holds
+;; the runner to the deadline it was given: one that kills early would
+;; otherwise pass, still carrying what the child printed.
 (define (in-time timed deadline)
   (list (car timed)
-        (if (< (cadr timed) (+ deadline slack-seconds))
-            'within-the-deadline
+        (if (<= deadline (cadr timed) (+ deadline slack-seconds -1))
+            'at-the-deadline
             (list 'took (cadr timed) 'seconds))))
 
 ;; brief : object -> object
@@ -80,19 +84,34 @@
         '((stderr-bytes . 1048576))
         (brief (level-3-run chez stand-in '(flood) 20)))
 
-      (let ((stalled (timed-run 'stall 5)))
+      ;; 10 s leaves the stand-in time to start and print under load before
+      ;; the deadline counts against it; it sleeps 60.
+      (let ((stalled (timed-run 'stall 10)))
         (test-equal "a child that prints half a datum and stalls is killed at the deadline, carrying what it printed"
           '((killed-at-cap "((level . 3) (objects" "stall child: stalling\n")
-            within-the-deadline)
-          (in-time stalled 5))
+            at-the-deadline)
+          (in-time stalled 10))
 
         ;; A runner that polls without sleeping spends the whole wait on the
-        ;; CPU, 4,982 ms here, and a minute for each hung child in a real
-        ;; suite. One that sleeps between polls spent 13-19 ms (2026-10-09).
-        (test-equal "the runner sleeps between polls: under 1,000 ms of CPU in a 5 s wait"
+        ;; CPU, 4,982 ms in a 5 s wait, and a minute for each hung child in
+        ;; a real suite. One that sleeps between polls spent 13-19 ms
+        ;; (2026-10-09). The wait must have lasted, or a runner that
+        ;; answered early would pass whatever it spent.
+        (test-equal "the runner sleeps between polls: under 1,000 ms of CPU in a 10 s wait"
           'slept
-          (let ((ms (caddr stalled)))
-            (if (< ms 1000) 'slept (list 'spent ms 'ms)))))
+          (let ((seconds (cadr stalled)) (ms (caddr stalled)))
+            (cond
+              ((< seconds 10) (list 'wait-ended-after seconds 'seconds))
+              ((< ms 1000) 'slept)
+              (else (list 'spent ms 'ms))))))
+
+      ;; A deadline that is not a number makes the wait raise once the
+      ;; child is running: a fault after the spawn, which the runner must
+      ;; not report as one in it.
+      (test-equal "a raise while the child runs answers run-failed, not spawn-failed"
+        'run-failed
+        (let ((report (level-3-run chez stand-in '(stall) 'not-a-number)))
+          (if (pair? report) (car report) report)))
 
       (test-equal "a child that prints no datum answers unreadable, with its stdout and stderr"
         '(unreadable "garbage\n" "garbage child: no datum\n")
