@@ -285,10 +285,11 @@ None is obvious from reading the code.
   one thread. `uv_run` is `__collect_safe`, so a thread whose stack runs
   out there and catches the error to keep going hangs: #94's repro did,
   on a macOS `fork-thread` thread (#95). macOS probes `uv__io_poll`'s
-  32 KiB frame before moving `sp`, so the handler has room there; Linux's
-  overflow is a plain `SIGSEGV`. A Chez patched to reactivate in
-  `do_error` stopped hanging, and ran on until the handler itself had no
-  stack. Never treat that error as recoverable, and never write a
+  32 KiB frame before moving `sp`, so the handler has room there. On
+  Linux arm64 the same overflow, swallowing repro included, ended in a
+  plain `SIGSEGV`; why it differs there was not measured. A Chez patched
+  to reactivate in `do_error` stopped hanging, and ran on until the
+  handler itself had no stack. Never treat that error as recoverable, and never write a
   `(guard (e (#t …)))` that swallows it in a loop. The no-libuv repro is
   `.plans/fault-deactivated-probe.sps`, and the upstream draft is
   `.plans/upstream-chez-fault-deactivated-issue.md`

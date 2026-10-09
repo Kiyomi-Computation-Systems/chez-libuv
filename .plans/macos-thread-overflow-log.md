@@ -29,8 +29,10 @@ the fault is the first word of the guard page below it, and `sp` is
 `struct kevent events[1024]` (vendor/libuv/src/unix/kqueue.c:159), 32 KiB,
 and macOS probes a large frame page by page before moving `sp`. So Chez's
 `SIGSEGV` handler has room to run, and raises "invalid memory reference".
-Nothing below the stack is written. The main thread faults the same way,
-at the same offset into its 8 MB.
+Nothing below the stack is written. The main thread faults the same way:
+lldb shows its stack as [0x16f604000, 0x16fe00000), the fault at
+0x16f603ff8 in the same probe, and `sp` 0x16f60bfd0, again 32 KiB above
+the guard.
 
 The fault came at escape 1,430 (index 1429) on every run, about 375 B an
 escape.
@@ -45,9 +47,20 @@ is still at the guard. Measured outcomes:
 | probe `escape 1000 thread` | survived |
 | probe `escape 1500`…`8000 thread` | the thread's guard caught "invalid memory reference"; the thread ended; exit 1 |
 | probe `escape 20000` (main) | survived |
-| probe `escape 30000`, `40000` (main) | `SIGSEGV` (139), nothing printed: unguarded, and the default handler faults again |
+| probe `escape 30000`, `40000` (main) | `SIGSEGV` (139), nothing printed: unguarded, and under lldb the run faulted again at the same probe after the first |
 | #94's repro (guard swallows each raise) on a thread, 2,000+ | caught 24 faults (escapes 1429-1452), then hung, 0% CPU, in `S_condition_wait` |
 | the same, patched Chez (below) | caught 90 faults, then spun at 100% CPU in `handle_signal` under `_sigtramp` |
+
+Linux arm64 (the image above, vendored libuv 1.52.1), on a `fork-thread`
+thread with glibc's 8 MB:
+
+| Run | Result |
+|---|---|
+| probe `escape 8000`, `16000 thread` | survived (VmStk 132 kB: the thread's stack is not the process's) |
+| probe `escape 24000 thread` | `SIGSEGV` (139) |
+| #94's repro, thread, 30,000 | `SIGSEGV` (139): no fault reached Scheme |
+
+Why Linux gives no catchable fault was not measured.
 
 ## The hang: a fault in a `__collect_safe` call leaves the thread inactive
 
@@ -89,9 +102,12 @@ if (tc != (ptr)0 && !ACTIVE(tc)) reactivate_thread(tc);
 
 All five shapes then finished on macOS. The swallowing repro no longer
 hung in the rendezvous; it ran on to the spin in the table above, which is
-the stack itself running out under a handler with nowhere to go. The patched
-build was compared against Homebrew's 10.4.1, not against the same tree
-built without the line.
+the stack itself running out under a handler with nowhere to go.
+
+The control is the same tree built the same way without the line (the
+two `configure` logs are identical, and `diff` of c/schsig.c shows only
+the line and its comment): `flat`, `nested` and `escaped` hung, `none` and `unsafe`
+finished, as on Homebrew's build. The draft's repro hung there too.
 
 ## What this leaves for the binding
 

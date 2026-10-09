@@ -4,8 +4,9 @@ Not filed. Drafted 2026-10-09 from chez-libuv #95
 (`.plans/macos-thread-overflow-log.md`). It needs the maintainer's OK
 before it goes to https://github.com/cisco/ChezScheme/issues. Run on Chez
 10.4.1, macOS 26.6.2 arm64 and Linux arm64. The patch below was built from
-the v10.4.1 tag and run against the repro on macOS only; Chez's own test
-suite was not run on it.
+the v10.4.1 tag and run against the repro on macOS only, with the same
+tree built without it as the control; Chez's own test suite was not run
+on it.
 
 ---
 
@@ -59,5 +60,6 @@ handler), caught the error and went on, and hung at the next collection.
  #endif /* PTHREADS */
 ```
 
-With it, the repro prints `finished`, and so do the nested and escaped
-variants.
+Built from the v10.4.1 tag with and without this line, everything
+else equal: without it the repro hangs, and with it the repro prints
+`finished`, and so do the nested and escaped variants.
