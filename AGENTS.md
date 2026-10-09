@@ -57,6 +57,28 @@
   When a milestone's process reviews the spec adversarially, the plan's code
   blocks get the same pass.
 
+## Guix development container
+
+* **On a Guix host, run every build and test through `scripts/guix-env`**,
+  e.g. `scripts/guix-env make test`. Batch commands with
+  `scripts/guix-env sh -c 'make a && make b'`: each call takes about 3 s
+  to start. The first call builds Chez 10.4.1 from source, in about
+  two minutes.
+* Edit, commit, fetch and push on the host. The container has git, but no
+  identity, credentials or agent, and no network but loopback (ADR-0020).
+  A fresh clone runs `git submodule update --init --recursive` on the host
+  once: that clone needs the network.
+* Verify it with `make check-guix`, run on the host.
+* The container exports `CHEZ` (the real `scheme` binary) and `CC` (gcc;
+  the toolchain has no `cc`). pkg-config finds the profile's libuv 1.52.1,
+  so the default build is the pkg-config leg; `make HAVE_PKG=no …` builds
+  the vendored one. It sets no `LD_LIBRARY_PATH`.
+* In a linked worktree the launcher also shares the main repository's
+  `.git`, so git works there too.
+* `make test-root` and the Docker targets do not run in the container. On
+  a Linux Guix host, `scripts/guix-env make HAVE_PKG=no test-memory` is
+  CI's Valgrind leg itself; `test-memory-docker` is for macOS boxes.
+
 ## Traps this repo has already hit
 
 Each of these shipped a passing test or a working-looking build that was wrong.
@@ -399,3 +421,19 @@ None is obvious from reading the code.
   SERIAL `make` (parallel bootstrap raced: `nanopass.so` not created). A
   version assertion beside "Report versions" keeps the floor from silently
   drifting — the same check-not-comment logic as `check-pins`.
+* **In a rootless container, `setuid` to another uid fails with `EINVAL`,
+  not `EPERM`.** The Guix container is a user namespace that maps only the
+  caller's own uid (`/proc/self/uid_map` is `1000 1000 1`), and the kernel
+  rejects an unmapped uid before it checks permission. test-process's
+  non-root `uid` row expected `EPERM` or `EACCES` and failed a correct build
+  there. It now reads the map to choose which to expect, and rows on fixed
+  maps hold the parser, since any one environment takes only one branch.
+  An errno a row expects from the kernel can depend on the namespace it
+  runs in.
+* **In a linked worktree, `.git` is a file naming a directory outside the
+  working tree, so a container that shares only the worktree has no
+  repository.** git there says `fatal: not a git repository: (null)`, and
+  `make check-pins` fails reading an empty submodule pin; chez-curl hit
+  the same and took git out of its container. `scripts/guix-env` reads the
+  `.git` file and shares the main repository's `.git` as well, and the
+  self-test's `git-reads-repo` fails without it.

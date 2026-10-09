@@ -1,8 +1,19 @@
 # chez-libuv
+#
+# On a Guix host, run targets through the pinned container (ADR-0020):
+#   scripts/guix-env make <target>
 
+# In the container, scripts/guix-env-enter exports both: the profile's real
+# `scheme` binary, and its gcc (the toolchain has no cc).
 CHEZ        ?= chez
 CC          ?= cc
 UNAME_S     := $(shell uname -s)
+
+# The make target to name in a missing-tool hint (scripts/require-tools):
+# what the user typed, $(MAKECMDGOALS), or, when that is empty, the
+# recipe's own target, $@. Recursively expanded (=, not :=), so each
+# reference picks up whichever recipe is running it.
+GOAL = $(strip $(if $(MAKECMDGOALS),$(MAKECMDGOALS),$@))
 
 ifeq ($(UNAME_S),Darwin)
   SHLIB_EXT := dylib
@@ -161,7 +172,7 @@ PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
 # here.
 MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 
-.PHONY: all build deps relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info
+.PHONY: all build deps require-toolchain relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside
 
 .DEFAULT_GOAL := help
 
@@ -178,7 +189,7 @@ MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 # undocumented without also going unbuildable-looking, i.e. it is a check,
 # not a comment (AGENTS.md).
 help: ## Show this help message
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_.-]+:.*?## / { printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_.-]+:.*?## / { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # A target dropped from its own `## ` line, or renamed without updating
 # .PHONY, silently stops being discoverable via `make help`. This is the
@@ -200,13 +211,32 @@ deps-info: ## Report which libuv acquisition path and artifacts are active
 	@echo "uv dlls      : $(UV_DLLS)"
 	@echo "version range: [$(UV_RANGE_LO),$(UV_RANGE_HI)] (floor $(UV_FLOOR_DOTTED))"
 
+# The pinned Guix container (ADR-0020). check-guix runs on the host: the
+# launcher's own tests, which run no Guix, then the self-test inside the
+# container, which ends by running check-help and test there.
+check-guix: ## Test scripts/guix-env on the host, then the toolchain inside the container
+	@scripts/require-tools "$(GOAL)" guix
+	@sh tests/guix-env-launcher.sh
+	@scripts/guix-env make check-guix-inside
+
+check-guix-inside: ## (inside the container) Assert the pinned toolchain, isolation and loopback-only network
+	@sh scripts/guix-env-selftest
+
 all: build ## Alias for build
 
 # relink-guard FIRST, and the order is load-bearing: it deletes a shim whose
 # provenance no longer matches what was asked for, and make only stats
 # $(SHIM) when it reaches it -- after that recipe has run. See the guard's
 # own comment for why the stamps cannot do this on their own.
-build: relink-guard $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.sls
+build: require-toolchain relink-guard $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.sls
+
+# FIRST in build, so a missing tool stops the run before anything is built,
+# and on a Guix host says to use the container. Chez is required here too:
+# config.sls is for Chez, and every target past build runs it. The vendored
+# leg also needs git and cmake (the vendor recipe checks them again, since
+# it can be run on its own).
+require-toolchain: ## Fail early, naming the Guix container, when the compiler, Chez, or the vendored leg's tools are missing
+	@scripts/require-tools "$(GOAL)" $(CC) $(CHEZ) $(if $(filter no,$(HAVE_PKG)),git cmake)
 
 # Scheme dependencies. chez-srfi is vendored as a submodule pinned to the SAME
 # commit Akku.lock names (7879b52). Keep them equal: bumping the Akku dependency
@@ -229,6 +259,7 @@ build: relink-guard $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.
 # submodule pin touches would leave stale symlinks after a re-pin. `ln -sfn` is
 # idempotent and the whole loop is well under a second.
 deps: ## Vendor chez-srfi and symlink it (plus %3a-decoded names) into build/scheme-libs
+	@scripts/require-tools "$(GOAL)" git
 	git submodule update --init $(SRFI_SRC)
 	mkdir -p $(SRFI_LIBS)/srfi
 	src=$(abspath $(SRFI_SRC)); dst=$(abspath $(SRFI_LIBS))/srfi; \
@@ -492,6 +523,7 @@ $(CONFIG_SLS): $(SHIM) Makefile
 # CMake. libuv's own CMakeLists requires cmake >= 3.10 and does not hit
 # that warning, so the flag has nothing to work around here.
 vendor: ## Build the vendored libuv fallback (used when HAVE_PKG=no)
+	@scripts/require-tools "$(GOAL)" git cmake
 	git submodule update --init --recursive
 	cmake -S $(VENDOR_DIR) -B $(VENDOR_BUILD) \
 	  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -606,6 +638,7 @@ test-memory: build deps check-pins $(STALE_SHIM) ## Run suites under Valgrind (L
 	  exit 1; \
 	}
 ifeq ($(UNAME_S),Linux)
+	@scripts/require-tools "$(GOAL)" valgrind
 # UV_USE_IO_URING=0: an escape hatch, not a default. Some CI kernels (older
 # seccomp profiles, containers that disallow the io_uring syscalls) reject
 # setup calls Valgrind's syscall emulation does not model, producing

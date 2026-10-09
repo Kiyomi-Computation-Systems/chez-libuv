@@ -293,3 +293,58 @@ Every assertion in those suites has been watched to fail. Each stage's
 mutation log (`.plans/*-mutation-log.md`) records the mutation that breaks
 each decision, the assertion that caught it *by name*, and — where nothing
 could catch one — why, rather than leaving the gap silent.
+
+## On a Guix host
+
+A machine managed by [Guix](https://guix.gnu.org) can build and test
+without installing anything into the host. Fill the submodules once, on
+the host, since that clones from the network:
+
+```sh
+git submodule update --init --recursive
+```
+
+then run any target through the pinned container:
+
+```sh
+scripts/guix-env make test
+scripts/guix-env make test-memory
+scripts/guix-env            # an interactive shell
+```
+
+`scripts/guix-env` runs `guix time-machine` at the Guix commit in
+`channels.scm`, with the toolchain in `manifest.scm`, in a container:
+
+- Chez Scheme 10.4.1, this project's floor. The pinned Guix packages
+  10.4.0, so the first run builds Chez from source, in about two minutes;
+  later runs start in about 3 s.
+- libuv 1.52.1 through `pkg-config`; `make HAVE_PKG=no …` builds the
+  vendored one with the container's `cmake`.
+- gcc, Valgrind, git, make and the usual shell tools.
+
+The container shares the checkout and nothing else from your home
+directory, and has no network but loopback. Its git can read the
+repository but has no identity or credentials, so commit, fetch and push
+on the host. It exports `CHEZ` and `CC`, so no `CHEZ=` is needed.
+
+Outside the container on such a host, `make build`, and every target
+that builds, stops before it builds anything when a tool is missing, and
+says to use the container:
+
+```
+make build: cmake not found.
+On this Guix host, run it in the project's container: scripts/guix-env make build
+```
+
+```sh
+make check-guix
+```
+
+tests the launcher on the host, then checks the container from inside:
+the pinned tools, Chez and libuv at their floors, the isolation, the
+loopback-only network, and finally `make test`.
+[ADR-0020](../.plans/decisions/0020-pinned-guix-container.md) records the
+choices. `sudo make test-root` and the Docker targets cannot run in the
+container. Neither needs to on this host:
+`scripts/guix-env make HAVE_PKG=no test-memory` there is CI's Valgrind
+leg itself.

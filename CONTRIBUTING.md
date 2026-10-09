@@ -24,6 +24,10 @@ make test
 `make help` lists every target; [docs/building.md](docs/building.md) has
 the full build story.
 
+On a [Guix](https://guix.gnu.org) host, run targets through the pinned
+development container instead, e.g. `scripts/guix-env make test`
+([docs/building.md](docs/building.md#on-a-guix-host)).
+
 ## The gates
 
 A PR must keep these green — they are exactly what CI runs:

@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs INSIDE the container, as the first command scripts/guix-env starts
+# (ADR-0020). Exports what the Makefile and the suites take from the
+# profile, then runs the command:
+#
+#   CHEZ  the profile's scheme, the real binary: the Makefile's default,
+#         `chez`, is not in the profile, a symlink named chez breaks Chez's
+#         boot-file lookup, and a wrapper script hides Chez from Valgrind
+#   CC    the profile's gcc: gcc-toolchain installs no cc
+#
+# It sets no LD_LIBRARY_PATH. config.sls names libuv and the shim by
+# absolute path, and pkg-config finds libuv through the PKG_CONFIG_PATH the
+# profile sets.
+set -eu
+
+die() { printf 'guix-env-enter: %s\n' "$*" >&2; exit 2; }
+
+if [ -z "${GUIX_ENVIRONMENT:-}" ]; then
+  die "not inside a Guix environment; use scripts/guix-env"
+fi
+
+# need FILE: dies unless FILE is a regular file, or a symlink to one.
+need() {
+  [ -f "$1" ] || die "no $1 in the profile; is its package in manifest.scm?"
+}
+
+need "$GUIX_ENVIRONMENT/bin/scheme"
+need "$GUIX_ENVIRONMENT/bin/gcc"
+need "$GUIX_ENVIRONMENT/lib/pkgconfig/libuv.pc"
+
+export CHEZ="$GUIX_ENVIRONMENT/bin/scheme"
+export CC="$GUIX_ENVIRONMENT/bin/gcc"
+
+exec "$@"
