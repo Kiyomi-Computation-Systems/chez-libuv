@@ -18,8 +18,8 @@
 ;;;   abort    prints nothing and aborts: SIGABRT, as a Chez spawned with
 ;;;            the wrong argv[0] dies (AGENTS.md)
 ;;;   datum-then-exit  prints a whole datum, then exits with status 5
-;;;   hush     closes its stdout and stderr, then sleeps 60 s: both pipes
-;;;            end long before the child does
+;;;   hush     prints a line on stderr, closes its stdout and stderr, then
+;;;            sleeps 60 s: both pipes end long before the child does
 (import (rnrs)
         (only (chezscheme) sleep make-time foreign-procedure
               load-shared-object))
@@ -73,6 +73,7 @@
    (say out "((level . 3))\n")
    (exit 5))
   ((hush)
+   (say err "hush child: closing\n")
    (close-fd! 1)
    (close-fd! 2)
    (pause 60000)))

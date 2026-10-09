@@ -11,7 +11,7 @@
         (uv-level-3)
         (only (chezscheme) getenv current-time time-difference time-second
               cpu-time open-process-ports sleep make-time foreign-procedure
-              load-shared-object))
+              load-shared-object machine-type))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -97,6 +97,35 @@
                  (poll (- tries 1)))
           r))))
 
+;; wait-within : pid -> integer
+;; waitpid for PID without waiting, polled every 10 ms for up to 5 s while
+;; it answers 0.
+(define (wait-within pid)
+  (let poll ((tries 500))
+    (let ((r (waitpid pid (make-bytevector 4 0) 1)))
+      (if (and (= r 0) (> tries 0))
+          (begin (sleep (make-time 'time-duration 10000000 0))
+                 (poll (- tries 1)))
+          r))))
+
+;; with-sigchld-ignored : (-> object) -> object
+;; THUNK's value, called with SIGCHLD's action SIG_IGN (1 on Linux and
+;; macOS), and the action before it put back after.
+(define signal-action (foreign-procedure "signal" (int uptr) uptr))
+(define sigchld
+  (let ((machine (symbol->string (machine-type))))
+    (if (string=? (substring machine (- (string-length machine) 3)
+                             (string-length machine))
+                  "osx")
+        20
+        17)))
+(define (with-sigchld-ignored thunk)
+  (let ((before #f))
+    (dynamic-wind
+      (lambda () (set! before (signal-action sigchld 1)))
+      thunk
+      (lambda () (signal-action sigchld before)))))
+
 ;; spawn-true : -> pid
 ;; Runs `true` and reads its stdout to the end, leaving it unreaped.
 (define (spawn-true)
@@ -163,11 +192,13 @@
         (level-3-run chez stand-in '(garbage) 20))
 
       ;; Both pipes' end is not the child's: one that closed them and kept
-      ;; running was answered unreadable at once, and left running. 3 s,
-      ;; as the stand-in starts before it closes them.
+      ;; running was answered unreadable at once, and left running. The
+      ;; stand-in's line is the precondition: a child killed before it
+      ;; closed its pipes would pass a runner that stops at their end. 10 s,
+      ;; as for stall.
       (test-equal "a child that closes both pipes and keeps running is killed at the deadline"
-        '((killed-at-cap "" "" (signal 9)) at-the-deadline)
-        (in-time (timed-run 'hush 3) 3))
+        '((killed-at-cap "" "hush child: closing\n" (signal 9)) at-the-deadline)
+        (in-time (timed-run 'hush 10) 10))
 
       ;; #110: a child that dies before printing anything said nothing
       ;; about why. Its status is the one datum that does.
@@ -182,7 +213,23 @@
       ;; A datum alone is not success: the child must also exit 0.
       (test-equal "a child that prints its datum and exits 5 answers bad-exit, not the datum"
         '(bad-exit "((level . 3))\n" "" (exit 5))
-        (level-3-run chez stand-in '(datum-then-exit) 20))))
+        (level-3-run chez stand-in '(datum-then-exit) 20))
+
+      ;; With SIGCHLD ignored, the system reaps each child itself, and
+      ;; waitpid refuses it. A runner that took the refusal for a child
+      ;; still running would wait out the deadline and kill a pid that was
+      ;; no longer its child.
+      (test-equal "precondition: with SIGCHLD ignored, the system reaps a finished child itself"
+        'reaped-by-the-system
+        (with-sigchld-ignored
+         (lambda ()
+           (let* ((pid (spawn-true)) (r (wait-within pid)))
+             (if (= r -1) 'reaped-by-the-system (list 'waitpid-answered r 'for pid))))))
+
+      (test-equal "a child the system reaps first answers wait-failed, not killed-at-cap"
+        '(unreadable "" "" (wait-failed))
+        (with-sigchld-ignored
+         (lambda () (level-3-run chez stand-in '(quiet-exit) 20))))))
 
 ;; Last, after every run: a child the runner never waited on stays a zombie
 ;; until this process exits (#110).

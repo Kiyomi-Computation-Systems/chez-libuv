@@ -17,7 +17,10 @@
 ;;;
 ;;; PURE: none of the binding's native code, so the pure suites can use it
 ;;; (PURE_TESTS). It loads libc for waitpid, which make check-purity allows:
-;;; it poisons only the shim.
+;;; it poisons only the shim. Where libc does not load, every status is
+;;; (wait-unavailable), so the level-3 rows fail carrying it: the import
+;;; itself must not raise, or every row of test-addrinfo and test-process
+;;; is lost with it.
 (library (uv-level-3)
   (export level-3-run level-3-entry)
   (import (rnrs)
@@ -26,14 +29,16 @@
                 input-port-ready? sleep make-time system current-time
                 add-duration time>=? foreign-procedure load-shared-object))
 
-  ;; open-process-ports gives the child's pid and nothing that waits on it,
-  ;; so the runner waits through libc (#110). Loaded ahead of the binding
-  ;; below: foreign-procedure resolves its entry when it is evaluated.
-  (define libc
-    (guard (e (#t (load-shared-object "libc.dylib")))
-      (load-shared-object "libc.so.6")))
-
-  (define waitpid (foreign-procedure "waitpid" (int u8* int) int))
+  ;; waitpid, or #f where libc did not load. open-process-ports gives the
+  ;; child's pid and nothing that waits on it, so the runner waits through
+  ;; libc (#110). The load comes first: foreign-procedure resolves its entry
+  ;; when it is evaluated.
+  (define waitpid
+    (guard (e (#t #f))
+      (let load ((names '("libc.so.6" "libc.dylib" "libc.so")))
+        (guard (e ((pair? (cdr names)) (load (cdr names))))
+          (load-shared-object (car names))))
+      (foreign-procedure "waitpid" (int u8* int) int)))
 
   ;; WNOHANG, 1 on Linux and on macOS.
   (define wnohang 1)
@@ -55,7 +60,10 @@
   ;;   (run-failed text status) for a raise while it ran, after which the
   ;;     child is killed too.
   ;; A status is (exit code), (signal number), (not-reaped) for a child
-  ;; that had not ended a second after its kill, or (wait-failed). Every
+  ;; that had not ended a second after its kill, (wait-failed) for a
+  ;; waitpid that refused, as it does for a child the system reaped itself
+  ;; (SIGCHLD ignored), or (wait-unavailable) where libc did not load. Only
+  ;; (exit 0) lets a datum through. Every
   ;; child that ends is waited on, so none is left a zombie (#110). The
   ;; deadline is level-3-deadline-seconds unless given. The command execs
   ;; Chez, so the pid is Chez's own: the kill reaches the child, and the
@@ -154,12 +162,14 @@
   ;; running. Raises nothing: it also runs from watch's handler.
   (define (try-reap pid)
     (guard (e (#t '(wait-failed)))
-      (let* ((cell (make-bytevector 4 0))
-             (r (waitpid pid cell wnohang)))
-        (cond
-          ((= r pid) (decode-status (bytevector-s32-native-ref cell 0)))
-          ((= r 0) #f)
-          (else '(wait-failed))))))
+      (if (not waitpid)
+          '(wait-unavailable)
+          (let* ((cell (make-bytevector 4 0))
+                 (r (waitpid pid cell wnohang)))
+            (cond
+              ((= r pid) (decode-status (bytevector-s32-native-ref cell 0)))
+              ((= r 0) #f)
+              (else '(wait-failed)))))))
 
   ;; decode-status : integer -> status
   ;; A wait status as (exit code) or (signal number), by the encoding Linux
