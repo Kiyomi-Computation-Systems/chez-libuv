@@ -46,15 +46,29 @@ being 0), each at the last fuel before its step:
 | `uv-write*!` | 22 |
 | `uv-shutdown!` | 11 |
 
-Each builds its refusal in `step-refusal`, a call in another library,
-which is a point an expiry can come at. The other 24 verbs, swept in 25
-sweeps (`uv-tcp-keepalive!` has two forms), named the right owner in
-every run: nothing between their step and the second read can trap. That
-covers the constructors, `uv-update-time!`, `uv-listen!`, `uv-tcp-nodelay!`,
-`uv-tcp-keepalive!`, the timer verbs, `uv-signal-stop!`, the read verbs,
-`uv-stream-write-queue-size`, the lookups, `uv-cancel!`, `uv-spawn!`,
-`uv-process-kill!` and `uv-process-pid`. For them only another thread's
-claim could come between the step and the read, and no sweep runs one.
+Each was refused by its step, and the hand-back came in `step-refusal`,
+before the second read. The other 24 verbs, swept in 25 sweeps
+(`uv-tcp-keepalive!` has two forms), named the right owner in every run,
+for one of two reasons. A probe told them apart: in a scratch copy
+of the fix, whose steps and fuel maps are main's, `step-refusal` named
+every refusal it built from an owner-mismatch `STEP` instead of the verb,
+and the sweep listed which verbs' steps refused.
+
+- **Refused by their step, with no trap before the second read** (10):
+  the five constructors (fuel 14–18), `uv-update-time!` (7), `uv-getaddrinfo!`
+  (31), `uv-getnameinfo!` (38), `uv-cancel!` (9) and `uv-spawn!` (68). On
+  main no expiry came between their step and the second read.
+- **Never refused by their step** (14): the five timer verbs,
+  `uv-listen!`, `uv-tcp-nodelay!`, `uv-tcp-keepalive!`, `uv-signal-stop!`,
+  both read verbs, `uv-stream-write-queue-size`, `uv-process-kill!` and
+  `uv-process-pid`. Nothing between their entry check and their step can
+  trap, so the entry check, which builds its condition from what it
+  compared, refused every run stopped before the step. #109's amendment
+  measured the same for four of them.
+
+The probe's step refusals were the fifteen above and these ten, 25 verbs
+in all. For all 24 without the defect, only another thread's claim could
+open the window, and no sweep runs one.
 
 The suite's three sweep rows on main: the bad-run row FAILED with the
 fifteen runs above; the reach row (every sweep refused its verb in some
@@ -143,9 +157,24 @@ each, so it would see one the day a change gives it a window:
 | ID | Mutation | Killed by |
 |---|---|---|
 | P1 | `refused?` answers only for a symbol | test-owner-refusal "refused? answers for an owner check's refusal and a symbol, not for a pointer", and its bad-run and reach rows |
-| P2 | `uv-timer-repeat`'s step tests its pointer with `symbol?` | rule 9's `symbol?` row. test-owner-refusal survives: the step's refusal has no window |
+| P2 | `uv-timer-repeat`'s step tests its pointer with `symbol?` | rule 9's `symbol?` row. test-owner-refusal survives: this verb's step is never the one to refuse |
 | P3 | `uv-process-pid` tests its step's answer with `symbol?` | the same |
-| P4 | `uv-tcp-bind!`'s step tests its pointer with `symbol?` | rule 9's `symbol?` row; test-owner-refusal's bad-run and reach rows (the record reached the bind) |
+| P4 | `uv-tcp-bind!`'s step tests its pointer with `symbol?` | rule 9's `symbol?` row; test-owner-refusal's bad-run and reach rows; test-handle-steps "a handle verb whose loop changes hands is refused" (fuels 11–25: the record reached `uv_tcp_bind`, which raised `invalid foreign-procedure argument` inside the step and left interrupts disabled) |
+
+### The sweep's list (rule 9, added in review)
+
+The hand-back sweep's list of verbs is held to every verb `(libuv)`
+exports whose definition reaches an owner check (`require-loop-thread`,
+`owned-loop-ptr`, `owned-handle-ptr` or `loop-owner-mismatch`, through
+any chain of definitions in `src/`). Run against the fix, the two sets
+are the same 39 verbs.
+
+| ID | Mutation | Row's answer |
+|---|---|---|
+| L1 | the sweep drops `uv-process-pid` | `(unswept (uv-process-pid) not-owner-checked ())` |
+| L2 | the sweep lists `uv-now`, which checks no owner | `(unswept () not-owner-checked (uv-now))` |
+| L3 | `uv-stop!` checks the owner (`owned-loop-ptr`), unlisted | `(unswept (uv-stop!) not-owner-checked ())` |
+| L4 | the suite defines its list under another name | every owner-checked verb unswept |
 
 ### The sweep itself
 

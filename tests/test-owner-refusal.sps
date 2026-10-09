@@ -145,7 +145,9 @@
 
 ;; --- the verbs --------------------------------------------------------------------
 ;; uv-tcp-keepalive! has a form to enable and a form to disable, and each is
-;; swept: uv-tcp-keepalive!/off names the second.
+;; swept: uv-tcp-keepalive!/off names the second. Rule 9 of
+;; tests/test-source-rules.sps holds this list to every verb (libuv)
+;; exports that reaches an owner check.
 (define verbs
   '(make-uv-timer make-uv-tcp make-uv-pipe make-uv-signal make-uv-async uv-accept!
     uv-update-time!

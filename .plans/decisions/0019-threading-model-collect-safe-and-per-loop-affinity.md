@@ -202,12 +202,23 @@ constructor mutates the registry before a handle exists to check.
 > - **Fifteen verbs** were refused naming this thread as both, each at the
 >   last fuel before its step: `uv-accept!`, the seven scratch verbs,
 >   `uv-tcp-connect!`, both signal starts, `uv-write!`, `uv-write*!` and
->   `uv-shutdown!`. Each builds its refusal in `step-refusal`, whose call
->   is a point an expiry can come at.
-> - **No window today** for the other 24, the constructors, the lookups,
->   `uv-cancel!` and `uv-spawn!` among them. Nothing between their step and
->   the second read can trap, so only another thread's claim could come
->   between, and no sweep runs one.
+>   `uv-shutdown!`. Each was refused by its step, and the hand-back came
+>   in `step-refusal`, before the second read.
+> - **No window today** for the other 24, for one of two reasons, measured
+>   by tagging every refusal a step built:
+>   - ten were refused by their step, but nothing between the step and the
+>     second read could trap: the five constructors, `uv-update-time!`,
+>     both lookups, `uv-cancel!` and `uv-spawn!`;
+>   - fourteen were never refused by their step. Nothing between their
+>     entry check and their step can trap, so the entry check, which
+>     builds its condition from what it compared, refused every run
+>     stopped before the step: the five timer verbs, `uv-listen!`,
+>     `uv-tcp-nodelay!`, `uv-tcp-keepalive!`, `uv-signal-stop!`, both
+>     read verbs, `uv-stream-write-queue-size`, `uv-process-kill!` and
+>     `uv-process-pid`.
+>
+>   For all 24 only another thread's claim could open the window, and no
+>   sweep runs one.
 >
 > An owner check now answers what it found. `loop-owner-mismatch`, the one
 > read of a loop's owner that decides whether a verb may go on, answers
@@ -222,8 +233,10 @@ constructor mutates the registry before a handle exists to check.
 > record from a pointer: `symbol?` would take it for one and hand it to
 > libuv. Rule 9 of `tests/test-source-rules.sps` holds this. It allows
 > `make-uv-wrong-thread` only in `wrong-thread-refusal`, the owner field's
-> accessor only in `loop-owner-mismatch`, and `symbol?` only in three
-> definitions that never test a step's answer.
+> accessor only in `loop-owner-mismatch`, and `symbol?` only in
+> `refused?`, in `step-refusal` once it has ruled out an owner-mismatch,
+> and in `signal-symbol->int`. It also holds the hand-back sweep's list to
+> every verb `(libuv)` exports that reaches an owner check.
 >
 > - **Measured after:** every refusal in the sweep names the other thread
 >   as `expected` and this one as `actual`. A call that is not refused

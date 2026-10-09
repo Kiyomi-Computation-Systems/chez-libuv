@@ -16,7 +16,7 @@
           one-step open-handle-ptr open-loop-ptr owned-loop-ptr owned-handle-ptr
           step-refusal handle-call! submit-request!
           try-construct-handle construct-handle try-construct-loop
-          refused? loop-owner-mismatch wrong-thread-refusal
+          refused? loop-owner-mismatch
           make-owner-mismatch owner-mismatch? owner-mismatch-owner owner-mismatch-caller
 
           ;; loop record

@@ -203,8 +203,9 @@ None is obvious from reading the code.
     An owner check now answers an `owner-mismatch` holding what it
     compared, and a step tests its pointer with `refused?`, never
     `symbol?`, which would take the record for a pointer. Rule 9 holds
-    both, and `tests/test-owner-refusal.sps`'s hand-back sweep holds what
-    each owner-checked verb's refusal names: a new one joins its list.
+    both. `tests/test-owner-refusal.sps`'s hand-back sweep holds what each
+    owner-checked verb's refusal names, and rule 9 fails a new
+    owner-checked verb until that sweep lists it.
 * **Affinity keeps each loop to one thread, not the process.** ADR-0019
   left the handle registry unlocked because only a loop's own thread uses
   that loop's handles. But the registry is one table for every loop, and
