@@ -409,9 +409,10 @@
   (bad-runs good? handback-sweeps))
 
 ;; The row above says nothing unless each sweep's verb was refused in some
-;; run, and the sweep ran it to the end. A run's first fuels end before the
-;; verb's checks, since the hand-back comes one tick after the handoff, so
-;; the first verdict is no witness.
+;; run, and the sweep ran it to the end. The first verdict is no witness:
+;; in a sweep's first runs the hand-back comes one tick after the handoff,
+;; and the loop is back with this thread by the time the verb's checks read
+;; its owner, so the verb makes its call and returns.
 (test-equal "each hand-back sweep had its verb refused and ran it to the end"
   (map (lambda (verb) (list verb #t 'untouched)) verbs)
   (reach-any 'refused handback-sweeps))

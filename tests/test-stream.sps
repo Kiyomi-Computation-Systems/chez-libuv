@@ -992,8 +992,8 @@
     (lambda (lk fill) 'unobservable)
     (lambda (lk fill) #t))))
 
-;; split-run : variant exact-positive-integer symbol -> verdict
-;; MODE is 'free, 'reuse to open a new connection after the free, or
+;; split-run : variant exact-positive-integer symbol -> (values verdict boolean)
+;; The run's verdict, and whether an expiry reached it. MODE is 'free, 'reuse to open a new connection after the free, or
 ;; 'handoff to hand the loop to another thread in place of the close.
 (define (split-run v fuel mode)
   (if (eq? mode 'handoff)
@@ -1022,22 +1022,24 @@
          (list 'untouched 'never-landed (link-evidence lk)))
         (else 'untouched)))
 
-;; handoff-run : variant exact-positive-integer -> verdict
+;; handoff-run : variant exact-positive-integer -> (values verdict boolean)
 ;; At the expiry, hands sw-loop to another thread, resumes the verb, and
 ;; hands the loop back. The stream stays open throughout.
 (define (handoff-run v fuel)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
                (returned #f)
+               (expired #f)
                (eng (start-engine v lk fill (lambda () (set! returned #t))))
                (verdict
                 (eng fuel
                      (lambda (ticks outcome) (run-ended v lk fill outcome))
                      (lambda (resume)
+                       (set! expired #t)
                        (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
                                                returned))
                               (landed (and made-before ((variant-landed? v) lk fill)))
@@ -1056,23 +1058,25 @@
                                                         (link-evidence lk)))
                                                  (else 'made-before-handoff))))))))))
           (close-link! lk)
-          (checked-verdict verdict 'finished before balance)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
-;; close-run : variant exact-positive-integer symbol -> verdict
+;; close-run : variant exact-positive-integer symbol -> (values verdict boolean)
 ;; MODE is 'free, or 'reuse to open a new connection after the free.
 (define (close-run v fuel mode)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
                (returned #f)
+               (expired #f)
                (eng (start-engine v lk fill (lambda () (set! returned #t))))
                (verdict
                 (eng fuel
                      (lambda (ticks outcome) (run-ended v lk fill outcome))
                      (lambda (resume)
+                       (set! expired #t)
                        (let* ((made-before (or (eq? #t ((variant-made? v) lk fill))
                                                returned))
                               (landed (and made-before ((variant-landed? v) lk fill))))
@@ -1101,16 +1105,17 @@
                                                           (link-evidence lk)))
                                                    (else 'made-before-close)))))))))))
           (close-link! lk)
-          (checked-verdict verdict 'finished before balance)))))
+          (values (checked-verdict verdict 'finished before balance) expired)))))
 
-;; drop-run : variant exact-positive-integer -> verdict
+;; drop-run : variant exact-positive-integer -> (values verdict boolean)
 (define (drop-run v fuel)
   (let* ((before (balance))
          (lk (connect-link!)))
     (if (not lk)
-        '(connect-failed)
+        (values '(connect-failed) #f)
         (let* ((fill (+ 1 (mod fuel 250)))
                (prepared ((variant-prepare v) lk fill))
+               (expired #f)
                (eng (make-engine
                      (lambda ()
                        (guard (e (#t (list 'raised (describe e))))
@@ -1118,9 +1123,9 @@
                          'returned))))
                (outcome (eng fuel
                              (lambda (ticks o) (if (eq? o 'returned) 'untouched (list 'untouched o)))
-                             (lambda (resume) 'dropped))))
+                             (lambda (resume) (set! expired #t) 'dropped))))
           (close-link! lk)
-          (checked-verdict outcome 'finished before balance)))))
+          (values (checked-verdict outcome 'finished before balance) expired)))))
 
 (define sweep-fuel-cap 400)
 
@@ -1129,18 +1134,14 @@
 (define (unconnected? verdict)
   (and (pair? verdict) (memq (car verdict) '(connect-failed no-new-connection)) #t))
 
-;; sweep : (exact-positive-integer -> verdict)
+;; sweep : (exact-positive-integer -> (values verdict boolean))
 ;;         -> (list-of (list fuel verdict expired?))
 ;; From fuel 1 to the first run no expiry reaches, whatever its verdict, or
-;; to the first run whose connection failed, or to the cap. A run's verdict
-;; says whether an expiry reached it: only an untouched run was not. The
-;; driver ends the sweep at a raise between runs, keeping the runs before
-;; it (tests/uv-sweep.sls).
+;; to the first run whose connection failed, or to the cap. The driver ends
+;; the sweep at a raise between runs, keeping the runs before it
+;; (tests/uv-sweep.sls).
 (define (sweep run)
-  (sweep-fuels (lambda (fuel)
-                 (let ((verdict (run fuel)))
-                   (values verdict (not (untouched? verdict)))))
-               sweep-fuel-cap unconnected?))
+  (sweep-fuels run sweep-fuel-cap unconnected?))
 
 (define (named-sweeps run vs)
   (map (lambda (v) (cons (variant-name v) (sweep (lambda (fuel) (run v fuel))))) vs))

@@ -547,18 +547,22 @@
   '()
   (bad-runs drop-good? drop-sweeps))
 
-(test-equal "each drop sweep dropped its verb before its check and ran it to the end"
+(test-equal "each drop sweep dropped its verb and ran it to the end"
   '((uv-process-kill!-0 dropped untouched)
     (uv-process-pid dropped untouched))
   (reach drop-sweeps))
 
 ;; --- the suite's end ------------------------------------------------------------------
+;; The counters are read once the teardown is over: counts-at-start was read
+;; before the suite's loop was made, and Chez fixes no order for a call's
+;; arguments, so a list of the two could read them with the loop alive.
 (test-equal "the suite's loop tears down, and every counter is back where the suite began"
   '(torn-down ())
-  (list (guard (e (#t (list 'teardown-raised (describe e))))
-          (uv-loop-teardown! loop)
-          'torn-down)
-        (residue counts-at-start (live-counts))))
+  (let* ((torn (guard (e (#t (list 'teardown-raised (describe e))))
+                 (uv-loop-teardown! loop)
+                 'torn-down))
+         (left (residue counts-at-start (live-counts))))
+    (list torn left)))
 
 ;; A process left open with no native block, as a broken close would leave
 ;; it, is refused inside the step: open-handle-ptr answers a status, and the

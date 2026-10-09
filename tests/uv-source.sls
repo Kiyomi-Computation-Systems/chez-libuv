@@ -1,12 +1,12 @@
 #!r6rs
 ;;; This repo's own library sources, read as data, for the suites that hold
 ;;; rules only a reading of the source can hold (tests/test-require-threaded.sps,
-;;; tests/test-source-rules.sps).
+;;; tests/test-source-rules.sps, tests/test-sweep.sps).
 ;;;
 ;;; PURE: it reads files and imports no library of this repo, so pure suites
 ;;; (PURE_TESTS) can use it.
 (library (uv-source)
-  (export sls-file? sls-files src-libraries)
+  (export sls-file? sls-files src-libraries library-exports)
   (import (rnrs)
           (only (chezscheme) directory-list file-directory?))
 
@@ -30,6 +30,15 @@
                           ((sls-file? name) (list path))
                           (else '()))))
                 (list-sort string<? (directory-list dir)))))
+
+  ;; library-exports : datum -> (list-of datum)
+  ;; What a library form's export form names: '() for a datum that is not
+  ;; a library form with its export form third.
+  (define (library-exports lib)
+    (if (and (list? lib) (>= (length lib) 3) (pair? (caddr lib))
+             (eq? (car (caddr lib)) 'export))
+        (cdr (caddr lib))
+        '()))
 
   ;; src-libraries : -> (list-of (string . datum))
   ;; Each library under src/ as (path . its library form), read from the repo

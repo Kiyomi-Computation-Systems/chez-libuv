@@ -9,6 +9,8 @@
 (import (rnrs)
         (srfi :64)
         (uv-sweep)
+        ;; The definition census reads the shared libraries' export forms.
+        (only (uv-source) library-exports)
         ;; The engine census reads the suites' sources; the rows for what a
         ;; run leaves behind set interrupts and print.
         (only (chezscheme) directory-list with-output-to-string get-thread-id
@@ -258,6 +260,16 @@
     (list (residue before '((registry . 4) (handle . 2) (block . 3)))
           (residue before before))))
 
+;; Paired by position, a balance read in another order would put one
+;; count's change under another's name, and one with a count more would
+;; raise from map.
+(test-equal "residue answers two balances that name their counts differently, rather than pair them"
+  '(((balance-names (registry block) (block registry)))
+    ((balance-names (registry block) (registry block fds))))
+  (let ((before '((registry . 3) (block . 5))))
+    (list (residue before '((block . 5) (registry . 3)))
+          (residue before '((registry . 3) (block . 5) (fds . 9))))))
+
 ;; A balance before a run, and two a suite's (balance) could read after it.
 (define before-run '((registry . 3) (block . 5)))
 (define (as-before) before-run)
@@ -384,34 +396,52 @@
 ;; describe was copied into seven suites and libraries before #81, and the
 ;; step suites' sweep helpers into eight suites before #103; each now lives
 ;; in one library. A new copy of any name either library exports fails this
-;; row by name, as (name file ...).
-;; defines? : datum symbol -> boolean
-;; Whether X defines NAME, as a procedure or a variable, anywhere outside
-;; quoted data.
-(define (defines? x name)
+;; row by name, as (name file ...): a definition, procedure or variable, or
+;; a binding in a let, let*, letrec or letrec*, or a named let's name,
+;; anywhere in a source directly under tests/. test-constructors bound its
+;; own `me` in a let* until #103. What the census cannot see: a lambda's
+;; parameters, a copy under another name, and one written out inline, as
+;; test-process wrote `(+ (get-thread-id) 1)` for other-thread.
+;; binds? : datum symbol -> boolean
+;; Whether X defines or let-binds NAME anywhere outside quoted data.
+(define (binds? x name)
   (and (pair? x)
        (not (eq? (car x) 'quote))
        (or (and (eq? (car x) 'define) (pair? (cdr x))
                 (eq? (if (pair? (cadr x)) (car (cadr x)) (cadr x)) name))
+           (and (memq (car x) '(let let* letrec letrec*)) (pair? (cdr x))
+                (let* ((named (symbol? (cadr x)))
+                       (bindings (if named
+                                     (and (pair? (cddr x)) (caddr x))
+                                     (cadr x))))
+                  (or (and named (eq? (cadr x) name))
+                      (and (list? bindings)
+                           (exists (lambda (b) (and (pair? b) (eq? (car b) name)))
+                                   bindings)))))
            (let walk ((x x))
-             (and (pair? x) (or (defines? (car x) name) (walk (cdr x))))))))
+             (and (pair? x) (or (binds? (car x) name) (walk (cdr x))))))))
 
 ;; exports : string -> (list-of symbol)
-;; The names a library source exports: its first form's export clause.
+;; The names a library source exports, from its library form.
 (define (exports path)
-  (cdr (caddr (car (read-forms path)))))
+  (library-exports (car (read-forms path))))
 
 ;; definers : (list-of symbol) -> (list-of (cons symbol (list-of string)))
+;; Each name, with every source that defines or let-binds it. Each source
+;; is read once.
 (define (definers names)
-  (map (lambda (name)
-         (cons name
-               (filter (lambda (path)
-                         (exists (lambda (form) (defines? form name))
-                                 (read-forms path)))
-                       (test-sources))))
-       names))
+  (let ((sources (map (lambda (path) (cons path (read-forms path)))
+                      (test-sources))))
+    (map (lambda (name)
+           (cons name
+                 (map car
+                      (filter (lambda (source)
+                                (exists (lambda (form) (binds? form name))
+                                        (cdr source)))
+                              sources))))
+         names)))
 
-(test-equal "each name (uv-describe) and (uv-sweep) export is defined in its own library alone"
+(test-equal "each name (uv-describe) and (uv-sweep) export is defined or let-bound in its own library alone"
   '((describe "tests/uv-describe.sls")
     (resume-fuel "tests/uv-sweep.sls") (resume-cap "tests/uv-sweep.sls")
     (run-capped "tests/uv-sweep.sls") (run-capped* "tests/uv-sweep.sls")

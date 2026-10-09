@@ -402,14 +402,6 @@
 (define (library-body lib)
   (if (and (list? lib) (>= (length lib) 4)) (cddddr lib) '()))
 
-;; library-exports : datum -> (list-of datum)
-;; What a library form's export form names.
-(define (library-exports lib)
-  (if (and (list? lib) (>= (length lib) 3) (pair? (caddr lib))
-           (eq? (car (caddr lib)) 'export))
-      (cdr (caddr lib))
-      '()))
-
 ;; top-level-forms : datum -> (list-of datum)
 ;; The library form LIB's body, with every top-level begin spliced in, as
 ;; the expander reads it.
@@ -1631,14 +1623,21 @@
                                 (mentions-outside? '(registry-lock) '(quote) (cdr e))))
                          libraries))))
 
+;; A reader that read no export would find neither, so the row first asks
+;; that it read one it must: handles.sls exports registry-count.
 (test-equal "no library in src/ exports the registry or the orphan list"
   '()
-  (apply append
-         (map (lambda (e)
-                (map (lambda (name) (list (car e) name))
-                     (filter (lambda (x) (memq x '(registry orphan-events)))
-                             (library-exports (cdr e)))))
-              libraries)))
+  (if (not (memq 'registry-count
+                 (library-exports
+                  (cdr (or (assoc "src/libuv/private/handles.sls" libraries)
+                           '(#f . #f))))))
+      '(registry-count-not-read-from-handles.sls)
+      (apply append
+             (map (lambda (e)
+                    (map (lambda (name) (list (car e) name))
+                         (filter (lambda (x) (memq x '(registry orphan-events)))
+                                 (library-exports (cdr e)))))
+                  libraries))))
 
 ;; The C shim, read as lines of text.
 (define shim-lines

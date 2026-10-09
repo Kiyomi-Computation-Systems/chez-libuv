@@ -20,38 +20,57 @@ helpers that read their sweeps, and the copies had drifted:
 
 Each helper now lives once, in `(uv-sweep)`, and
 `tests/test-sweep.sps` holds every one. Its census row, "each name
-(uv-describe) and (uv-sweep) export is defined in its own library
-alone", fails a new definition of any exported name, procedure or
-variable, at any depth of any source directly under `tests/`.
+(uv-describe) and (uv-sweep) export is defined or let-bound in its own
+library alone", fails a new definition of any exported name, procedure
+or variable, or a binding of one in a let, let*, letrec, letrec* or a
+named let's name, at any depth of any source directly under `tests/`.
 
 ## The shape settled on
 
 - A run is `(fuel verdict expired?)`, as `sweep-fuels` makes it. The
-  three suites with drivers of their own now sweep with `sweep-fuels`,
-  through a one-line adapter that answers whether an expiry reached the
-  run from its verdict, as their drivers did. A raise between runs now
-  keeps the runs before it, where their drivers kept none.
+  three suites with drivers of their own now sweep with `sweep-fuels`. A
+  raise between runs now keeps the runs before it, where their drivers
+  kept none. Their drivers took expiry from the verdict; each run in
+  test-constructors and test-stream now answers whether its engine's
+  expiry handler ran, and a run whose fixture could not be made (no
+  engine at all) answers that none did. test-process-steps' runs already
+  answered it. test-constructors' sweeps also stop at a run that reached
+  call-with-uv-loop's body, as its driver did.
 - `(bad-runs good? sweeps)`: the predicate first, as `filter` takes it.
 - `(reach sweeps)` answers each sweep's first verdict and its last;
   `(reach-any verdict sweeps)` answers whether some run had the verdict,
-  for test-owner-refusal, whose first runs end before the verb's checks.
+  for test-owner-refusal: in its first runs the loop is back with this
+  thread by the time the verb's checks read the owner, so the verb
+  returns, and the first verdict is no witness.
 - A balance is a list of `(name . count)`, which each suite still reads
   itself (the registry, the debug counters, the descriptors it counts).
-  `(residue before after)` is pure.
+  `(residue before after)` is pure. Two balances that name their counts
+  differently, in order or number, answer `(balance-names …)` instead of
+  pairing them by position.
 - `(checked-verdict verdict finished before balance)` reads the balance
   itself. A run's tidying is often an argument (`(finish! …)`), and Chez
-  evaluates arguments right to left, so a balance read in an argument
-  could come before the tidying.
+  fixes no order for a call's arguments (AGENTS.md: right to left in
+  compiled library code; a probe program here evaluated a `list` call's
+  left to right), so a balance read in another argument could come
+  before the tidying.
 - `me` and `other-thread` are the library's. Chez instantiates a
   program's libraries on its main thread before the body runs, measured
   with a library whose body printed its thread id and a program that
   first referenced it from a forked thread: id 0, before the body, both
   interpreted and compiled.
 
-Two names collided with the census without being copies, both in
-test-loop-claim: a thread body called `other-thread`, and a predicate
-over race verdicts called `stuck?`. They are renamed `claim-and-hold` and
-`race-stuck?`.
+Five names collided with the census without being copies, and are
+renamed: in test-loop-claim a thread body called `other-thread`
+(`claim-and-hold`), a predicate over race verdicts called `stuck?`
+(`race-stuck?`) and a let-bound thread id called `me` (`this-thread`);
+in test-process two let-bound values called `residue` (`left`).
+
+`library-exports` moved from test-source-rules into the pure
+`(uv-source)`, and the census reads exports with it. The one row in
+test-source-rules that used it, "no library in src/ exports the registry
+or the orphan list", expected `'()` and so passed a reader that read
+nothing; it now first requires that the reader found `registry-count`
+among handles.sls's exports.
 
 ## What changed in what the rows ask
 
@@ -125,12 +144,33 @@ a failing build would show, and test-sweep's rows are what hold it.
 
 ### The drivers the three suites moved onto
 
+D1 and D2 ran against the first form of this change, in which an
+adapter took expiry from the verdict; X1, X3 and X4 against the runs
+that answer it themselves.
+
 | ID | Mutation | Killed by |
 |---|---|---|
 | D1 | test-stream's adapter says no run expired | stream's 4 reach rows |
 | D2 | test-constructors', the same | constructors' 4 reach rows |
-| D3 | test-process-steps', the same | process-steps' 4 reach rows and its reuse seed |
+| D3 | test-process-steps' adapter, the same | process-steps' 4 reach rows and its reuse seed |
 | D4 | test-owner-refusal's sweep stops at every verdict | owner-refusal's reach row |
+| X1 | test-constructors' split run never says it expired | the split reach row |
+| X3 | test-stream's close run, the same | the split and reuse reach rows |
+| X4 | test-stream's drop run, the same | the drop reach row |
+| X5 | test-constructors' sweeps do not stop at a reached body | survives: the call-with-uv-loop sweep runs fuels 16 to 400 as `reached-body`, under a second; the stop only bounds its length, as the driver's did |
+
+### The review's fixes (PR #119)
+
+| ID | Mutation | Killed by |
+|---|---|---|
+| F1 | test-process-steps' suite-end row reads the counters before the teardown | that row: `(torn-down ((loop 1) (block 1)))` |
+| F2 | `residue` pairs balances by position whatever their names | test-sweep "residue answers two balances that name their counts differently, rather than pair them" |
+| H22 | test-timer let*-binds its own `me` | the census row |
+| H23 | test-timer names a named let `reach` | the census row |
+| H24 | `library-exports` reads nothing | the census row; test-source-rules' registry row (before its seed, it survived there) |
+
+H12, H13, H18 and H19 were run again against the fixed tree: killed by
+the same rows.
 
 ### Source defects, run against main's suites and the branch's
 
@@ -152,6 +192,9 @@ and their steps can trap, so the entry check refuses every handed-off run
   balance after them is the procedure call's own semantics; no mutation
   of the library can break it, and a call site that read the balance in
   an argument instead would fail its suite's rows on a correct build.
+- **Copies the census cannot read.** It reads definitions and let
+  bindings, not a lambda's parameters, nor a copy written out inline, as
+  test-process wrote `(+ (get-thread-id) 1)` for `other-thread`.
 - **Copies under other names.** The census reads names. test-addrinfo's
   `sweep-reach` and `bad-rows` (one sweep's rows, not named sweeps),
   test-timer's `close-sweep-reach` (a list of symbols) and test-process's

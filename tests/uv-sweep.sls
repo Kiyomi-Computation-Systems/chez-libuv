@@ -141,8 +141,10 @@
 
   ;; reach-any : verdict sweeps -> (list-of (list name boolean last))
   ;; Whether some run of each sweep answered VERDICT, and its last verdict:
-  ;; reach for a sweep whose first runs end before the verb's checks, as
-  ;; test-owner-refusal's hand-back does.
+  ;; reach for a sweep whose first verdict is no witness. In the first runs
+  ;; of test-owner-refusal's hand-back sweeps, the loop is back with this
+  ;; thread by the time the verb's checks read its owner, so the verb makes
+  ;; its call and returns.
   (define (reach-any verdict sweeps)
     (map (lambda (s)
            (list (car s)
@@ -190,24 +192,29 @@
     (disable-interrupts)
     (zero? (enable-interrupts)))
 
-  ;; residue : balance balance -> (list-of (list name delta))
-  ;; What changed from BEFORE to AFTER, each a balance: a list of
-  ;; (name . count) in a fixed order, as a suite's own (balance) reads the
-  ;; registry, the debug counters and whatever else it counts. '() when
-  ;; nothing did.
+  ;; residue : balance balance -> (list-of list)
+  ;; What changed from BEFORE to AFTER, as (name delta) pairs; '() when
+  ;; nothing did. A balance is a list of (name . count), as a suite's own
+  ;; (balance) reads the registry, the debug counters and whatever else it
+  ;; counts. Two balances that do not name the same counts in the same order
+  ;; answer (balance-names BEFORE-NAMES AFTER-NAMES) instead: pairing them
+  ;; by position would put one count's change under another's name.
   (define (residue before after)
-    (filter (lambda (x) x)
-            (map (lambda (b a)
-                   (and (not (= (cdr b) (cdr a)))
-                        (list (car b) (- (cdr a) (cdr b)))))
-                 before after)))
+    (let ((names (map car before)))
+      (if (not (equal? names (map car after)))
+          (list (list 'balance-names names (map car after)))
+          (filter (lambda (x) x)
+                  (map (lambda (b a)
+                         (and (not (= (cdr b) (cdr a)))
+                              (list (car b) (- (cdr a) (cdr b)))))
+                       before after)))))
 
   ;; checked-verdict : verdict object balance (-> balance) -> verdict
   ;; VERDICT, or what its run left behind with it. FINISHED is 'finished, or
   ;; why the run could not be tidied. What the run left is the residue from
   ;; BEFORE to what BALANCE reads here, once the arguments are in hand: the
-  ;; run's tidying is often one of them, and Chez evaluates arguments right
-  ;; to left, so a balance read in an argument could come before it.
+  ;; run's tidying is often one of them, and Chez fixes no order for a
+  ;; call's arguments, so a balance read in another could come before it.
   ;; Interrupts left disabled are enabled again, so the next run starts
   ;; clean.
   (define (checked-verdict verdict finished before balance)
