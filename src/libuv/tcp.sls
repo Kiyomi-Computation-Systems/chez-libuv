@@ -56,11 +56,14 @@
   ;; uv-tcp-bind! : uv-tcp string exact-nonnegative-integer (listof symbol)
   ;;               -> unspecified
   ;; The optional flag list accepts '(reuseport) for SO_REUSEPORT load balancing
-  ;; across processes or loops. Flags are resolved to a bitmask BEFORE any
-  ;; allocation, so a malformed flag list (or one naming reuseport on a libuv
-  ;; that lacks it) leaves no scratch behind. The sockaddr is synchronous
-  ;; scratch and is freed on every exit path. The address is read once, by
+  ;; across processes or loops. Flags are resolved to a bitmask before the
+  ;; step, so a malformed flag list (or one naming reuseport on a libuv that
+  ;; lacks it) is refused with nothing allocated. The address is read once, by
   ;; validate-address, and libuv parses that copy (tests/test-address.sps).
+  ;; One interrupt-free step checks again that this thread owns the loop and
+  ;; that the client is open, and allocates the sockaddr, fills it, binds and
+  ;; frees it (#86). So no engine can split the bind from those checks, or
+  ;; drop it holding the sockaddr (tests/test-handle-steps.sps).
   (define uv-tcp-bind!
     (case-lambda
       ((tcp ip port) (bind! tcp ip port '()))
@@ -70,77 +73,85 @@
     (require-open-tcp tcp 'uv-tcp-bind!)
     (let ((ip-bytes (validate-address ip 'uv-tcp-bind!)))
       (require-port port 'uv-tcp-bind!)
-      ;; Resolve flags first, in its own let: a raise here (bad flag, or
-      ;; reuseport on a libuv without it) must happen before alloc-zeroed, or
-      ;; the scratch leaks -- the guard below covers only the allocated window.
-      (let ((flag-bits (bind-flags->bits flags 'uv-tcp-bind!)))
-        (let ((addr (alloc-zeroed (sizeof-sockaddr-storage))))
-          (guard (e (#t (free! addr) (raise e)))
-            (fill-sockaddr! addr ip-bytes port 'uv-tcp-bind!)
-            (uv-check (uv-tcp-bind (handle-pointer tcp 'uv-tcp-bind!) addr flag-bits)
-                      'uv-tcp-bind!))
-          (free! addr)))))
+      (let* ((flag-bits (bind-flags->bits flags 'uv-tcp-bind!))
+             (size (sizeof-sockaddr-storage))
+             (rc (one-step
+                  (let ((ptr (owned-handle-ptr tcp)))
+                    (if (symbol? ptr)
+                        ptr
+                        (let ((addr (alloc-block size)))
+                          (if (zero? addr)
+                              'no-memory
+                              (let* ((filled (try-fill-sockaddr! addr ip-bytes port))
+                                     (rc (if (eq? filled 'filled)
+                                             (uv-tcp-bind ptr addr flag-bits)
+                                             filled)))
+                                (free-block! addr)
+                                rc))))))))
+        (unless (eqv? rc 0)
+          (raise (step-refusal rc 'uv-tcp-bind! tcp))))))
+
+  ;; query-sockaddr : uv-tcp procedure boolean symbol
+  ;;                  -> (or exact-nonnegative-integer
+  ;;                         (pair (or string #f) exact-nonnegative-integer))
+  ;; TCP's port, or its address and port when ADDRESS?, as NATIVE
+  ;; (uv_tcp_getsockname or uv_tcp_getpeername) reports them. One
+  ;; interrupt-free step checks again that this thread owns the loop and
+  ;; that the client is open, and allocates the sockaddr and its in/out
+  ;; length in one block, asks libuv, reads the answer out and frees the
+  ;; block (#86). So no engine can split the call from those checks, or drop
+  ;; it holding the block (tests/test-handle-steps.sps).
+  (define (query-sockaddr tcp native address? who)
+    (require-open-tcp tcp who)
+    (let* ((storage (sizeof-sockaddr-storage))
+           (len-offset (align-16 storage))
+           (port-offset (offsetof-sockaddr-in-sin-port))
+           (answer
+            (one-step
+             (let ((ptr (owned-handle-ptr tcp)))
+               (if (symbol? ptr)
+                   ptr
+                   (let ((block (alloc-block (+ len-offset (c-int-size)))))
+                     (if (zero? block)
+                         'no-memory
+                         (let* ((len (+ block len-offset))
+                                (rc (if (try-c-int-set! len storage)
+                                        (native ptr block len)
+                                        'sockaddr-length-not-set))
+                                (answer
+                                 (cond
+                                   ((not (eqv? rc 0)) rc)
+                                   ((< (c-int-ref len) (+ port-offset 2))
+                                    'sockaddr-too-small-for-a-port)
+                                   (address?
+                                    (cons (sockaddr->address-string block)
+                                          (read-net-u16 block port-offset)))
+                                   (else (read-net-u16 block port-offset)))))
+                           (free-block! block)
+                           answer))))))))
+      (if (or (pair? answer) (and (fixnum? answer) (fx>=? answer 0)))
+          answer
+          (raise (step-refusal answer who tcp)))))
 
   ;; uv-tcp-getsockname-port : uv-tcp -> exact-nonnegative-integer
-  ;; Read the in/out length and the network-order port before freeing scratch.
   (define (uv-tcp-getsockname-port tcp)
-    (require-open-tcp tcp 'uv-tcp-getsockname-port)
-    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
-          (len  (alloc-zeroed (c-int-size))))
-      (guard (e (#t (free! addr) (free! len) (raise e)))
-        (c-int-set! len (sizeof-sockaddr-storage))
-        (uv-check (uv-tcp-getsockname
-                   (handle-pointer tcp 'uv-tcp-getsockname-port) addr len)
-                  'uv-tcp-getsockname-port)
-        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
-          (raise (make-uv-invalid-argument 'uv-tcp-getsockname-port
-                                           'sockaddr-too-small-for-a-port)))
-        (let ((port (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
-          (free! addr)
-          (free! len)
-          port))))
+    (query-sockaddr tcp uv-tcp-getsockname #f 'uv-tcp-getsockname-port))
 
   ;; uv-tcp-peer-address : uv-tcp
   ;;                       -> (values (or string #f) exact-nonnegative-integer)
   ;; An unconnected handle raises the native ENOTCONN condition.
   (define (uv-tcp-peer-address tcp)
-    (require-open-tcp tcp 'uv-tcp-peer-address)
-    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
-          (len  (alloc-zeroed (c-int-size))))
-      (guard (e (#t (free! addr) (free! len) (raise e)))
-        (c-int-set! len (sizeof-sockaddr-storage))
-        (uv-check (uv-tcp-getpeername-native
-                   (handle-pointer tcp 'uv-tcp-peer-address) addr len)
-                  'uv-tcp-peer-address)
-        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
-          (raise (make-uv-invalid-argument 'uv-tcp-peer-address
-                                           'sockaddr-too-small-for-a-port)))
-        (let ((address (sockaddr->address-string addr))
-              (port    (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
-          (free! addr)
-          (free! len)
-          (values address port)))))
+    (let ((answer (query-sockaddr tcp uv-tcp-getpeername-native #t
+                                  'uv-tcp-peer-address)))
+      (values (car answer) (cdr answer))))
 
   ;; uv-tcp-sockname-address : uv-tcp
   ;;                           -> (values (or string #f) exact-nonnegative-integer)
   ;; A bound, unconnected handle already has a local address.
   (define (uv-tcp-sockname-address tcp)
-    (require-open-tcp tcp 'uv-tcp-sockname-address)
-    (let ((addr (alloc-zeroed (sizeof-sockaddr-storage)))
-          (len  (alloc-zeroed (c-int-size))))
-      (guard (e (#t (free! addr) (free! len) (raise e)))
-        (c-int-set! len (sizeof-sockaddr-storage))
-        (uv-check (uv-tcp-getsockname
-                   (handle-pointer tcp 'uv-tcp-sockname-address) addr len)
-                  'uv-tcp-sockname-address)
-        (unless (>= (c-int-ref len) (+ (offsetof-sockaddr-in-sin-port) 2))
-          (raise (make-uv-invalid-argument 'uv-tcp-sockname-address
-                                           'sockaddr-too-small-for-a-port)))
-        (let ((address (sockaddr->address-string addr))
-              (port    (read-net-u16 addr (offsetof-sockaddr-in-sin-port))))
-          (free! addr)
-          (free! len)
-          (values address port)))))
+    (let ((answer (query-sockaddr tcp uv-tcp-getsockname #t
+                                  'uv-tcp-sockname-address)))
+      (values (car answer) (cdr answer))))
 
   ;; uv-listen! : uv-tcp exact-nonnegative-integer procedure -> unspecified
   ;; Store the callback before listening because connections may arrive at once.
@@ -180,9 +191,9 @@
                            (if (zero? rc)
                                client
                                (begin (begin-close! client #f) rc))))))))))
-      (cond ((uv-handle? accepted) accepted)
-            ((eq? accepted 'wrong-thread) (raise (wrong-thread-refusal loop 'uv-accept!)))
-            (else (raise (step-refusal accepted 'uv-accept! server))))))
+      (if (uv-handle? accepted)
+          accepted
+          (raise (step-refusal accepted 'uv-accept! server)))))
 
   ;; uv-tcp-connect! : uv-tcp string exact-nonnegative-integer procedure
   ;;                   -> uv-request
@@ -218,10 +229,9 @@
                                   count-connect-req-new! count-connect-req-free!
                                   (uv-tcp-connect-native block ptr addr))
                                  (begin (free-block! block) filled))))))))))
-        (cond ((uv-req? started) started)
-              ((eq? started 'wrong-thread)
-               (raise (wrong-thread-refusal loop 'uv-tcp-connect!)))
-              (else (raise (step-refusal started 'uv-tcp-connect! tcp)))))))
+        (if (uv-req? started)
+            started
+            (raise (step-refusal started 'uv-tcp-connect! tcp))))))
 
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
   ;; Require a boolean because Scheme's 0 is true while C's 0 is false.

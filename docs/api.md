@@ -241,17 +241,25 @@ resumed either had not begun, or libuv holds its request, which the
 request's completion frees, as the client's close or the loop's teardown
 brings about; `uv-cancel!` allocates nothing.
 
+`uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+`uv-tcp-peer-address` and the four buffer-size verbs
+(`uv-send-buffer-size`, `uv-send-buffer-size!`, `uv-recv-buffer-size`,
+`uv-recv-buffer-size!`) make both promises too. Each borrows a block for
+its call, and makes it, calls libuv and frees it in its step. One resumed
+after its handle was closed raises `&uv-handle-closed`, and one resumed
+after its loop was handed to another thread raises `&uv-wrong-thread`.
+Before, one resumed after a close raised `null-handle-pointer`, or called
+libuv on whatever handle had been given the closed one's address; one
+resumed after a handoff made its call on a handle the other thread now
+owned; and one
+whose engine was never resumed lost its block, or both of its blocks. Now
+it leaves nothing behind.
+
 The other verbs do not promise this yet
 ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
 decision 3, amended 2026-10-06). Until they do, close a handle only from
 the task that is using it, and do not abandon an engine inside
-`call-with-uv-loop`'s teardown on the way out of its body, or a verb that
-borrows a scratch block for its answer:
-`uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
-`uv-tcp-peer-address`, and the four buffer-size verbs
-(`uv-send-buffer-size`, `uv-send-buffer-size!`, `uv-recv-buffer-size`,
-`uv-recv-buffer-size!`). Each of those loses its block, or both of them,
-when its engine is never resumed.
+`call-with-uv-loop`'s teardown on the way out of its body.
 
 ## Flow control
 
