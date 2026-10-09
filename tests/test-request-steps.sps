@@ -528,6 +528,10 @@
   (let ((seven (map (lambda (i) (alloc-block lookup-block-size)) '(1 2 3 4 5 6 7))))
     (for-each free-block! seven)))
 
+;; The fuels of the completion sweep's expired runs whose zeroed blocks
+;; missed the freed request's address, latest first.
+(define missed-landings '())
+
 ;; cancel-run : symbol exact-positive-integer -> (values verdict boolean)
 ;; MODE is 'complete or 'handoff.
 (define (cancel-run mode fuel)
@@ -563,6 +567,8 @@
                                     (outcome (resume 1000000 (lambda (ticks o) o)
                                                      (lambda (more) 'still-running))))
                                (for-each free-block! blocks)
+                               (unless (= (car blocks) ptr)
+                                 (set! missed-landings (cons fuel missed-landings)))
                                (cond ((not (vector-ref done 0))
                                       (list 'lookup-never-completed outcome))
                                      ((not (= (car blocks) ptr))
@@ -590,7 +596,7 @@
             (list (cons 'uv-cancel! cancel-complete-sweep))))
 
 ;; A run whose zeroed block missed the freed address answers the same, and
-;; counts for the reach: only the witness row below needs a landing.
+;; counts for the reach: the witness row below names it.
 (define (landed-or-not run)
   (if (eq? (cadr run) 'answered-done-no-reuse)
       (cons (car run) (cons 'answered-done (cddr run)))
@@ -600,11 +606,14 @@
   '((uv-cancel! answered-done untouched))
   (reach (list (cons 'uv-cancel! (map landed-or-not cancel-complete-sweep)))))
 
-;; The witness: a zeroed block took the freed request's address in at least
-;; one run, or a stale cancel could not be seen at all.
-(test-assert "the completion sweep's zeroed block took the freed request's address"
-  (or under-memory-tool?
-      (exists (lambda (run) (eq? (cadr run) 'answered-done)) cancel-complete-sweep)))
+;; The witness: a zeroed block took the freed request's address in every
+;; run the engine expired in. A run where none did could not have shown a
+;; stale cancel, so asking for one landing let every other run prove
+;; nothing. The reach row above holds that the sweep's runs expired at all:
+;; only an expired run answers 'answered-done.
+(test-equal "the completion sweep's zeroed block took the freed request's address in every expired run"
+  '()
+  (if under-memory-tool? '() (reverse missed-landings)))
 
 (test-equal "a cancel resumed after its loop changed hands is refused"
   '()

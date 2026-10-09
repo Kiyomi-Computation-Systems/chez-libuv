@@ -463,8 +463,10 @@ drains a caller-side queue rather than assuming one item per send.
 > handle or loop, read its pointer, allocated, filled, registered and
 > counted its request and called libuv with interrupts enabled between, and
 > `uv-cancel!` read its request's pointer and called `uv_cancel` the same
-> way. Measured on main (27d84bb), macOS, with the sweeps now in
-> `tests/test-request-steps.sps`:
+> way. Measured on macOS with the sweeps now in
+> `tests/test-request-steps.sps`: the three request verbs on main
+> (27d84bb), and `uv-cancel!` as main has it, with the other three
+> already one step:
 >
 > - **Split by a handoff:** every run suspended past the entry check made
 >   its call after the loop changed hands, all four verbs. The lookups

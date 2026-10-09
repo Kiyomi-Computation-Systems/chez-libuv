@@ -145,3 +145,51 @@ One harness note: an earlier driver applied its mutants with `python3`
 inside the Ubuntu image, which has none, and every "mutant" ran
 unmutated. Mutants are made on the host now, and a setup failure is
 reported as such.
+
+## The review's follow-ups
+
+PR #100's review (2026-10-09) found two gaps in this log's evidence.
+
+**The cancel witness asked for one landing.** The completion sweep proves
+a stale cancel is refused only in a run where a zeroed block took the
+freed request's address: in a run where none did, a cancel holding the old
+pointer would hand libuv a block no one owns, and answer as the right one
+does. The witness row passed if one expired run landed, so every other run
+could miss and the sweep would still pass. The run now records each
+expired run whose block missed, and the row expects none:
+
+```
+the completion sweep's zeroed block took the freed request's address in every expired run
+```
+
+The reach row holds that the sweep had expired runs to look at, as only an
+expired run answers `'answered-done`. Under a memory tool no run lands, so
+the row is excused there, as before.
+
+| Mutant | Change | Result |
+|---|---|---|
+| W1 | a same-size decoy takes the freed address first, in odd-fuel runs only | **killed**, macOS and glibc: `actual: (1 3 5 7 9)`. Every other row passes. |
+| W1, old witness | the same decoy, against the one-landing row | **survived**, 18 rows pass: the gap the review found |
+
+Unmutated, the new row passes on macOS and, three runs of three, on glibc
+(Debian 12, aarch64), landing in all nine expired runs each time.
+
+**The `'no-memory` branches were neither mutated nor logged.** Each of the
+three request verbs answers `'no-memory` from its step when `alloc-block`
+answers 0, and raises it after as ENOMEM.
+
+| Mutant | Change | Result |
+|---|---|---|
+| NM1 | connect's step ignores a 0 block | survived: **uncovered** (request-steps 18, tcp 238 pass) |
+| NM2 | getaddrinfo's step ignores a 0 block | survived: **uncovered** (request-steps 18, dns 150 pass) |
+| NM3 | getnameinfo's step ignores a 0 block | survived: **uncovered** (request-steps 18, dns 150 pass) |
+
+`alloc-block` answers 0 only for a size that is not a positive fixnum or
+one the allocator refuses. Each verb's size is its request's size plus a
+sockaddr or an addrinfo, constants of the platform, and the shim has no
+hook to fail an allocation, so no input reaches these branches. What they
+answer is covered elsewhere: `step-refusal` maps `'no-memory` to ENOMEM in
+test-loop's rows, and `alloc-block`'s refusals are test-native's.
+
+Driver: the session scratchpad's `rs2-mut/mutants.py`, the same shape as
+`rs-mut`'s, rooted at #100's tree with the witness fix applied.
