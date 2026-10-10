@@ -22,9 +22,12 @@
 ;;;            sleeps 60 s: both pipes end long before the child does
 ;;;   level    prints the optimize level it runs at: what the runner's
 ;;;            options set
+;;;   outlived prints a whole datum and exits 0 at once, leaving its stdout
+;;;            and stderr to a background sleep that holds them 1 s: the
+;;;            runner polls for that second with the child already ended
 (import (rnrs)
         (only (chezscheme) sleep make-time foreign-procedure
-              load-shared-object optimize-level))
+              load-shared-object optimize-level system))
 
 (define out (current-output-port))
 (define err (current-error-port))
@@ -76,6 +79,10 @@
    (exit 5))
   ((level)
    (say out (string-append "((level . " (number->string (optimize-level)) "))\n")))
+  ((outlived)
+   (system "sleep 1 &")
+   (say out "((outlived . #t))\n")
+   (exit 0))
   ((hush)
    (say err "hush child: closing\n")
    (close-fd! 1)

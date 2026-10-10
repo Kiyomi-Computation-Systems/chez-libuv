@@ -14,7 +14,8 @@
         (uv-child)
         (only (chezscheme) getenv current-time time-difference time-second
               cpu-time open-process-ports sleep make-time foreign-procedure
-              load-shared-object machine-type))
+              load-shared-object machine-type collect collect-trip-bytes
+              collect-maximum-generation collect-request-handler))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -129,6 +130,16 @@
       thunk
       (lambda () (signal-action sigchld before)))))
 
+;; with-collect-trip-bytes : integer (-> object) -> object
+;; THUNK's value, called with a collection requested every BYTES bytes
+;; allocated, and the setting before it put back after.
+(define (with-collect-trip-bytes bytes thunk)
+  (let ((before #f))
+    (dynamic-wind
+      (lambda () (set! before (collect-trip-bytes)) (collect-trip-bytes bytes))
+      thunk
+      (lambda () (collect-trip-bytes before)))))
+
 ;; spawn-true : -> pid
 ;; Runs `true` and reads its stdout to the end, leaving it unreaped.
 (define (spawn-true)
@@ -233,6 +244,46 @@
         '(bad-exit "((level . 3))\n" "" (exit 5))
         (level-3-run chez stand-in '(datum-then-exit) 20))
 
+      ;; #128: Chez records every child open-process-ports starts, and each
+      ;; collection reaps the ones that have ended and keeps no status
+      ;; (c/gc.c, the child_process list). One between a child's end and
+      ;; the runner's wait took the status, and test-level-3's flood row
+      ;; failed once on CI with (wait-failed). The precondition shows the
+      ;; collector does it: the runner's own wait is not what it measures.
+      ;; It collects every generation: the list of children moves up the
+      ;; generations with them, and a collection while the child still ran
+      ;; left it where a bare (collect) did not look, 1 run in 3.
+      (test-equal "precondition: a collection reaps an ended child of open-process-ports itself"
+        'reaped-by-the-collector
+        (let ((pid (spawn-true)))
+          (sleep (make-time 'time-duration 200000000 0))
+          (collect (collect-maximum-generation))
+          (let ((r (waitpid pid (make-bytevector 4 0) 1)))
+            (if (= r -1) 'reaped-by-the-collector (list 'waitpid-answered r 'for pid)))))
+
+      ;; The outlived child ends at once and leaves its pipes open for a
+      ;; second, so the runner polls with it ended; a collection requested
+      ;; every 256 bytes then comes at almost every poll.
+      (test-equal "a child that ends while the runner still polls answers its datum: no collection takes its status"
+        '((outlived . #t))
+        (with-collect-trip-bytes 256
+          (lambda () (child-run chez '() stand-in '(outlived) 20))))
+
+      ;; The deferral is the runner's alone: the suite's own handler, a
+      ;; procedure no default could be eq? to, is back once it returns.
+      (test-equal "child-run puts back the collect-request-handler it found"
+        'put-back
+        (let ((before (collect-request-handler))
+              (mine (lambda () (collect))))
+          (dynamic-wind
+            (lambda () (collect-request-handler mine))
+            (lambda ()
+              (child-run chez '() stand-in '(level) 20)
+              (if (eq? (collect-request-handler) mine)
+                  'put-back
+                  (list 'left (collect-request-handler))))
+            (lambda () (collect-request-handler before)))))
+
       ;; With SIGCHLD ignored, the system reaps each child itself, and
       ;; waitpid refuses it. A runner that took the refusal for a child
       ;; still running would wait out the deadline and kill a pid that was
@@ -244,8 +295,8 @@
            (let* ((pid (spawn-true)) (r (wait-within pid)))
              (if (= r -1) 'reaped-by-the-system (list 'waitpid-answered r 'for pid))))))
 
-      (test-equal "a child the system reaps first answers wait-failed, not killed-at-cap"
-        '(unreadable "" "" (wait-failed))
+      (test-equal "a child the system reaps first answers wait-failed with ECHILD, not killed-at-cap"
+        '(unreadable "" "" (wait-failed ECHILD))
         (with-sigchld-ignored
          (lambda () (level-3-run chez stand-in '(quiet-exit) 20))))))
 
