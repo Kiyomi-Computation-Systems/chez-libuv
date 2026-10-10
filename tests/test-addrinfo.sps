@@ -523,19 +523,16 @@
 ;; string truncated and collected then has fewer characters behind it than
 ;; the copy reads: the copy reads past it, into whatever the collector put
 ;; next (measured). The validator copies with interrupts disabled, so no
-;; handler runs inside the copy. The z strings make what lies next
-;; recognizable.
+;; handler runs inside the copy. What lies next needs no filling: without
+;; the copy's fence the sweep fails with or without strings allocated after
+;; the collection (macOS and Linux arm64, #89).
 (define trunc-length 512)
-(define trunc-neighbours '())
 
 (define truncation-sweep
   (node-sweep (lambda () (make-string trunc-length #\a))
               (lambda (node)
                 (string-truncate! node 1)
-                (collect)
-                (set! trunc-neighbours
-                      (list (make-string trunc-length #\z)
-                            (make-string trunc-length #\z))))))
+                (collect))))
 
 (test-equal "the truncation sweep began before the copy and ended untouched"
   (list (answered-c-string "a") #f)

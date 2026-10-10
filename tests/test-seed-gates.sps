@@ -70,7 +70,8 @@
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 (import (rnrs)
         (srfi :64)
-        (only (chezscheme) directory-list))
+        (only (chezscheme) directory-list)
+        (only (uv-source) read-forms))
 
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
@@ -98,7 +99,7 @@
     ("tests/test-stream.sps" (named s-peer sw-accepted))
     ("tests/test-flow.sps" (spelt not-accepted) (named closing-peer))
     ("tests/test-facade.sps" (spelt never-accepted))
-    ("tests/test-lifecycle.sps" (spelt never-accepted))
+    ("tests/test-lifecycle.sps")
     ("tests/test-callback-alloc.sps" (named r-peer rd-peer) (rows row))
     ("tests/test-process.sps" (named accepted))
     ("tests/test-echo.sps")
@@ -127,16 +128,6 @@
            (string=? (substring n (- len 4) len) ".sps"))))
   (map (lambda (n) (string-append "tests/" n))
        (list-sort string<? (filter suite? (directory-list "tests")))))
-
-;; read-forms : string -> (list-of datum)
-(define (read-forms path)
-  (call-with-input-file path
-    (lambda (port)
-      (let loop ((forms '()))
-        (let ((form (read port)))
-          (if (eof-object? form)
-              (reverse forms)
-              (loop (cons form forms))))))))
 
 ;; runs-at-once? : datum -> boolean
 ;; A call handing a lambda to with-loop or call-with-uv-loop, which run it
@@ -693,12 +684,12 @@
 ;; Each suite's placeholders and what its accepted peers set, as found. A
 ;; scan that found none would pass the rules below against any file at all.
 (define expected-placeholders
-  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
+  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer s-peer
      m-peer b-peer x-peer wv-peer rt-peer ka-peer)
     ("tests/test-stream.sps" s-peer sw-accepted)
     ("tests/test-flow.sps" closing-peer cpeer cidle-peer)
     ("tests/test-facade.sps" f-accepted c-accepted)
-    ("tests/test-lifecycle.sps" w-peer)
+    ("tests/test-lifecycle.sps")
     ("tests/test-callback-alloc.sps" r-peer rd-peer)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps")
@@ -708,12 +699,12 @@
     ("tests/test-owner-refusal.sps")))
 
 (define expected-seeded
-  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
+  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer s-peer
      m-peer b-peer x-peer x-data-fires x-eof-fires x-error wv-peer rt-peer ka-peer)
     ("tests/test-stream.sps" s-peer sw-accepted)
     ("tests/test-flow.sps" accepted collectors cpeer cidle-peer)
     ("tests/test-facade.sps" f-accepted f-read f-eof f-read-error c-accepted)
-    ("tests/test-lifecycle.sps" w-peer accepts)
+    ("tests/test-lifecycle.sps" accepts)
     ("tests/test-callback-alloc.sps" r-peer rd-peer w-peers)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps" accept-error peers)

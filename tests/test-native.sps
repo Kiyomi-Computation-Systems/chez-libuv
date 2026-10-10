@@ -1325,9 +1325,12 @@
 ;; copy-in! makes the final check and the copy one interrupt-free step.
 ;;
 ;; The scan runs copy-in! in an engine at rising fuel. On the first expiry it
-;; truncates the source to 16 bytes, collects, and fills the heap with #x77,
-;; then resumes. Every run must either be refused (the expiry came before the
-;; check) or copy only the source's #x11 (the copy came first). The scan stops
+;; truncates the source to 16 bytes and collects, then resumes. Every run
+;; must either be refused (the expiry came before the check) or copy only
+;; the source's #x11 (the copy came first). The heap needs no filling after
+;; the collection: with the check outside the interrupt-free step, the scan
+;; finds the read past the end with or without one (macOS and Linux arm64,
+;; #89). The scan stops
 ;; at the first run that finishes before any expiry, since more fuel changes
 ;; nothing after that. The scan runs outside any row, so every raise inside
 ;; the engine becomes an outcome and fails the second row by name instead of
@@ -1335,8 +1338,7 @@
 (define (truncation-outcome fuel)
   (let* ((n 4096)
          (bv (make-bytevector n #x11))
-         (dst (alloc-zeroed n))
-         (spray '()))
+         (dst (alloc-zeroed n)))
     (let-values (((answer expired)
                   (run-capped
                    (lambda ()
@@ -1347,12 +1349,7 @@
                    fuel
                    (lambda ()
                      (bytevector-truncate! bv 16)
-                     (collect)
-                     (set! spray
-                       (let fill ((i 0) (acc '()))
-                         (if (= i 2000)
-                             acc
-                             (fill (+ i 1) (cons (make-bytevector 48 #x77) acc)))))))))
+                     (collect)))))
       (let ((copied (foreign->bytevector dst n)))
         (free! dst)
         (values

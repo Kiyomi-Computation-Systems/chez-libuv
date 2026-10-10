@@ -1007,13 +1007,18 @@
 ;; The ticking wait, asserted by name: a plain 'once would block for good on a
 ;; peer that is never accepted, since the listening server keeps the loop
 ;; alive. This one gives up at its cap, and the row says which handshake
-;; failed.
+;; failed: what the listen and connect callbacks were handed, or that they
+;; never fired.
 (test-equal "seed: the pending-write pair connected and was accepted"
   'satisfied
-  (run-until/ticking pl
-                     (lambda () (and (not (eq? pending-connect-err 'connect-cb-never-fired))
-                                     (uv-tcp? pending-peer)))
-                     handshake-cap))
+  (let ((waited (run-until/ticking
+                 pl
+                 (lambda () (and (not (eq? pending-connect-err 'connect-cb-never-fired))
+                                 (uv-tcp? pending-peer)))
+                 handshake-cap)))
+    (if (eq? waited 'satisfied)
+        waited
+        (list waited 'listen pending-conn 'connect pending-connect-err))))
 
 (define write-req-live-before-pending (live-count 'write-req))
 
@@ -1172,8 +1177,6 @@
 ;; is caught, stored, and re-raised by uv-run wrapped as &uv-callback-error
 ;; composed with the original condition.
 (define gl (make-uv-loop))
-(define graise-conn 'connection-cb-never-fired)
-(define graise-peer 'never-accepted)
 
 (define gserver (make-uv-tcp gl))
 (define gserver-port (bind-loopback! gserver))
@@ -1181,8 +1184,7 @@
 (uv-listen! gserver 128
             (lambda (err)
               (collect)
-              (set! graise-conn err)
-              (when (not err) (set! graise-peer (uv-accept! gserver)))))
+              (when (not err) (uv-accept! gserver))))
 
 (define gclient (make-uv-tcp gl))
 

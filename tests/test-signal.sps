@@ -28,6 +28,18 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
+;; The simple runner prints only a failing row's title. The E2E rows answer
+;; what they found as their actual value (an early exit's status, how the
+;; child's pipe ended), so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
+
 (test-begin "signal")
 
 (define signal-base (live-count 'signal))
@@ -403,8 +415,15 @@
         'satisfied (run-until/ticking l4 (lambda () (pair? done)) 4096))
       (test-equal "…killed by the second SIGTERM: (0 sigterm) -- graceful then killed"
         '(0 sigterm) done)
-      (test-equal "the ack transcript is exactly READY/GOT1/DISARMED"
-        "READY\nGOT1\nDISARMED\n" (utf8->string (collector-bytes out)))
+      ;; A short transcript fails carrying how the pipe ended: at EOF, by a
+      ;; read error, or not yet.
+      (let ((acks "READY\nGOT1\nDISARMED\n"))
+        (test-equal "the ack transcript is exactly READY/GOT1/DISARMED"
+          acks
+          (let ((transcript (utf8->string (collector-bytes out))))
+            (if (string=? transcript acks)
+                transcript
+                (list transcript 'pipe eof-mark)))))
 
       (uv-loop-teardown! l4)
       (test-equal "signal counter balanced after the E2E"

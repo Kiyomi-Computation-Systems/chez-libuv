@@ -405,7 +405,6 @@
 ;; tolerate on a 'closing handle. Whichever ordering the platform produces,
 ;; the block is freed exactly once.
 (define wl (make-uv-loop))
-(define w-peer 'never-accepted)
 (define w-connect-err 'connect-cb-never-fired)
 (define w-write-err 'write-cb-never-fired)
 (define w-closed 'on-close-never-ran)
@@ -418,7 +417,7 @@
 (uv-listen! wserver 128
             (lambda (err)
               (collect)
-              (when (not err) (set! w-peer (uv-accept! wserver)))))
+              (when (not err) (uv-accept! wserver))))
 
 (define wclient (make-uv-tcp wl))
 
