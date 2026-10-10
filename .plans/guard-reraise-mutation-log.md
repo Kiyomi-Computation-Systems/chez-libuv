@@ -189,3 +189,7 @@ new suite). After the review: `make test` again, and the Valgrind run with
 test-loop-claim added: 0 bytes definitely lost in all three; nothing
 suppressed in the new suite, 6 blocks in test-loop and 22 in
 test-loop-claim, both on `MEMORY_ESCAPE_SUITES`.
+
+**macOS** (a plain `make test` on #120's head, c9973f8): all 35 suites
+passed, test-loop-guard with 18 and test-sweep with 18. CI passed on both
+Linux jobs.
