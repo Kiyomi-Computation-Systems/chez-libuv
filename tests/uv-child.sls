@@ -22,7 +22,8 @@
                 input-port-ready? sleep make-time system current-time
                 add-duration time>=? foreign-procedure load-shared-object
                 foreign-ref collect-request-handler void
-                with-interrupts-disabled))
+                with-interrupts-disabled make-mutex mutex-acquire
+                mutex-release))
 
   ;; waitpid, or #f where libc did not load. open-process-ports gives the
   ;; child's pid and nothing that waits on it, so the runner waits through
@@ -50,14 +51,11 @@
                (foreign-procedure (car names) () uptr))))))
 
   ;; errno-name : integer -> object
-  ;; The errnos a WNOHANG wait can answer, by the numbers Linux and macOS
-  ;; share, else the number.
+  ;; ECHILD, 10 on Linux and on macOS, by its name: the refusal a WNOHANG
+  ;; wait for a pid it has already given up answers. Any other errno stays
+  ;; a number.
   (define (errno-name n)
-    (case n
-      ((10) 'ECHILD)
-      ((4) 'EINTR)
-      ((22) 'EINVAL)
-      (else n)))
+    (if (= n 10) 'ECHILD n))
 
   ;; How long a child may run, by the monotonic clock. A healthy child takes
   ;; under a second; a poll count of 10 ms sleeps, as #69's runner kept, came
@@ -91,8 +89,10 @@
   ;; ended, keeping no status (c/gc.c); one between the child's end and the
   ;; runner's wait left the wait ECHILD (#128). Collections are deferred
   ;; through collect-request-handler, for every thread, from the spawn to
-  ;; the last wait, and the handler put back after. An explicit collect
-  ;; meanwhile, on any thread, can still take the status. The
+  ;; the last wait, and the handler put back once no run is left. An
+  ;; explicit collect meanwhile, on any thread, can still take the status,
+  ;; and an engine dropped inside a run leaves collections off for good:
+  ;; child-run is not for engines. The
   ;; deadline is child-deadline-seconds unless given. The command execs
   ;; Chez, so the pid is Chez's own: the kill reaches the child, and the
   ;; status is its own.
@@ -130,17 +130,37 @@
                         (watch from-child errors pid deadline-seconds))
                       spawned))))))))
 
+  ;; The runs under way on every thread, and the collect-request-handler
+  ;; the first of them found. Runs on two threads need not end in the order
+  ;; they began, so the handler goes back when the last run ends, not when
+  ;; each does. deferral-lock is taken and released with interrupts
+  ;; disabled, so no engine or collection stops a thread holding it.
+  (define deferral-lock (make-mutex))
+  (define runs-deferring 0)
+  (define handler-found #f)
+
   ;; without-collections : (-> object) -> object
-  ;; THUNK's value, called with every collection request dropped, and the
-  ;; collect-request-handler before it put back after.
+  ;; THUNK's value, called with every collection request dropped until no
+  ;; run is left.
   (define (without-collections thunk)
-    (let ((before #f))
-      (dynamic-wind
-        (lambda ()
-          (set! before (collect-request-handler))
-          (collect-request-handler void))
-        thunk
-        (lambda () (collect-request-handler before)))))
+    (dynamic-wind
+      (lambda ()
+        (with-interrupts-disabled
+         (mutex-acquire deferral-lock)
+         (when (= runs-deferring 0)
+           (set! handler-found (collect-request-handler))
+           (collect-request-handler void))
+         (set! runs-deferring (+ runs-deferring 1))
+         (mutex-release deferral-lock)))
+      thunk
+      (lambda ()
+        (with-interrupts-disabled
+         (mutex-acquire deferral-lock)
+         (set! runs-deferring (- runs-deferring 1))
+         (when (= runs-deferring 0)
+           (collect-request-handler handler-found)
+           (set! handler-found #f))
+         (mutex-release deferral-lock)))))
 
   ;; How long the pipes are drained after the kill, for what the child wrote
   ;; since the last pass and what the pipes still hold, and then how long
@@ -219,8 +239,9 @@
 
   ;; wait-once : pid bytevector -> (values integer (or integer #f))
   ;; waitpid's answer for PID with WNOHANG, its status in CELL, and errno
-  ;; read straight after it, with interrupts disabled between so nothing
-  ;; else can set it, or #f where errno cannot be read.
+  ;; read straight after it, or #f where errno cannot be read. Interrupts
+  ;; are disabled between the two, so no timer, engine or keyboard handler
+  ;; runs there and makes a call that sets errno.
   (define (wait-once pid cell)
     (with-interrupts-disabled
      (let* ((r (waitpid pid cell wnohang))

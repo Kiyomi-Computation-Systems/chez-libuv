@@ -2,7 +2,9 @@
 ;;; Probe for #128: does a collection between a child's exit and child-run's
 ;;; reap take the child's status? Runs the stand-in's quiet-exit and flood
 ;;; children N times each with collections made frequent, and counts each
-;;; answer's shape. Run as make test runs a suite:
+;;; answer's shape: datum only for a report that is an alist, so a probe
+;;; whose children never ran answers spawn-failed. Run as make test runs a
+;;; suite:
 ;;;   CHEZSCHEMELIBDIRS=src:tests:build/scheme-libs CHEZ_LIBUV_TEST_CHEZ=$CHEZ \
 ;;;     $CHEZ --program .plans/child-reap-probe.sps [trip-bytes] [runs]
 (import (rnrs) (uv-child) (only (chezscheme) getenv collect-trip-bytes))
@@ -17,7 +19,9 @@
   (cond ((and (pair? report) (memq (car report) '(unreadable bad-exit killed-at-cap)))
          (list (car report) (list-ref report 3)))
         ((and (pair? report) (eq? (car report) 'run-failed)) (list 'run-failed (caddr report)))
-        (else 'datum)))
+        ((and (pair? report) (eq? (car report) 'spawn-failed)) report)
+        ((and (list? report) (pair? report) (for-all pair? report)) 'datum)
+        (else (list 'unknown report))))
 
 (define (tally mode)
   (let loop ((i 0) (seen '()))

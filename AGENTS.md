@@ -405,14 +405,21 @@ None is obvious from reading the code.
     missed one time in three until it collected every generation.
   - `child-run` (`tests/uv-child.sls`) defers collections from the spawn
     to the last wait, through `collect-request-handler`, and puts the
-    handler back. An explicit `collect` on any thread meanwhile can still
-    take the status.
+    handler back when the last run on any thread ends. An explicit
+    `collect` on any thread meanwhile can still take the status, and an
+    engine dropped inside a run leaves collections off.
+  - A row that counts zombies has the same hole: a collection clears
+    them first. test-level-3 turns collections off for the whole suite.
   - test-level-3's outlived row, a child that ends while its pipes stay
     open for a second, with collections forced every 256 B, fails 10 runs
     in 10 without the deferral (`.plans/child-reap-mutation-log.md`).
   
-  A process the binding spawns through libuv (`uv-spawn!`) is not on that
-  list; only `open-process-ports`, `process` and the like put it there.
+  Only `open-process-ports` and `process` put a pid on that list, not
+  libuv's `uv-spawn!`. A pid stays on it after its own waiter has reaped
+  it, until a collection of its generation. A child that reuses the pid
+  in that window, `uv-spawn!`'s included, can lose its status to the
+  collector too. That takes the pid numbers wrapping around, and nothing
+  holds it.
 
 ### The build (make)
 
