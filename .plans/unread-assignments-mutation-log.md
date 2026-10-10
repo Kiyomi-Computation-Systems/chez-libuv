@@ -250,7 +250,10 @@ is now called inside rows.
 
 ## Gates
 
-- `make test` and `make check-purity` on the final tree.
+- `make test` and `make check-purity` on the final tree, and again on its
+  merge with main at 5e2a832 (#120, #121, #122). Rule 5 and the widened
+  census read the new `tests/test-loop-guard.sps` and `tests/uv-child.sls`
+  there.
 - Linux aarch64 (Ubuntu 26.04, libuv 1.51.0, in Docker): the two fills'
   measurements above.
 - CI's first run on this PR failed in test-dns's queued-tail teardown,
