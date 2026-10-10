@@ -10,7 +10,7 @@
         (srfi :64)
         (uv-sweep)
         ;; The definition census reads the shared libraries' export forms.
-        (only (uv-source) library-exports)
+        (only (uv-source) library-exports test-sources read-forms)
         ;; The engine census reads the suites' sources; the rows for what a
         ;; run leaves behind set interrupts and print.
         (only (chezscheme) directory-list with-output-to-string get-thread-id
@@ -343,25 +343,6 @@
     ;; The driver's own, which shows the census read the sources.
     ("tests/uv-sweep.sls" library)))
 
-;; test-sources : -> (list-of string)
-;; Every .sps and .sls file directly under tests/, sorted.
-(define (test-sources)
-  (define (source? n)
-    (let ((len (string-length n)))
-      (and (> len 4)
-           (not (char=? (string-ref n 0) #\.))
-           (member (substring n (- len 4) len) '(".sps" ".sls"))
-           #t)))
-  (map (lambda (n) (string-append "tests/" n))
-       (list-sort string<? (filter source? (directory-list "tests")))))
-
-(define (read-forms path)
-  (call-with-input-file path
-    (lambda (port)
-      (let loop ((forms '()))
-        (let ((form (read port)))
-          (if (eof-object? form) (reverse forms) (loop (cons form forms))))))))
-
 ;; calls? : datum symbol -> boolean
 ;; Whether X calls NAME anywhere outside quoted data.
 (define (calls? x name)
@@ -393,9 +374,10 @@
   engine-sites-allowed
   (engine-sites))
 
-;; describe was copied into seven suites and libraries before #81, and the
-;; step suites' sweep helpers into eight suites before #103; each now lives
-;; in one library. A new copy of any name either library exports fails this
+;; describe was copied into seven suites and libraries before #81, the step
+;; suites' sweep helpers into eight suites before #103, and the source
+;; lister and reader into three suites before #89; each now lives in one
+;; library. A new copy of any name these libraries export fails this
 ;; row by name, as (name file ...): a definition, procedure or variable, or
 ;; a binding in a let, let*, letrec or letrec*, or a named let's name,
 ;; anywhere in a source directly under tests/. test-constructors bound its
@@ -441,7 +423,7 @@
                               sources))))
          names)))
 
-(test-equal "each name (uv-describe) and (uv-sweep) export is defined or let-bound in its own library alone"
+(test-equal "each name (uv-describe), (uv-sweep) and (uv-source) export is defined or let-bound in its own library alone"
   '((describe "tests/uv-describe.sls")
     (resume-fuel "tests/uv-sweep.sls") (resume-cap "tests/uv-sweep.sls")
     (run-capped "tests/uv-sweep.sls") (run-capped* "tests/uv-sweep.sls")
@@ -452,9 +434,14 @@
     (report! "tests/uv-sweep.sls") (untouched? "tests/uv-sweep.sls")
     (interrupts-enabled? "tests/uv-sweep.sls") (residue "tests/uv-sweep.sls")
     (checked-verdict "tests/uv-sweep.sls") (me "tests/uv-sweep.sls")
-    (other-thread "tests/uv-sweep.sls"))
+    (other-thread "tests/uv-sweep.sls")
+    (sls-file? "tests/uv-source.sls") (sls-files "tests/uv-source.sls")
+    (src-libraries "tests/uv-source.sls") (library-exports "tests/uv-source.sls")
+    (source-file? "tests/uv-source.sls") (test-sources "tests/uv-source.sls")
+    (read-forms "tests/uv-source.sls"))
   (definers (append (exports "tests/uv-describe.sls")
-                    (exports "tests/uv-sweep.sls"))))
+                    (exports "tests/uv-sweep.sls")
+                    (exports "tests/uv-source.sls"))))
 
 (test-end "sweep")
 

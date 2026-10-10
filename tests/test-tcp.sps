@@ -984,6 +984,7 @@
 ;; close starts), so this asserts the disjunction and RECORDS which one this
 ;; platform produced, rather than pretending one of them is the contract.
 (define pl (make-uv-loop))
+(define pending-conn 'connection-cb-never-fired)
 (define pending-peer 'never-accepted)
 (define pending-write-err 'write-cb-never-fired)
 (define pending-closed 'on-close-never-ran)
@@ -995,6 +996,7 @@
 (uv-listen! pserver 128
             (lambda (err)
               (collect)
+              (set! pending-conn err)
               (when (not err) (set! pending-peer (uv-accept! pserver)))))
 
 (define pclient (make-uv-tcp pl))
@@ -1005,13 +1007,18 @@
 ;; The ticking wait, asserted by name: a plain 'once would block for good on a
 ;; peer that is never accepted, since the listening server keeps the loop
 ;; alive. This one gives up at its cap, and the row says which handshake
-;; failed.
+;; failed: what the listen and connect callbacks were handed, or that they
+;; never fired.
 (test-equal "seed: the pending-write pair connected and was accepted"
   'satisfied
-  (run-until/ticking pl
-                     (lambda () (and (not (eq? pending-connect-err 'connect-cb-never-fired))
-                                     (uv-tcp? pending-peer)))
-                     handshake-cap))
+  (let ((waited (run-until/ticking
+                 pl
+                 (lambda () (and (not (eq? pending-connect-err 'connect-cb-never-fired))
+                                 (uv-tcp? pending-peer)))
+                 handshake-cap)))
+    (if (eq? waited 'satisfied)
+        waited
+        (list waited 'listen pending-conn 'connect pending-connect-err))))
 
 (define write-req-live-before-pending (live-count 'write-req))
 

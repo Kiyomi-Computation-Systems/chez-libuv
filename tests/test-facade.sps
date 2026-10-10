@@ -379,11 +379,7 @@
                          (uv-write! fclient (string->utf8 "facade")
                                     (lambda (werr)
                                       (collect)
-                                      (set! f-write-err werr)
-                                      (uv-shutdown! fclient
-                                                    (lambda (serr)
-                                                      (collect)
-                                                      (set! f-shutdown-err serr))))))))
+                                      (set! f-write-err werr))))))
     'started))
 
 ;; Bounded by iteration count, never by a clock (design spec S11). The whole
@@ -392,8 +388,13 @@
 ;; BOTH ends are waited for, not just the client's chain: the listening
 ;; socket's readability and the client's connect completion are separate poll
 ;; events, and libuv does not promise them in the same iteration. Draining
-;; only until the shutdown completed left the accept unobserved on some runs
-;; and passed on others -- measured, not theorised.
+;; only until the client's chain completed left the accept unobserved on some
+;; runs and passed on others -- measured, not theorised.
+;;
+;; The client shuts down only after the peer's read is stopped, so the read
+;; uv-read-stop! stops is still running: libuv ends a read at EOF
+;; (vendor/libuv/src/unix/stream.c's uv__stream_eof), and stopping one that
+;; has ended returns at once. The read then restarts to take the EOF.
 ;;
 ;; THE TICKER IS WHAT MAKES THE BOUND REAL (final-review triage, Task 9
 ;; Minors). Without it, `uv-run 'once` BLOCKS waiting for an event, so a
@@ -407,8 +408,8 @@
 ;; not stand between this suite and the facade.
 ;;
 ;; THE SAME TICKER MAKES THE CAP A TIME BUDGET. Each tick spends an
-;; iteration, so the cap counts milliseconds, not events. This drain, the dns
-;; and resolve->connect drains and the spawn drain wait on the kernel or the
+;; iteration, so the cap counts milliseconds, not events. These TCP drains, the
+;; dns and resolve->connect drains and the spawn drain wait on the kernel or the
 ;; threadpool, and load can slow those while the ticker keeps its pace: under
 ;; a loopback flood (2026-10-06), handshakes outlasted a cap of 32 in up to 18
 ;; runs of 20. delivery-cap is four seconds or more. Under the heaviest flood
@@ -422,16 +423,18 @@
 (define f-ticker (make-uv-timer fl))
 (uv-timer-start! f-ticker (lambda (t) (collect)) 1 1)
 
-(let drain ((i 0))
-  (when (and (< i delivery-cap)
-             (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
-                 (eq? f-accepted 'never-accepted)
-                 (eq? f-read 'on-data-never-fired)
-                 (eq? f-eof 'on-eof-never-fired)))
-    (uv-run fl 'once)
-    (drain (+ i 1))))
+;; facade-drain : (-> boolean) -> unspecified
+;; Steps the loop until DONE? answers true or the cap is spent.
+(define (facade-drain done?)
+  (let drain ((i 0))
+    (when (and (< i delivery-cap) (not (done?)))
+      (uv-run fl 'once)
+      (drain (+ i 1)))))
 
-(uv-timer-stop! f-ticker)
+(facade-drain (lambda ()
+                (and (not (eq? f-write-err 'write-cb-never-fired))
+                     (not (eq? f-accepted 'never-accepted))
+                     (not (eq? f-read 'on-data-never-fired)))))
 
 (test-equal "uv-tcp-connect! is re-exported and its callback reports success"
   'no-error (facade-err->symbol f-connect-err))
@@ -442,23 +445,54 @@
 (test-equal "uv-write! is re-exported and its completion reports success"
   'no-error (facade-err->symbol f-write-err))
 
-(test-equal "uv-shutdown! is re-exported and its completion reports success"
-  'no-error (facade-err->symbol f-shutdown-err))
-
 (test-equal "uv-read-start! is re-exported and delivered the payload to the peer"
   "facade" f-read)
 
 (test-equal "reading through the facade fired no error callback"
   'on-error-never-fired f-read-error)
 
-(test-equal "the client's shutdown ended the peer's read through on-eof"
-  'eof f-eof)
-
+;; A read that has ended would make this row pass without stopping anything,
+;; so it says so instead.
 (test-equal "uv-read-stop! is re-exported and stops a running read"
   'stopped
-  (guard (e (#t (list 'raised e)))
-    (uv-read-stop! f-accepted)
-    'stopped))
+  (if (eq? f-eof 'on-eof-never-fired)
+      (guard (e (#t (list 'raised e)))
+        (uv-read-stop! f-accepted)
+        'stopped)
+      (list 'read-had-ended f-eof)))
+
+(test-equal "uv-shutdown! is re-exported and starts the client's shutdown"
+  'started
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-shutdown! fclient (lambda (serr) (collect) (set! f-shutdown-err serr)))
+    'started))
+
+(facade-drain (lambda () (not (eq? f-shutdown-err 'shutdown-cb-never-fired))))
+
+(test-equal "uv-shutdown! is re-exported and its completion reports success"
+  'no-error (facade-err->symbol f-shutdown-err))
+
+(test-equal "the stopped read delivered no EOF while the client shut down"
+  'on-eof-never-fired f-eof)
+
+(test-equal "uv-read-start! restarts the stopped read"
+  'restarted
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-read-start! f-accepted
+                    (lambda (bv start end) (collect))
+                    (lambda () (collect) (set! f-eof 'eof))
+                    (lambda (rerr) (collect) (set! f-read-error (facade-err->symbol rerr))))
+    'restarted))
+
+(facade-drain (lambda () (not (eq? f-eof 'on-eof-never-fired))))
+
+(uv-timer-stop! f-ticker)
+
+(test-equal "the client's shutdown ended the restarted read through on-eof"
+  'eof f-eof)
+
+(test-equal "the restarted read fired no error callback"
+  'on-error-never-fired f-read-error)
 
 ;; --- v0.5 buffer-size surfaces, reached through the facade only -----------
 ;; EACH NAME MUST BE EXERCISED, not merely called: a bare invocation would
