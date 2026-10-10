@@ -426,7 +426,8 @@
   (when (and (< i delivery-cap)
              (or (eq? f-shutdown-err 'shutdown-cb-never-fired)
                  (eq? f-accepted 'never-accepted)
-                 (eq? f-read 'on-data-never-fired)))
+                 (eq? f-read 'on-data-never-fired)
+                 (eq? f-eof 'on-eof-never-fired)))
     (uv-run fl 'once)
     (drain (+ i 1))))
 
@@ -449,6 +450,9 @@
 
 (test-equal "reading through the facade fired no error callback"
   'on-error-never-fired f-read-error)
+
+(test-equal "the client's shutdown ended the peer's read through on-eof"
+  'eof f-eof)
 
 (test-equal "uv-read-stop! is re-exported and stops a running read"
   'stopped

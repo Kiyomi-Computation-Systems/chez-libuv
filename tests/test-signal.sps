@@ -343,7 +343,6 @@
       'skipped 'skipped)
     (let ((l4 (make-uv-loop)))
       (define out (make-byte-collector))
-      (define eof-mark 'not-yet)
       (define done 'not-yet)
       (define child-out (make-uv-pipe l4))
       (define proc
@@ -381,8 +380,8 @@
             (begin (uv-kill! (uv-process-pid proc) 'sigterm) 'sent)))
       (uv-read-start! child-out
                       (lambda (bv start end) (collect) (collect-span! out bv start end))
-                      (lambda () (collect) (set! eof-mark 'eof))
-                      (lambda (err) (collect) (set! eof-mark (list 'error err))))
+                      (lambda () (collect))
+                      (lambda (err) (collect)))
 
       (test-equal "the child armed and acked READY"
         'acked (await-acks 1 4096))

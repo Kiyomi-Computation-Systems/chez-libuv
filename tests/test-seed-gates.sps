@@ -62,6 +62,20 @@
 ;;;    its first loopback fixture when every address is refused
 ;;;    (.plans/ffi-and-plumbing-rules-mutation-log.md).
 ;;;
+;;; 5. Every variable a file directly under tests/ assigns is read, other
+;;;    than in its own assignment. A placeholder that a callback sets and
+;;;    no row reads checks nothing, and reads as though something did (#89).
+;;;    The rule reads scope, because the suites reuse names across sections:
+;;;    a read of another binding of the same name does not count. A read
+;;;    inside the variable's own set! does not count either, unless a lambda
+;;;    there holds it: the lambda runs later and reads the value stored. It
+;;;    reads the binding forms the tests use: define and define-values,
+;;;    lambda and case-lambda, the let family with let-values, do, guard,
+;;;    syntax-rules, whose pattern variables bind in their template, and a
+;;;    record type's protocol. Anything else is read as a call whose
+;;;    arguments form a body, as a macro's would, so a binding form a test
+;;;    adds outside that list counts its names as reads.
+;;;
 ;;; Neither of the first two rules sees a callback that raises inside a later
 ;;; wait, which a late handshake can cause. That was checked by forcing each seed to fail, in a
 ;;; scratch clone (.plans/tcp-seed-gates-mutation-log.md and
@@ -98,7 +112,7 @@
     ("tests/test-stream.sps" (named s-peer sw-accepted))
     ("tests/test-flow.sps" (spelt not-accepted) (named closing-peer))
     ("tests/test-facade.sps" (spelt never-accepted))
-    ("tests/test-lifecycle.sps" (spelt never-accepted))
+    ("tests/test-lifecycle.sps")
     ("tests/test-callback-alloc.sps" (named r-peer rd-peer) (rows row))
     ("tests/test-process.sps" (named accepted))
     ("tests/test-echo.sps")
@@ -543,6 +557,167 @@
               (display "] ") (write f) (newline))
             found))
 
+;; test-source? : string -> boolean
+;; A program or library source: named *.sps or *.sls, and not a dotfile. A
+;; name no longer than its suffix, as the scratch directory tests/tmp, is
+;; not one.
+(define (test-source? name)
+  (let ((len (string-length name)))
+    (and (> len 4)
+         (not (char=? (string-ref name 0) #\.))
+         (member (substring name (- len 4) len) '(".sps" ".sls"))
+         #t)))
+
+;; Every source directly under tests/, sorted.
+(define test-sources
+  (map (lambda (n) (string-append "tests/" n))
+       (list-sort string<? (filter test-source? (directory-list "tests")))))
+
+;; A variable the walk below found bound, and what it saw done to it.
+(define-record-type binding (fields name (mutable assigned) (mutable read)))
+
+;; formals-names : datum -> (list-of symbol)
+;; The names a lambda's formals bind: a list, an improper list or one name.
+(define (formals-names formals)
+  (cond ((symbol? formals) (list formals))
+        ((pair? formals) (append (formals-names (car formals))
+                                 (formals-names (cdr formals))))
+        (else '())))
+
+;; body-names : (list-of datum) -> (list-of symbol)
+;; The names a body's definitions bind, a begin's included.
+(define (body-names forms)
+  (apply append
+         (map (lambda (f)
+                (cond ((not (pair? f)) '())
+                      ((and (eq? (car f) 'define) (pair? (cdr f)))
+                       (let head ((target (cadr f)))
+                         (cond ((symbol? target) (list target))
+                               ((pair? target) (head (car target)))
+                               (else '()))))
+                      ((and (eq? (car f) 'define-values) (pair? (cdr f)))
+                       (formals-names (cadr f)))
+                      ((eq? (car f) 'begin) (body-names (cdr f)))
+                      (else '())))
+              forms)))
+
+;; unread-assignments : (list-of datum) -> (list-of symbol)
+;; The variables FORMS bind that a set! assigns and nothing reads, in the
+;; order they are bound. FORMS is a program's forms, or a list holding one
+;; library form. A read inside the variable's own set! does not count,
+;; unless a lambda there holds it.
+(define (unread-assignments forms)
+  (define made '())
+  (define (bind names env)
+    (let ((frame (map (lambda (n) (cons n (make-binding n #f #f))) names)))
+      (set! made (append (reverse (map cdr frame)) made))
+      (cons frame env)))
+  (define (lookup name env)
+    (and (pair? env)
+         (let ((hit (assq name (car env))))
+           (if hit (cdr hit) (lookup name (cdr env))))))
+  (define (walk-each xs env self)
+    (cond ((pair? xs) (walk (car xs) env self) (walk-each (cdr xs) env self))
+          ((null? xs) #f)
+          (else (walk xs env self))))
+  (define (walk-body forms env self)
+    (let ((env (bind (body-names forms) env)))
+      (for-each (lambda (f) (walk-form f env self)) forms)))
+  ;; A body's own forms, where each definition's name is already bound.
+  (define (walk-form f env self)
+    (cond ((not (pair? f)) (walk f env self))
+          ((and (eq? (car f) 'define) (pair? (cdr f)))
+           (if (pair? (cadr f))
+               (walk-lambda (cdadr f) (cddr f) env)
+               (walk-each (cddr f) env self)))
+          ((eq? (car f) 'define-values) (walk-each (cddr f) env self))
+          ((eq? (car f) 'begin) (for-each (lambda (g) (walk-form g env self)) (cdr f)))
+          ((eq? (car f) 'import) #f)
+          (else (walk f env self))))
+  ;; A lambda's body runs later, so a read there sees the value stored.
+  (define (walk-lambda formals body env)
+    (walk-body body (bind (formals-names formals) env) #f))
+  (define (walk-scope names body env self)
+    (walk-body body (bind names env) self))
+  (define (walk-quasi x env self depth)
+    (cond ((not (pair? x)) #f)
+          ((memq (car x) '(unquote unquote-splicing))
+           (if (= depth 1)
+               (walk-each (cdr x) env self)
+               (walk-quasi (cdr x) env self (- depth 1))))
+          ((eq? (car x) 'quasiquote) (walk-quasi (cdr x) env self (+ depth 1)))
+          (else (walk-quasi (car x) env self depth)
+                (walk-quasi (cdr x) env self depth))))
+  (define (walk x env self)
+    (cond
+     ((symbol? x)
+      (let ((b (lookup x env)))
+        (when (and b (not (eq? b self))) (binding-read-set! b #t))))
+     ((not (pair? x)) #f)
+     (else
+      (let ((rest (cdr x)))
+        (case (car x)
+          ((quote) #f)
+          ((quasiquote) (walk-quasi (car rest) env self 1))
+          ((set!)
+           (let ((b (lookup (car rest) env)))
+             (when b (binding-assigned-set! b #t))
+             (walk-each (cdr rest) env (or b self))))
+          ((lambda) (walk-lambda (car rest) (cdr rest) env))
+          ((case-lambda)
+           (for-each (lambda (clause) (walk-lambda (car clause) (cdr clause) env)) rest))
+          ((let)
+           (if (symbol? (car rest))
+               (begin (walk-each (map cadr (cadr rest)) env self)
+                      (walk-scope (map car (cadr rest)) (cddr rest)
+                                  (bind (list (car rest)) env) self))
+               (begin (walk-each (map cadr (car rest)) env self)
+                      (walk-scope (map car (car rest)) (cdr rest) env self))))
+          ((let*)
+           (let each ((bindings (car rest)) (env env))
+             (if (null? bindings)
+                 (walk-body (cdr rest) env self)
+                 (begin (walk-each (cdar bindings) env self)
+                        (each (cdr bindings) (bind (list (caar bindings)) env))))))
+          ((letrec letrec*)
+           (let ((env (bind (map car (car rest)) env)))
+             (walk-each (map cadr (car rest)) env self)
+             (walk-body (cdr rest) env self)))
+          ((let-values let*-values)
+           (walk-each (map cadr (car rest)) env self)
+           (walk-scope (apply append (map (lambda (b) (formals-names (car b))) (car rest)))
+                       (cdr rest) env self))
+          ((do)
+           (walk-each (map cadr (car rest)) env self)
+           (let ((env (bind (map car (car rest)) env)))
+             (walk-each (map cddr (car rest)) env self)
+             (walk-each (cadr rest) env self)
+             (walk-body (cddr rest) env self)))
+          ((guard)
+           (walk-each (cdar rest) (bind (list (caar rest)) env) self)
+           (walk-body (cdr rest) env self))
+          ((case)
+           (walk (car rest) env self)
+           (for-each (lambda (clause) (walk-each (cdr clause) env self)) (cdr rest)))
+          ((syntax-rules)
+           (for-each (lambda (clause)
+                       (walk-scope (formals-names (car clause)) (cdr clause) env self))
+                     (cdr rest)))
+          ((define-record-type)
+           (for-each (lambda (clause)
+                       (when (and (pair? clause) (eq? (car clause) 'protocol))
+                         (walk-each (cdr clause) env self)))
+                     (cdr rest)))
+          ;; A call, or a form this walk does not know. Its arguments are
+          ;; read as a body, as a macro's body would be (with-mutex,
+          ;; parameterize): a definition there binds for the rest of them.
+          (else (walk (car x) env self)
+                (walk-body rest env self)))))))
+  (walk-body forms '() #f)
+  (map binding-name
+       (filter (lambda (b) (and (binding-assigned b) (not (binding-read b))))
+               (reverse made))))
+
 (test-begin "seed-gates")
 
 ;; One case per decision the scans make: what each must report, then what
@@ -693,12 +868,12 @@
 ;; Each suite's placeholders and what its accepted peers set, as found. A
 ;; scan that found none would pass the rules below against any file at all.
 (define expected-placeholders
-  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
+  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer s-peer
      m-peer b-peer x-peer wv-peer rt-peer ka-peer)
     ("tests/test-stream.sps" s-peer sw-accepted)
     ("tests/test-flow.sps" closing-peer cpeer cidle-peer)
     ("tests/test-facade.sps" f-accepted c-accepted)
-    ("tests/test-lifecycle.sps" w-peer)
+    ("tests/test-lifecycle.sps")
     ("tests/test-callback-alloc.sps" r-peer rd-peer)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps")
@@ -708,12 +883,12 @@
     ("tests/test-owner-refusal.sps")))
 
 (define expected-seeded
-  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer graise-peer s-peer
+  '(("tests/test-tcp.sps" accepted pa-peer pending-peer q-peer s-peer
      m-peer b-peer x-peer x-data-fires x-eof-fires x-error wv-peer rt-peer ka-peer)
     ("tests/test-stream.sps" s-peer sw-accepted)
     ("tests/test-flow.sps" accepted collectors cpeer cidle-peer)
     ("tests/test-facade.sps" f-accepted f-read f-eof f-read-error c-accepted)
-    ("tests/test-lifecycle.sps" w-peer accepts)
+    ("tests/test-lifecycle.sps" accepts)
     ("tests/test-callback-alloc.sps" r-peer rd-peer w-peers)
     ("tests/test-process.sps" accepted)
     ("tests/test-echo.sps" accept-error peers)
@@ -878,6 +1053,73 @@
                                 " calls an address or DNS verb where a raise would end the suite")
        '() found)))
  verb-suites verb-suite-forms)
+
+;; Rule 5, first on seeded bodies: one case for each decision the walk
+;; makes, what it must report and then what it must not.
+(test-equal "rule 5 flags a variable that is assigned and never read, and only that"
+  '((x) () () (x) (x) () () (x) (x) ())
+  (map unread-assignments
+       '(((define x 0) (set! x 1))
+         ((define x 0) (set! x 1) (display x))
+         ((define f 0) (set! f car) (f 1))
+         ((define x 0) (set! x 1) (f 'x))
+         ((define x 0) (set! x (+ x 1)))
+         ((define x 0) (set! x (g (lambda () x))))
+         ((define x 0) (set! x 1) (f `(a ,x)))
+         ((define x 0) (set! x 1) (f `(a x)))
+         ((define x 0) (set! x 1) (import (only (lib) x)))
+         ((set! y 1)))))
+
+(test-equal "rule 5 counts a read only of the binding in scope"
+  '((x) (x) (x) (x) (x) (r) (a)
+    (a) () (a) (loop) () (a) (i) () (e) () (a) (a) () (n) (a) () (x) (x))
+  (map unread-assignments
+       '(((define x 0) (define (f x) x) (set! x 1))
+         ((define x 0) (display x) (let ((x 1)) (set! x 2)))
+         ((define x 0) (set! x 1) (define (f) (define x 2) x))
+         ((define x 0) (display x) (define (f) (begin (define x 1)) (set! x 2)))
+         ((define x 0) (set! x 1) (define (f) (define-values (x y) (values 1 2)) x))
+         ((define r 0) (set! r 1) (lambda (a . r) r))
+         ((define a 0) (set! a 1) (case-lambda ((a) a)))
+         ((define a 0) (set! a 1) (let* ((a 2) (b a)) b))
+         ((define a 0) (set! a 1) (let ((a 2) (b a)) b))
+         ((define a 0) (set! a 1) (letrec ((a (lambda () 2)) (b (lambda () (a)))) (b)))
+         ((define loop 0) (set! loop 1) (let loop ((i 0)) (when (< i 1) (loop (+ i 1)))))
+         ((define i 0) (set! i 1) (let lp ((i i)) i))
+         ((define a 0) (set! a 1) (let-values (((a b) (values 1 2))) (+ a b)))
+         ((define i 0) (set! i 1) (do ((i 0 (+ i 1))) ((= i 2)) (display i)))
+         ((define i 0) (set! i 1) (do ((i i (+ i 1))) ((= i 2))))
+         ((define e 0) (set! e 1) (guard (e (#t e)) (f)))
+         ((define e 0) (set! e 1) (guard (e (#t 1)) e))
+         ((define a 0) (set! a 1) (case k ((a) 1) (else 2)))
+         ((define a 0) (set! a 1) (define-syntax m (syntax-rules () ((_ a) a))))
+         ((define a 0) (set! a 1) (define-syntax m (syntax-rules () ((_ b) (f a b)))))
+         ((define-syntax m (syntax-rules () ((_) (begin (define n 0) (define (bump!) (set! n (+ n 1))))))))
+         ((define a 0) (set! a 1) (define-record-type r (fields a)))
+         ((define a 0) (set! a 1) (define-record-type r (fields x) (protocol (lambda (new) (lambda () (new a))))))
+         ((library (l) (export f) (import (rnrs)) (define x 0) (define (f) (set! x 1))))
+         ((define x 0) (set! x 1) (with-mutex m (define x 2) x)))))
+
+(test-equal "rule 5 reads every .sps and .sls file directly under tests/, and no other file"
+  '((#t #t #t #t) (#t #t #f #f #f #f))
+  (list (map (lambda (path) (and (member path test-sources) #t))
+             '("tests/test-tcp.sps" "tests/signal-child.sps" "tests/uv-testing.sls"
+               "tests/test-seed-gates.sps"))
+        (map test-source? '("a.sps" "a.sls" ".#a.sps" "a.ss" "a.sps~" "sps"))))
+
+;; Two variables are kept only to keep their values alive: the strings
+;; trunc-neighbours holds sit next to the string test-addrinfo.sps truncates,
+;; and spray holds the bytevectors test-native.sps fills the heap with. They
+;; stand here as the scan's seed: a scan that found nothing fails this row.
+(define kept-alive
+  '(("tests/test-addrinfo.sps" trunc-neighbours)
+    ("tests/test-native.sps" spray)))
+
+(test-equal "every variable a file in tests/ assigns is read, but the two kept only to keep their values alive"
+  kept-alive
+  (filter (lambda (found) (pair? (cdr found)))
+          (map (lambda (path) (cons path (unread-assignments (read-forms path))))
+               test-sources)))
 
 (test-end "seed-gates")
 

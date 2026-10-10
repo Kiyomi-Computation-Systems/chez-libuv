@@ -984,7 +984,6 @@
 ;; close starts), so this asserts the disjunction and RECORDS which one this
 ;; platform produced, rather than pretending one of them is the contract.
 (define pl (make-uv-loop))
-(define pending-conn 'connection-cb-never-fired)
 (define pending-peer 'never-accepted)
 (define pending-write-err 'write-cb-never-fired)
 (define pending-closed 'on-close-never-ran)
@@ -996,7 +995,6 @@
 (uv-listen! pserver 128
             (lambda (err)
               (collect)
-              (set! pending-conn err)
               (when (not err) (set! pending-peer (uv-accept! pserver)))))
 
 (define pclient (make-uv-tcp pl))
@@ -1172,8 +1170,6 @@
 ;; is caught, stored, and re-raised by uv-run wrapped as &uv-callback-error
 ;; composed with the original condition.
 (define gl (make-uv-loop))
-(define graise-conn 'connection-cb-never-fired)
-(define graise-peer 'never-accepted)
 
 (define gserver (make-uv-tcp gl))
 (define gserver-port (bind-loopback! gserver))
@@ -1181,8 +1177,7 @@
 (uv-listen! gserver 128
             (lambda (err)
               (collect)
-              (set! graise-conn err)
-              (when (not err) (set! graise-peer (uv-accept! gserver)))))
+              (when (not err) (uv-accept! gserver))))
 
 (define gclient (make-uv-tcp gl))
 
