@@ -1,8 +1,8 @@
 #!r6rs
 ;;; Stand-in child for tests/test-level-3.sps, which runs it through
-;;; tests/uv-level-3.sls's level-3-run the way the real children run. It
-;;; tests the runner, not the binding, so it imports none of it. Its one
-;;; argument picks what it does:
+;;; tests/uv-level-3.sls's level-3-run and tests/uv-child.sls's child-run
+;;; the way the real children run. It tests the runner, not the binding, so
+;;; it imports none of it. Its one argument picks what it does:
 ;;;
 ;;;   flood    writes 1 MiB to stderr, more than a pipe holds, then prints
 ;;;            its datum: a runner that reads stderr only once stdout is
@@ -20,9 +20,11 @@
 ;;;   datum-then-exit  prints a whole datum, then exits with status 5
 ;;;   hush     prints a line on stderr, closes its stdout and stderr, then
 ;;;            sleeps 60 s: both pipes end long before the child does
+;;;   level    prints the optimize level it runs at: what the runner's
+;;;            options set
 (import (rnrs)
         (only (chezscheme) sleep make-time foreign-procedure
-              load-shared-object))
+              load-shared-object optimize-level))
 
 (define out (current-output-port))
 (define err (current-error-port))
@@ -72,6 +74,8 @@
   ((datum-then-exit)
    (say out "((level . 3))\n")
    (exit 5))
+  ((level)
+   (say out (string-append "((level . " (number->string (optimize-level)) "))\n")))
   ((hush)
    (say err "hush child: closing\n")
    (close-fd! 1)

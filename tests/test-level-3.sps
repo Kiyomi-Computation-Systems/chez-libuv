@@ -1,14 +1,17 @@
 #!r6rs
-;;; SRFI-64 suite for tests/uv-level-3.sls's runner, level-3-run, which
-;;; test-addrinfo and test-process use to run their level-3 children (#88).
-;;; It runs tests/level-3-stand-in-child.sps, which misbehaves on purpose,
-;;; under deadlines short enough for a row.
+;;; SRFI-64 suite for tests/uv-child.sls's runner, child-run, and
+;;; tests/uv-level-3.sls's level-3-run on it, which test-addrinfo and
+;;; test-process use to run their level-3 children (#88). test-loop runs its
+;;; stranded child through child-run (#117). It runs
+;;; tests/level-3-stand-in-child.sps, which misbehaves on purpose, under
+;;; deadlines short enough for a row.
 ;;;
 ;;; Pure: the runner and the stand-in import no native code, and make
 ;;; check-purity runs this suite with the shim poisoned (PURE_TESTS).
 (import (rnrs)
         (srfi :64)
         (uv-level-3)
+        (uv-child)
         (only (chezscheme) getenv current-time time-difference time-second
               cpu-time open-process-ports sleep make-time foreign-procedure
               load-shared-object machine-type))
@@ -148,6 +151,21 @@
     (test-equal "level-3 runner rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
+      ;; child-run hands its options to Chez ahead of --program (#117). Two
+      ;; levels other than 3, so a runner that drops its options and one
+      ;; that runs level 3 whatever it is given each fail a row.
+      (test-equal "child-run runs the child with the options it is given"
+        '((level . 2))
+        (child-run chez '("--optimize-level" "2") stand-in '(level) 20))
+
+      (test-equal "child-run with no options runs the child at Chez's default level"
+        '((level . 0))
+        (child-run chez '() stand-in '(level) 20))
+
+      (test-equal "level-3-run runs the child at --optimize-level 3"
+        '((level . 3))
+        (level-3-run chez stand-in '(level) 20))
+
       ;; The deadline is long enough for any healthy child, so a runner that
       ;; leaves the child blocked on stderr is caught by what it answers,
       ;; killed-at-cap, and not by a slow machine.

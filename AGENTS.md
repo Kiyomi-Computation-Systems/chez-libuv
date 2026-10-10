@@ -265,8 +265,10 @@ None is obvious from reading the code.
   its `uv_run`'s frames on the thread's stack, and the next call pushes
   below them. A probe of #91's fix, 20,000 escapes on one thread, died with
   `SIGSEGV` on Linux at 8 MB (16,000 passed; a 64 MB stack held 40,000). On
-  macOS the main thread held 20,000, and a `fork-thread` thread only 1,000:
-  at 2,000 it hung inside Chez, with no crash and no message. A suite that
+  macOS the main thread held 20,000. A `fork-thread` thread there has
+  pthread's 512 KiB default, and its 1,430th escape faulted (arm64). The
+  fault reached Scheme as "invalid memory reference", and #94's repro,
+  which caught it and kept going, hung (#95; next trap). A suite that
   escapes callbacks in bulk (test-loop-claim's exit race) runs them in
   batches on threads it lets end, and docs/api.md tells users the cost.
   Each escape also strands a heap block, the `jmp_buf` Chez's `S_call_help`
@@ -274,6 +276,24 @@ None is obvious from reading the code.
   thread's end does not free; so does an engine dropped inside a callback. Valgrind calls it reachable or definitely
   lost by collection timing, so the gate suppresses exactly it
   (`tests/valgrind-chez.supp`; #94, ADR-0003's amendment of 2026-10-09).
+* **A fault caught from a `__collect_safe` call can deadlock the next
+  collection.** Chez turns a `SIGSEGV` in foreign code into "invalid
+  memory reference" and jumps back into Scheme, but a `__collect_safe`
+  call had deactivated the thread, and nothing reactivates it until the
+  next such call returns. A collection requested in between waits for
+  good in `$collect-rendezvous`, at 0% CPU and with no message, even with
+  one thread. `uv_run` is `__collect_safe`, so a thread whose stack runs
+  out there and catches the error to keep going hangs: #94's repro did,
+  on a macOS `fork-thread` thread (#95). macOS probes `uv__io_poll`'s
+  32 KiB frame before moving `sp`, so the handler has room there. On
+  Linux arm64 the same overflow, swallowing repro included, ended in a
+  plain `SIGSEGV`; why it differs there was not measured. A Chez patched
+  to reactivate in `do_error` stopped hanging, and ran on until the
+  handler itself had no stack. Never treat that error as recoverable, and never write a
+  `(guard (e (#t …)))` that swallows it in a loop. The no-libuv repro is
+  `.plans/fault-deactivated-probe.sps`, and the upstream draft is
+  `.plans/upstream-chez-fault-deactivated-issue.md`
+  (`.plans/macos-thread-overflow-log.md`).
 * **A return from a callback abandons every callback entered after it on
   the thread that has not returned.** Chez's `S_return` longjmps to the
   frame that entered the callback and drops every newer context from the

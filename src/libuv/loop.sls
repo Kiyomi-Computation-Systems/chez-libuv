@@ -345,20 +345,56 @@
   ;;   call: claimed again here, it would stay claimed with no run in it.
   ;; - A loop claimed by another thread is live under that thread's call:
   ;;   the teardown refuses it, as from any exit.
+  ;; - A guard unwinds to itself before it tests its clauses, and when none
+  ;;   matches it re-raises from where the body raised: a re-entry (#118).
+  ;;   So the first re-entry after the body was left while raising raises
+  ;;   that raise again, and every other re-entry &uv-handle-closed: the
+  ;;   guards outside get the body's own condition, and nothing resumes the
+  ;;   body. Only the first: a handler outside that answers the raise by
+  ;;   re-entering the body, to retry it, would otherwise get the same raise
+  ;;   for good (#120's review).
+  ;;   RAISING is that raise in a list, so that a body that raises #f is told
+  ;;   from one that raised nothing. The handler that records it hands the
+  ;;   raise on in place, with raise-continuable, so handlers outside run in
+  ;;   the body's dynamic environment, and one that returns from a
+  ;;   raise-continuable resumes the body as before. One that returns from
+  ;;   a raise sees one call more: R6RS raises the &non-continuable from
+  ;;   the handler that was returned to, which is now this one.
+  ;;   A return ends the raise, and so does the body's: RAISING goes back to
+  ;;   #f, not to a raise it interrupted. A raise can interrupt another only
+  ;;   when a handler gave the other up by jumping back into the body.
   (define (call-with-uv-loop proc)
     (ensure-native-loaded!)
-    (let ((loop #f) (left #f))
+    (let ((loop #f) (left #f) (raising #f) (left-raising #f))
       (dynamic-wind
        (lambda ()
          (when left
-           (raise (make-uv-handle-closed 'loop))))
+           (let ((pending left-raising))
+             (set! left-raising #f)
+             (raise (if pending
+                        (car pending)
+                        (make-uv-handle-closed 'loop))))))
        (lambda ()
          (let ((made (try-construct-loop uv-loop-init (lambda (made) (set! loop made)))))
            (if (uv-loop? made)
-               (proc made)
+               (with-exception-handler
+                (lambda (c)
+                  (set! raising (list c))
+                  (call-with-values
+                   (lambda () (raise-continuable c))
+                   (lambda answers
+                     (set! raising #f)
+                     (apply values answers))))
+                (lambda ()
+                  (call-with-values
+                   (lambda () (proc made))
+                   (lambda answers
+                     (set! raising #f)
+                     (apply values answers)))))
                (raise (step-refusal made 'make-uv-loop #f)))))
        (lambda ()
          (set! left #t)
+         (set! left-raising raising)
          (when (loop-open? loop)
            (if (eqv? (loop-holder loop) (current-thread-id))
                (let ((failure (teardown! loop #t)))

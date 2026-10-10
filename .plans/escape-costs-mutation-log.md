@@ -206,7 +206,9 @@ through would fail them by name, and one that crashed would end the suite.
   Both are drafted, not filed, in `.plans/upstream-chez-cchain-issue.md`.
 - Whether the binding should count escapes per thread and raise a named
   condition before the stack runs out.
-- macOS x86-64 and Windows are unmeasured.
+- macOS arm64 is measured in #95 (`.plans/macos-thread-overflow-log.md`): a
+  `fork-thread` thread there has 512 KiB, and faults at escape 1,430.
+  macOS x86-64 and Windows are unmeasured.
 - The code review also asked for a check on how many blocks each escape
   suite has suppressed (test-loop's rose from 3 to 6 here, and nothing
   pins it). The Makefile and suppression comments now name the new

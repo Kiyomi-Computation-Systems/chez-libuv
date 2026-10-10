@@ -106,6 +106,30 @@ says. Inside `call-with-uv-loop` the suspension is an
 exit like any other: the loop is torn down, and resuming the engine raises
 `&uv-handle-closed`.
 
+**A raise out of `call-with-uv-loop`'s body reaches the guards outside it
+as itself.** The body runs once, so every way back into a body that has
+been left is refused. The first way back into a body left while one of
+its raises was being handled is refused with that raise. Every other is
+refused with `&uv-handle-closed`. R6RS `guard` needs the first: it
+unwinds to itself before it tests its clauses, and when none matches, it
+re-raises from where the body raised, which re-enters the body.
+
+Handlers outside the body run where it raised, as R6RS says, and one
+that returns from the body's `raise-continuable` resumes it as usual. The
+costs:
+- A guard whose clauses do not match the body's condition tests them a
+  second time, and any handler between that guard and the body sees the
+  condition twice.
+- A handler that answers the body's raise by re-entering the body, to
+  retry it, gets the raise once more and then `&uv-handle-closed`.
+- A handler that returns from the body's `raise` (not
+  `raise-continuable`) is called once more, with the `&non-continuable`
+  that R6RS raises for it. `call-with-uv-loop` passes the raise on with a
+  handler of its own, and R6RS raises the `&non-continuable` from the
+  handler that was returned to.
+- A handler between a guard and the body cannot resume a body that the
+  guard has already unwound.
+
 Callbacks on one thread nest: each is entered from C, and returns by
 jumping back to the C frame that entered it. That jump abandons every
 callback entered after it on the thread that has not yet returned. A
@@ -141,9 +165,17 @@ Measured with `call-with-uv-loop` bodies that each leave from a timer
 callback, an escape costs about 400 bytes of stack on Linux x86-64, and 400
 to 500 on arm64. On arm64, 16,000 to 20,000 of them filled an 8 MB stack
 and the process died with `SIGSEGV`, and on x86-64, 20,000 to 24,000; a
-thread made with `fork-thread` held 16,000 on both. On macOS the main
-thread held 20,000 to 40,000, and a thread made with `fork-thread` 1,000 to
-2,000, after which it hung. A raise costs nothing: the seam catches it
+thread made with `fork-thread` held 16,000 on both. On macOS arm64 the
+main thread held 20,000, and died with `SIGSEGV` by 30,000. A thread made
+with `fork-thread` gets macOS's default 512 KiB stack, not 8 MB, and its
+1,430th escape faulted. The fault comes as a Scheme error, "invalid memory
+reference", on a stack that is still full, so it cannot be recovered from.
+A handler that catches it can fault again, and can hang for good, with no
+message, at the next garbage collection: the fault was inside `uv_run`,
+Chez leaves the thread marked as running outside Scheme after a fault in
+such a call (one made `__collect_safe`), and the collection waits for it
+to stop. That is Chez's, with or without libuv. Keep a thread's escapes
+well under its stack. A raise costs nothing: the seam catches it
 inside the callback, which then returns. Neither does an engine that is
 resumed. Short of the thread's end, the frames go only when a callback
 entered before them returns, so a program that leaves callbacks by
