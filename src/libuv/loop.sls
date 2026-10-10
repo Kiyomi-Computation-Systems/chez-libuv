@@ -52,17 +52,21 @@
   (define (raise-if-error! error)
     (when error (raise error)))
 
-  ;; run-step! : uv-loop exact-integer
-  ;;             -> (values (or uptr 'loop-running 'loop-not-open 'no-loop-pointer)
+  ;; run-step! : uv-loop exact-integer exact-integer
+  ;;             -> (values (or uptr stack-shortfall 'loop-running 'loop-not-open
+  ;;                            'no-loop-pointer)
   ;;                        exact-integer (or condition #f))
   ;; One uv_run of LOOP in MODE-INT, claimed, taking the loop over, and given
   ;; back once uv_run returns: the claim's answer, libuv's return code, and
   ;; the pending callback error, for the caller to raise. uv-run and every
   ;; drain step of a teardown run this way, so the claim is held only
   ;; between the claim's step and the release's, around the native call: an
-  ;; engine dropped anywhere else leaves the loop unclaimed.
-  (define (run-step! loop mode-int)
-    (let ((ptr (claim-loop! loop #t)))
+  ;; engine dropped anywhere else leaves the loop unclaimed. Every uv_run
+  ;; the binding makes starts here, so this is where the C stack's headroom
+  ;; is checked against FLOOR (claim-loop-for-run!; #94): uv-run's is
+  ;; run-stack-floor and a drain's teardown-stack-floor.
+  (define (run-step! loop mode-int floor)
+    (let ((ptr (claim-loop-for-run! loop floor)))
       (if (refused? ptr)
           (values ptr 0 #f)
           (begin
@@ -101,7 +105,8 @@
        (require-open-loop loop 'uv-run)
        (when (loop-running? loop)
          (raise (make-uv-invalid-argument 'uv-run 'loop-running)))
-       (let-values (((ptr rc error) (run-step! loop (run-mode->int mode 'uv-run))))
+       (let-values (((ptr rc error)
+                     (run-step! loop (run-mode->int mode 'uv-run) run-stack-floor)))
          (when (refused? ptr)
            (raise (step-refusal ptr 'uv-run #f)))
          (raise-if-error! error)
@@ -271,11 +276,13 @@
              'started)))))
 
   ;; drain-step! : uv-loop -> (or 'work 'drained 'loop-not-open 'loop-running
-  ;;                              'no-loop-pointer condition)
+  ;;                              'no-loop-pointer stack-shortfall condition)
   ;; One run-step! in 'default mode, as uv-run's: 'work or
-  ;; 'drained, the run's pending callback error, or the claim's refusal.
+  ;; 'drained, the run's pending callback error, or the claim's refusal. Its
+  ;; floor is the teardown's, under uv-run's, so a run refused for the stack
+  ;; can still be torn down.
   (define (drain-step! loop)
-    (let-values (((ptr rc error) (run-step! loop (uv-run-default))))
+    (let-values (((ptr rc error) (run-step! loop (uv-run-default) teardown-stack-floor)))
       (cond ((refused? ptr) ptr)
             (error error)
             ((zero? rc) 'drained)

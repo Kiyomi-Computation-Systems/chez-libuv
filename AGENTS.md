@@ -274,7 +274,14 @@ None is obvious from reading the code.
   (`.plans/2026-10-09-escape-headroom-check-design.md`). Measure an escape
   cost per callback kind, never from timers alone. The
   fault reached Scheme as "invalid memory reference", and #94's repro,
-  which caught it and kept going, hung (#95; next trap). A suite that
+  which caught it and kept going, hung (#95; next trap). So every `uv_run`
+  now starts in `run-step!`, which reads the thread's headroom through the
+  shim first and refuses with `&uv-stack-exhausted` under a floor: 128 KiB
+  for `uv-run`, 64 KiB for a teardown's drain, so that a refused run can
+  still be torn down. Rule 11 of `tests/test-source-rules.sps` holds every
+  `uv_run` there, and `tests/test-stack-headroom.sps` holds the floors
+  against what one escape strands on the platform running it. A new path
+  into `uv_run` goes through `run-step!` or it is unchecked. A suite that
   escapes callbacks in bulk (test-loop-claim's exit race) runs them in
   batches on threads it lets end, and docs/api.md tells users the cost.
   Each escape also strands a heap block, the `jmp_buf` Chez's `S_call_help`

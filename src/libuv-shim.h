@@ -1,10 +1,12 @@
 /* Thin ABI shim for compiler-derived constants, layouts, errnos, optional
- * allocation counters, bulk byte moves, and libuv's alloc callback for reads.
- * It does not wrap uv_* operations. */
+ * allocation counters, bulk byte moves, libuv's alloc callback for reads,
+ * and the calling thread's stack headroom. It does not wrap uv_*
+ * operations. */
 #ifndef CHEZ_LIBUV_SHIM_H
 #define CHEZ_LIBUV_SHIM_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* A struct tag introduced only in a prototype has prototype scope. */
 struct uv_handle_s;
@@ -41,6 +43,18 @@ void chez_uv_zero(void *dst, size_t len);
  * callback as UV_ENOBUFS. It calls nothing, in libuv or in Scheme. */
 void chez_uv_alloc_cb(struct uv_handle_s *handle, size_t suggested_size,
                       struct uv_buf_t *buf);
+
+/* The distance in bytes from this call's frame to the bottom of the calling
+ * thread's stack (ADR-0002 as amended for issue #94): how much C stack a
+ * call made from here still has. Every uv_run the binding makes asks first,
+ * and is refused below a floor, because each continuation that escapes a
+ * callback leaves its uv_run's frames on the stack for the thread's life.
+ * The bottom is read from pthreads on the thread's first call and kept for
+ * the thread. Where it cannot be read, the answer is
+ * CHEZ_UV_HEADROOM_UNKNOWN, which is more than any floor, so nothing is
+ * refused. It calls nothing in libuv or in Scheme. */
+#define CHEZ_UV_HEADROOM_UNKNOWN ((uintptr_t)1 << 40)
+uintptr_t chez_uv_stack_headroom(void);
 
 /* The binding's own foreign blocks: handles, requests, read buffers and
  * scratch. chez_uv_alloc answers n zeroed bytes, or NULL when the allocator

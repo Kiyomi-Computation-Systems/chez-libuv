@@ -30,7 +30,11 @@
           uv-callback-error-cause
 
           &uv-wrong-thread make-uv-wrong-thread uv-wrong-thread?
-          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual)
+          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual
+
+          &uv-stack-exhausted make-uv-stack-exhausted uv-stack-exhausted?
+          uv-stack-exhausted-who uv-stack-exhausted-headroom
+          uv-stack-exhausted-floor)
   (import (rnrs))
 
   (define-condition-type &uv-error &error
@@ -85,4 +89,17 @@
     make-uv-wrong-thread uv-wrong-thread?
     (who      uv-wrong-thread-who)
     (expected uv-wrong-thread-expected)
-    (actual   uv-wrong-thread-actual)))
+    (actual   uv-wrong-thread-actual))
+
+  ;; &uv-stack-exhausted fields: symbol exact-integer exact-integer
+  ;; Raised when a uv_run is refused because its thread's C stack has less
+  ;; headroom left than the run's floor (#94): who is the verb refused,
+  ;; headroom the bytes the thread had left, floor the bytes the run needed.
+  ;; A continuation that escapes a callback leaves its uv_run's C frames on
+  ;; the stack until the thread ends, so the headroom comes back only then,
+  ;; or when an engine resumed inside a callback returns.
+  (define-condition-type &uv-stack-exhausted &uv-error
+    make-uv-stack-exhausted uv-stack-exhausted?
+    (who      uv-stack-exhausted-who)
+    (headroom uv-stack-exhausted-headroom)
+    (floor    uv-stack-exhausted-floor)))

@@ -18,6 +18,8 @@
           try-construct-handle construct-handle try-construct-loop
           refused? loop-owner-mismatch
           make-owner-mismatch owner-mismatch? owner-mismatch-owner owner-mismatch-caller
+          ;; the C stack's headroom (#94)
+          run-stack-floor teardown-stack-floor claim-loop-for-run!
 
           ;; loop record
           %make-uv-loop-record uv-loop?
@@ -88,7 +90,7 @@
           (libuv private conditions)
           (only (libuv private native)
                 uv-cancel
-                uv-loop-stop uv-close-native free!
+                uv-loop-stop uv-close-native free! stack-headroom
                 count-timer-free! count-tcp-free!
                 count-pipe-free! count-process-free!
                 count-signal-free! count-async-free!
@@ -220,6 +222,47 @@
     (memory-order-release)
     (set-box! mark #f))
 
+  ;; The C stack a uv_run needs left below it (#94;
+  ;; .plans/2026-10-09-escape-headroom-check-design.md). A continuation that
+  ;; escapes a callback leaves its uv_run's frames on the thread's stack for
+  ;; the thread's life, and enough of them overflow it: SIGSEGV, or on macOS
+  ;; a fault Chez catches, after which the thread can hang the next
+  ;; collection (#95).
+  ;; - teardown-stack-floor is a teardown's drain's. The deepest path
+  ;;   measured through a uv_run is 35.8 KiB (macOS arm64: libuv's poll,
+  ;;   whose frame holds 32 KiB of events, then a collection inside an I/O
+  ;;   callback); 21 KiB on Linux arm64.
+  ;; - run-stack-floor is uv-run's. Headroom shrinks only when a run's
+  ;;   callback escapes, and one escape strands at most one run's frames
+  ;;   (34.4 KiB measured, from an I/O callback). The gap between the floors
+  ;;   holds that, so a run let through at this floor that then escapes
+  ;;   still leaves its teardown the teardown floor.
+  ;; tests/test-stack-headroom.sps holds both against what one escape
+  ;; strands on the platform running it.
+  (define teardown-stack-floor 65536)
+  (define run-stack-floor 131072)
+
+  ;; What a run found when its thread had too little C stack: the headroom
+  ;; and the floor it fell short of, for &uv-stack-exhausted.
+  (define-record-type stack-shortfall (fields headroom floor))
+
+  ;; claim-loop-for-run! : uv-loop exact-integer
+  ;;   -> (or uptr stack-shortfall 'loop-running 'loop-not-open 'no-loop-pointer)
+  ;; claim-loop! for a uv_run of LOOP, taking the loop over, unless this
+  ;; thread's C stack has less headroom than FLOOR. The headroom is read
+  ;; first, in the claim's step, before the mark is taken, so a shortfall
+  ;; changes nothing and leaves nothing to give back. The uv_run itself
+  ;; cannot be in the step (it is __collect_safe), so an engine can expire
+  ;; between the two, and a resume from deeper in the C stack runs below
+  ;; where the step measured: the gap between the floors is what absorbs
+  ;; that.
+  (define (claim-loop-for-run! loop floor)
+    (one-step
+     (let ((headroom (stack-headroom)))
+       (if (< headroom floor)
+           (make-stack-shortfall headroom floor)
+           (claim-loop! loop #t)))))
+
   ;; What an owner check found when another thread owned the loop: the owner
   ;; it compared against and the caller. The check answers it, and the
   ;; refusal is built from it (wrong-thread-refusal), never from a second
@@ -261,12 +304,13 @@
 
   ;; refused? : object -> boolean
   ;; Whether a pointer check's answer is a refusal rather than a pointer: a
-  ;; symbol, or the owner-mismatch an owner check answers (owned-loop-ptr,
-  ;; owned-handle-ptr). A step tests its pointer, and a verb the step's
-  ;; answer, with this: tested with symbol?, an owner-mismatch would pass
-  ;; for a pointer and reach libuv (tests/test-source-rules.sps's rule 9).
+  ;; symbol, the owner-mismatch an owner check answers (owned-loop-ptr,
+  ;; owned-handle-ptr), or the stack-shortfall a run's claim answers
+  ;; (claim-loop-for-run!). A step tests its pointer, and a verb the step's
+  ;; answer, with this: tested with symbol?, a record would pass for a
+  ;; pointer and reach libuv (tests/test-source-rules.sps's rule 9).
   (define (refused? answer)
-    (or (symbol? answer) (owner-mismatch? answer)))
+    (or (symbol? answer) (owner-mismatch? answer) (stack-shortfall? answer)))
 
   (define (loop-has-pending-error? loop)
     (not (eq? (loop-pending-error loop) no-pending)))
@@ -661,19 +705,24 @@
     (or (loop-owner-mismatch (handle-loop handle))
         (open-handle-ptr handle)))
 
-  ;; step-refusal : (or symbol owner-mismatch exact-integer) symbol
-  ;;                (or uv-handle #f) -> condition
+  ;; step-refusal : (or symbol owner-mismatch stack-shortfall exact-integer)
+  ;;                symbol (or uv-handle #f) -> condition
   ;; What verb WHO raises, once its step is over, for a step on HANDLE that
   ;; answered STATUS instead of starting; a step on a loop has no handle to
   ;; pass. An owner-mismatch is the &uv-wrong-thread naming what the owner
-  ;; check found (wrong-thread-refusal). A closed handle or loop and a
-  ;; missing pointer are the refusals the checked accessors raise outside a
-  ;; step; a refused registration is registry-register!'s; an integer is
-  ;; libuv's errno. Any other symbol is a refusal of WHO's own argument, and
-  ;; names it.
+  ;; check found (wrong-thread-refusal), and a stack-shortfall the
+  ;; &uv-stack-exhausted naming the headroom and floor the run's claim
+  ;; compared. A closed handle or loop and a missing pointer are the
+  ;; refusals the checked accessors raise outside a step; a refused
+  ;; registration is registry-register!'s; an integer is libuv's errno. Any
+  ;; other symbol is a refusal of WHO's own argument, and names it.
   (define (step-refusal status who handle)
-    (if (owner-mismatch? status)
-        (wrong-thread-refusal status who)
+    (cond
+     ((owner-mismatch? status) (wrong-thread-refusal status who))
+     ((stack-shortfall? status)
+      (make-uv-stack-exhausted who (stack-shortfall-headroom status)
+                               (stack-shortfall-floor status)))
+     (else
         (case status
           ((not-open) (make-uv-handle-closed (handle-kind handle)))
           ((no-pointer) (make-uv-invalid-argument who 'null-handle-pointer))
@@ -684,7 +733,7 @@
            (make-uv-invalid-argument 'uv-registry-register! status))
           (else (if (symbol? status)
                     (make-uv-invalid-argument who status)
-                    (uv-errno-condition status who))))))
+                    (uv-errno-condition status who)))))))
 
   ;; (handle-call! handle who native arg ...) calls (NATIVE ptr ARG ...) on
   ;; HANDLE's pointer in one interrupt-free step that checks again that this

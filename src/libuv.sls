@@ -77,7 +77,11 @@
           uv-callback-error-cause
 
           &uv-wrong-thread make-uv-wrong-thread uv-wrong-thread?
-          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual)
+          uv-wrong-thread-who uv-wrong-thread-expected uv-wrong-thread-actual
+
+          &uv-stack-exhausted make-uv-stack-exhausted uv-stack-exhausted?
+          uv-stack-exhausted-who uv-stack-exhausted-headroom
+          uv-stack-exhausted-floor)
   (import (rnrs)
           (libuv loop)
           (libuv handle)

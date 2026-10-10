@@ -15,7 +15,7 @@ libraries exist for narrower imports.
 |---|---|
 | `make-uv-loop` | A new loop. Initialises the binding, including the version gate |
 | `uv-loop?` `uv-loop-open?` | Is this a loop; is it still open |
-| `uv-run` | Run it: `'default`, `'once`, or `'nowait`. `#t` if work remains |
+| `uv-run` | Run it: `'default`, `'once`, or `'nowait`. `#t` if work remains. `&uv-stack-exhausted` when its thread has less than 128 KiB of C stack left (see "An escape also costs its thread stack") |
 | `uv-stop!` | Stop the loop; legal from inside a callback |
 | `uv-loop-alive?` | Whether the loop has anything left to do |
 | `uv-now` | libuv's cached "now", in ms, updated once per iteration or by `uv-update-time!` |
@@ -175,18 +175,33 @@ events: a read, connect, accept, async wake, signal, child's exit or
 request's completion, and a write's when the poll finished the write. An
 escape from one of those costs 34,352 bytes on macOS arm64 and 22,272 on
 Linux arm64. The macOS main thread's 8 MB held 242 of them, a Linux
-thread's 8 MB held 375, and a macOS `fork-thread` thread held 14. The fault comes as a Scheme error, "invalid memory
-reference", on a stack that is still full, so it cannot be recovered from.
-A handler that catches it can fault again, and can hang for good, with no
-message, at the next garbage collection: the fault was inside `uv_run`,
-Chez leaves the thread marked as running outside Scheme after a fault in
-such a call (one made `__collect_safe`), and the collection waits for it
-to stop. That is Chez's, with or without libuv. Keep a thread's escapes
-well under its stack. A raise costs nothing: the seam catches it
-inside the callback, which then returns. Neither does an engine that is
-resumed. Short of the thread's end, the frames go only when a callback
-entered before them returns, so a program that leaves callbacks by
-continuation as a habit should do it on a thread it can end.
+thread's 8 MB held 375, and a macOS `fork-thread` thread held 14.
+
+So the binding measures before every `uv_run` it makes how much C stack
+its thread has left, and refuses the run short of the fault: `uv-run`
+raises `&uv-stack-exhausted` with less than 128 KiB left, and a teardown's
+drain with less than 64 KiB. The deepest path measured through a run is
+36 KiB, and one escape strands at most one run's frames, so the gap
+between the two leaves a refused run room to tear its loops down:
+`call-with-uv-loop` still tears down around a `uv-run` that raised it.
+Under the check, a macOS `fork-thread` thread holds 12 escapes from I/O
+callbacks before its run is refused, and 1,152 from timer callbacks. A thread that gets `&uv-stack-exhausted` has nothing to gain
+from trying again: short of the thread's end, the frames go only when a
+callback entered before them returns, as a resumed engine's does. End
+the thread. A program that leaves callbacks by continuation as a habit
+should do it on a thread it can end.
+
+The check sees only the runs the binding makes. C code a callback calls on
+its own, or another library's callback a continuation escapes, spends the
+same stack unseen. A thread that runs out anyway faults, as a Scheme
+error, "invalid memory reference", on a stack that is still full, so it
+cannot be recovered from. A handler that catches it can fault again, and
+can hang for good, with no message, at the next garbage collection: after
+a fault inside a call made `__collect_safe`, as `uv_run` is, Chez leaves
+the thread marked as running outside Scheme, and the collection waits for
+it to stop. That is Chez's, with or without libuv. A raise costs nothing:
+the seam catches it inside the callback, which then returns. Neither does
+an engine that is resumed.
 
 It costs heap as well, and neither of those gives it back. Chez allocates
 a block for each call from C into Scheme, a callback included, and frees it
@@ -855,6 +870,7 @@ discriminant is a symbol).
 | `&uv-invalid-argument` | `who` `reason` | A caller error, refused leaving nothing allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
 | `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the id of the thread the verb's check found owning the loop, `actual` the caller's. The two always differ, even if the loop has changed hands again since the check ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
+| `&uv-stack-exhausted` | `who` `headroom` `floor` | A run was refused because its thread had `headroom` bytes of C stack left, under the `floor` it needs: 131,072 for `uv-run`, 65,536 for a teardown's drain. Escapes from callbacks spend that stack, and the thread gets it back only by ending |
 
 v0.3, v0.4, v0.5 and v0.7 added no new condition types, and v0.6 added one — every
 `(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv

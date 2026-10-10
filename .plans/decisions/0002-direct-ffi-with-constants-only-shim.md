@@ -1,6 +1,6 @@
 # ADR-0002: Bind libuv directly via FFI; keep the C shim to constants only
 
-- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline. Amended 2026-10-05 (issue #45): a sixth kind, libuv's alloc callback for reads — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline. Amended 2026-10-05 (issue #45): a sixth kind, libuv's alloc callback for reads — see the dated note inline. Amended 2026-10-09 (issue #94): a seventh kind, the calling thread's stack headroom — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0001](0001-hybrid-native-dependency-acquisition.md)
@@ -157,6 +157,48 @@ binding's behalf.
 >   allocation with a second lifetime to keep in step with the handle's.
 > - **A table in C keyed by handle**, which would be a lookup on every read
 >   for what one field already holds.
+>
+> **Amended 2026-10-09 (issue #94).** A seventh kind of export:
+> `chez_uv_stack_headroom`, the distance from its own frame to the bottom of
+> the calling thread's stack. `run-step!`, where every `uv_run` the binding
+> makes starts, asks it first, and refuses the run below a floor
+> ([the design](../2026-10-09-escape-headroom-check-design.md)). A
+> continuation that escapes a callback leaves its `uv_run`'s C frames on
+> the stack for the thread's life, and enough of them overflowed it.
+>
+> Scheme has no way to read where the C stack is or where it ends: Chez's
+> own stack is a separate, heap-allocated thing. The C stack pointer is
+> only visible from C, and its bottom only through pthreads
+> (`pthread_get_stackaddr_np` and `pthread_get_stacksize_np` on macOS,
+> `pthread_getattr_np` on Linux).
+>
+> The line this ADR draws holds: the export calls nothing in libuv or in
+> Scheme. What it relies on:
+>
+> - **The bottom is read once per thread.** On Linux the main thread's
+>   costs 22 µs, because glibc reads `/proc/self/maps` for it, and 263 ns
+>   on another thread. The shim keeps it in a `__thread` variable, so the
+>   call costs about 4 ns, against 100–200 ns for the cheapest run.
+>   `tests/test-source-rules.sps`'s rule 6 lists it, and holds that it is
+>   declared `__thread`: kept process-wide, one thread's bottom measured
+>   another's stack.
+> - **Where the bottom cannot be read, nothing is refused.** On a system
+>   other than macOS and Linux, or when pthreads refuses, the answer is
+>   `CHEZ_UV_HEADROOM_UNKNOWN`, 2^40, which no floor reaches. Windows
+>   ([ADR-0004](0004-windows-deferred-design-clean.md)) would read
+>   `GetCurrentThreadStackLimits`.
+> - **The bounds are where the stack really ends.** On macOS and Linux
+>   arm64, main and `fork-thread` threads both faulted at the headroom
+>   libuv's poll needs (33.3 KiB and 21 KiB). Valgrind's main thread reads
+>   8,386,832 B, so the memory gate's runs are not refused.
+>   `tests/test-stack-headroom.sps` holds the refusals on a real thread
+>   with a full stack.
+>
+> Rejected: counting escapes in Scheme, which needs no export. One escape
+> strands from 352 B (a timer callback's) to 34,352 B (an I/O callback's),
+> a count misses escapes from a bare `uv-run`, and it cannot see an engine
+> resumed inside a callback give the stack back. The design note weighs
+> the rest.
 
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object
@@ -180,7 +222,8 @@ layers above this binding depend on.
   (Amended 2026-09-27 for #35: five kinds of export now. The fifth is three
   one-line functions, and "four" always counted kinds, not symbols.
   Amended 2026-10-05 for #45: six. The sixth is the one function libuv
-  calls, and it calls nothing back.)
+  calls, and it calls nothing back. Amended 2026-10-09 for #94: seven. The
+  seventh reads the calling thread's stack pointer and stack bottom.)
 - The Linux load-order requirement becomes a hard invariant, enforced in
   `native.sls` and covered by `test-shim-loading`; getting it wrong fails at
   import time, not at first call.

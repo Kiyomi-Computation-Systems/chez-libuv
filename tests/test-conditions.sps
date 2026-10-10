@@ -306,6 +306,32 @@
     (raise (make-uv-wrong-thread 'sentinel-who-wt 515151 626262))
     'no-raise))
 
+;; --- &uv-stack-exhausted (who headroom floor) ------------------------------
+;; #94: raised when a run is refused because its thread's C stack has less
+;; headroom than the run's floor. who is the verb; headroom and floor are
+;; byte counts, so distinct sentinels catch a headroom/floor swap.
+
+(test-equal "stack-exhausted predicate accepts its own instance"
+  #t
+  (guard (e ((uv-stack-exhausted? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-stack-exhausted 'sentinel-who-se 4343 9797))
+    'no-raise))
+
+(test-equal "stack-exhausted carries the refused verb, the headroom and the floor"
+  '(sentinel-who-se 4343 9797)
+  (guard (e ((uv-stack-exhausted? e)
+             (list (uv-stack-exhausted-who e) (uv-stack-exhausted-headroom e)
+                   (uv-stack-exhausted-floor e)))
+            (#t 'wrong-condition))
+    (raise (make-uv-stack-exhausted 'sentinel-who-se 4343 9797))
+    'no-raise))
+
+(test-equal "stack-exhausted is a uv-error"
+  #t
+  (guard (e ((uv-error? e) #t) (#t 'wrong-condition))
+    (raise (make-uv-stack-exhausted 'sentinel-who-se 4343 9797))
+    'no-raise))
+
 ;; --- Subtype + sibling discrimination matrix -------------------------------
 ;; Every &uv-* type (other than the root) must satisfy uv-error? AND its own
 ;; predicate, and must NOT satisfy any sibling's predicate. Looping over the
@@ -342,7 +368,10 @@
               uv-callback-error?)
         (list 'uv-wrong-thread
               (make-uv-wrong-thread 'matrix-who 909090 818181)
-              uv-wrong-thread?)))
+              uv-wrong-thread?)
+        (list 'uv-stack-exhausted
+              (make-uv-stack-exhausted 'matrix-who 707070 606060)
+              uv-stack-exhausted?)))
 
 ;; Every instance must satisfy uv-error?, the family-wide predicate.
 (for-each

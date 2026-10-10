@@ -188,6 +188,17 @@
           (if (uv-shim-unavailable? e) 'also-shim-unavailable 'not-shim-unavailable)
           (uv-shim-unavailable-path e))))
 
+;; &uv-stack-exhausted is raised from a run deep in a thread's stack, which
+;; this suite does not reach (tests/test-stack-headroom.sps does), so its
+;; type and accessors are exercised directly.
+(test-equal "&uv-stack-exhausted is re-exported, with its who, headroom and floor"
+  '(stack-exhausted uv-run 4096 131072)
+  (let ((e (make-uv-stack-exhausted 'uv-run 4096 131072)))
+    (list (if (uv-stack-exhausted? e) 'stack-exhausted 'not-stack-exhausted)
+          (uv-stack-exhausted-who e)
+          (uv-stack-exhausted-headroom e)
+          (uv-stack-exhausted-floor e))))
+
 ;; --- the re-exported handle and timer surfaces --------------------------
 ;; Driven through the facade alone, for the same reason as the loop rows
 ;; above: every name below has to come from src/libuv.sls or this file does

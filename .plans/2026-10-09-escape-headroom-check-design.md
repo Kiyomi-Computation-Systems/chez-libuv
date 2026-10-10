@@ -1,8 +1,9 @@
 # Refusing a run before the C stack runs out (#94): design note
 
 - **Status:** Accepted, 2026-10-09: option D, with every recommendation
-  under "Decisions" below. Nothing in `src/` has changed yet. The check
-  comes in its own pull request. The docs correction ships with this note.
+  under "Decisions" below. Implemented the same day
+  (`.plans/stack-headroom-mutation-log.md`), as proposed except where
+  "As built" says otherwise.
 - **Scope:** the part of #94 still open after #115: "whether the binding can
   do more than document it". The upstream question (can Chez reclaim the
   frames?) is drafted separately and not filed.
@@ -227,6 +228,33 @@ The user took every recommendation:
    the call, and the way to recover (end the thread) is unlike any other
    refusal's.
 4. **The docs correction ships now**, with this note, ahead of the check.
+
+## As built (2026-10-09)
+
+- The shim export, the floors and `&uv-stack-exhausted` are as proposed.
+  The floors live in `(libuv private handles)` as `run-stack-floor` and
+  `teardown-stack-floor`. The check is `claim-loop-for-run!`, which reads
+  the headroom first in the claim's step, ahead of every other refusal,
+  and `run-step!` is its only caller. Rule 11 of
+  `tests/test-source-rules.sps` holds that, and that `run-step!` is the
+  only caller of the foreign call to `uv_run`.
+- Where the stack's bottom cannot be read, the export answers
+  `CHEZ_UV_HEADROOM_UNKNOWN` (2^40), so nothing is refused.
+- The tests run in a child, `tests/stack-headroom-child.sps`, on a
+  `fork-thread`. Its `floors` mode reaches a depth by nesting libc `qsort`
+  comparator callbacks, which all return, so the floors are tested without
+  any escape. Its `escapes` mode escapes async callbacks until refused.
+  Measured there, under the check:
+
+  | | macOS arm64 | Linux arm64 |
+  |---|---|---|
+  | I/O escapes held by a `fork-thread` thread | 12 | 370 |
+  | headroom at the refusal | 123,792 B | 119,296 B |
+  | loops left open | 0 | 0 |
+
+  Timer escapes held by a macOS `fork-thread` thread: 1,152.
+- Valgrind's main thread reads 8,386,832 B of headroom, so the memory
+  gate's runs are not refused.
 
 ## Reproducing
 

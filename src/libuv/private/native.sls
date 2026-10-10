@@ -32,6 +32,7 @@
 
           ;; runtime sizes and loop entry points
           uv-loop-size uv-handle-size uv-req-size
+          stack-headroom
 
           uv-loop-init uv-loop-run uv-loop-stop
           uv-loop-alive uv-loop-now uv-loop-update-time uv-loop-close
@@ -208,6 +209,14 @@
   ;; the stream's own read buffer, is fixed per handle and needs no Scheme.
   ;; uv-read-start-native hands libuv this address.
   (define alloc-cb-entry (shim-entry "chez_uv_alloc_cb"))
+
+  ;; stack-headroom : -> exact-integer
+  ;; How many bytes of C stack this thread has left below the call (#94;
+  ;; ADR-0002 as amended for it): run-step! refuses a uv_run below a floor.
+  ;; Plain, and it raises nothing, so a step can make it. The shim reads the
+  ;; thread's stack bottom on its first call and keeps it, so the call costs
+  ;; about 4 ns.
+  (define stack-headroom (shim-procedure "chez_uv_stack_headroom" () uptr))
 
   ;; The binding's blocks come from the shim: zeroed, 0 when the allocator
   ;; refuses, and counted alive by the debug shim (live-counts' 'block).

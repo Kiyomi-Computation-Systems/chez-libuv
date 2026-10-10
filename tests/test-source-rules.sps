@@ -51,7 +51,11 @@
 ;;;    place (passes first to a procedure whose name ends in !), or makes,
 ;;;    while its body runs, with a table, a box, a vector, a parameter, a
 ;;;    lock or a guardian, or as a closure over a variable it assigns. It
-;;;    lists each static variable in the C shim too. A new one fails here
+;;;    lists each static variable in the C shim too: a counter, or a
+;;;    variable each thread has its own copy of, which must be declared
+;;;    __thread (the stack bottom chez_uv_stack_headroom caches, #94; read
+;;;    by another thread, it measured that thread's stack against the wrong
+;;;    one). A new one fails here
 ;;;    until it is listed. Each word for how threads share a variable is
 ;;;    checked against the source, by where the variable is written or by
 ;;;    what makes it. The registry and the orphan list are used only inside
@@ -149,6 +153,15 @@
 ;;;    - a new registry entry to registry-add!, the only definition that
 ;;;      makes one, and every write of the table to registry-add! and the
 ;;;      put-back in registry-take-accepted!.
+;;;
+;;; 11. Every uv_run starts in run-step!, where the C stack's headroom is
+;;;    checked first (#94). An escape from a callback leaves its uv_run's
+;;;    frames on the thread's stack for good, and a run made that deep
+;;;    crashes the thread, or on macOS hangs it (#95). run-step! claims
+;;;    the loop through claim-loop-for-run!, which refuses a run below its
+;;;    floor, so a uv_run made anywhere else would go unchecked. So this
+;;;    suite holds uv-loop-run, the foreign call, and claim-loop-for-run!
+;;;    to run-step!, named once each.
 ;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
@@ -898,6 +911,23 @@
                           names)))
             acc))))))
 
+;; thread-local-lapses : (list-of symbol) (list-of string) -> (list-of symbol)
+;; Each of NAMES that no line of LINES defines as `static __thread`.
+(define (thread-local-lapses names lines)
+  (filter (lambda (name)
+            (not (exists (lambda (line)
+                           (let ((t (trim-left line)))
+                             (and (>= (string-length t) 16)
+                                  (string=? (substring t 0 16) "static __thread ")
+                                  (memq name (static-objects (list line))))))
+                         lines)))
+          names))
+
+;; Every static variable the shim keeps for each thread on its own: the
+;; bottom of the thread's stack, which chez_uv_stack_headroom reads on the
+;; thread's first call (#94). Each must be __thread.
+(define shim-thread-locals '(stack_low))
+
 ;; Every static variable the shim defines: the debug counters, each updated
 ;; only through count_add and read only through count_read, which are
 ;; atomic. Pinned, so that the row cannot pass by reading nothing.
@@ -1180,6 +1210,13 @@
                     "  static int table_size;"
                     "int global;")))
 
+(test-equal "rule 6 finds a per-thread variable defined without __thread"
+  '(b c)
+  (thread-local-lapses '(a b c)
+                       '("static __thread uintptr_t a;"
+                         "static uintptr_t b;"
+                         "uintptr_t c;")))
+
 (test-equal "rule 6 finds a counter used outside count_add and count_read"
   '((3 live_a) (4 live_b))
   (bare-counter-uses '(live_a live_b)
@@ -1461,6 +1498,14 @@
      ("src/libuv/private/handles.sls" registry-take-accepted! 1)))
   (list (namers-in-src '%make-registry-entry) (registry-writes)))
 
+(test-equal "rule 11: uv-loop-run, the foreign call to uv_run, is named only by run-step!, once"
+  '(("src/libuv/loop.sls" run-step! 1))
+  (namers-in-src 'uv-loop-run))
+
+(test-equal "rule 11: claim-loop-for-run!, which checks the C stack's headroom, is named only by run-step!, once"
+  '(("src/libuv/loop.sls" run-step! 1))
+  (namers-in-src 'claim-loop-for-run!))
+
 (test-equal "rule 10 counts each (hashtable-set! registry ...) in a form, and no other table's"
   '(2 0)
   (list (registry-set-count '(define (f p e) (when p (hashtable-set! registry p e)) (hashtable-set! registry 1 e)))
@@ -1643,11 +1688,15 @@
 (define shim-lines
   (text-lines (call-with-input-file "src/libuv-shim.c" get-string-all)))
 
-(test-equal "every static variable in the C shim is a counter this suite lists, and every listed one is still there"
+(test-equal "every static variable in the C shim is a counter or a per-thread variable this suite lists, and every listed one is still there"
   '(unlisted () gone ())
-  (let ((found (static-objects shim-lines)))
-    (list 'unlisted (filter (lambda (n) (not (memq n shim-counters))) found)
-          'gone (filter (lambda (n) (not (memq n found))) shim-counters))))
+  (let ((found (static-objects shim-lines))
+        (listed (append shim-counters shim-thread-locals)))
+    (list 'unlisted (filter (lambda (n) (not (memq n listed))) found)
+          'gone (filter (lambda (n) (not (memq n found))) listed))))
+
+(test-equal "every per-thread variable in the C shim is declared __thread"
+  '() (thread-local-lapses shim-thread-locals shim-lines))
 
 (test-equal "the shim's counters are changed only through count_add and read only through count_read, which are atomic"
   '() (bare-counter-uses shim-counters shim-lines))
