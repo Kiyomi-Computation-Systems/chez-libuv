@@ -54,14 +54,27 @@
         (only (uv-evidence) live-count describe)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
-        ;; make-engine suspends a run inside a callback (#45); getenv and
-        ;; open-process-ports run tests/stranded-exit-child.sps.
-        (only (chezscheme) collect sleep make-time make-engine
-              getenv open-process-ports))
+        ;; make-engine suspends a run inside a callback (#45); getenv finds
+        ;; the Chez that runs tests/stranded-exit-child.sps.
+        (only (chezscheme) collect sleep make-time make-engine getenv)
+        ;; The stranded child runs under a deadline, and is reaped (#117).
+        (uv-child))
 
 ;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
 (define runner (test-runner-simple))
 (test-runner-current runner)
+
+;; The simple runner prints only a failing row's title. A stranded-exit row
+;; answers the child's output and exit status when it fails (#117), and a
+;; row that catches a raise answers its evidence, so print that too.
+(let ((simple-end (test-runner-on-test-end runner)))
+  (test-runner-on-test-end! runner
+    (lambda (r)
+      (simple-end r)
+      (when (eq? (test-result-kind r) 'fail)
+        (display "  actual: ")
+        (write (test-result-ref r 'actual-value))
+        (newline)))))
 
 ;; Captured BEFORE anything in this suite creates a loop, so the seeds below
 ;; are real observations rather than restatements of the current state.
@@ -1848,27 +1861,18 @@
 ;; suite checks the datum it prints.
 (define chez-for-children (getenv "CHEZ_LIBUV_TEST_CHEZ"))
 
+;; child-run kills a child that outlives its deadline and answers the
+;; status of one that ends without a datum, so a teardown that never
+;; returns, or a crash, fails the rows below carrying its output, where the
+;; suite once waited on the child's stdout for good (#117).
 (define stranded-report
   (if (not chez-for-children)
       'no-chez
-      (guard (e (#t (list 'spawn-failed (describe e))))
-        (let-values (((to-child from-child errors pid)
-                      (open-process-ports
-                       (string-append chez-for-children
-                                      " --program tests/stranded-exit-child.sps")
-                       (buffer-mode block) (native-transcoder))))
-          (close-port to-child)
-          (let* ((out (get-string-all from-child))
-                 (err (get-string-all errors)))
-            (close-port from-child)
-            (close-port errors)
-            (let ((datum (guard (e (#t #f)) (read (open-string-input-port out)))))
-              (if (list? datum) datum (list 'unreadable out err))))))))
+      (child-run chez-for-children '() "tests/stranded-exit-child.sps" '())))
 
 ;; stranded : symbol -> object, one entry of the child's report.
 (define (stranded key)
-  (let ((entry (and (list? stranded-report) (assq key stranded-report))))
-    (if entry (cdr entry) (list 'no-entry key stranded-report))))
+  (child-entry stranded-report key))
 
 (if (eq? stranded-report 'no-chez)
     (test-equal "stranded-exit rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
