@@ -266,7 +266,13 @@ None is obvious from reading the code.
   below them. A probe of #91's fix, 20,000 escapes on one thread, died with
   `SIGSEGV` on Linux at 8 MB (16,000 passed; a 64 MB stack held 40,000). On
   macOS the main thread held 20,000. A `fork-thread` thread there has
-  pthread's 512 KiB default, and its 1,430th escape faulted (arm64). The
+  pthread's 512 KiB default, and its 1,430th escape faulted (arm64). Those
+  were timer callbacks' escapes, 352–384 B each on arm64. An escape from a
+  callback `uv__io_poll` calls (a read, an async wake, a request's
+  completion…) strands the poll's 1,024-event array too: 34,352 B on macOS
+  and 22,272 B on Linux arm64, so that macOS thread holds 14
+  (`.plans/2026-10-09-escape-headroom-check-design.md`). Measure an escape
+  cost per callback kind, never from timers alone. The
   fault reached Scheme as "invalid memory reference", and #94's repro,
   which caught it and kept going, hung (#95; next trap). A suite that
   escapes callbacks in bulk (test-loop-claim's exit race) runs them in

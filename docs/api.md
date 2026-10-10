@@ -168,7 +168,14 @@ and the process died with `SIGSEGV`, and on x86-64, 20,000 to 24,000; a
 thread made with `fork-thread` held 16,000 on both. On macOS arm64 the
 main thread held 20,000, and died with `SIGSEGV` by 30,000. A thread made
 with `fork-thread` gets macOS's default 512 KiB stack, not 8 MB, and its
-1,430th escape faulted. The fault comes as a Scheme error, "invalid memory
+1,430th escape faulted. Those are escapes from timer callbacks, the
+cheapest kind. A callback that libuv calls while it polls for I/O also
+leaves the poll's frame behind, and that frame holds libuv's array of
+events: a read, connect, accept, async wake, signal, child's exit or
+request's completion, and a write's when the poll finished the write. An
+escape from one of those costs 34,352 bytes on macOS arm64 and 22,272 on
+Linux arm64. The macOS main thread's 8 MB held 242 of them, a Linux
+thread's 8 MB held 375, and a macOS `fork-thread` thread held 14. The fault comes as a Scheme error, "invalid memory
 reference", on a stack that is still full, so it cannot be recovered from.
 A handler that catches it can fault again, and can hang for good, with no
 message, at the next garbage collection: the fault was inside `uv_run`,
