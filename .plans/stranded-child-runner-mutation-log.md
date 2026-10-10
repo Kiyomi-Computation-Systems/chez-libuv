@@ -112,7 +112,8 @@ the level-3 rows already did: where libc does not load, every status is
 Linux only, and the suite runs on macOS by hand. Windows, which the
 project means to support, runs neither runner's shell command as written;
 the old copy's plain command line may have, unchecked. That is the level-3
-suites' cost already, now shared by test-loop's eight rows.
+suites' cost already, now shared by test-loop's eight rows. Left as an
+ADR-0004 deferral; #125 holds the Windows test infrastructure.
 
 ## Code review (PR #122)
 
@@ -125,7 +126,7 @@ suites' cost already, now shared by test-loop's eight rows.
   `level-3-options`, and `level-3-entry` is a renamed export.
 - The comment above `stranded-report` stated the runner's guarantees as
   test-loop's: it now names test-level-3 as what holds them.
-- Windows: recorded above, not changed.
+- Windows: recorded above, not changed (#125).
 
 ## Gates
 
