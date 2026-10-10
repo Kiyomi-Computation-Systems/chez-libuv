@@ -51,7 +51,7 @@
         ;; The uv-update-time! rows step their loops with the shared capped
         ;; stepper rather than a hand-rolled one.
         (only (uv-testing) run-until)
-        (only (uv-evidence) live-count describe)
+        (only (uv-evidence) live-count describe print-actual-on-failure!)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
         ;; make-engine suspends a run inside a callback (#45); getenv finds
@@ -64,17 +64,9 @@
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
-;; The simple runner prints only a failing row's title. A stranded-exit row
-;; answers the child's output and exit status when it fails (#117), and a
-;; row that catches a raise answers its evidence, so print that too.
-(let ((simple-end (test-runner-on-test-end runner)))
-  (test-runner-on-test-end! runner
-    (lambda (r)
-      (simple-end r)
-      (when (eq? (test-result-kind r) 'fail)
-        (display "  actual: ")
-        (write (test-result-ref r 'actual-value))
-        (newline)))))
+;; A failing row's actual value is its evidence: the stranded child's
+;; output and exit status (#117), or what a row caught.
+(print-actual-on-failure! runner)
 
 ;; Captured BEFORE anything in this suite creates a loop, so the seeds below
 ;; are real observations rather than restatements of the current state.
@@ -1861,23 +1853,37 @@
 ;; suite checks the datum it prints.
 (define chez-for-children (getenv "CHEZ_LIBUV_TEST_CHEZ"))
 
-;; child-run kills a child that outlives its deadline and answers the
-;; status of one that ends without a datum, so a teardown that never
-;; returns, or a crash, fails the rows below carrying its output, where the
-;; suite once waited on the child's stdout for good (#117).
+;; child-run (tests/uv-child.sls) kills a child still running at its
+;; deadline, reads both its pipes as it writes, waits on it, and answers its
+;; status; test-level-3's rows hold each of those against a stand-in child.
+;; Through it, a teardown that never returns, or a crash, fails the rows
+;; below, where the suite once waited on the child's stdout for good (#117).
 (define stranded-report
   (if (not chez-for-children)
       'no-chez
       (child-run chez-for-children '() "tests/stranded-exit-child.sps" '())))
 
-;; stranded : symbol -> object, one entry of the child's report.
+;; stranded-reported? : -> boolean
+;; Whether the child exited 0 having printed its report, an alist.
+(define (stranded-reported?)
+  (and (list? stranded-report) (for-all pair? stranded-report)))
+
+;; stranded : symbol -> object
+;; One entry of the child's report. Without a report, the precondition row
+;; carries what child-run answered, output and status, once: the rows after
+;; it say only that there is none, so a child's long stderr is not printed
+;; seven times over.
 (define (stranded key)
-  (child-entry stranded-report key))
+  (if (stranded-reported?)
+      (child-entry stranded-report key)
+      (list 'no-entry key 'no-report)))
 
 (if (eq? stranded-report 'no-chez)
     (test-equal "stranded-exit rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
+      (test-equal "precondition: the stranded child exited 0, printing its report"
+        'reported (if (stranded-reported?) 'reported stranded-report))
       (test-equal "seed: the child's engine ran out of fuel inside the close callback"
         #t (stranded 'engine-in-close))
       (test-equal "an escape out of a close callback, with another close pending, keeps its value"

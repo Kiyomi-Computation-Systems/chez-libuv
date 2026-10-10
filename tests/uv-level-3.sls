@@ -18,20 +18,18 @@
 ;;;
 ;;; PURE, as (uv-child) is.
 (library (uv-level-3)
-  (export level-3-run level-3-entry)
+  ;; level-3-entry is child-entry, under the name the level-3 suites read.
+  (export level-3-run (rename (child-entry level-3-entry)))
   (import (rnrs)
           (uv-child))
+
+  (define level-3-options '("--optimize-level" "3"))
 
   ;; level-3-run : string string (list-of symbol) [seconds] -> (or alist list)
   ;; child-run's answer for PROGRAM run at --optimize-level 3.
   (define level-3-run
     (case-lambda
       ((chez program names)
-       (child-run chez '("--optimize-level" "3") program names))
+       (child-run chez level-3-options program names))
       ((chez program names deadline-seconds)
-       (child-run chez '("--optimize-level" "3") program names deadline-seconds))))
-
-  ;; level-3-entry : object symbol -> object
-  ;; child-entry, under the name the level-3 suites read.
-  (define (level-3-entry report key)
-    (child-entry report key)))
+       (child-run chez level-3-options program names deadline-seconds)))))

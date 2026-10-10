@@ -151,9 +151,6 @@
     (test-equal "level-3 runner rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
-      ;; The deadline is long enough for any healthy child, so a runner that
-      ;; leaves the child blocked on stderr is caught by what it answers,
-      ;; killed-at-cap, and not by a slow machine.
       ;; child-run hands its options to Chez ahead of --program (#117). Two
       ;; levels other than 3, so a runner that drops its options and one
       ;; that runs level 3 whatever it is given each fail a row.
@@ -169,6 +166,9 @@
         '((level . 3))
         (level-3-run chez stand-in '(level) 20))
 
+      ;; The deadline is long enough for any healthy child, so a runner that
+      ;; leaves the child blocked on stderr is caught by what it answers,
+      ;; killed-at-cap, and not by a slow machine.
       (test-equal "a child that writes 1 MiB to stderr before its datum answers the datum"
         '((stderr-bytes . 1048576))
         (brief (level-3-run chez stand-in '(flood) 20)))
