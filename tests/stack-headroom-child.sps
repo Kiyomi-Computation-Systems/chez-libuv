@@ -4,7 +4,7 @@
 ;;; deep would crash this process with SIGSEGV, or on macOS hang it (#95),
 ;;; so it runs in a process of its own, under tests/uv-level-3.sls's
 ;;; deadline. Its work runs on a thread made with fork-thread: 512 KiB on
-;;; macOS, 8 MiB on Linux.
+;;; macOS, 8 MiB on Linux, made after the main thread has run a loop.
 ;;;
 ;;; It prints one datum, an alist, for the suite's rows:
 ;;;   floors   runs and teardowns at a depth between the two floors, and at
@@ -165,6 +165,11 @@
     (with-mutex m
       (let wait () (unless done (condition-wait c m) (wait))))
     (car done)))
+
+;; The main thread runs a loop first, so it has read its own stack bottom,
+;; and the thread made next starts with that cached: a thread that measured
+;; against it would never be refused.
+(call-with-uv-loop (lambda (loop) (uv-run loop 'nowait)))
 
 (write (on-thread (case mode
                     ((floors) floors)

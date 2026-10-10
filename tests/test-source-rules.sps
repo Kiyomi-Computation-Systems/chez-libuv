@@ -51,11 +51,10 @@
 ;;;    place (passes first to a procedure whose name ends in !), or makes,
 ;;;    while its body runs, with a table, a box, a vector, a parameter, a
 ;;;    lock or a guardian, or as a closure over a variable it assigns. It
-;;;    lists each static variable in the C shim too: a counter, or a
-;;;    variable each thread has its own copy of, which must be declared
-;;;    __thread (the stack bottom chez_uv_stack_headroom caches, #94; read
-;;;    by another thread, it measured that thread's stack against the wrong
-;;;    one). A new one fails here
+;;;    lists each static variable in the C shim too, and the shim keeps no
+;;;    thread-local storage: glibc mallocs a dlopened library's on each
+;;;    thread's first use, and the memory gate counted that block as
+;;;    suppressed (#94). A new one fails here
 ;;;    until it is listed. Each word for how threads share a variable is
 ;;;    checked against the source, by where the variable is written or by
 ;;;    what makes it. The registry and the orphan list are used only inside
@@ -712,7 +711,8 @@
      (dispatch-table library-init) (installed-dispatch-names library-init))
     ("src/libuv/private/native.sls"
      (dispatchers library-init) (dispatchers-installed library-init)
-     (init-mutex lock) (initialized? init-lock) (init-count init-lock))))
+     (init-mutex lock) (initialized? init-lock) (init-count init-lock)
+     (stack-bottom-cell thread-local))))
 
 ;; The procedures that may write a library-init variable, each called only
 ;; while a library's body runs.
@@ -911,22 +911,15 @@
                           names)))
             acc))))))
 
-;; thread-local-lapses : (list-of symbol) (list-of string) -> (list-of symbol)
-;; Each of NAMES that no line of LINES defines as `static __thread`.
-(define (thread-local-lapses names lines)
-  (filter (lambda (name)
-            (not (exists (lambda (line)
-                           (let ((t (trim-left line)))
-                             (and (>= (string-length t) 16)
-                                  (string=? (substring t 0 16) "static __thread ")
-                                  (memq name (static-objects (list line))))))
-                         lines)))
-          names))
-
-;; Every static variable the shim keeps for each thread on its own: the
-;; bottom of the thread's stack, which chez_uv_stack_headroom reads on the
-;; thread's first call (#94). Each must be __thread.
-(define shim-thread-locals '(stack_low))
+;; thread-local-lines : (list-of string) -> (list-of integer)
+;; The number of each line of C in LINES that names thread-local storage.
+(define (thread-local-lines lines)
+  (let each ((lines lines) (n 1) (acc '()))
+    (cond ((null? lines) (reverse acc))
+          ((exists (lambda (word) (string-index-of (car lines) word 0))
+                   '("__thread" "_Thread_local" "thread_local"))
+           (each (cdr lines) (+ n 1) (cons n acc)))
+          (else (each (cdr lines) (+ n 1) acc)))))
 
 ;; Every static variable the shim defines: the debug counters, each updated
 ;; only through count_add and read only through count_read, which are
@@ -1210,12 +1203,13 @@
                     "  static int table_size;"
                     "int global;")))
 
-(test-equal "rule 6 finds a per-thread variable defined without __thread"
-  '(b c)
-  (thread-local-lapses '(a b c)
-                       '("static __thread uintptr_t a;"
-                         "static uintptr_t b;"
-                         "uintptr_t c;")))
+(test-equal "rule 6 finds each line of C that names thread-local storage, in any spelling"
+  '(1 3 4)
+  (thread-local-lines '("static __thread uintptr_t a;"
+                        "static uintptr_t b;"
+                        "_Thread_local int c;"
+                        "thread_local long d;"
+                        "uintptr_t chez_uv_stack_bottom(void);")))
 
 (test-equal "rule 6 finds a counter used outside count_add and count_read"
   '((3 live_a) (4 live_b))
@@ -1688,15 +1682,14 @@
 (define shim-lines
   (text-lines (call-with-input-file "src/libuv-shim.c" get-string-all)))
 
-(test-equal "every static variable in the C shim is a counter or a per-thread variable this suite lists, and every listed one is still there"
+(test-equal "every static variable in the C shim is a counter this suite lists, and every listed one is still there"
   '(unlisted () gone ())
-  (let ((found (static-objects shim-lines))
-        (listed (append shim-counters shim-thread-locals)))
-    (list 'unlisted (filter (lambda (n) (not (memq n listed))) found)
-          'gone (filter (lambda (n) (not (memq n found))) listed))))
+  (let ((found (static-objects shim-lines)))
+    (list 'unlisted (filter (lambda (n) (not (memq n shim-counters))) found)
+          'gone (filter (lambda (n) (not (memq n found))) shim-counters))))
 
-(test-equal "every per-thread variable in the C shim is declared __thread"
-  '() (thread-local-lapses shim-thread-locals shim-lines))
+(test-equal "the C shim keeps no thread-local storage, which glibc would malloc on each thread's first use"
+  '() (thread-local-lines shim-lines))
 
 (test-equal "the shim's counters are changed only through count_add and read only through count_read, which are atomic"
   '() (bare-counter-uses shim-counters shim-lines))

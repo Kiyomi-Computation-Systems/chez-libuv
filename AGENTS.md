@@ -452,6 +452,15 @@ None is obvious from reading the code.
   mode also requires the file's kinds to name definite. A new suppression
   gets the same: a mode that counts what it hides, a planted leak it must
   not, and a rule for where it may match at all.
+* **A C thread-local in the shim is a malloc on every thread, and
+  Valgrind hides it.** glibc allocates a dlopened library's `__thread`
+  storage on each thread's first use. On x86-64 Valgrind's own default
+  suppressions hide that block, and the gate counts every suppressed block:
+  `check-memory-gate`'s escape mode went red on PR #126 (4 blocks for 3),
+  and `test-memory` fails any non-escape suite with one. arm64's Debian 12
+  showed no block at all, so only CI saw it. Rule 6 of
+  `tests/test-source-rules.sps` holds the shim to no thread-local storage;
+  keep per-thread state in a Scheme thread parameter.
 * **valgrind gates on leak kinds it does not display.** `--errors-for-leak-kinds`
   defaults to `definite,possible` while `--show-leak-kinds=definite` hides the
   "possible" ones — the gate exits 9 with nothing in the log explaining why.

@@ -8,11 +8,15 @@ The design and its measurements are in
 
 ## What changed
 
-- **The shim** exports `chez_uv_stack_headroom`: the distance from its own
-  frame to the bottom of the calling thread's stack. The bottom comes from
-  pthreads on the thread's first call and is kept in a `__thread` variable.
-  Where it cannot be read, the answer is `CHEZ_UV_HEADROOM_UNKNOWN` (2^40).
-  ADR-0002 is amended for this seventh kind of export.
+- **The shim** exports `chez_uv_stack_pointer`, the address of its own
+  frame, and `chez_uv_stack_bottom`, the lowest address of the calling
+  thread's stack from pthreads, or 0 where it cannot be read. It keeps no
+  state. ADR-0002 is amended for this seventh kind of export.
+- **`(libuv private native)`**'s `stack-headroom` is the distance between
+  the two. It reads each thread's bottom once and keeps it in a thread
+  parameter, `stack-bottom-cell`, as `(thread-id . bottom)`: a new thread
+  starts with its creator's cell and reads its own. Where the bottom is 0
+  the headroom is 2^40, so nothing is refused.
 - **`(libuv private handles)`** defines `run-stack-floor` (131,072) and
   `teardown-stack-floor` (65,536), a `stack-shortfall` record that
   `refused?` takes for a refusal, and `claim-loop-for-run!`: in one
@@ -46,15 +50,25 @@ macOS   floors   ((between (refused uv-run 131072 98288) torn-down #f) (under (r
 macOS   escapes  ((first escaped escaped) (timer-strand . 352) (async-strand . 34352) (escapes . 11) (last refused uv-run 131072 123792) (open-loops . 0))
 Linux   floors   ((between (refused uv-run 131072 98272) torn-down #f) (under (refused uv-run 131072 48832) (refused uv-loop-teardown! 65536 48832)) (after-return torn-down #f))
 Linux   escapes  ((first escaped escaped) (timer-strand . 384) (async-strand . 22272) (escapes . 370) (last refused uv-run 131072 119296) (open-loops . 0))
+x86-64  floors   ((between (refused uv-run 131072 97328) torn-down #f) (under (refused uv-run 131072 48144) (refused uv-loop-teardown! 65536 48144)) (after-return torn-down #f))
+x86-64  escapes  ((first escaped escaped) (timer-strand . 480) (async-strand . 17264) (escapes . 478) (last refused uv-run 131072 114048) (open-loops . 0))
 ```
+
+x86-64 is Ubuntu 26.04 emulated in Docker on the arm64 Mac, with apt's
+Chez 10.0.0 and Valgrind 3.26. Emulation changes no frame size.
+
+The child's main thread runs a loop before it makes the thread, so the
+thread starts with the main thread's cached bottom, which it must not
+use.
 
 Also:
 - `tests/test-conditions.sps`: the type's predicate, fields and parent, and
   a place in the sibling matrix.
 - `tests/test-facade.sps`: the re-export.
 - `tests/test-source-rules.sps`:
-  - rule 6 lists `stack_low` as a per-thread static and holds it to
-    `__thread`, with a seeded row for the checker;
+  - rule 6 lists `stack-bottom-cell` as thread-local, and holds the C shim
+    to no thread-local storage in any spelling, with a seeded row for the
+    checker;
   - rule 11 (new) holds `uv-loop-run` and `claim-loop-for-run!` to
     `run-step!`.
 
@@ -75,14 +89,42 @@ discarded. The correct tree passes every row.
 | the refusal's headroom and floor swapped | between the floors; refused between them; under the teardown floor; escapes end in refusal | |
 | the shortfall answered after the claim, which it keeps | between the floors; refused between them; under the teardown floor; the deep loop tears down after | each teardown then raised `&uv-invalid-argument` `'loop-running` |
 | `refused?` blind to a shortfall | all 9 | the record went to `uv_run` as a loop pointer (the child runs at optimize-level 3, where nothing checks it): "invalid memory reference" |
-| the export always answers "unknown" (C) | all 9 | the floors child nested until it died of signal 4, and the escapes child faulted |
+| `stack-headroom` always answers "unknown" | all 9 | the floors child nested until it died of signal 4, and the escapes child faulted |
 | the stack bottom read as its top (C, macOS) | all 9 | the same |
-| `stack_low` without `__thread` (C) | source-rules: "every per-thread variable in the C shim is declared __thread" | `(stack_low)` |
-| rule 6's lapse checker reading any `static` | source-rules: "rule 6 finds a per-thread variable defined without __thread" | `(c)` |
+| `stack-headroom` takes any cell, not only its own thread's | all 9 | the thread measured against the main thread's bottom: the same |
+| a `static __thread` counter in the shim (C) | source-rules: "the C shim keeps no thread-local storage…" and the static list | `(437)` and `(unlisted (calls))` |
+| rule 6's thread-local checker reading only `__thread` | source-rules: "rule 6 finds each line of C that names thread-local storage, in any spelling" | `(1)` |
+| `stack-bottom-cell` left out of rule 6's list | source-rules: "every process-wide variable in src/ is listed…" | `(unlisted (("src/libuv/private/native.sls" stack-bottom-cell)))` |
 | the condition's headroom and floor accessors swapped | conditions: "stack-exhausted carries…"; facade: "&uv-stack-exhausted is re-exported…" | |
 | `&uv-stack-exhausted` under `&error`, not `&uv-error` | conditions: "stack-exhausted is a uv-error"; the matrix's subtype row | |
 | `run-step!` claims with `claim-loop!` | source-rules: rule 11's `claim-loop-for-run!` row; test-stack-headroom: 8 of 9 | |
 | the drain calls `uv-loop-run` itself | source-rules: rule 11's `uv-loop-run` row | |
+
+## The first push failed CI
+
+The first version kept each thread's bottom in the shim, in a `static
+__thread uintptr_t stack_low`. CI's x86-64 Valgrind leg (Ubuntu 26.04)
+failed `check-memory-gate`'s escape mode: Valgrind suppressed "608 bytes
+in 4 blocks" where the mode requires the three 200 B `jmp_buf`s three
+escapes strand. Reproduced under emulated x86-64 with
+`--default-suppressions=no`, the fourth block was 8 bytes:
+
+```
+8 bytes in 1 blocks are still reachable in loss record 1 of 10
+   at malloc (vg_replace_malloc.c:447)
+   by allocate_dtv_entry (dl-tls.c:760)
+   by tls_get_addr_tail (dl-tls.c:1012)
+   by __tls_get_addr (tls_get_addr.S:55)
+   by chez_uv_stack_headroom (libuv-shim.c:467)
+```
+
+glibc mallocs a dlopened library's thread-local storage on each thread's
+first use, and Valgrind's own default suppressions hide the block. The
+escape mode counts every suppressed block, and `test-memory` fails any
+suite outside `MEMORY_ESCAPE_SUITES` that has one, so every suite would
+have failed on x86-64. arm64's Debian 12 showed no such block. With the
+bottom kept in Scheme instead, the same run suppressed "600 bytes in 3
+blocks", and test-timer and test-stack-headroom suppressed nothing.
 
 ## What no row holds
 
@@ -104,6 +146,8 @@ discarded. The correct tree passes every row.
 ## Other runs
 
 - `make test` passes on macOS: 36 suites.
+- Linux x86-64, emulated: the escape sabotage under Valgrind suppressed
+  exactly the 3 escape blocks, and test-timer and test-stack-headroom 0.
 - Linux arm64, as a non-root user (the container's root fails test-process's
   non-root setuid row, on any tree): 36 suites pass, with `make -o
   check-pins` since the container has no git. Under Valgrind

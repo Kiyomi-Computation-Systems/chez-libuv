@@ -1,4 +1,4 @@
-/* pthread_getattr_np, for chez_uv_stack_headroom, is a GNU extension. It
+/* pthread_getattr_np, for chez_uv_stack_bottom, is a GNU extension. It
  * must be asked for before the first system header. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
@@ -429,13 +429,22 @@ void chez_uv_free(void *p) {
 }
 
 #if !defined(__GNUC__) && !defined(__clang__)
-#error "chez_uv_stack_headroom needs __builtin_frame_address and __thread"
+#error "chez_uv_stack_pointer needs __builtin_frame_address"
 #endif
+
+/* The address of this call's own frame: within a few hundred bytes of the
+ * Scheme caller's C stack pointer. */
+uintptr_t chez_uv_stack_pointer(void) {
+  return (uintptr_t)__builtin_frame_address(0);
+}
 
 /* The lowest address of the calling thread's stack, or 0 where the system
  * gives no way to read it. On Linux the main thread's costs about 22 us,
- * since glibc reads /proc/self/maps for it, which is why it is cached. */
-static uintptr_t thread_stack_low(void) {
+ * since glibc reads /proc/self/maps for it, so Scheme keeps it per thread
+ * (native.sls's stack-headroom). The shim keeps nothing itself: a
+ * thread-local here is a block glibc mallocs on each thread's first use,
+ * which the memory gate counted (rule 6 of tests/test-source-rules.sps). */
+uintptr_t chez_uv_stack_bottom(void) {
 #if defined(__APPLE__)
   pthread_t self = pthread_self();
   return (uintptr_t)pthread_get_stackaddr_np(self) -
@@ -455,18 +464,4 @@ static uintptr_t thread_stack_low(void) {
 #else
   return 0;
 #endif
-}
-
-/* This thread's stack bottom: 0 until its first call, UINTPTR_MAX if it
- * could not be read. Each thread's is its own (rule 6 of
- * tests/test-source-rules.sps). */
-static __thread uintptr_t stack_low;
-
-uintptr_t chez_uv_stack_headroom(void) {
-  uintptr_t here = (uintptr_t)__builtin_frame_address(0);
-  if (stack_low == 0) {
-    uintptr_t low = thread_stack_low();
-    stack_low = low != 0 ? low : UINTPTR_MAX;
-  }
-  return here > stack_low ? here - stack_low : CHEZ_UV_HEADROOM_UNKNOWN;
 }
