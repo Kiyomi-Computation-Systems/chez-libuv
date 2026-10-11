@@ -1,55 +1,54 @@
 #!r6rs
 ;;; SRFI-64 suite for what the binding allocates around each callback it
-;;; delivers (#45), with the callbacks themselves allocating nothing.
+;;; delivers, with the callbacks themselves allocating nothing.
 ;;;
 ;;; A delivery crosses three layers: the native trampoline, the seam that
 ;;; contains whatever the callback raises, and the dispatcher that finds the
-;;; handle and calls the user's procedure. v0.7.3 contained every raise
-;;; twice, with a `guard` at the seam and another around the user's call,
-;;; gathered each callback's arguments into a rest list, wrapped every uv-run
-;;; in a dynamic-wind, and guarded every write only to free its block when
-;;; libuv refused it. Each row below holds a path to a bound it can meet only
-;;; without the cost it is named for.
+;;; handle and calls the user's procedure. Each row below holds a path to a
+;;; bound it can meet only without the cost it is named for: every raise
+;;; contained twice, with a `guard` at the seam and another around the
+;;; user's call; each callback's arguments gathered into a rest list; every
+;;; uv-run wrapped in a dynamic-wind; or every write guarded only to free
+;;; its block when libuv refuses it.
 ;;;
-;;; libuv's alloc callback no longer crosses at all. It crossed into Scheme
-;;; before every read, only to answer the stream's own read buffer, and the
-;;; shim answers it now (ADR-0002, amended 2026-10-05). The two read rows
-;;; through libuv hold that.
+;;; libuv's alloc callback does not cross into Scheme at all. All it does is
+;;; answer the stream's own read buffer, so the shim answers it
+;;; (chez_uv_alloc_cb in src/libuv-shim.c) rather than crossing into Scheme
+;;; before every read. The two read rows through libuv hold that.
 ;;;
 ;;; THE METER. (+ (bytes-allocated) (bytes-deallocated)) is the total ever
 ;;; allocated, so a collection cannot make it run backwards, and reading it
 ;;; allocates nothing. Each call is metered on its own, with the collector
 ;;; held off and its set-up outside the meter, and a row takes the FEWEST
-;;; bytes over the calls that did the work. The fewest, because now and then
-;;; a call is charged for a fresh 64 KiB stack segment, needed after earlier
-;;; continuations split the stack, which has nothing to do with that call
-;;; (measured: 2 calls in 600 of an unguarded uv-write!). One row takes a
-;;; mean instead, for the one cost that lands only on such calls. The first
-;;; rows check the meter itself.
+;;; bytes over the calls that did the work. The fewest, because once in a
+;;; while a call is charged for a fresh 64 KiB stack segment, needed after
+;;; earlier continuations split the stack, which has nothing to do with
+;;; that call (measured: 2 calls in 600 of an unguarded uv-write!). One row
+;;; takes a mean instead, for the one cost that lands only on such calls.
+;;; The first rows check the meter itself.
 ;;;
 ;;; THE BOUNDS follow the Chez that runs the suite. Each path declares what it
 ;;; allocated on Chez 10.4.1 and how many guards it holds, and the suite
 ;;; measures a guard and a dynamic-wind of its own, so a path's bound moves
 ;;; with what a guard costs on this Chez:
 ;;;
-;;;   bound = bytes on 10.4.1 + guards x (a guard now - a guard on 10.4.1)
-;;;           + half a guard now
+;;;   bound = bytes on 10.4.1 + guards x (a guard here - a guard on 10.4.1)
+;;;           + half a guard here
 ;;;
-;;; Half a guard is far more than the platforms measured differ by (macOS
-;;; arm64, Linux aarch64 and x86_64 agree to the byte), and less than any
-;;; undone change adds back: a second guard around the user's call, or one
-;;; around a write's native start. The idle run's margin is half a
-;;; dynamic-wind instead, for the one uv-run held, and so is the stream
-;;; verbs': their steps are bare interrupt pairs, and with-interrupts-disabled
-;;; in their place is a dynamic-wind.
+;;; where "here" is the Chez running the suite. Half a guard is far more
+;;; than the platforms measured differ by (macOS arm64, Linux aarch64 and
+;;; x86_64 agree to the byte), and less than either cost the rows exclude
+;;; adds: a second guard around the user's call, or one around a write's
+;;; native start. The idle run's margin is half a dynamic-wind instead, the
+;;; cost a uv-run wrapped in one would add, and so is the stream verbs':
+;;; their steps are bare interrupt pairs, and with-interrupts-disabled in
+;;; their place is a dynamic-wind.
 ;;;
 ;;; One row holds a difference instead. A read through libuv crosses into
 ;;; Scheme once, as a timer does, so each costs over its delivery straight
 ;;; through the slot what the other does. An alloc callback answered in
 ;;; Scheme would add a crossing to every read, under half a guard when it
-;;; has no seam around it. The figures are in
-;;; .plans/callback-alloc-mutation-log.md, .plans/shim-alloc-mutation-log.md
-;;; and .plans/stream-step-mutation-log.md.
+;;; has no seam around it.
 ;;;
 ;;; NOT pure: (libuv) reaches (libuv private native). Never add this to the
 ;;; Makefile's PURE_TESTS.
@@ -156,9 +155,10 @@
      (lambda () (collect-request-handler saved)))))
 
 ;; --- what a guard and a dynamic-wind cost on this Chez ---------------------
-;; Each is shaped like the code the paths hold or once held: a guard with an
-;; else clause around a call through a variable, like a seam's, and a
-;; dynamic-wind whose thunks set a field around a call, like uv-run's.
+;; Each is shaped like the code a path holds or its bound excludes: a guard
+;; with an else clause around a call through a variable, like a seam's, and
+;; a dynamic-wind whose thunks set a field around a call, as one wrapped
+;; around uv-run would.
 (define ref-cell (make-vector 1 #f))
 (define (ref-record! e) (vector-set! ref-cell 0 e))
 (define ref-callee (lambda (a) #f))
@@ -187,7 +187,7 @@
        (list a-guard a-wind)))
 
 ;; Every path, in one place: what it allocated on Chez 10.4.1, and how many
-;; guards it holds (see the header and the mutation log).
+;; guards it holds (see the header).
 (define paths
   '((read-data 368 1) (read-eof 336 1) (read-error 944 1)
     (connection 336 1) (timer 320 1) (signal 336 1) (async 320 1)
@@ -201,8 +201,8 @@
     (guarded-callback-through-libuv 787 2)
     ;; one interrupt-free step each, with no dynamic-wind
     (uv-write! 144 0) (uv-write*! 176 0) (uv-shutdown! 128 0)
-    ;; 32 B a segment: a one-pair spec and the walk's spine pair (#64's
-    ;; review); a list of three per segment cost 64
+    ;; 32 B a segment: a one-pair spec and the walk's spine pair; a spec
+    ;; that was a list of three would make it 64
     (uv-write*-64 3200 0)))
 
 ;; bound : symbol -> exact-integer, per the header.
@@ -451,8 +451,9 @@
 (row 'idle-run "a uv-run with nothing to do"
      (fewest-bytes void (lambda () (uv-run idle-loop 'nowait)) always))
 
-;; A timer due now, and the one 'once that fires it. A run that returns
-;; before the timer comes due does not count (AGENTS.md's 'once trap).
+;; A timer due at once, and the one 'once that fires it. A run that returns
+;; before the timer comes due does not count: a single 'once is not
+;; guaranteed to fire a timer that is about to come due.
 (define fire-loop (make-uv-loop))
 (define fire-timer (make-uv-timer fire-loop))
 
@@ -500,8 +501,8 @@
 ;; which copies the 16 bytes out and calls on-data. The reader has a loop of
 ;; its own, so the metered run delivers that read and nothing else. Each
 ;; call's 16 bytes are written, and the write completed, on the writer's
-;; loop, off the meter. Answered in Scheme instead, the alloc callback cost
-;; 416 B more a read (.plans/shim-alloc-mutation-log.md).
+;; loop, off the meter. Answered in Scheme instead, the alloc callback
+;; would cost 416 B more a read.
 (define rd-loop (make-uv-loop))
 (define wr-loop (make-uv-loop))
 (define rd-server (make-uv-tcp rd-loop))
@@ -534,8 +535,8 @@
 ;; Should a read never arrive, the watchdog ends the run that waits for it,
 ;; and that call does not count, rather than the suite hanging there. 50 ms
 ;; is plenty: a 'once run polls for I/O before it runs any timer, so a read
-;; already on its way is delivered first, and a read took 2 ms at most under
-;; Valgrind. At 1 s, a change that stopped reads cost 64 s to report.
+;; already on its way is delivered first, and a read takes 2 ms at most
+;; under Valgrind. At 1 s, a change that stops reads takes 64 s to report.
 (define rd-watchdog (make-uv-timer rd-loop))
 (define (on-watchdog t) #f)
 

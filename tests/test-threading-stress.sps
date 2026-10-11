@@ -1,17 +1,17 @@
 #!r6rs
-;;; STRESS TIER (ADR-0010 companion) — deliberately OFF the default `make test`
-;;; gate. This suite forks a real OS thread and is timing-dependent by nature;
-;;; it runs via `make test-threading`, not the deterministic suite. It is the
-;;; red→green oracle for issue #19: a loop thread blocked in `uv-run` must not
-;;; freeze garbage collection for other Scheme threads.
+;;; STRESS TIER — deliberately OFF the default `make test` gate. This suite
+;;; forks real OS threads and is timing-dependent by nature; it runs via
+;;; `make test-threading`, not the deterministic suite. Its first rows hold
+;;; that a loop thread blocked in `uv-run` does not freeze garbage
+;;; collection for other Scheme threads.
 ;;;
-;;; The mechanism (proved in spike/threading/): Chez's collector is stop-the-
-;;; world and needs every OTHER thread deactivated. A thread inside a PLAIN
-;;; foreign `uv_run` stays ACTIVE, so a worker thread's `(collect)` raises
+;;; The mechanism: Chez's collector is stop-the-world and needs every OTHER
+;;; thread deactivated. A thread inside a PLAIN foreign `uv_run` stays
+;;; ACTIVE, so a worker thread's `(collect)` raises
 ;;;   "cannot collect when multiple threads are active".
-;;; Rebinding `uv_run` __collect_safe (and the callables it invokes)
-;;; deactivates the loop thread for the blocking poll, and the worker collects
-;;; freely. So this suite is RED before that conversion and GREEN after.
+;;; Binding `uv_run` __collect_safe (and the callables it invokes)
+;;; deactivates the loop thread for the blocking poll, and the worker
+;;; collects freely. Binding it plain fails the first rows.
 ;;;
 ;;; NOT pure: reaches (libuv private native). Never add to PURE_TESTS, and it is
 ;;; filtered out of the default TESTS in the Makefile (STRESS_TESTS).
@@ -85,21 +85,22 @@
   (uv-loop-teardown! loop)
 
   ;; The load-bearing assertion: with a collect-safe uv_run the worker
-  ;; completes every collect while the loop thread is blocked. RED (0/N,
-  ;; "cannot collect when multiple threads are active") until #19 lands.
+  ;; completes every collect while the loop thread is blocked. A plain
+  ;; uv_run binding fails it at 0 of N, with "cannot collect when multiple
+  ;; threads are active" as the first error.
   (test-equal "a worker thread collects freely while the loop thread blocks in uv-run"
     N ok-collects)
   (test-equal "the worker hit no collector error"
     #f first-error))
 
-;; --- bulk copies stay plain, not __collect_safe (issue #35) -------------
+;; --- bulk copies stay plain, not __collect_safe -------------------------
 ;; The mirror of the rows above. copy-in! and copy-out hand a bytevector to
 ;; the shim as a u8*, which is only safe while the collector cannot move it:
 ;; the binding is PLAIN, so the calling thread stays active and no collection
 ;; can run until the copy returns. Chez accepts __collect_safe on those
 ;; bindings without complaint, and then a concurrent collection moves the
-;; bytevector mid-copy and corrupts it (review of #36: 31-49 of 50 slowed
-;; copies). No single-threaded suite can see the difference, so it is pinned
+;; bytevector mid-copy and corrupts it (31-49 of 50 slowed copies,
+;; measured). No single-threaded suite can see the difference, so it is pinned
 ;; here: a helper thread keeps calling (collect) while the main thread copies
 ;; 64 MiB, and none of its attempts made wholly inside a copy may succeed.
 ;;
@@ -112,14 +113,14 @@
 ;;
 ;; Each row runs intervals until the helper has tried inside one: at least
 ;; its minimum (10 for copy-in!, 3 for copy-out) and at most MAX-INTERVALS.
-;; Fixed counts once failed at loads of 170-340 with the helper never
-;; scheduled inside any (`(never-tried 0)`, in either row). Copy-out keeps
-;; its 3 because each further interval is another chance for a broken
-;; binding to abort Chez. Between intervals the helper is parked, and it
-;; collects while parked, when the main thread is waiting for it and no
-;; other thread is active. So every interval starts with the helper just
-;; woken, and a copy-out interval's 64 MiB result is collected before the
-;; next one: only one is ever alive, which the third row holds.
+;; A fixed count of intervals fails a correct build at loads of 170-340,
+;; with the helper scheduled inside none (`(never-tried 0)`, in either
+;; row). Copy-out's minimum is 3 because each further interval is another
+;; chance for a broken binding to abort Chez. Between intervals the helper
+;; is parked, and it collects while parked, when the main thread is waiting
+;; for it and no other thread is active. So every interval starts with the
+;; helper just woken, and a copy-out interval's 64 MiB result is collected
+;; before the next one: only one is ever alive, which the third row holds.
 (let ()
   (define n (* 64 1024 1024))
   (define bv (make-bytevector n 1))
@@ -253,7 +254,7 @@
     (test-equal "copy-out's intervals keep at most one 64 MiB result alive"
       'bounded copy-out-memory)))
 
-;; --- real cross-thread affinity refusal (design §6.3) -------------------
+;; --- real cross-thread affinity refusal ---------------------------------
 ;; The deterministic suite (test-async.sps) simulates a foreign owner by
 ;; setting the owner field. Here a genuinely different OS thread calls a verb
 ;; on a main-owned loop and must be refused with &uv-wrong-thread.
@@ -276,7 +277,7 @@
   (test-equal "a real worker thread's handle verb is refused with &uv-wrong-thread"
     'wrong-thread outcome))
 
-;; --- real owner transfer to a second thread (design §6.2) ---------------
+;; --- real owner transfer to a second thread -----------------------------
 ;; A loop created on the main thread and run by thread B becomes owned by B —
 ;; the worker-pool handoff, with a real second thread.
 (let ()
@@ -334,15 +335,15 @@
                      (and (pair? o) (eq? (car o) 'no-room))))
                outcomes)))
 
-;; --- worker pool posting work via uv-async-send! (design §6.1) ----------
+;; --- worker pool posting work via uv-async-send! ------------------------
 ;; K workers push items to a shared queue and wake the loop thread. The wake
 ;; callback drains the WHOLE queue each time, so coalescing (N sends -> 1
-;; callback) never loses an item. This is the driver's real shape and the #20
-;; payoff, shutdown included: the loop thread closes the async while the
-;; workers are still posting.
+;; callback) never loses an item. This is the shape uv-async exists for, a
+;; worker pool waking its loop, shutdown included: the loop thread closes
+;; the async while the workers are still posting.
 ;;
-;; Since #33 the binding keeps every send off a closing handle by itself (the
-;; careless pool below). It cannot tell a worker which of its items arrive:
+;; The binding keeps every send off a closing handle by itself (the careless
+;; pool below holds that). It cannot tell a worker which of its items arrive:
 ;; a close drops a wake still pending, and a refused send may follow an item
 ;; its worker already queued. Exact delivery is the caller's, and this block
 ;; exercises the discipline for it (docs/api.md, Async):
@@ -357,20 +358,19 @@
 ;; every worker before teardown.
 ;;
 ;; A slip in this discipline loses its race only some of the time: a flag
-;; cleared after uv-close!, a send outside QM, or a missing join was caught by
-;; only 2 to 11 of 20 single-pool runs (measured; see
-;; .plans/async-close-discipline-mutation-log.md). So the pool runs ROUNDS
+;; cleared after uv-close!, a send outside QM, or a missing join is caught by
+;; only 2 to 11 of 20 single-pool runs (measured). So the pool runs ROUNDS
 ;; times, fresh each time, and a row passes only if it held in every round.
 ;;
 ;; The loop thread's drains pace the posts: a worker that finds ROOM items
-;; queued waits for the next drain. A fixed cap alone let a starved loop
-;; thread fail a correct build: under CPU load the busiest worker posted up
-;; to 304,839 items before the close, and one reached the cap of 1,000,000
-;; at a load average of 200 (.plans/careless-pool-starvation-mutation-
-;; log.md). Paced, a worker reaches CAP only if the loop thread drains over
-;; and over without closing. The wait for a drain is bounded too, so a loop
-;; thread that stops draining without closing fails a row, where a worker
-;; waiting for good would hang the suite inside uv-run.
+;; queued waits for the next drain. A fixed cap alone lets a starved loop
+;; thread fail a correct build: unpaced, under CPU load, the busiest worker
+;; posts up to 304,839 items before the close, and at a load average of 200
+;; one reaches a cap of 1,000,000. Paced, a worker reaches CAP only if the
+;; loop thread drains over and over without closing. The wait for a drain
+;; is bounded too, so a loop thread that stops draining without closing
+;; fails a row, where a worker waiting for good would hang the suite inside
+;; uv-run.
 (let ()
   (define rounds 30)
   (define k 4)
@@ -528,30 +528,29 @@
     (test-equal "the shared queue is fully drained"
       (make-list rounds 'empty) (every-round 3))))
 
-;; --- a careless pool: sends that race the close (#33) ----------------------
+;; --- a careless pool: sends that race the close ---------------------------
 ;; The pool above sends only under its own lock. This one takes no lock: K
 ;; workers send until refused, and the loop thread closes the async from
-;; on-wake while they are still sending. #32 measured this shape reaching the
-;; freed handle (.plans/async-close-discipline-mutation-log.md) before the
-;; binding fenced its sends. Now every worker must end refused with
-;; &uv-handle-closed, and nothing else may raise.
+;; on-wake while they are still sending. Without the binding's fence around
+;; each send, this shape reaches the freed handle. Every worker must end
+;; refused with &uv-handle-closed, and nothing else may raise.
 ;;
 ;; A worker has no cap on its sends: it sends for as long as the loop thread
-;; takes to close. A cap of 1,000,000 failed a correct build when a load
-;; average of 140 starved the loop thread, and one worker reached the cap
-;; before the 50th wake (.plans/careless-pool-starvation-mutation-log.md).
-;; What ends a worker on a build that never refuses is the contract instead
-;; (docs/api.md, Async): a send made once a close has begun is refused.
-;; Workers spin while the loop thread is stalled, and that spinning is what
-;; races the close: backing off in stalls cut the failing rounds of main's
-;; unfenced send from 150 to 35 in 40 runs (the same log).
+;; takes to close. A worker bounded by its own count, not the loop thread's
+;; progress, can fail a correct build: at a load average of 140 the starved
+;; loop thread lets one worker reach a cap of 1,000,000 sends before the
+;; 50th wake. What ends a worker on a build that never refuses is the
+;; contract instead (docs/api.md, Async): a send made once a close has begun
+;; is refused. Workers spin while the loop thread is stalled, and that
+;; spinning is what races the close: with an unfenced send, backing off in
+;; stalls cuts the failing rounds from 150 to 35 in 40 runs.
 ;;
-;; How often the refusal row catches main's unfenced send depends on load:
-;; in 6 of 6 runs at a load average near 170, and in 44 of 80 near 10 (the
-;; same log). It catches a wrong refusal in every round, and a send that
-;; returns after its worker saw the close begin. It never sees the closer's
-;; half of the fence: the closer row in tests/test-async-fence.sps holds
-;; that, and holds both halves on the default gate. The first row is the
+;; How often the refusal row catches an unfenced send depends on load: in
+;; 6 of 6 runs at a load average near 170, and in 44 of 80 near 10. It
+;; catches a wrong refusal in every round, and a send that returns after
+;; its worker saw the close begin. It never sees the closer's half of the
+;; fence: the closer row in tests/test-async-fence.sps holds that, and
+;; holds both halves on the default gate. The first row is the
 ;; precondition: the loop thread closed the async while the workers sent,
 ;; and the round's own close and teardown raised nothing.
 (let ()

@@ -1,8 +1,8 @@
 #!r6rs
-;;; Child program for tests/test-stack-headroom.sps (#94). Each mode fills a
+;;; Child program for tests/test-stack-headroom.sps. Each mode fills a
 ;;; thread's C stack on purpose, and a binding that let a run through too
-;;; deep would crash this process with SIGSEGV, or on macOS hang it (#95),
-;;; so it runs in a process of its own, under tests/uv-level-3.sls's
+;;; deep would crash this process with SIGSEGV, or on macOS hang it, so it
+;;; runs in a process of its own, under tests/uv-level-3.sls's
 ;;; deadline. Its work runs on a thread made with fork-thread: 512 KiB on
 ;;; macOS, 8 MiB on Linux, made after the main thread has run a loop.
 ;;;

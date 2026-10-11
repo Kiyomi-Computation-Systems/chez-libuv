@@ -5,7 +5,7 @@
 # itself; CHANGELOG.md and git history keep where it came from.
 #
 # Usage: scripts/check-history-refs [file ...]
-# With no files it checks the source, build files and user docs.
+# With no files it checks the source, tests, build files and user docs.
 #
 # The pattern is tested before it is used: every planted reference below
 # must match and every lookalike must not, or the check fails first.
@@ -88,8 +88,8 @@ if [ $# -eq 0 ]; then
   # A tracked file deleted from the working tree is skipped. This file is
   # left out: its planted references are the point.
   list=$(git -c core.quotePath=false ls-files --cached --others \
-           --exclude-standard -- src docs README.org NOTICE SECURITY.md \
-           Makefile scripts manifest.scm channels.scm docker) || {
+           --exclude-standard -- src tests docs README.org NOTICE \
+           SECURITY.md Makefile scripts manifest.scm channels.scm docker) || {
     echo "check-history-refs: git could not list the files to check" >&2
     exit 2
   }

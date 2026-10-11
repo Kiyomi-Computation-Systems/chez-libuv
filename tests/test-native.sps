@@ -1,12 +1,17 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv private native) + (libuv private constants) --
-;;; design spec S4 (native.sls rules), S9 (conditions), S11 (testing), and
-;;; ADR-0005 (constants are never transcribed).
+;;; SRFI-64 suite for (libuv private native) + (libuv private constants):
+;;; the loading and init gate and the version gate; the constants snapshot,
+;;; whose every value is read from the shim, never transcribed into Scheme;
+;;; the conditions native.sls raises; its memory, copy and step helpers;
+;;; the C layouts and out-parameters; the address helpers; the list readers
+;;; that read a caller's list once; the debug counters; resolve-shim-path;
+;;; and the callback dispatcher slots.
 ;;;
 ;;; This suite is NOT pure: importing (libuv private native) loads libuv and
 ;;; the shim as a side effect of library instantiation (that is the whole
-;;; point of the load-before-bind ordering, design spec S4 rule 3). So this
-;;; file must never appear in the Makefile's PURE_TESTS.
+;;; point of the load-before-bind ordering: Chez resolves a foreign
+;;; procedure's entry point when its definition is evaluated). So this file
+;;; must never appear in the Makefile's PURE_TESTS.
 ;;;
 ;;; Division of labour with tests/test-shim-loading.sps: that suite drives
 ;;; the real CHEZ_LIBUV_SHIM wiring through fresh subprocesses, because the
@@ -22,7 +27,7 @@
         (libuv private constants)
         (libuv private conditions)
         (libuv private config)
-        ;; The bulk rows' libc reference and timing (issue #35).
+        ;; The bulk rows' libc reference and timing.
         (uv-bulk)
         ;; foreign-alloc / foreign-set! / foreign-ref / foreign-free build
         ;; and mutate real C buffers for the string- and memory-helper tests
@@ -47,7 +52,7 @@
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
-;; runner so its fail count can drive the exit status (AGENTS.md).
+;; runner so its fail count can drive the exit status.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -76,7 +81,7 @@
 ;; Not the vacuous "calling it twice does not raise": the initialiser keeps
 ;; a count of how many times its BODY actually ran, so removing the
 ;; `unless initialized?` guard makes the second call increment it and the
-;; third assertion below fails by name. Seeded per AGENTS.md -- the count is
+;; third assertion below fails by name. Seeded -- the count is
 ;; asserted to be 0 first, then exactly 1, so a counter stuck at any single
 ;; value cannot satisfy all three.
 (test-equal "before any call, ensure-native-loaded!'s body has not run"
@@ -107,8 +112,8 @@
 (test-equal "constants-initialized? flips to true once the snapshot is built"
   #t (constants-initialized?))
 
-;; ensure-native-loaded! is what forces the constants snapshot (design spec
-;; S4). Same seeding: 0 before, exactly 1 after, and it does not rebuild.
+;; ensure-native-loaded! is what forces the constants snapshot. Same
+;; seeding: 0 before, exactly 1 after, and it does not rebuild.
 (test-equal "before any call, the constants snapshot has not been built"
   0 constants-count-at-start)
 
@@ -145,7 +150,7 @@
 
 ;; Every rejection case is written as (not ...) with expected #t, never as
 ;; expected #f: SRFI-64 turns a raise in the actual expression into #f, so an
-;; expected-#f assertion would pass if the predicate blew up (AGENTS.md).
+;; expected-#f assertion would pass if the predicate blew up.
 (test-equal "version-supported? accepts the floor of the configured range"
   #t (version-supported? range-lo))
 
@@ -257,7 +262,7 @@
   (decode-version (uv-version))
   (uv-version-string))
 
-;; --- constants: the snapshot (ADR-0005) ---------------------------------
+;; --- constants: the snapshot --------------------------------------------
 ;; The three run modes must be three DIFFERENT values. A snapshot that
 ;; resolved all three names to the same entry -- or to a default -- would
 ;; silently make uv-run 'once behave as 'default.
@@ -296,8 +301,8 @@
      (positive? ((cdr entry)))))
  sizeof-accessors)
 
-;; The runtime accessors and the compile-time sizeof must agree -- spike
-;; FINDINGS Q-1 finding 1 is what lets the binding allocate handles from
+;; The runtime accessors and the compile-time sizeof must agree -- their
+;; agreement is what lets the binding allocate handles from
 ;; uv_handle_size() rather than needing a struct definition. If they ever
 ;; diverged, every handle allocation would be the wrong size.
 (test-equal "uv_loop_size() agrees with the shim's sizeof(uv_loop_t)"
@@ -343,7 +348,7 @@
 (test-equal "AF_INET and AF_UNSPEC are distinct"
   #t (not (= (af-inet) (af-unspec))))
 
-;; --- constants: the DNS additions (design spec v0.2 S5.2) ---------------
+;; --- constants: the DNS additions ---------------------------------------
 ;; Presence is enforced at init (a snapshot name the shim lacks raises
 ;; &uv-constant-unavailable before any row here runs); what these rows add
 ;; is INTERNAL consistency -- distinctness, bounds -- never a
@@ -429,7 +434,7 @@
 
 ;; Informational, deliberately NOT asserted: uv_buf_t is {base,len} on POSIX
 ;; but {len,base} on Windows (WSABUF order), so an assertion here would
-;; encode a platform fact ADR-0004 has not committed to. The layout CHECK
+;; encode one platform's field order as the binding's. The layout CHECK
 ;; that does run is the ftype-vs-shim comparison below, which fails closed
 ;; on any platform where the declared ftype and the real struct disagree.
 (display "  [informational] uv_buf_t offsets on this platform: base=")
@@ -446,7 +451,7 @@
 (newline)
 ;; Informational for the same reason as the two above: glibc orders ai_addr
 ;; before ai_canonname, Darwin the reverse, so the ORDER of these two is a
-;; platform fact no assertion should encode (design spec v0.2 S5.2).
+;; platform fact no assertion should encode.
 (display "  [informational] addrinfo offsets: ai_addr=")
 (display (offsetof-addrinfo-ai-addr))
 (display " ai_canonname=")
@@ -455,7 +460,7 @@
 (display (sizeof-addrinfo))
 (newline)
 
-;; --- v0.3 process/pipe constants (THE SPEC §5.3; ADR-0005) --------------
+;; --- process/pipe constants ----------------------------------------------
 ;; Structural sanity only: values are platform truths, so the assertions
 ;; are relations, never literals.
 (test-assert "process options struct has positive size"
@@ -506,9 +511,8 @@
 (test-assert "process/pipe type tags resolve"
   (and (integer? (uv-process-type)) (integer? (uv-named-pipe-type))))
 
-;; v0.4 signal (design spec 2026-08-22 S5.5; ADR-0017): UV_SIGNAL must be a
-;; snapshotted, distinct handle type tag, exactly like every other
-;; uv_handle_type member above.
+;; UV_SIGNAL must be a snapshotted, distinct handle type tag, exactly like
+;; every other uv_handle_type member above.
 (test-equal "UV_SIGNAL is snapshotted and distinct from the other handle type tags"
   'distinct-positive
   (if (and (integer? (uv-signal-type))
@@ -520,9 +524,9 @@
       'distinct-positive
       'wrong))
 
-;; #20 async (issue #20, threading arc): UV_ASYNC must be a snapshotted,
-;; distinct handle type tag, exactly like UV_SIGNAL above. Sized at runtime via
-;; (uv-handle-size (uv-async-type)); no SIZEOF_UV_ASYNC_T (signal precedent).
+;; UV_ASYNC must be a snapshotted, distinct handle type tag, exactly like
+;; UV_SIGNAL above. Sized at runtime via (uv-handle-size (uv-async-type));
+;; there is no SIZEOF_UV_ASYNC_T, as there is no SIZEOF_UV_SIGNAL_T.
 (test-equal "UV_ASYNC is snapshotted and distinct from the other handle type tags"
   'distinct-positive
   (if (and (integer? (uv-async-type))
@@ -534,11 +538,12 @@
       'distinct-positive
       'wrong))
 
-;; --- constants: a name the shim does not have (ADR-0005) ----------------
+;; --- constants: a name the shim does not have ---------------------------
 ;; The failure must be structured and must NAME the missing constant. A
-;; default value, a zero, or a bare #f here is the exact silent-transcription
-;; failure ADR-0005 exists to prevent. The sentinel 'no-raise (not #f) is the
-;; no-raise case, since SRFI-64 turns a raise into #f (AGENTS.md).
+;; default value, a zero, or a bare #f here would be a value made up rather
+;; than read from the shim, the silent failure that reading every constant
+;; from the shim exists to prevent. The sentinel 'no-raise (not #f) is the
+;; no-raise case, since SRFI-64 turns a raise into #f.
 (test-equal "a constant name the shim does not define raises uv-constant-unavailable"
   #t
   (guard (e ((uv-constant-unavailable? e) #t) (#t 'wrong-condition))
@@ -560,8 +565,8 @@
   (constant-ref 'UV_EOF))
 
 ;; A name holding a NUL names no constant. The shim reads a name as a C
-;; string, up to its first NUL, so this one resolved to UV_EOF's value
-;; while names crossed as Chez strings (#64).
+;; string, up to its first NUL, so a name crossing as a Chez string would
+;; resolve this one to UV_EOF's value.
 (define nul-name (string->symbol "UV_EOF\x0;junk"))
 
 (test-equal "a constant name holding a NUL names no constant, not the one before its NUL"
@@ -571,7 +576,7 @@
             (#t (list 'wrong-condition (describe e))))
     (list 'answered (constant-ref nul-name))))
 
-;; --- errno enumeration (ADR-0006) ---------------------------------------
+;; --- errno enumeration --------------------------------------------------
 (test-equal "the errno enumeration is non-empty"
   #t (positive? (errno-count)))
 
@@ -580,7 +585,7 @@
 
 ;; The mapping's most load-bearing single entry: UV_EOF is what the read
 ;; path discriminates on, and it is the one libuv value that is identical
-;; across platforms (spike FINDINGS Q-1 finding 4).
+;; across platforms: libuv defines it as -4095, below the errno range.
 (test-equal "errno-value->symbol maps UV_EOF's value to 'EOF"
   'EOF (errno-value->symbol (uv-eof)))
 
@@ -615,9 +620,8 @@
 ;;
 ;; The obvious probe -- UV_EOF + 1 -- is NOT unmapped: libuv reserves -4094
 ;; for its own `XX(UNKNOWN, ...)` entry, which the shim exports under the
-;; bare name "UNKNOWN". (Discovered by this very assertion failing on the
-;; first GREEN run; it is the reason the probe code is checked rather than
-;; assumed.) UV_EOF - 1 is below libuv's entire sentinel range instead.
+;; bare name "UNKNOWN", which is why the probe code is checked rather than
+;; assumed. UV_EOF - 1 is below libuv's entire sentinel range instead.
 (define probe-unknown-code (- (uv-eof) 1))
 
 (test-equal "the probe code used for the unknown-errno case really is unmapped"
@@ -653,7 +657,7 @@
   (not (string=? (errno->message (uv-eof))
                  (errno->message (errno-symbol->value 'EACCES)))))
 
-;; --- uv-check (design spec S9) ------------------------------------------
+;; --- uv-check -----------------------------------------------------------
 ;; The "0 is truthy" trap, head on: a uv-check written as (if rc rc (raise ...))
 ;; never raises at all, because every integer including 0 is true in Scheme.
 ;; The raise-path assertion below therefore compares the errno SYMBOL against
@@ -675,9 +679,9 @@
     (uv-check (uv-eof) 'test-who)
     'no-raise))
 
-;; ADR-0006: the raw platform int stays reachable for diagnostics even though
-;; the symbol is the discriminant. Several libuv errnos are derived from the
-;; host errno.h and differ across platforms (spike FINDINGS Q-1 finding 3),
+;; The raw platform int stays reachable for diagnostics even though the
+;; symbol is the discriminant. Several libuv errnos are derived from the
+;; host errno.h and differ across platforms (UV_ECANCELED is -89 on macOS),
 ;; so the expected value is the constant, never a literal.
 (test-equal "the raised condition preserves the raw return code"
   (uv-eof)
@@ -713,14 +717,14 @@
     (uv-check probe-unknown-code 'test-who)
     'no-raise))
 
-;; --- c-string->string (ADR-0009) ----------------------------------------
+;; --- c-string->string ---------------------------------------------------
 ;; NULL must stay distinguishable from the empty string: uv_err_name_r and
 ;; friends can return either, and conflating them invents data.
 ;;
 ;; Written as (not …) with expected #t, NOT as expected #f: SRFI-64 folds any
 ;; raise in the actual expression into #f, so `(test-equal … #f (c-string->string 0))`
 ;; would pass identically against a c-string->string that blew up on a null
-;; address -- the exact AGENTS.md trap. The (not …) form turns a raise into a
+;; address -- the expected-#f trap. The (not …) form turns a raise into a
 ;; propagating failure instead.
 (test-equal "c-string->string maps NULL to #f"
   #t (not (c-string->string 0)))
@@ -770,8 +774,7 @@
 ;; zero-out! is tested with the buffer SEEDED non-zero, and the seeding is
 ;; itself asserted first -- otherwise "every byte is zero" would pass against
 ;; a zero-out! that does nothing, on memory the allocator happened to hand
-;; back clean (AGENTS.md's "seed an output variable before asserting it is
-;; empty").
+;; back clean. Seed an output before asserting it is empty.
 (define (all-bytes-equal? addr len v)
   (let loop ((i 0))
     (cond ((= i len) #t)
@@ -799,14 +802,13 @@
     'no-raise))
 
 ;; The rejection must happen BEFORE any write. The buffer is seeded #xff,
-;; asserted #xff, then must still be #xff afterwards. Since #35 no single
-;; mutation of zero-out! can break "wrote nothing": the shim's memset
-;; receives the length through a size_t argument, and Chez refuses 3.0 there
-;; before C runs. The check-before-call ORDER is pinned instead by the
-;; rejection row's who, which a raise from the FFI would not carry. This row
-;; still fails if zero-out! goes back to a Scheme loop that writes before it
-;; validates -- `(< i 3.0)` is true, so such a loop zeroes three bytes -- the
-;; shape it was written against (stage-1 M52; bulk-copy mutation log).
+;; asserted #xff, then must still be #xff afterwards. No single mutation of
+;; zero-out! can break "wrote nothing": the shim's memset receives the
+;; length through a size_t argument, and Chez refuses 3.0 there before C
+;; runs. The check-before-call ORDER is pinned instead by the rejection
+;; row's who, which a raise from the FFI would not carry. This row still
+;; fails if zero-out! is ever a Scheme loop that writes before it validates
+;; -- `(< i 3.0)` is true, so such a loop zeroes three bytes.
 (let ((addr (foreign-alloc 64)))
   (let fill ((i 0))
     (when (< i 64) (foreign-set! 'unsigned-8 addr i #xff) (fill (+ i 1))))
@@ -853,12 +855,11 @@
 ;; uses (chez_uv_alloc). The shim does not draw on the blocks Chez's
 ;; foreign-free releases: measured on macOS, a block foreign-free had just
 ;; released came back from the shim 0 times in 200, and one the shim had
-;; just freed came back 200 times in 200. A churn through foreign-alloc, as
-;; this row once used, left the shim nothing dirty, and a shim that did not
-;; zero (malloc in place of calloc) passed it in three runs of five (the
-;; stream-step mutation log). So each allocation first dirties a block
-;; through the shim and frees it, and records whether alloc-zeroed was
-;; handed that very block and whether it came back zeroed.
+;; just freed came back 200 times in 200. A churn through foreign-alloc
+;; leaves the shim nothing dirty: a shim that did not zero (malloc in place
+;; of calloc) passed such a churn in three runs of five. So each allocation
+;; first dirties a block through the shim and frees it, and records whether
+;; alloc-zeroed was handed that very block and whether it came back zeroed.
 (define churn-size (sizeof-uv-loop-t))
 
 ;; dirty-then-alloc-zeroed : -> (list reused? zeroed?)
@@ -884,9 +885,8 @@
 ;; test-memory sets CHEZ_LIBUV_UNDER_VALGRIND=1 on its Linux leg and
 ;; ASAN_OPTIONS on its macOS one, and under either the seed requires only
 ;; that the allocations were made; the dirty-memory property is held by the
-;; plain run (the stage-1 mutation log addendum). under-memory-tool? asks
-;; the allocator as well, so a plain run that inherits ASAN_OPTIONS from a
-;; shell still holds the seed.
+;; plain run. under-memory-tool? asks the allocator as well, so a plain run
+;; that inherits ASAN_OPTIONS from a shell still holds the seed.
 (if under-memory-tool?
     (test-equal "seed: alloc-zeroed made every allocation (a memory tool: reuse unobservable by design)"
       32 (length shim-dirt))
@@ -964,10 +964,10 @@
       (copy-out addr 4)))
   (free! addr))
 
-;; free! of a null pointer is always a bug: design spec S5/S6/S7 require the
-;; freeing site to zero the stored uptr immediately, so a zeroed slot
-;; reaching free! means something tried to free twice. It fails loudly rather
-;; than handing 0 to the C allocator.
+;; free! of a null pointer is always a bug: every freeing site zeroes the
+;; stored uptr immediately, so a zeroed slot reaching free! means something
+;; tried to free twice. It fails loudly rather than handing 0 to the C
+;; allocator.
 (test-equal "free! rejects a null pointer instead of passing it to the allocator"
   'uv-free!
   (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
@@ -976,7 +976,7 @@
     'no-raise))
 
 ;; free-block! ignores an address past the address space; free!, the checked
-;; form, refuses it, as foreign-free did before the shim's free replaced it.
+;; form, refuses it rather than hand it to the shim's free.
 (test-equal "free! rejects an address past the address space"
   '(uv-free! null-or-invalid-pointer)
   (guard (e ((uv-invalid-argument? e)
@@ -985,11 +985,12 @@
     (free! (expt 2 64))
     'no-raise))
 
-;; copy-in! / copy-out are the two halves of ADR-0009's copy-at-the-boundary
-;; rule. Round-trip through real foreign memory, including a non-zero start
-;; offset so an implementation ignoring `start` is caught. The helpers run
-;; inside the rows, so one that raises fails a row by name instead of
-;; aborting the suite (AGENTS.md).
+;; copy-in! / copy-out are the two halves of copying at the boundary: bytes
+;; cross between a bytevector and foreign memory by copy, and libuv never
+;; holds a pointer into the Scheme heap. Round-trip through real foreign
+;; memory, including a non-zero start offset so an implementation ignoring
+;; `start` is caught. The helpers run inside the rows, so one that raises
+;; fails a row by name instead of aborting the suite.
 (let ((addr (alloc-zeroed 8))
       (src (u8-list->bytevector (list 10 20 30 40 50))))
   (test-equal "copy-in! copies the requested span, honouring start"
@@ -1019,8 +1020,9 @@
     'no-raise))
 
 ;; try-copy-in! is copy-in! for a caller that owns a block it must free when
-;; the span no longer fits (the write verbs): that refusal is its answer, not
-;; a raise, and nothing is written.
+;; the span does not fit, as when its payload shrank after the caller
+;; checked it (the write verbs): that refusal is its answer, not a raise,
+;; and nothing is written.
 (test-equal "try-copy-in! answers copied for a span that fits, and copies it"
   (list 'copied (u8-list->bytevector (list 20 30 40 0)))
   (let* ((addr (alloc-zeroed 4))
@@ -1102,9 +1104,9 @@
 
 ;; copy-in!'s sign checks are all that stands between a negative argument and
 ;; the shim's memcpy: Chez's size_t accepts -2^63..2^64-1 and wraps a
-;; negative value into a huge one (bulk-copy mutation log). Each row keeps
-;; the span bound (<= (+ start len) (bytevector-length bv)) satisfied, so the
-;; sign check is the only possible rejection. The negative length is below
+;; negative value into a huge one. Each row keeps the span bound
+;; (<= (+ start len) (bytevector-length bv)) satisfied, so the sign check
+;; is the only possible rejection. The negative length is below
 ;; size_t's range, so a copy-in! without its length check fails this row by
 ;; name when the FFI refuses the argument; a length of -1 would instead wrap
 ;; to SIZE_MAX and run memcpy off the heap.
@@ -1145,7 +1147,7 @@
 ;; libuv reads each as a C string, with strlen and then a copy, so the
 ;; wrapper takes the bytes and refuses any that are not one C string: one
 ;; NUL, the last byte. It answers the refusal rather than raising it, as it
-;; is called inside uv-getaddrinfo!'s interrupt-free step (#85). The request
+;; is called inside uv-getaddrinfo!'s interrupt-free step. The request
 ;; pointer here is NULL, which libuv answers with UV_EINVAL before it reads
 ;; anything else (getaddrinfo.c), so a wrapper that skipped its check would
 ;; answer that errno instead.
@@ -1181,10 +1183,10 @@
              (list #f (u8-list->bytevector '(56 48 0)))
              (list #f #f))))
 
-;; --- bulk, not byte-at-a-time (issue #35) --------------------------------
+;; --- bulk, not byte-at-a-time --------------------------------------------
 ;; copy-in!, copy-out and zero-out! each move their span in ONE call into the
-;; shim. They used to loop in Scheme, one foreign-set! or foreign-ref per
-;; byte, and a 4 MiB uv-write! held its loop ~250 ms: half zeroing its block,
+;; shim. Looping in Scheme instead, one foreign-set! or foreign-ref per
+;; byte, a 4 MiB uv-write! holds its loop ~250 ms: half zeroing its block,
 ;; half copying the payload in. Each row times its helper against libc's own
 ;; memcpy or memset over the same bytes and wants it within bulk-bar of libc;
 ;; tests/uv-bulk.sls says why libc is the reference and records the margins.
@@ -1227,7 +1229,7 @@
 ;; has its own multiplier and keeps its reference live, because copy-out's
 ;; result is a fresh bytevector that Chez does not zero: storage recycled
 ;; from a dead bytevector carrying the same pattern would let a copy-out that
-;; stopped short pass (bulk-copy mutation log).
+;; stopped short pass.
 (define big-size (* 1024 1024))
 
 ;; patterned-bytes : exact-nonnegative-integer multiplier offset -> bytevector
@@ -1286,9 +1288,9 @@
 ;; An empty span at the very END of its bytevector is the edge a bulk move
 ;; reaches with a one-past-the-end source address: it must be accepted, and
 ;; it must write nothing. The call runs inside the row, so a regression that
-;; refuses the span fails the row by name instead of aborting the suite
-;; (AGENTS.md). The destination is checked under two seeds, because a byte
-;; wrongly copied from past the bytevector's end could equal any one seed.
+;; refuses the span fails the row by name instead of aborting the suite.
+;; The destination is checked under two seeds, because a byte wrongly
+;; copied from past the bytevector's end could equal any one seed.
 (define (empty-span-at-end-writes-nothing? seed)
   (let ((dst (foreign-alloc 4)))
     (libc-memset! dst seed 4)
@@ -1321,20 +1323,19 @@
 ;; bytevector to memcpy. If an interrupt handler ran between the two -- an
 ;; engine's timer expiry is one -- and truncated the bytevector, memcpy would
 ;; read past its new end, and a uv-write! would send the Chez heap that
-;; follows to the peer. The old per-byte loop re-checked every index; now
-;; copy-in! makes the final check and the copy one interrupt-free step.
+;; follows to the peer. So copy-in! makes the final check and the copy one
+;; interrupt-free step.
 ;;
 ;; The scan runs copy-in! in an engine at rising fuel. On the first expiry it
 ;; truncates the source to 16 bytes and collects, then resumes. Every run
 ;; must either be refused (the expiry came before the check) or copy only
 ;; the source's #x11 (the copy came first). The heap needs no filling after
 ;; the collection: with the check outside the interrupt-free step, the scan
-;; finds the read past the end with or without one (macOS and Linux arm64,
-;; #89). The scan stops
-;; at the first run that finishes before any expiry, since more fuel changes
-;; nothing after that. The scan runs outside any row, so every raise inside
-;; the engine becomes an outcome and fails the second row by name instead of
-;; aborting the suite (AGENTS.md).
+;; finds the read past the end with or without one (measured on macOS and
+;; Linux arm64). The scan stops at the first run that finishes before any
+;; expiry, since more fuel changes nothing after that. The scan runs
+;; outside any row, so every raise inside the engine becomes an outcome and
+;; fails the second row by name instead of aborting the suite.
 (define (truncation-outcome fuel)
   (let* ((n 4096)
          (bv (make-bytevector n #x11))
@@ -1376,7 +1377,7 @@
                            finished-before-any-expiry))))
           truncation-scan))
 
-;; --- uv_buf_t ftype vs the shim's real layout (design spec S4 rule 4) ---
+;; --- uv_buf_t ftype vs the shim's real layout ---------------------------
 ;; uv-buf-ftype-layout MEASURES the declared ftype -- offsets via
 ;; ftype-&ref address arithmetic, widths via the byte extent a real
 ;; ftype-set! actually writes -- so neither side of these comparisons is
@@ -1400,8 +1401,9 @@
 
 ;; Widths, not just offsets: a `len` field narrowed to 32 bits would keep
 ;; every offset and the struct size intact while writing only half the value
-;; libuv reads -- the buffer-length corruption that spike FINDINGS Q3's
-;; ssize_t mutation is the read-side twin of.
+;; libuv reads -- the write-side twin of binding the read callback's
+;; signed nread as unsigned, which turns UV_EOF into a length of
+;; 2^64 - 4095.
 (test-equal "the uv_buf_t ftype's base field fills the space before len"
   (offsetof-uv-buf-t-len) (+ layout-base-off layout-base-width))
 
@@ -1478,36 +1480,36 @@
     (c-int-ref 0)
     'no-raise))
 
-;; --- v0.5's natives: the size_t return and the int out-parameter --------
-;; Design spec v0.5 §13.5. STUB-LEVEL round-trips: a raw loop and a raw tcp
-;; handle sized from uv_loop_size/uv_handle_size, no dispatcher installed and
-;; no live socket, so these exercise the FFI marshalling and nothing else. The
-;; wrappers' live-socket behaviour is tests/test-flow.sps's job.
+;; --- flow-control natives: the size_t return and the int out-parameter --
+;; STUB-LEVEL round-trips: a raw tcp handle sized from uv_handle_size, no
+;; dispatcher installed and no live socket, so these exercise the FFI
+;; marshalling and nothing else. The wrappers' live-socket behaviour is
+;; tests/test-flow.sps's job.
 ;;
 ;; This suite deliberately never imports (libuv private handles): doing so
 ;; instantiates its body and installs the dispatchers, which would break the
 ;; "before installation" rows further down. Everything here is raw pointers.
-;; NO uv_loop_init HERE, and that is the point. An earlier version of this
-;; block built a real loop and a real tcp handle, freed its own two blocks,
-;; and skipped uv_loop_close on the reasoning that the handle was never
-;; closed so a close would answer EBUSY. That reasoning was wrong in a way
-;; macOS cannot see: uv_loop_init allocates libuv's own internals
-;; (uv_loop_init -> uv__process_init -> uv_signal_init -> uv__io_init_start),
-;; and skipping the close leaks them. CI's Linux Valgrind leg caught it at
-;; 128 + 448 bytes definitely lost; the macOS ASan leg makes no leak claim
-;; and stayed green.
+;; NO uv_loop_init HERE, and that is the point. uv_loop_init allocates
+;; libuv's own internals (uv_loop_init -> uv__process_init ->
+;; uv_signal_init -> uv__io_init_start), which only uv_loop_close frees, and
+;; a loop holding a tcp handle that was never closed answers EBUSY to the
+;; close. A block that built a real loop and a real tcp handle and freed
+;; only its own two blocks would leak them in a way macOS cannot see: the
+;; Linux Valgrind leg reports that leak as 128 + 448 bytes definitely lost,
+;; and the macOS ASan leg, which makes no leak claim, stays green.
 ;;
 ;; A ZEROED, UNINITIALISED handle exercises both marshalling paths without
-;; libuv allocating anything at all, which is what "stub-level" should have
-;; meant in the first place: write_queue_size is a struct field read, and
-;; uv__socket_sockopt dispatches on handle->type, which is 0
-;; (UV_UNKNOWN_HANDLE) in a zeroed block and answers UV_ENOTSUP.
+;; libuv allocating anything at all, which is what "stub-level" means here:
+;; write_queue_size is a struct field read, and uv__socket_sockopt
+;; dispatches on handle->type, which is 0 (UV_UNKNOWN_HANDLE) in a zeroed
+;; block and answers UV_ENOTSUP.
 (let ((tp (alloc-zeroed (uv-handle-size (uv-tcp-type)))))
 
   ;; size_t, and deliberately not a signed type: the queue size cannot be
   ;; negative and the call cannot fail. Binding it signed would be the mirror
-  ;; of the `nread` scar the read dispatcher records -- there, reading UV_EOF
-  ;; through an unsigned binding delivered four gigabytes of data.
+  ;; of the `nread` hazard the read dispatcher guards against -- there,
+  ;; reading UV_EOF through an unsigned binding delivers it as a read of
+  ;; 2^64 - 4095 bytes.
   (test-equal "uv_stream_get_write_queue_size marshals as a non-negative exact integer"
     '(exact non-negative)
     (let ((q (uv-stream-get-write-queue-size-native tp)))
@@ -1528,8 +1530,7 @@
     ;; only the symbol is therefore blind to the exact defect it looks like it
     ;; is testing, an `int` rc bound as `unsigned-int`. The wrappers survive
     ;; that mutation only because uv-check gates on negativity before mapping;
-    ;; at this level the row has to gate on it itself. This row was written
-    ;; the blind way first and caught by running the mutation.
+    ;; at this level the row has to gate on it itself.
     (test-equal "uv_send_buffer_size on an unknown handle type answers a NEGATIVE ENOTSUP rc"
       '(negative ENOTSUP)
       (let ((rc (uv-send-buffer-size-native tp cell)))
@@ -1541,7 +1542,7 @@
 
   (free! tp))
 
-;; --- c-uptr-ref: the pointer-wide sibling (design spec v0.2 S5.1) -------
+;; --- c-uptr-ref: the pointer-wide sibling -------------------------------
 ;; The probe value deliberately does NOT fit in 32 bits: on every supported
 ;; target a c-uptr-ref accidentally narrowed to a 32-bit read would answer a
 ;; truncated number that is still a plausible pointer, so a value whose high
@@ -1559,7 +1560,7 @@
     (c-uptr-ref 0)
     'no-raise))
 
-;; --- read-net-u16: ntohs, by hand (spike FINDINGS Q3) -------------------
+;; --- read-net-u16: ntohs, by hand ---------------------------------------
 ;; `sin_port` is stored big-endian whatever the host's order is, so this is
 ;; the one decision in the getsockname path that a host-order read would get
 ;; PLAUSIBLY wrong -- a different number, still in port range. The bytes are
@@ -1597,17 +1598,16 @@
         (read-net-u16 cell -1)))
     'no-raise))
 
-;; --- sockaddr->address-string (design spec v0.2 S5.1) -------------------
+;; --- sockaddr->address-string -------------------------------------------
 ;; Both refusal rows expect a SENTINEL reached through `or`, never a bare
-;; #f: SRFI-64 turns any raise in the actual expression into #f (AGENTS.md's
-;; named trap), so a row expecting #f would pass identically against a
-;; wrapper that raises.
+;; #f: SRFI-64 turns any raise in the actual expression into #f, so a row
+;; expecting #f would pass identically against a wrapper that raises.
 ;;
 ;; The zero-pointer refusal must not reach native at all: uv_ip_name
 ;; dereferences sa_family unconditionally (vendor/libuv/src/uv-common.c:311),
 ;; so the arm under test here is the one that keeps synthetic addrinfo
-;; chains with NULL ai_addr safe and makes the v0.2 offset-swap mutation
-;; fail by name instead of by SIGSEGV.
+;; chains with NULL ai_addr safe, and makes a decode that reads ai_addr at
+;; ai_canonname's offset fail by name instead of by SIGSEGV.
 (test-equal "sockaddr->address-string refuses a zero pointer with #f, without calling native"
   'refused-null
   (or (sockaddr->address-string 0) 'refused-null))
@@ -1637,12 +1637,13 @@
     (or (sockaddr->address-string addr) 'refused-family))
   (free! addr))
 
-;; --- validate-address / require-port (post-v0.2 lift) -------------------
-;; The ADR-0012 input vocabulary's validators, asserted at their shared
-;; home: tcp.sls and dns.sls both import THIS copy, so these rows pin the
-;; semantics every verb boundary observes. `who` is a symbol no real
-;; caller passes: each raise must name the caller handed in, not the
-;; helper or a baked-in verb name.
+;; --- validate-address / require-port ------------------------------------
+;; The validators of the address vocabulary (an address is a
+;; presentation-form string, a port a separate exact integer in 0..65535),
+;; asserted at their shared home: tcp.sls and dns.sls both import THIS
+;; copy, so these rows pin the semantics every verb boundary observes.
+;; `who` is a symbol no real caller passes: each raise must name the caller
+;; handed in, not the helper or a baked-in verb name.
 (test-equal "validate-address refuses a non-string, naming its caller and why"
   '(test-lift address-not-a-string)
   (guard (e ((uv-invalid-argument? e)
@@ -1665,7 +1666,7 @@
        '("127.0.0.1\x0;x" "\x0;")))
 
 ;; Address-ness here is C-string-ness, a string holding no NUL, BY DESIGN:
-;; parse refusal is fill-sockaddr!'s job (spike FINDINGS Q3), so a validator
+;; parse refusal is fill-sockaddr!'s job (libuv's own parser), so a validator
 ;; tightened to pre-parse would fail this row by name. What it answers is
 ;; the string's C string, the bytes libuv parses: UTF-8 and one terminating
 ;; NUL.
@@ -1712,7 +1713,7 @@
              (string->utf8 "not-an-ip\x0;"))))
 
 ;; try-fill-sockaddr! and try-c-int-set! are the forms an interrupt-free step
-;; calls (#85), where a raise would leave interrupts disabled for good. Each
+;; calls, where a raise would leave interrupts disabled for good. Each
 ;; answers what it refuses, for any argument, and writes nothing then. The
 ;; verbs check ports before their steps, so a port the parser's C int cannot
 ;; hold reaches try-fill-sockaddr! only from a drifted check: one past the
@@ -1808,12 +1809,13 @@
              (circular '(a b c d) 2)
              (circular '(a b c d e) 1))))
 
-;; --- proper-length: a list changed during the count (#64) ------------------
+;; --- proper-length: a list changed during the count -----------------------
 ;; proper-length counts with a hare and a tortoise, and the tortoise walks
 ;; pairs the hare has passed, which a change made during the count (by an
-;; engine's handler or another thread) can have cut behind the hare. It took
-;; the cdr of whatever it found there: `cdr: ... is not a pair` for a list of
-;; twelve cut during the count, and at optimize-level 3 an unchecked read.
+;; engine's handler or another thread) can have cut behind the hare. A
+;; tortoise that took the cdr of whatever it found there would raise `cdr:
+;; ... is not a pair` for a list of twelve cut during the count, and at
+;; optimize-level 3 make an unchecked read.
 ;; Each sweep counts a fresh twelve-element list in an engine at rising
 ;; fuel and changes it at the first expiry: the third pair's cdr becomes a
 ;; vector, or the list's head. A run must answer #f or 12, the count the
@@ -1840,7 +1842,7 @@
 ;; Two cycles at once: the fifth pair's cdr back to the fourth, and the
 ;; twelfth's back to the eleventh. A count that walked a second pointer
 ;; behind the first could be left on one cycle while the first went round
-;; the other, and never end (#64's review).
+;; the other, and never end.
 (define (two-cycles! l)
   (let ((p4 (list-tail l 4)) (p5 (list-tail l 5))
         (p10 (list-tail l 10)) (p11 (list-tail l 11)))
@@ -1875,7 +1877,7 @@
                    (if (caddr last-run) 'expired (cadr last-run))))))
        length-sweeps))
 
-;; --- read-proper-list: a caller's list, read once (#66) -------------------
+;; --- read-proper-list: a caller's list, read once -------------------------
 ;; read-proper-list counts with proper-length, walks at most that many
 ;; pairs, checking each, and requires the list's end after them. Its READ
 ;; sees each element once, in order, and its answer is a fresh list or #f.
@@ -1967,14 +1969,14 @@
                    (if (caddr last-run) 'expired (cadr last-run))))))
        read-sweeps))
 
-;; --- let-fixed-list: a caller's list of a fixed length, read once (#81) ----
+;; --- let-fixed-list: a caller's list of a fixed length, read once ---------
 ;; uv-spawn!'s pipe specs and uv-write*!'s (bv start end) spans are lists of
 ;; a fixed length. let-fixed-list binds their elements walking the list once,
 ;; each pair checked before it is read through, and requires the end after
-;; the last. Each pipe spec's tail used to be checked and then read again, a
-;; read Chez's own cadr raised on, or at --optimize-level 3 read through, when
-;; another thread cut it in between (#66). The race row below holds the
-;; once-only read; these hold the shape.
+;; the last. A tail checked and then read again is a read Chez's own cadr
+;; raises on, or at --optimize-level 3 reads through, when another thread
+;; cuts it in between. The race row below holds the once-only read; these
+;; hold the shape.
 (define (fixed-3 x)
   (let-fixed-list (a b c) x 'mismatch (list a b c)))
 
@@ -2019,10 +2021,10 @@
 ;; --- fold-flags: a flag list spliced longer during the walk ---------------
 ;; fold-flags walks no further than its count and requires the list's end
 ;; after it, as read-proper-list does. Without the end, a tail spliced in
-;; during the walk was folded as far as the stale count, into flags the
-;; caller never held. A walk the splice contradicts counts and walks the
+;; during the walk would be folded as far as the stale count, into flags
+;; the caller never held. A walk the splice contradicts counts and walks the
 ;; list once more, as read-proper-list does, so a list that was proper
-;; before the splice and after it is never refused (#81). The sweep splices
+;; before the splice and after it is never refused. The sweep splices
 ;; splice-tail in at the first expiry, as the read sweeps do, and folds 2^e
 ;; for each element e, so that each list's flags are its own: every run must
 ;; answer the flags of the list as it was or as the splice left it.
@@ -2055,14 +2057,14 @@
           (if (caddr last-run) 'expired (cadr last-run)))))
 
 ;; --- proper-length against changes nobody chose ---------------------------
-;; The sweeps above make the changes a reader thought of; one reader thought
-;; only of single changes, and the count above hung on two. These trials
+;; The sweeps above make only the changes someone thought of, and a count
+;; can survive every single change and still hang on two. These trials
 ;; make changes at random: a list of 1 to 16 pairs, counted in an engine
 ;; whose fuel runs out somewhere in the count (a count of N pairs takes
 ;; N + 1 ticks), and one or two changes at each of its first one or two
 ;; expiries. A change points a random pair's cdr at a random pair of the
 ;; list, at '() or at a vector. The count may then answer #f or any length,
-;; since the list may now have it, but it must end and raise nothing. The
+;; since the changed list may have it, but it must end and raise nothing. The
 ;; seed is fixed, so every run makes the same trials.
 (define count-trials 3000)
 
@@ -2133,12 +2135,11 @@
 ;; the list. Cut to a vector, every count must answer #f or 12, and every
 ;; read #f or the list, without raising. A count or read that took a cdr
 ;; twice, checking it the first time, would read through the vector the
-;; second: the shape #61's count had, which no engine sweep can split. Cut
-;; to the list's head, which makes it circular, a read can go around the
-;; cycle, below. As in test-addrinfo's cross-thread row, the rows assert
-;; only what no schedule can make fail on a right answer, and the
-;; informational lines count the counts and reads the flipper's change
-;; reached.
+;; second, a shape no engine sweep can split. Cut to the list's head, which
+;; makes it circular, a read can go around the cycle, below. As in
+;; test-addrinfo's cross-thread row, the rows assert only what no schedule
+;; can make fail on a right answer, and the informational lines count the
+;; counts and reads the flipper's change reached.
 ;;
 ;; A flipper that never ran, or stopped, would leave those rows passing. So
 ;; before the first count or read and after the last, each race waits to
@@ -2241,9 +2242,9 @@
 ;; read sees two. A walk the change reaches contradicts its count, and
 ;; read-proper-list then counts and walks the list once more, so every read
 ;; must answer the list before the change or after it, never #f. With one
-;; count and one walk, a change between the two answered #f for a list that
-;; was proper before and after it, and uv-spawn! refused it as no list
-;; (#73's review: 20,246 of 100,000 spawns). A precondition row holds that
+;; count and one walk, a change between the two would answer #f for a list
+;; that was proper before and after it, and uv-spawn! would refuse it as no
+;; list (measured: 20,246 of 100,000 spawns). A precondition row holds that
 ;; the reads saw both lengths, so the other thread was changing the list.
 ;; Not under Valgrind.
 (define one-change-rounds 20000)
@@ -2383,10 +2384,10 @@
               (list 'shorter (list-ref race 3) 'longer (list-ref race 4)))))))
 
 
-;; The flags were measured with a guarded length, and a guard costs a few
-;; hundred bytes a call even when nothing raises; the walk that replaced it
-;; allocates nothing. tests/uv-meter.sls has the meter; the row's second
-;; element shows it sees an allocation.
+;; Measuring the flags with a guarded length would cost a few hundred bytes
+;; a call even when nothing raises; fold-flags's walk allocates nothing.
+;; tests/uv-meter.sls has the meter; the row's second element shows it sees
+;; an allocation.
 (test-equal "fold-flags allocates nothing, where the meter sees a 64-byte allocation"
   '(0 meter-live)
   (let ((flags (list 'a 'b 'c))
@@ -2443,38 +2444,27 @@
          (require-port 65535 'test-lift)
          'accepted))
 
-;; --- debug counters (design spec S10) -----------------------------------
+;; --- debug counters -----------------------------------------------------
 ;; The dev shim is built with CHEZ_LIBUV_DEBUG_COUNTERS, so these are live.
 ;; Seeded: the counter is driven to a non-zero value and asserted there
 ;; first, so a counter permanently stuck at 0 cannot pass the balance check.
 
-;; Task 2 (v0.4) added the signal row; #20 added async as the thirteenth;
-;; block, every block the binding allocates, is the fourteenth.
+;; Every class, in live-counts' order. block counts every block the shim's
+;; allocator hands the binding, whatever it holds.
 (test-equal "live-counts reports all fourteen allocation classes"
   '(loop tcp timer write-req connect-req
     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options
     signal async block)
   (map car (live-counts)))
 
-;; Superseded by the twelve-class row above, kept for provenance:
-;; (test-equal "live-counts reports all eleven allocation classes"
-;;   '(loop tcp timer write-req connect-req
-;;     getaddrinfo-req getnameinfo-req read-buffer pipe process spawn-options)
-;;   (map car (live-counts)))
-;;
-;; (test-equal "live-counts reports all eight allocation classes"
-;;   '(loop tcp timer write-req connect-req
-;;     getaddrinfo-req getnameinfo-req read-buffer)
-;;   (map car (live-counts)))
-
 (test-equal "the counters start at zero"
   #t (for-all (lambda (p) (zero? (cdr p))) (live-counts)))
 
-;; SEED / PRECONDITION, asserted before the eleven-class matrix below. Every
-;; assertion in that matrix requires the DEV shim (built with
+;; SEED / PRECONDITION, asserted before the fourteen-class matrix below.
+;; Every assertion in that matrix requires the DEV shim (built with
 ;; CHEZ_LIBUV_DEBUG_COUNTERS -- the Makefile's CFLAGS_DEV). Against a
 ;; production shim the counter entry points are no-ops whose live queries
-;; always return 0, so all eleven "increments are visible" assertions would
+;; always return 0, so all fourteen "increments are visible" assertions would
 ;; fail while pointing at cross-wiring that is not there. This names the
 ;; real precondition first, so it is the assertion that fails, by name.
 (count-loop-new!)
@@ -2482,7 +2472,7 @@
   1 (live-count 'loop))
 (count-loop-free!)
 
-;; All eleven classes, not just one. There are twenty-two near-identical
+;; All fourteen classes, not just one. There are twenty-six near-identical
 ;; count entry point names in the shim, and binding count-timer-new! to
 ;; chez_uv_count_tcp_new would be invisible to any test that only exercised
 ;; a single class. Each class is driven to a non-zero value (the seed),
@@ -2490,7 +2480,7 @@
 ;; process and spawn-options rows are driven through the same exported
 ;; count-* procedures as every other row -- this suite deliberately
 ;; imports neither (libuv pipe) nor (libuv process); without these rows a
-;; cross-wired spawn-options pair was invisible to everything but
+;; cross-wired spawn-options pair would be invisible to everything but
 ;; valgrind.
 (define counter-classes
   (list (list 'loop        count-loop-new!        count-loop-free!)
@@ -2578,8 +2568,8 @@
 ;; does NOT exist is rejected by the regular-file? check alone, so it proves
 ;; nothing about absoluteness -- dropping the absolute-path? test entirely
 ;; still passes the assertion above. What must be refused is a relative path
-;; that DOES resolve, under the current working directory: design spec S4
-;; rule 1's "the working directory is never consulted".
+;; that DOES resolve, under the current working directory: resolve-shim-path
+;; never consults the working directory.
 ;;
 ;; Seeded, so it cannot pass vacuously from a different cwd: the probe is
 ;; asserted to name a real file first. Both suites are run from the repo
@@ -2633,10 +2623,10 @@
 ;; --- the libuv leg: the SUBTYPE, through the same two procedures ---------
 ;; native.sls's uv-loaded definition routes libuv's own shared objects
 ;; through resolve-shim-path and load-shim with make-uv-libuv-unavailable,
-;; so a libuv-path failure is no longer mislabeled as the shim's (the
-;; final-review triage item). The maker argument is asserted here directly;
-;; tests/test-shim-loading.sps drives the real uv-loaded wiring end to end
-;; in a subprocess and greps for the subtype's name.
+;; so a libuv-path failure is labelled as libuv's, not the shim's. The maker
+;; argument is asserted here directly; tests/test-shim-loading.sps drives
+;; the real uv-loaded wiring end to end in a subprocess and greps for the
+;; subtype's name.
 ;;
 ;; Each row asserts the SHARPER predicate. The plain rows above prove the
 ;; default maker still answers the parent type, so the pair together is what
@@ -2659,9 +2649,10 @@
     (load-shim a-real-non-library-file make-uv-libuv-unavailable)
     'no-raise))
 
-;; The two-argument resolve-shim-path and one-argument load-shim keep their
-;; old contract: without a maker they still raise the PARENT type and not
-;; the subtype, so no existing caller's discrimination changed underneath it.
+;; The two-argument resolve-shim-path and one-argument load-shim raise the
+;; PARENT type and not the subtype: only a caller that passes the subtype's
+;; maker, the libuv leg, gets it, so the shim's own failures stay the
+;; shim's.
 (test-equal "without a maker, resolve-shim-path still raises the plain parent type"
   'parent-only
   (guard (e ((uv-libuv-unavailable? e) 'subtype)
@@ -2681,11 +2672,10 @@
 ;; These rows live here, and only here, because this is the one suite whose
 ;; import chain never reaches (libuv private handles) -- and handles.sls
 ;; installs the thirteen dispatchers in its own library body, at instantiation
-;; (design spec S4: "the slots themselves are filled exactly once, by
-;; handles.sls"). In every other suite's process the install has therefore
-;; already happened before the first test line runs, so the uninstalled
-;; state, the partial-install refusal, and the install itself are only
-;; observable from here.
+;; (the slots are filled exactly once, by handles.sls). In every other
+;; suite's process the install has therefore already happened before the
+;; first test line runs, so the uninstalled state, the partial-install
+;; refusal, and the install itself are only observable from here.
 ;;
 ;; ORDER IS LOAD-BEARING: the slots are process-global and install-once, so
 ;; every "not installed yet" assertion has to run before the install below.
@@ -2707,12 +2697,11 @@
        'no-raise)))
  dispatcher-names)
 
-;; The exit and walk slots, specifically: v0.3's two additions to the
-;; twelve, asserted with their own real arity (three args for exit, two for
-;; walk) and the exact uninstalled-stub message, beside the generic
-;; single-arg loop above (ADR-0015; test-native.sps never imports
-;; handles.sls, so both slots stay uninstalled for the life of this suite's
-;; process).
+;; The exit and walk slots, specifically, asserted with their own real
+;; arity (three args for exit, two for walk) and the exact uninstalled-stub
+;; message, beside the generic single-arg loop above (test-native.sps never
+;; imports handles.sls, so both slots stay uninstalled for the life of this
+;; suite's process).
 (test-assert "the exit slot holds the raising uninstalled stub"
   (guard (e (#t (and (uv-error? e)
                      (string=? (condition-message e)
@@ -2727,9 +2716,9 @@
     ((dispatcher-ref 'walk) 0 0)
     #f))
 
-;; The signal slot, v0.4's thirteenth: uv_signal_cb's own (handle signum)
-;; arity. It shares connection's arity and still has its own slot -- the
-;; per-TYPE rule ADR-0008's third amendment states in its own terms.
+;; The signal slot: uv_signal_cb's own (handle signum) arity. It shares
+;; connection's arity and still has its own slot -- there is one slot per
+;; callback TYPE, not per arity.
 (test-assert "the signal slot holds the raising uninstalled stub"
   (guard (e (#t (and (uv-error? e)
                      (string=? (condition-message e)
@@ -2737,8 +2726,8 @@
     ((dispatcher-ref 'signal) 0 0)
     #f))
 
-;; The async slot, #20's fourteenth: uv_async_cb's (handle) arity. Same arity
-;; as close/timer, distinct callback TYPE, own slot (ADR-0008's per-type rule).
+;; The async slot: uv_async_cb's (handle) arity. Same arity as close/timer,
+;; distinct callback TYPE, own slot.
 (test-assert "the async slot holds the raising uninstalled stub"
   (guard (e (#t (and (uv-error? e)
                      (string=? (condition-message e)

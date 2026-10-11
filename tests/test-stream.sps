@@ -1,14 +1,13 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv stream) -- THE SPEC §9.3's gating matrix: the
-;;; five stream verbs (uv-write!, uv-write*!, uv-shutdown!, uv-read-start!,
+;;; SRFI-64 suite for (libuv stream) -- the gating matrix: the five stream
+;;; verbs (uv-write!, uv-write*!, uv-shutdown!, uv-read-start!,
 ;;; uv-read-stop!) accept any STREAM handle -- tcp or pipe -- refuse a
 ;;; non-stream kind with 'not-a-uv-stream, and refuse a closed stream with
 ;;; &uv-handle-closed carrying ITS kind. tcp's own write/read/shutdown
 ;;; coverage (payload integrity, backpressure, the counters) stays in
-;;; test-tcp.sps and test-echo.sps -- both run UNCHANGED here, through
-;;; (libuv tcp)'s re-export, as this task's regression evidence. The
-;;; refuses-process row is deferred to test-process.sps (Task 10), once
-;;; uv-spawn! can construct a process record.
+;;; test-tcp.sps and test-echo.sps, which reach these verbs through
+;;; (libuv tcp)'s re-export. The refuses-process rows are below, once a
+;;; spawn has made a process record.
 ;;;
 ;;; NOT pure: (libuv stream) reaches (libuv private native). Never add this
 ;;; to the Makefile's PURE_TESTS.
@@ -64,12 +63,11 @@
 (define timer (make-uv-timer loop))
 (define (nop . args) #f)
 
-;; --- the gating matrix (THE SPEC §9.3) -----------------------------------
-;; Each verb: accepts tcp (proved by the untouched v0.1/v0.2 suites),
+;; --- the gating matrix ---------------------------------------------------
+;; Each verb: accepts tcp (test-tcp.sps and test-echo.sps prove that),
 ;; refuses a non-stream kind with 'not-a-uv-stream, refuses a closed
 ;; stream with &uv-handle-closed carrying ITS kind. The refuses-process
-;; row lands in Task 10 (test-process.sps), once uv-spawn! can construct
-;; one -- recorded there, not here.
+;; rows come later in this file, once a spawn has made a process.
 (define (refuses-timer? thunk)
   (guard (e (#t (and (uv-invalid-argument? e)
                      (eq? 'not-a-uv-stream (uv-invalid-argument-reason e)))))
@@ -86,8 +84,8 @@
 (test-assert "uv-read-stop! refuses a timer"
   (refuses-timer? (lambda () (uv-read-stop! timer))))
 
-;; --- stream verbs on an UNCONNECTED pipe (THE SPEC §4.6, §9.3) -----------
-;; A fresh pipe has no fd yet -- uv_spawn is what connects it (V3). The
+;; --- stream verbs on an UNCONNECTED pipe ---------------------------------
+;; A fresh pipe has no fd yet -- uv_spawn is what connects it. The
 ;; verbs pass the kind gate and libuv answers an errno; this row PINS
 ;; whatever that errno is (bind what you test): expected 'EBADF-class.
 ;; The assertion accepts the symbol family rather than one platform's
@@ -95,7 +93,7 @@
 ;; pinned value is recorded in every run's output.
 ;;
 ;; Any other raise is kept as the evidence, so that the row below fails by
-;; name rather than this plumbing aborting the suite (the #49 review's M8).
+;; name rather than this plumbing aborting the suite.
 (define unconnected-errno
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
             (#t (list 'raised (describe e))))
@@ -107,12 +105,12 @@
   (begin (display "  [informational] unconnected pipe write: ")
          (display unconnected-errno) (newline) #t))
 
-;; --- a start libuv refuses leaves nothing behind (#45) -------------------
+;; --- a start libuv refuses leaves nothing behind ------------------------
 ;; Each verb registers its request before libuv sees it, so a refusal has
 ;; to take the request back: deregistered, freed and uncounted, then
 ;; libuv's errno raised under the verb's own name. `let*` orders the reads
-;; around the call (AGENTS.md's right-to-left trap). The block counter
-;; sees the free itself.
+;; around the call, since compiled Chez code can evaluate a call's
+;; arguments right to left. The block counter sees the free itself.
 (define (refusal-and-residue thunk)
   (let* ((write-reqs-before (live-count 'write-req))
          (registry-before (registry-count))
@@ -383,16 +381,17 @@
   '()
   (bad-runs not-sent-wrongly? shrink-sweeps))
 
-;; --- a segment list that changes during the call (#64) ---------------------
-;; uv-write*! reads the caller's segment list before its step. It used to
-;; read it with Chez's map, which measures a list and then walks it without
-;; checking its pairs. An engine's handler, or another thread, that put a
-;; non-pair in the list during the walk had the walk read through it, an
-;; `invalid memory reference` wherever the non-pair pointed. A list made
-;; circular there was walked without end, in a walk no engine's fuel stops:
-;; the process grew to about 6 GB before it was killed. The verb now counts
-;; the list with proper-length, walks at most that many pairs checking each
-;; one, and reads each (bytevector start end) span once the same way.
+;; --- a segment list that changes during the call --------------------------
+;; uv-write*! reads the caller's segment list before its step. Chez's map
+;; measures a list and then walks it without checking its pairs, so a read
+;; with map would read through a non-pair that an engine's handler, or
+;; another thread, put in the list during the walk: an `invalid memory
+;; reference` wherever the non-pair pointed. A list made circular there
+;; would be walked without end, in a walk no engine's fuel stops: measured,
+;; the process grew to about 6 GB before it was killed. So the verb reads
+;; the list with read-proper-list, which counts it with proper-length and
+;; walks at most that many pairs, checking each one, and reads each
+;; (bytevector start end) span once the same way, with let-fixed-list.
 ;;
 ;; Each sweep writes twelve 5-byte segments through uv-write*! in an engine
 ;; at rising fuel, as the payload sweeps above do, and changes the list at
@@ -403,7 +402,7 @@
 ;;                           twelfth's the eleventh: a count that walked a
 ;;                           second pointer behind the first could be left
 ;;                           on one cycle while the first went round the
-;;                           other, and never end (#64's review);
+;;                           other, and never end;
 ;;   span-cut                the third segment, a (bv 0 5) span, loses its end.
 ;; Each run has one right answer: 'refused under the verb's own name with no
 ;; request left, or 'written with the peer receiving exactly the twelve
@@ -503,7 +502,7 @@
   '()
   (bad-runs not-sent-wrongly? list-sweeps))
 
-;; --- a segment list changed into another proper list (#81) ----------------
+;; --- a segment list changed into another proper list ---------------------
 ;; uv-write*! reads its segment list with read-proper-list, which counts the
 ;; list again and walks it once more when a walk contradicts its count. So a
 ;; list changed during the read into another proper list is written as it
@@ -512,9 +511,8 @@
 ;; fresh segments, five of 5 bytes and five of 4, so the list grows from
 ;; twelve segments to thirteen and its bytes stay sixty: a write of either
 ;; version drains the same count, and the bytes say which it was. A walk
-;; that refused a list contradicting its count, as uv-write*!'s own walk did
-;; until #81, refused every run the splice reached between the count and the
-;; walk's end.
+;; that refused a list contradicting its count, with no second count, would
+;; refuse every run the splice reached between the count and the walk's end.
 ;; The change sees only the list, so a spliced segment's byte comes from the
 ;; list's first byte, which is (seg-byte fill 0).
 (define (splice-byte first-byte j) (+ 1 (mod (+ first-byte 100 (* 13 j)) 254)))
@@ -578,7 +576,7 @@
                                 '(uv-write*! segments-not-a-list))))
     (list verdict expired)))
 
-;; --- a span another thread changes during the call (#64) -------------------
+;; --- a span another thread changes during the call ------------------------
 ;; An engine stops a call only at a trap check, but another thread can
 ;; change a span between any two instructions. A flipper turns a (bv 0 5)
 ;; span's tail between (5) and 'oops while this thread writes the span
@@ -670,15 +668,16 @@
 
 (uv-loop-teardown! s-loop)
 
-;; --- the write verbs move their payload in bulk (issue #35) -------------
+;; --- the write verbs move their payload in bulk ---------------------------
 ;; A write to the unconnected pipe runs the verb's whole synchronous prefix --
 ;; the checks, the block's allocation and zeroing, the payload copy, the
 ;; uv_buf_t, the registry -- then libuv answers the errno above and the block
-;; is abandoned. That prefix is what held the loop ~250 ms per 4 MiB before
-;; #35, and half of it was alloc-zeroed, which test-native's helper rows do
-;; not reach. Each row times the verb against libc allocating, zeroing and
-;; copying the same bytes (tests/uv-bulk.sls) and wants it within bulk-bar;
-;; a regression to a byte loop anywhere in the prefix lands 100x or more away.
+;; is abandoned. With its zeroing and copy done a byte at a time in Scheme,
+;; that prefix holds the loop about 250 ms per 4 MiB, half of it in
+;; alloc-zeroed, which test-native's helper rows do not reach. Each row
+;; times the verb against libc allocating, zeroing and copying the same
+;; bytes (tests/uv-bulk.sls) and wants it within bulk-bar; a regression to a
+;; byte loop anywhere in the prefix lands 100x or more away.
 (define bulk-size (* 4 1024 1024))
 (define bulk-payload (make-bytevector bulk-size 7))
 (define bulk-segments                   ; 16 spans of 256 KiB
@@ -729,7 +728,7 @@
   (guard (e ((uv-errno-error? e) #t))   ;; unbound tcp: libuv may refuse; the KIND gate passed
     (uv-write! tcp (make-bytevector 1 0) nop) #t))
 
-;; --- the refuses-process row (deferred here from Task 7) -----------------
+;; --- the refuses-process rows --------------------------------------------
 ;; A spawn that raises is kept as the evidence, so that the rows below fail
 ;; by name rather than this plumbing aborting the suite. They require a
 ;; process first: anything else is refused as 'not-a-uv-stream too.
@@ -749,12 +748,11 @@
          (uv-write*! proc (list (make-bytevector 1 0)) (lambda (err) #f)) #f)))
 (uv-loop-teardown! loop2)
 
-;; --- a CLOSED handle of the WRONG kind (Task 7's mutation probe 2 forward
-;; obligation, .plans/process-stage-4-mutation-log.md): require-open-stream's
-;; kind check runs FIRST, so a closed timer still raises 'not-a-uv-stream --
-;; never &uv-handle-closed. That ordering is exactly what probe 2 (swapping
-;; the kind/state check order) could not observe, because every closed
-;; handle this suite exercised elsewhere was already a real stream kind.
+;; --- a CLOSED handle of the WRONG kind -----------------------------------
+;; require-open-stream's kind check runs FIRST, so a closed timer still
+;; raises 'not-a-uv-stream -- never &uv-handle-closed. In this suite only
+;; these two rows see a swap of the kind and state checks: every other
+;; closed handle here is a real stream kind.
 (uv-close! timer)
 (run-until loop (lambda () (eq? 'closed (uv-handle-state timer))) 64)
 (test-assert "uv-write! on a CLOSED timer raises 'not-a-uv-stream, not &uv-handle-closed"
@@ -768,23 +766,25 @@
 
 ;; --- a verb split by an engine ---------------------------------------------
 ;; A green-thread scheduler on the loop thread runs each task in an engine,
-;; and a task's fuel can run out anywhere inside a stream verb. Two things
-;; can then go wrong, and both did on every verb here before each verb's
-;; check, allocation, registration and native call became one interrupt-free
-;; step (one-step in (libuv private handles)):
+;; and a task's fuel can run out anywhere inside a stream verb. Three things
+;; go wrong then, on every verb here, unless each verb's check, allocation,
+;; registration and native call are one interrupt-free step (one-step in
+;; (libuv private handles)):
 ;; - Another task closes the stream and runs the loop, which frees the
 ;;   uv_tcp_t, and the verb resumes past its open check with the stale
 ;;   pointer. Valgrind reports libuv reading the freed block. If a new
-;;   connection has been given the same address meanwhile, as it was on every
-;;   macOS run, the verb acts on that connection instead: a write delivers
-;;   its bytes to the new connection's peer and reports success.
+;;   connection has been given the same address meanwhile, as one was in
+;;   every macOS run measured, the verb acts on that connection instead: a
+;;   write delivers its bytes to the new connection's peer and reports
+;;   success.
 ;; - The scheduler drops the task, as a timeout does, and never resumes it.
 ;;   Whatever the verb had allocated and not yet handed to libuv is lost: a
 ;;   block, or a request registered and counted that libuv never saw.
 ;; - Another task hands the stream's loop to another thread, and the verb
-;;   resumes past its entry check, which asks for the loop's owner. The step
-;;   checked only that the stream was open, so the verb made its call on a
-;;   loop another thread now owned, racing that thread on the stream (#86).
+;;   resumes past its entry check, which asks for the loop's owner. A step
+;;   that checked only that the stream was open would make the call on a
+;;   loop another thread owns, racing that thread on the stream, so the step
+;;   checks the owner again (owned-handle-ptr).
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
 ;; the verb's own checks, and the sweep stops at the first run no expiry

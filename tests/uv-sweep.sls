@@ -1,21 +1,21 @@
 #!r6rs
-;;; The engine-sweep driver the suites share (#81): a call run in an engine
-;;; whose resumes are capped, a change made at its first expiry, and a sweep
-;;; of such runs at rising fuel. tests/test-sweep.sps holds it.
+;;; The engine-sweep driver the suites share: a call run in an engine whose
+;;; resumes are capped, a change made at its first expiry, and a sweep of
+;;; such runs at rising fuel. tests/test-sweep.sps holds it.
 ;;;
 ;;; A sweep runs a verb in an engine at fuel 1, 2, 3, ... and changes the
 ;;; verb's argument at the engine's first expiry, so that some run changes it
-;;; at each point the verb can be stopped at. Each suite used to write its own
-;;; copy, with resume caps of 10, 20, 100 or none, and three spellings of the
-;;; give-up; test-dns's had none, so a verb whose walk came to loop would have
-;;; hung its suite instead of failing a row by name.
+;;; at each point the verb can be stopped at. One copy gives every sweep the
+;;; same resume cap and the same give-up. A sweep with no cap hangs its
+;;; suite on a verb whose walk comes to loop, instead of failing a row by
+;;; name.
 ;;;
-;;; It also holds what the step suites read from their sweeps (#103): which
-;;; runs were wrong, how far each sweep reached, its fuel map, and what a
-;;; run left behind. Each step suite used to carry its own copy of these,
-;;; and the copies drifted: bad-runs took its arguments in two orders, and
-;;; runs had two shapes. tests/test-sweep.sps holds every one, and fails a
-;;; new copy of any name this library exports.
+;;; It also holds what the step suites read from their sweeps: which runs
+;;; were wrong, how far each sweep reached, its fuel map, and what a run
+;;; left behind. Copies of these kept in each suite drift apart, with
+;;; bad-runs taking its arguments in two orders and runs in two shapes, so
+;;; tests/test-sweep.sps holds every one, and fails a new copy of any name
+;;; this library exports.
 ;;;
 ;;; PURE: (rnrs) and a few Chez primitives, none native, so the pure suites
 ;;; can use it too (PURE_TESTS; make check-purity holds it).
@@ -30,8 +30,8 @@
 
   ;; A call is resumed with resume-fuel ticks at a time, at most resume-cap
   ;; times: 10,000,000 ticks, which a bare loop spends in about 8 ms
-  ;; (measured, 2026-10-07). The suites' own caps were 10 to 100 resumes of
-  ;; these ticks, and passed on every correct build.
+  ;; (measured). Caps of 10 to 100 resumes of these ticks pass on every
+  ;; correct build.
   (define resume-fuel 100000)
   (define resume-cap 100)
 
@@ -230,6 +230,6 @@
   ;; me is the thread a suite runs on: Chez instantiates a program's
   ;; libraries on its main thread, before its body. other-thread is another
   ;; thread's id, for a loop handed to it: no thread runs the loop, but its
-  ;; owner is no longer this one.
+  ;; owner is not this one.
   (define me (get-thread-id))
   (define other-thread (+ me 1)))

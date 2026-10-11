@@ -1,9 +1,8 @@
 #!r6rs
 ;;; SRFI-64 suite for (libuv loop) and the registry core of
-;;; (libuv private handles) -- design spec S5 (loop operations, the registry
-;;; as GC root), S8 (the store-and-reraise callback error policy), S10 (debug
-;;; counters), S11 (testing strategy), and ADR-0008 (thirteen dispatcher
-;;; slots, as amended through #45).
+;;; (libuv private handles): loop operations, the registry as GC root, the
+;;; store-and-reraise callback error policy, the debug counters, and the
+;;; thirteen callback dispatcher slots.
 ;;;
 ;;; This suite is NOT pure: (libuv loop) reaches (libuv private native),
 ;;; which loads libuv and the shim at library instantiation. It must never
@@ -11,8 +10,8 @@
 ;;;
 ;;; Tests import the private libraries directly and on purpose. The loop
 ;;; record's raw fields (loop-ptr, loop-state, loop-pending-error, ...) are
-;;; where several design-spec decisions actually live -- "the freeing site
-;;; zeroes the stored uptr immediately" (S10) is a statement about a field,
+;;; where several of the design's decisions actually live -- "the freeing
+;;; site zeroes the stored uptr immediately" is a statement about a field,
 ;;; and an assertion on the public surface alone cannot see it.
 ;;;
 ;;; THE DISPATCHER SLOTS AND THE CLOSE HOOK ARE ALREADY INSTALLED HERE. Both
@@ -24,9 +23,9 @@
 (import (rnrs)
         (srfi :64)
         (libuv loop)
-        ;; Stage 3: the teardown sweep is exercised with a REAL handle now,
-        ;; so this suite needs the timer constructor and the generic handle
-        ;; state accessor. Nothing else here goes through them.
+        ;; The teardown sweep is exercised with a REAL handle, so this
+        ;; suite needs the timer constructor and the generic handle state
+        ;; accessor. Nothing else here goes through them.
         (libuv handle)
         (libuv timer)
         (libuv private handles)
@@ -39,10 +38,10 @@
               native-initialized? live-counts uv-loop-size
               dispatcher-names dispatcher-ref dispatchers-installed?
               install-callback-dispatchers!
-              ;; v0.2 Stage 3: the synthetic handle-less request blocks the
-              ;; ADR-0011 rows below build are real foreign allocations, so
-              ;; complete-taken-request!'s free! sees the same kind of pointer the
-              ;; Stage 4 dispatchers will hand it.
+              ;; The synthetic handle-less request blocks the request rows
+              ;; below build are real foreign allocations, so
+              ;; complete-taken-request!'s free! sees the same kind of
+              ;; pointer the request dispatchers hand it.
               alloc-zeroed
               ;; The uv-update-time! affinity rows compare against it.
               current-thread-id)
@@ -54,18 +53,18 @@
         (only (uv-evidence) live-count describe print-actual-on-failure!)
         ;; sleep and make-time pace the uv-update-time! rows' wait for the
         ;; clock to advance; that wait is bounded by a poll count, not by them.
-        ;; make-engine suspends a run inside a callback (#45); getenv finds
+        ;; make-engine suspends a run inside a callback; getenv finds
         ;; the Chez that runs tests/stranded-exit-child.sps.
         (only (chezscheme) collect sleep make-time make-engine getenv)
-        ;; The stranded child runs under a deadline, and is reaped (#117).
+        ;; The stranded child runs under a deadline, and is reaped.
         (uv-child))
 
-;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
+;; SRFI-64's default runner does not set a process exit code.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
 ;; A failing row's actual value is its evidence: the stranded child's
-;; output and exit status (#117), or what a row caught.
+;; output and exit status, or what a row caught.
 (print-actual-on-failure! runner)
 
 ;; Captured BEFORE anything in this suite creates a loop, so the seeds below
@@ -141,7 +140,7 @@
 ;; the actual expression into #f, so an expected-#f assertion would pass if
 ;; uv-run blew up, and in Scheme every value except #f is true, so
 ;; test-assert would pass on the raw int a truthiness-confused uv-run
-;; returned (AGENTS.md).
+;; returned.
 (test-equal "uv-run 'default on an empty loop reports no work remaining"
   'no-work (if (uv-run l0 'default) 'work 'no-work))
 
@@ -177,8 +176,8 @@
 
 ;; --- uv-loop-alive? -----------------------------------------------------
 ;; An empty loop is not alive before or after a run; the TRANSITION needs a
-;; handle to hold the loop alive, which arrives with Task 7's timers. See
-;; .plans/stage-2-mutation-log.md, "deferred coverage".
+;; handle to hold the loop alive, and tests/test-timer.sps's "an armed
+;; timer holds its loop alive" holds it.
 (test-equal "an empty loop is not alive"
   'not-alive (if (uv-loop-alive? l0) 'alive 'not-alive))
 
@@ -201,7 +200,7 @@
 (test-equal "uv-now does not go backwards across a run"
   'monotone (if (>= now-after now-before) 'monotone 'went-backwards))
 
-;; --- uv-update-time! (issue #28) ----------------------------------------
+;; --- uv-update-time! ----------------------------------------------------
 ;; uv-now is a CACHE: libuv refreshes it once per loop iteration, so a
 ;; callback that holds the loop leaves it behind, and a timer armed after that
 ;; callback is due relative to a "now" from before the callback ran.
@@ -289,12 +288,13 @@
 (test-equal "...and that timer was live: the loop fires it once it runs"
   'satisfied rn-drive)
 
-;; Loop thread only (ADR-0019, extended for #28). The owner field is pointed at
-;; a thread id no real thread holds -- test-async.sps's technique, so no second
-;; thread is needed -- and the refusal must come BEFORE the write: the clock is
-;; let past the cached now first, so a check placed after the refresh would
-;; leave uv-now moved even though the call raised. The positive control, the
-;; same verb on the owning thread, is the refresh rows above.
+;; Loop thread only, and checked (docs/api.md, "One thread per loop"). The
+;; owner field is pointed at a thread id no real thread holds --
+;; test-async.sps's technique, so no second thread is needed -- and the
+;; refusal must come BEFORE the write: the clock is let past the cached now
+;; first, so a check placed after the refresh would leave uv-now moved even
+;; though the call raised. The positive control, the same verb on the
+;; owning thread, is the refresh rows above.
 (define foreign-owner 999999)
 (define wt-loop (make-uv-loop))
 (define wt-stale (uv-now wt-loop))
@@ -321,26 +321,28 @@
       'untouched
       (list 'stale wt-stale 'clock wt-advanced 'after wt-now-after-refusal)))
 
-;; Inside a run: the issue's own scenario. A callback holds the loop until
-;; libuv's clock is `hold-ms` past the loop's cached now, calls
+;; Inside a run: the scenario uv-update-time! is for. A callback holds the
+;; loop until libuv's clock is `hold-ms` past the loop's cached now, calls
 ;; uv-update-time! -- with the loop RUNNING, which is the whole use case --
-;; then arms a deadline `deadline-ms` out: chez-http-server's handler followed
-;; by its write deadline. libuv arms a timer from the cached now (timer.c:
-;; loop->time + timeout) and never fires one before loop->time reaches it, so
-;; a deadline armed from the refreshed clock fires at a now at least
-;; `deadline-ms` past the reference reading taken before the refresh.
+;; then arms a deadline `deadline-ms` out: chez-http-server's handler
+;; followed by its write deadline. libuv arms a timer from the cached now
+;; (timer.c: loop->time + timeout) and never fires one before loop->time
+;; reaches it, so a deadline armed from the refreshed clock fires at a now
+;; at least `deadline-ms` past the reference reading taken before the
+;; refresh.
 ;;
 ;; The hold is at least the deadline, so that a deadline armed from the STALE
-;; now would already be overdue when the callback returns -- the issue's own
-;; condition ("the write deadline had already passed when the loop's timers
-;; next ran"). The two are separate constants, so a precondition row checks
-;; the hold really carried the clock that far rather than trusting a comment.
+;; now would already be overdue when the callback returns -- the failure
+;; uv-update-time! prevents: the write deadline has already passed when the
+;; loop's timers next run. The two are separate constants, so a
+;; precondition row checks the hold really carried the clock that far
+;; rather than trusting a comment.
 ;;
 ;; THE TRAFFIC TIMER IS WHAT MAKES THE DEADLINE ROW ABLE TO FAIL. libuv
 ;; computes its poll timeout from the cached now as well, so on a loop whose
 ;; only wakeup is the deadline, a deadline armed from the stale now still
 ;; sleeps its full timeout and looks right. Measured: with the refresh mutated
-;; to a no-op and no traffic, the row passed at 26 ms. The issue's server is
+;; to a no-op and no traffic, the row passed at 26 ms. A real server is
 ;; never that quiet -- I/O wakes its loop, the clock is re-read, and the stale
 ;; deadline is found already overdue. A 1 ms repeating timer plays that
 ;; traffic, so a stale-armed deadline fires at the first wake after the hold
@@ -385,7 +387,7 @@
                  1 1)
 
 ;; Guarded, so a raise here fails the row below with its evidence instead of
-;; aborting the suite (AGENTS.md). The traffic wakes the loop about once a
+;; aborting the suite. The traffic wakes the loop about once a
 ;; millisecond, so the deadline takes some `deadline-ms` steps; the cap is ten
 ;; times that.
 (define sc-drive
@@ -469,18 +471,18 @@
 (uv-loop-close! wt-loop)
 (uv-loop-close! ut-loop)
 
-;; --- the thirteen callback dispatcher slots and the close hook (ADR-0008) -
-;; Both are process-global and install-once, and as of Stage 3 both are
-;; already filled before this suite's first line runs: (libuv private
-;; handles) installs the thirteen dispatchers and the real close-handle! in its
-;; own library body, and this suite imports it. So what is assertable HERE
-;; is the installed state and the refusal of a second install.
+;; --- the thirteen callback dispatcher slots and the close hook ----------
+;; Both are process-global and install-once, and both are already filled
+;; before this suite's first line runs: (libuv private handles) installs the
+;; thirteen dispatchers and the real close-handle! in its own library body,
+;; and this suite imports it. So what is assertable HERE is the installed
+;; state and the refusal of a second install.
 ;;
 ;; The pre-install state -- the raising stubs, the partial-install refusal,
 ;; the install itself -- is asserted in tests/test-native.sps, the one suite
 ;; whose import chain never reaches handles.sls and whose process therefore
-;; still has empty slots. Moving those rows there rather than deleting them
-;; is what keeps the uninstalled behaviour covered at all.
+;; still has empty slots. Those rows live there because no other suite can
+;; see the uninstalled behaviour at all.
 (test-equal "dispatcher-names names the thirteen callback types that cross into Scheme"
   '(read connection write-done close timer shutdown connect
     getaddrinfo getnameinfo exit walk signal async)
@@ -552,12 +554,11 @@
 
 ;; uv-loop-teardown! sweeps this snapshot and calls close-handle! on every
 ;; element, so it must contain HANDLES only. Requests live in the SAME table
-;; (design spec S5: one registry "for both handles and requests
-;; (discriminated by a kind field)"), and close-handle! rightly refuses
-;; anything that is not a handle record -- so a snapshot that included
-;; requests would make teardown raise 'not-a-uv-handle the moment a write was
-;; in flight, which is exactly the state Stage 4's close-with-a-pending-write
-;; row puts a loop in.
+;; (one registry for both handles and requests, discriminated by a kind
+;; field), and close-handle! rightly refuses anything that is not a handle
+;; record -- so a snapshot that included requests would make teardown raise
+;; 'not-a-uv-handle the moment a write was in flight, which is exactly the
+;; state a close with a pending write puts a loop in.
 (define fake-req (cons 4243 'fake-write-req))
 (registry-register! (car fake-req) 'write-req l0 fake-req)
 
@@ -572,7 +573,7 @@
   'listed (if (memq fake-handle (uv-loop-live-handles l0)) 'listed 'missing))
 
 ;; The close seam takes its pointer's entry out of the registry in the same
-;; locked step that finds it (#87), and puts back one whose object is not a
+;; locked step that finds it, and puts back one whose object is not a
 ;; handle: the close dispatcher records that as an orphan and frees nothing,
 ;; so the entry must stay where its owner left it.
 (define close-orphans-before (length (orphan-callback-events)))
@@ -583,17 +584,16 @@
   (list (if (eq? fake-req (registry-ref (car fake-req))) 'same 'disturbed)
         (list-tail (orphan-callback-events) close-orphans-before)))
 
-;; The take, the kind check and the put-back are one interrupt-free step
-;; (#116's review). Were they not, an engine whose fuel ran out between the
-;; take and the put-back, and that was then dropped, would lose the entry
-;; for good: teardown would never find what it held. So the close is run in
-;; an engine at fuel 1, 2, 3, ..., each run that expires is dropped there,
-;; and the entry is looked for after each drop. A run that finishes ends
-;; the sweep. The answer names the fuel of each drop that lost the entry,
-;; and puts it back for the next run. Today's take has no trap point
+;; The take, the kind check and the put-back are one interrupt-free step.
+;; Were they not, an engine whose fuel ran out between the take and the
+;; put-back, and that was then dropped, would lose the entry for good:
+;; teardown would never find what it held. So the close is run in an
+;; engine at fuel 1, 2, 3, ..., each run that expires is dropped there, and
+;; the entry is looked for after each drop. A run that finishes ends the
+;; sweep. The answer names the fuel of each drop that lost the entry, and
+;; puts it back for the next run. The take as written has no trap point
 ;; between its steps: removing the step alone fails nothing. A call placed
-;; there without the step does, at three fuels
-;; (.plans/registry-lock-once-mutation-log.md, M12).
+;; there without the step does, at three fuels.
 (define (refused-take-drop-sweep)
   (let sweep ((fuel 1) (lost '()) (dropped 0))
     (if (> fuel 5000)
@@ -644,10 +644,11 @@
 ;; with `registry-loop-of`, which reads THIS field, and then hands it to
 ;; `loop-record-error!`, whose own `require-loop` would RAISE on anything
 ;; that is not a loop record. That raise would be inside the guard's handler,
-;; i.e. outside the guard, i.e. straight into a C stack frame (spike FINDINGS
-;; Q2: exit 255, no teardown). Refusing the bad loop HERE, at the one place
-;; the field is ever written, is what makes that unreachable by construction
-;; rather than by hope.
+;; i.e. outside the guard, i.e. straight into libuv's C frames: with no
+;; handler outside uv-run that ends the process with exit status 255 and no
+;; teardown, and with one it leaves the loop mid-iteration. Refusing the
+;; bad loop HERE, at the one place the field is ever written, is what makes
+;; that unreachable by construction rather than by hope.
 (test-equal "registry-register! rejects an entry whose loop is not a uv-loop"
   '(uv-registry-register! loop-not-a-uv-loop)
   (guard (e ((uv-invalid-argument? e)
@@ -727,7 +728,8 @@
 (define found-caller (+ (current-thread-id) 2))
 
 ;; The owner-mismatch's owner, not the timer's loop's, which this thread
-;; owns: built from a second read of that, the refusal named this thread.
+;; owns: built from a second read of that, the refusal would name this
+;; thread.
 (test-equal "step-refusal raises each status as the checks outside a step do"
   `((handle-closed timer)
     (wrong-thread uv-test-verb! ,found-owner ,(current-thread-id))
@@ -751,17 +753,17 @@
 
 ;; A step with no handle to pass (a constructor's, a lookup's) needs none
 ;; for its owner refusal: the owner and the caller both come from what its
-;; check found (#102).
+;; check found.
 (test-equal "step-refusal names the owner and the caller an owner check found, with no handle to pass"
   `(wrong-thread uv-test-verb! ,found-owner ,found-caller)
   (refusal-shape (step-refusal (make-owner-mismatch found-owner found-caller)
                                'uv-test-verb! #f)))
 
-;; --- the callback error policy (design spec S8) -------------------------
-;; The dispatcher guard that CALLS loop-record-error! arrives with Task 7;
-;; the recording policy itself is exercised here by direct calls, which is
-;; also the only way to reach the "second and later errors" arm without a
-;; callback that raises twice.
+;; --- the callback error policy ------------------------------------------
+;; The dispatcher guard that CALLS loop-record-error! is held by
+;; tests/test-timer.sps's raising-callback rows; the recording policy itself
+;; is exercised here by direct calls, which is also the only way to reach
+;; the "second and later errors" arm without a callback that raises twice.
 (define policy-loop (make-uv-loop))
 (define err-1 (make-uv-errno-error 'ECONNRESET -104 "connection reset by peer"))
 (define err-2 (make-uv-errno-error 'EPIPE -32 "broken pipe"))
@@ -797,8 +799,8 @@
         'in-order
         'out-of-order)))
 
-;; uv-run's re-raise. The compound is the load-bearing part of S8: a guard
-;; written against the ORIGINAL condition type still has to match.
+;; uv-run's re-raise. The compound is the load-bearing part of the policy:
+;; a guard written against the ORIGINAL condition type still has to match.
 (define raised-by-run
   (guard (e (#t e))
     (uv-run policy-loop 'nowait)
@@ -832,8 +834,8 @@
 ;; also the run whose start-clear discards the deferred list. The
 ;; readable-until-the-next-run half is what the three order assertions above
 ;; check, against a loop with no run in between; the clearing half is what
-;; this one checks. The full end-to-end shape needs Task 7's timer callbacks
-;; -- recorded under "deferred coverage" in .plans/stage-2-mutation-log.md.
+;; this one checks. The full end-to-end shape needs real callbacks, and
+;; tests/test-timer.sps's deferred-pair rows hold it.
 (test-equal "uv-run clears the deferred list at the START of a run"
   '() (uv-loop-deferred-errors policy-loop))
 
@@ -909,8 +911,8 @@
 
 ;; --- uv-stop! -----------------------------------------------------------
 ;; uv_stop's effect is only observable from inside a running loop, which
-;; needs a callback (Task 7). What is asserted here is that it is accepted on
-;; an open loop and refused on a closed one (below, in the use-after-close
+;; needs a callback. What is asserted here is that it is accepted on an
+;; open loop and refused on a closed one (below, in the use-after-close
 ;; matrix).
 (test-equal "uv-stop! on an open loop returns without raising"
   'stopped
@@ -939,10 +941,10 @@
 (test-equal "uv-loop-open? is false for a closed loop"
   'not-open (if (uv-loop-open? close-loop) 'open 'not-open))
 
-;; Design spec S10: "each allocation kind is freed in exactly one place, and
-;; the freeing site zeroes the stored uptr immediately". This is the
-;; assertion that guards the zeroing -- the free! itself is guarded only by
-;; Valgrind/ASan (make test-memory), recorded honestly in the mutation log.
+;; Each allocation kind is freed in exactly one place, and the freeing site
+;; zeroes the stored uptr immediately. This is the assertion that guards
+;; the zeroing -- the free! itself is guarded only by Valgrind/ASan (make
+;; test-memory).
 (test-equal "closing zeroes the stored loop pointer"
   0 (loop-ptr close-loop))
 
@@ -999,12 +1001,11 @@
        (cons "uv-loop-live-handles"    (lambda () (uv-loop-live-handles dead-loop)))
        (cons "uv-loop-deferred-errors" (lambda () (uv-loop-deferred-errors dead-loop)))))
 
-;; --- pending-error delivery at close (v0.2) -----------------------------
-;; The v0.1 obligation recorded in uv-loop-close!'s comment block, decided
-;; 2026-08-21: a SUCCESSFUL close re-raises a stored pending callback
-;; error, composed exactly as uv-run's exit path composes it -- the
-;; alternative (discard) would silently lose the error for any caller who
-;; skips the next uv-run and goes straight to close. The loop must be
+;; --- pending-error delivery at close ------------------------------------
+;; A SUCCESSFUL close re-raises a stored pending callback error, composed
+;; exactly as uv-run's exit path composes it -- the alternative (discard)
+;; would silently lose the error for any caller who skips the next uv-run
+;; and goes straight to close. The loop must be
 ;; CLOSED when the raise escapes: the error is a message from a callback,
 ;; not a reason to abandon the close.
 (define pe-loop (make-uv-loop))
@@ -1126,12 +1127,12 @@
       (list 'not-delivered busy-drain-raised)))
 
 ;; That delivering run was also a STOPPED run -- loop-record-error! calls
-;; uv_stop when it stores the error (design spec S8), and the stored stop
-;; flag makes uv_run return before its first iteration -- so it delivered
-;; the ERROR but not the timer's close callback. One more run drains the
-;; close quietly (nothing pending any more), and the loop then closes
-;; cleanly. Probed before it was asserted: without this run the timer is
-;; still 'closing and the close below answers EBUSY again.
+;; uv_stop when it stores the error, and the stored stop flag makes uv_run
+;; return before its first iteration -- so it delivered the ERROR but not
+;; the timer's close callback. One more run drains the close quietly
+;; (nothing pending any more), and the loop then closes cleanly. Without
+;; this run the timer is still 'closing and the close below answers EBUSY
+;; again.
 (test-equal "one more run after the delivery drains the close sweep quietly"
   'drained
   (guard (e (#t (list 'raised e)))
@@ -1147,26 +1148,25 @@
     (uv-loop-close! pe-busy-loop)
     (if (eq? 'closed (loop-state pe-busy-loop)) 'closed-clean 'not-closed)))
 
-;; --- the cancel sweep and the completion machinery (ADR-0011) -----------
-;; v0.2 Stage 3: uv-loop-teardown! runs cancel-requests-for-loop! before
-;; its close sweep, and complete-taken-request! resolves the owning loop from the
-;; REGISTRY ENTRY rather than through the record's handle field, delivering
-;; any extras behind the err argument. No DNS request can exist yet --
-;; (libuv dns) is Stage 4 -- so what is assertable HERE is:
+;; --- the cancel sweep and the completion machinery ----------------------
+;; uv-loop-teardown! runs cancel-requests-for-loop! before its close sweep,
+;; and complete-taken-request! resolves the owning loop from the REGISTRY
+;; ENTRY rather than through the record's handle field, delivering any
+;; extras behind the err argument. With no real lookup in flight, what is
+;; assertable HERE is:
 ;;
 ;;   * the sweep's no-op contract on a loop with no DNS request entries:
 ;;     nothing deregistered, handle entries untouched, the loop and its
 ;;     counters exactly as they were;
-;;   * the generalized complete-taken-request!, driven synthetically the same way
-;;     the registry rows above drive registry-register!: a plain
+;;   * the generalized complete-taken-request!, driven synthetically the
+;;     same way the registry rows above drive registry-register!: a plain
 ;;     alloc-zeroed block, a handle-less req record (handle = #f, the shape
-;;     ADR-0011 documents), Stage 4's registry kinds, and a direct call --
-;;     which is exactly how the Stage 4 dispatchers will call it.
+;;     a DNS request has), the DNS registry kinds, and a direct call --
+;;     which is exactly how the DNS dispatchers call it.
 ;;
 ;; The sweep's positive arm -- a real in-flight DNS request cancelled at
-;; teardown -- is Stage 5's teardown-with-in-flight row (design spec v0.2
-;; S9); until then the TCP suites guard the substitution's equivalence for
-;; the handle-owned kinds.
+;; teardown -- is held by tests/test-dns.sps's teardown rows; the TCP
+;; suites hold the loop-from-entry resolution for the handle-owned kinds.
 (define sweep-loop (make-uv-loop))
 (define sweep-timer (make-uv-timer sweep-loop))
 (define registry-before-sweep (registry-count))
@@ -1222,7 +1222,7 @@
   '(#f record-a record-b) synth-delivered)
 
 ;; The seam takes a completing request's entry out of the registry before it
-;; calls the dispatcher (#87), so complete-taken-request! leaves the registry
+;; calls the dispatcher, so complete-taken-request! leaves the registry
 ;; alone: called directly, as here, it finds the entry still registered.
 (test-equal "the handle-less completion counted and zeroed the block, and left the registry to the seam"
   (list 'still-registered 1 0)
@@ -1232,12 +1232,12 @@
 
 (when (registry-ref synth-block) (registry-deregister! synth-block))
 
-;; abandon-taken-request! is complete-taken-request!'s release without a callback, for
-;; the getaddrinfo dispatcher's conversion-failure arm, which no input can
-;; reach (.plans/dns-stage-4-mutation-log.md). Its seam has taken the entry
-;; already, so it too leaves the registry alone; driven directly, here. The
-;; let* orders the reads after the call: Chez may evaluate a list's
-;; arguments right to left.
+;; abandon-taken-request! is complete-taken-request!'s release without a
+;; callback, for the getaddrinfo dispatcher's conversion-failure arm, which
+;; no input can reach. Its seam has taken the entry already, so it too
+;; leaves the registry alone; driven directly, here. The let* orders the
+;; reads after the call: Chez may evaluate a list's arguments right to
+;; left.
 (define abandon-block (alloc-zeroed 64))
 (define abandon-delivered 'not-delivered)
 (define abandon-req
@@ -1259,12 +1259,12 @@
 (when (registry-ref abandon-block) (registry-deregister! abandon-block))
 
 ;; The loop read must happen BEFORE the deregister pops the entry, and its
-;; answer is where a raising on-complete lands. Since #45 the seam reads it,
-;; before the dispatcher runs, and the seam is the only place a raise is
+;; answer is where a raising on-complete lands. The seam reads it, before
+;; the dispatcher runs, and the seam is the only place a raise is
 ;; contained, so this completion goes through an installed slot. The
-;; shutdown slot completes its request through complete-taken-request!, as the DNS
-;; slots do, and handles.sls installs it in every process. The raise must be
-;; recorded on the loop the REGISTRY ENTRY named -- a loop no
+;; shutdown slot completes its request through complete-taken-request!, as
+;; the DNS slots do, and handles.sls installs it in every process. The
+;; raise must be recorded on the loop the REGISTRY ENTRY named -- a loop no
 ;; (handle-loop (req-handle req)) read could have found, since the handle
 ;; field is #f.
 (define synth-raise-block (alloc-zeroed 64))
@@ -1286,8 +1286,8 @@
       (loop-pending-error sweep-loop)
       'no-pending-error))
 
-;; complete-taken-request! calls on-complete last, so a raise there skips none of
-;; its own steps (#45).
+;; complete-taken-request! calls on-complete last, so a raise there skips
+;; none of its own steps.
 (test-equal "...and the request was deregistered and zeroed before on-complete raised"
   '(deregistered 0)
   (list (if (registry-ref synth-raise-block) 'still-registered 'deregistered)
@@ -1295,9 +1295,9 @@
 
 (clear-loop-pending-error! sweep-loop)
 
-;; Teardown over this loop is the integration row for the new ordering:
-;; the cancel sweep runs first (a no-op here), then the close sweep takes
-;; the timer down exactly as it did in v0.1.
+;; Teardown over this loop is the integration row for the ordering: the
+;; cancel sweep runs first (a no-op here), then the close sweep takes the
+;; timer down.
 (test-equal "teardown still tears down a loop with a live handle after the cancel sweep"
   'torn-down
   (guard (e (#t (list 'raised e)))
@@ -1311,8 +1311,8 @@
 ;; --- uv-loop-teardown! --------------------------------------------------
 ;; The sweep is exercised with a REGISTERED handle rather than over an empty
 ;; registry: an empty sweep passes whether the sweep loop is there or not.
-;; Stage 3 replaced Stage 2's probe with a real timer, which makes the row
-;; below an assertion about the actual close protocol.
+;; A real timer makes the row below an assertion about the actual close
+;; protocol.
 ;;
 ;; The timer is deliberately NEVER STARTED. An armed one would keep the loop
 ;; alive, so a teardown that failed to sweep would BLOCK in the drain's
@@ -1387,15 +1387,13 @@
 (test-equal "the loop is torn down even when the body raises"
   cwl-live-before (live-count 'loop))
 
-;; The re-entry guard of design spec S5 ("dynamic-wind is valid here, unlike
-;; around an individual handle"), written in the shape the sibling
-;; chez-cmark-gfm project's test-lifecycle uses for its own re-entry ADR --
-;; this repo's ADR-0006 is about error codes being symbols and has nothing to
-;; do with it. A continuation captured INSIDE the extent is invoked after the
-;; extent has been left (and the loop torn down). dynamic-wind's before-thunk runs on
-;; the way back in and must refuse, because the loop it would hand the body
-;; is gone. `body-entries` is the sentinel: a re-entry that got past the
-;; guard would run the body a second time.
+;; The re-entry guard: dynamic-wind is valid around a loop's extent, unlike
+;; around an individual handle. A continuation captured INSIDE the extent
+;; is invoked after the extent has been left (and the loop torn down).
+;; dynamic-wind's before-thunk runs on the way back in and must refuse,
+;; because the loop it would hand the body is gone. `body-entries` is the
+;; sentinel: a re-entry that got past the guard would run the body a second
+;; time.
 (define resume-k #f)
 (define body-entries 0)
 
@@ -1427,16 +1425,16 @@
 (test-equal "the refused re-entry left no live loop behind"
   cwl-live-before (live-count 'loop))
 
-;; --- a run left from inside a callback (#45) ----------------------------
+;; --- a run left from inside a callback ----------------------------------
 ;; uv-run marks its loop running for as long as uv_run's frame is on the
 ;; stack, and a callback that never returns leaves that frame there: an
 ;; engine that runs out of fuel in a callback suspends it, and a continuation
 ;; that escapes a callback abandons it. Either way libuv is in the middle of
 ;; an iteration that only a return into the frame can finish, so the loop
 ;; stays marked running and every verb that would run, close or tear it down
-;; refuses it. Before #45 a dynamic-wind cleared the mark on the way out, so
-;; a teardown during an engine's suspension was accepted, and resuming the
-;; engine then died with "invalid memory reference".
+;; refuses it. A dynamic-wind that cleared the mark on the way out would let
+;; a teardown during an engine's suspension through, and resuming the
+;; engine would then die with "invalid memory reference".
 
 ;; raise-evidence : object -> object
 ;; A refusal as the rows below expect it, or else the raise's description.
@@ -1555,7 +1553,7 @@
 (test-equal "the escaped run's loop tears down once the suite clears its mark"
   'torn-down (tear-down-row-loop escaped-loop))
 
-;; --- two runs suspended inside callbacks on one thread (#94) -----------
+;; --- two runs suspended inside callbacks on one thread -----------------
 ;; Each callback is entered from C, and a return from it longjmps to the C
 ;; frame that entered it. Returning to an older frame abandons every frame
 ;; entered after it on the thread, so of two engines suspended inside
@@ -1760,7 +1758,7 @@
   '(torn-down torn-down)
   (map tear-down-as-is (list nested-loop nesting-loop)))
 
-;; --- call-with-uv-loop after a run left from inside a callback (#45) ----
+;; --- call-with-uv-loop after a run left from inside a callback ---------
 ;; call-with-uv-loop's loop does not outlive it. Its exit tears the loop down
 ;; even when the body left from inside one of the loop's callbacks, leaving
 ;; it marked running, as long as this thread is the one that left it so.
@@ -1818,9 +1816,9 @@
       'never-suspended))
 
 ;; A loop another thread is running is live under that thread's uv_run, and
-;; the exit leaves it alone: its teardown refuses it, as before #45. The row
-;; forges that state, a claim held by another thread's id, on a loop no
-;; thread is running, so a build that tore the loop down anyway fails here by name
+;; the exit leaves it alone: its teardown refuses it. The row forges that
+;; state, a claim held by another thread's id, on a loop no thread is
+;; running, so a build that tore the loop down anyway fails here by name
 ;; instead of racing a real thread.
 (define foreign-run-loop #f)
 (define foreign-run-outcome
@@ -1841,7 +1839,7 @@
 (test-equal "the forged run's loop tears down once the suite takes it back"
   'torn-down (tear-down-row-loop foreign-run-loop))
 
-;; --- an exit whose teardown libuv cannot finish (#46's review) ----------
+;; --- an exit whose teardown libuv cannot finish ------------------------
 ;; Left from inside one close callback while another close waits in libuv's
 ;; batch, the exit's teardown cannot close the loop: libuv walks that batch
 ;; from a list it has already detached, so the other close never finishes.
@@ -1857,7 +1855,8 @@
 ;; deadline, reads both its pipes as it writes, waits on it, and answers its
 ;; status; test-level-3's rows hold each of those against a stand-in child.
 ;; Through it, a teardown that never returns, or a crash, fails the rows
-;; below, where the suite once waited on the child's stdout for good (#117).
+;; below, where a suite that read the child's stdout to its end would wait
+;; on it for good.
 (define stranded-report
   (if (not chez-for-children)
       'no-chez

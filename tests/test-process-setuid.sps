@@ -1,15 +1,15 @@
 #!r6rs
-;;; ROOT LANE (THE SPEC §9.4, ADR-0016): the setuid/setgid POSITIVE tests.
-;;; Excluded from the default TESTS list; run only via `sudo make
-;;; test-root`. Refuses to run as non-root with a loud exit 1 — being
-;;; skipped silently is how a lane dies. The 'EPERM NEGATIVE test lives in
-;;; tests/test-process.sps, in the normal suite.
+;;; ROOT LANE: the setuid/setgid POSITIVE tests. Excluded from the default
+;;; TESTS list; run only via `sudo make test-root`. Refuses to run as
+;;; non-root with a loud exit 1 — being skipped silently is how a lane
+;;; dies. The 'EPERM NEGATIVE test lives in tests/test-process.sps, in the
+;;; normal suite.
 ;;;
 ;;; The unprivileged target identity is looked up AT RUNTIME (`id -u
-;;; nobody`) — never a transcribed uid (the ADR-0005 spirit applied to a
-;;; test fixture). All child output crosses a from-child pipe; the runner
-;;; is uv-spawn! itself, so the lane exercises the module under test even
-;;; in its own plumbing.
+;;; nobody`) — never a transcribed uid, which differs across platforms and
+;;; would be wrong silently. All child output crosses a from-child pipe;
+;;; the runner is uv-spawn! itself, so the lane exercises the module under
+;;; test even in its own plumbing.
 (import (rnrs)
         (srfi :64)
         (libuv loop)

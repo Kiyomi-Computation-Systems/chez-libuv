@@ -1,17 +1,16 @@
 #!r6rs
 ;;; SRFI-64 suite for (libuv process) -- uv-spawn!'s core: exit-code
 ;;; delivery, the argv/env/cwd block layout, env inheritance, the two
-;;; spawn-failure classes, on-exit = #f, and the full validation walk
-;;; (design spec v0.3 §9.2), PLUS (Task 9) the full stdio vocabulary: echo,
-;;; duplex, extra fd, inherit-fd, inherit-stream, and pipe reuse/wrong-loop.
-;;; The kill/pid/detached rows land in Task 10.
+;;; spawn-failure classes, on-exit = #f, and the full validation walk; the
+;;; full stdio vocabulary: echo, duplex, extra fd, inherit-fd,
+;;; inherit-stream, and pipe reuse/wrong-loop; kill, pid and detached.
 ;;;
-;;; HARNESS RULES (design spec v0.3 §9.1): every wait whose predicate
-;;; depends on a callback is run-until/ticking with an iteration cap;
-;;; child programs are /bin/sh only, by absolute path; EOF-vs-exit
-;;; ordering is never asserted (both orders are legal, vendor fact V5), so
-;;; every scenario that involves both waits for each independently;
-;;; sentinels are symbols, never #f or 0; every callback (collect)s.
+;;; HARNESS RULES: every wait whose predicate depends on a callback is
+;;; run-until/ticking with an iteration cap; child programs are /bin/sh
+;;; only, by absolute path; EOF-vs-exit ordering is never asserted (libuv
+;;; delivers them in either order), so every scenario that involves both
+;;; waits for each independently; sentinels are symbols, never #f or 0;
+;;; every callback (collect)s.
 ;;;
 ;;; NOT pure; never add to PURE_TESTS.
 (import (rnrs)
@@ -28,7 +27,7 @@
         (only (libuv private constants) uv-process-type)
         (uv-testing)
         (only (uv-evidence) live-count describe under-memory-tool?)
-        ;; uv-spawn!'s list reads against another thread (#66), the
+        ;; uv-spawn!'s list reads against another thread, the
         ;; meter its cost rows use, and the level-3 child's runner.
         (spawn-list-races)
         (only (uv-meter) fewest-bytes)
@@ -75,7 +74,7 @@
     (body loop)
     (uv-loop-teardown! loop)))
 
-;; --- exit-code delivery (design spec v0.3 §9.2) --------------------------
+;; --- exit-code delivery --------------------------------------------------
 (with-loop
  (lambda (loop)
    (define result 'not-yet)   ;; sentinel symbol, never #f
@@ -95,7 +94,7 @@
      '(7 #f) result)
    (test-assert "the record's exited? flag is set by the dispatcher"
      (process-exited? proc))
-   (test-assert "exit does not close: the handle is still open (§6)"
+   (test-assert "exit does not close: the handle is still open"
      (uv-handle-open? proc))
    (uv-close! proc)
    (test-equal "close drains"
@@ -104,7 +103,8 @@
                            64))
    (test-equal "process counter back to zero" 0 (live-count 'process))))
 
-;; --- argv/env/cwd combined: THE mutation target for every §5.3 offset row
+;; --- argv/env/cwd combined: the row a wrong file, args, env, cwd, stdio
+;; or exit_cb offset in the options block breaks
 (with-loop
  (lambda (loop)
    (define out (make-byte-collector))
@@ -166,10 +166,10 @@
      "inherited-value" (utf8->string (collector-bytes out)))
    ;; Deliberately NOT closed here: with-loop's teardown sweeps the process
    ;; and the pipe, and the suite-final counter rows are the assertion that
-   ;; it did (design spec v0.3 §6).
+   ;; it did.
    #f))
 
-;; --- explicitly EMPTY env: the child inherits NOTHING (§4.2) ------------
+;; --- explicitly EMPTY env: the child inherits NOTHING -------------------
 (with-loop
  (lambda (loop)
    (define ignored (putenv "CHEZ_LIBUV_TEST_EMPTY" "should-not-cross"))
@@ -193,21 +193,23 @@
    (run-until loop (lambda () (and (eq? 'closed (uv-handle-state proc))
                                    (eq? 'closed (uv-handle-state p)))) 128)))
 
-;; --- spawn failure: 'ENOENT, SQ1's production twin (ADR-0015) ------------
-;; ADR-0015's failure path is CLASS-DEPENDENT and the class is decided by
-;; asking the loop, never by the errno -- so this scenario asserts the two
-;; class-INDEPENDENT observables ADR-0015's consequences name (the counters
-;; balance once the loop has turned; a handle registered after the failure
-;; still exists) plus the always-immediate one (no options block survives).
+;; --- spawn failure: 'ENOENT ---------------------------------------------
+;; A failed spawn's cleanup is CLASS-DEPENDENT, and the class is decided by
+;; asking the loop, never by the errno: a handle libuv left linked in the
+;; loop's handle queue is closed through the normal protocol (the exec
+;; class arm), and one it unlinked is freed directly (the setup class arm).
+;; The two classes' errnos overlap, so this scenario asserts the two
+;; class-INDEPENDENT observables (the counters balance once the loop has
+;; turned; a handle registered after the failure still exists) plus the
+;; always-immediate one (no options block survives).
 ;;
 ;; WHY THE DRAIN. The exec-class arm registers and counts its handle before
 ;; closing it through the normal protocol, because close-dispatch is
-;; registry-driven and is the only place a handle pointer is freed
-;; (ADR-0015 decision 3). That close is ASYNCHRONOUS, so `process` reads
-;; procs-before + 1 between the raise and the next turn of the loop and
-;; returns to baseline only after it. Asserting the counter without the
-;; drain would be asserting the setup class's timing against whichever
-;; class libuv actually took.
+;; registry-driven and is the only place a handle pointer is freed. That
+;; close is ASYNCHRONOUS, so `process` reads procs-before + 1 between the
+;; raise and the next turn of the loop and returns to baseline only after
+;; it. Asserting the counter without the drain would be asserting the
+;; setup class's timing against whichever class libuv actually took.
 (with-loop
  (lambda (loop)
    (define procs-before (live-count 'process))
@@ -222,7 +224,7 @@
      'ENOENT raised)
    (test-equal "no options block leaked on the failure path"
      0 (live-count 'spawn-options))
-   (test-assert "the failure took exactly one of ADR-0015's two arms"
+   (test-assert "the failure took exactly one of the two cleanup arms: no process counted, or one"
      (or (= procs-at-raise procs-before)
          (= procs-at-raise (+ procs-before 1))))
    (test-assert "[informational] ENOENT failure class recorded"
@@ -238,10 +240,10 @@
                            64))
    (test-equal "no registry entry leaked on the failure path"
      registry-before (registry-count))
-   ;; ADR-0015's second observable: the wrong cleanup arm silently splices a
-   ;; LATER-registered live handle out of loop->handle_queue. uv_walk (the
-   ;; measured instrument, installed as the `walk` dispatcher by
-   ;; (libuv process)) is what can see that.
+   ;; The second class-independent observable: the wrong cleanup arm
+   ;; silently splices a LATER-registered live handle out of
+   ;; loop->handle_queue. uv_walk (the measured instrument, installed as the
+   ;; `walk` dispatcher by (libuv process)) is what can see that.
    (let ((late (make-uv-pipe loop)))
      (test-assert "a handle created after the failure is in the loop's queue"
        (handle-in-loop-queue? loop late))
@@ -253,10 +255,10 @@
      (test-assert "and is out of the queue once closed"
        (not (handle-in-loop-queue? loop late))))))
 
-;; --- 'EPERM: setuid as non-root (design spec v0.3 §9.2 -- the NORMAL suite)
+;; --- 'EPERM: setuid as non-root, in the NORMAL suite ---------------------
 ;; Which errno refuses it depends on whether uid 1 exists here. In a user
 ;; namespace that maps only the caller's own uid, as a rootless container's
-;; does (the Guix container's, ADR-0020), the kernel refuses an unmapped uid
+;; does (the Guix container's), the kernel refuses an unmapped uid
 ;; with EINVAL before it checks permission. Elsewhere it is EPERM, or EACCES
 ;; on some platforms. uid-in-map? reads a uid_map from port: #t when a line
 ;; of it, "inside outside count", maps uid. uid-mapped? is #t where there is
@@ -321,7 +323,7 @@
                            (lambda () (eq? 'closed (uv-handle-state proc)))
                            64))))
 
-;; --- the validation walk: every §4.7 reason symbol this task can drive ---
+;; --- the validation walk: each refusal of a malformed argument ----------
 (with-loop
  (lambda (loop)
    (define (reason-of thunk)
@@ -350,8 +352,8 @@
    (test-equal "a malformed options alist entry" 'option-unknown
      (reason-of (spawn-with "/bin/sh" ok-args '(not-a-pair) #f)))
    ;; Duplicates are refused, not first-wins: assq-shaped validation would
-   ;; validate only the first entry, so '((cwd . "/") (cwd . 7)) used to
-   ;; pass with the malformed second entry silently ignored -- invisible to
+   ;; validate only the first entry, so '((cwd . "/") (cwd . 7)) would pass
+   ;; with the malformed second entry silently ignored -- invisible to
    ;; everything but this row.
    (test-equal "a duplicated key whose second entry is malformed" 'option-duplicate
      (reason-of (spawn-with "/bin/sh" ok-args '((cwd . "/") (cwd . 7)) #f)))
@@ -401,12 +403,11 @@
    (test-equal "an inherit-fd value that is not an fd" 'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
                             '((stdio . ((inherit-fd . not-a-number)))) #f)))
-   ;; The container field is a C int, so 2^31 cannot be an fd. Unbounded,
-   ;; this escaped as a raw Chez condition from c-int-set! mid-build (the
-   ;; guard freed the block -- no leak, but not the uniform
-   ;; &uv-invalid-argument either). reason-of's guard passes a raw
-   ;; condition through, so the pre-fix behavior fails this row by shape,
-   ;; not just by name.
+   ;; The container field is a C int, so 2^31 cannot be an fd. With the
+   ;; check's upper bound removed, the value reaches the options block's
+   ;; fill, which refuses it under another name or as another condition.
+   ;; reason-of's guard passes any condition but &uv-invalid-argument
+   ;; through, so this row fails by shape, not just by name.
    (test-equal "an inherit-fd value too wide for the C int container field"
      'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
@@ -414,14 +415,15 @@
    (test-equal "an on-exit that is neither procedure nor #f"
      'on-exit-not-a-procedure
      (reason-of (spawn-with "/bin/sh" ok-args 'not-a-proc)))
-   ;; pipe-already-used / pipe-wrong-loop rows land in Task 9 (they need a
-   ;; consumed pipe / a second loop); signal-unknown lands in Task 10.
+   ;; The pipe-already-used and pipe-wrong-loop rows are further down, as
+   ;; they need a consumed pipe or a second loop; signal-unknown is with
+   ;; the kill rows.
    (test-equal "validation raised nothing into the options counter"
      0 (live-count 'spawn-options))
    (test-equal "validation created no process handle"
      0 (live-count 'process))))
 
-;; --- full echo loop (§9.2; SQ3's production twin) ------------------------
+;; --- full echo loop -----------------------------------------------------
 (with-loop
  (lambda (loop)
    (define stdin-pipe  (make-uv-pipe loop))
@@ -445,8 +447,8 @@
               (lambda (err) (collect)
                 (when (not err)
                   (uv-shutdown! stdin-pipe (lambda (err2) (collect))))))
-   ;; EOF and exit are waited for INDEPENDENTLY -- both orders are legal
-   ;; (V5, SQ3's measured evidence). Neither wait implies the other.
+   ;; EOF and exit are waited for INDEPENDENTLY -- both orders are legal,
+   ;; and both were measured. Neither wait implies the other.
    (test-equal "all bytes echo back and EOF arrives"
      'satisfied (run-until/ticking
                  loop (lambda () (and (= 4096 (collector-count out))
@@ -456,10 +458,10 @@
    (test-equal "clean exit" '(0 #f) exit-result)
    (test-assert "payload survived byte-for-byte"
      (bytevector=? payload (collector-bytes out)))
-   ;; pipe-already-used: a consumed pipe refuses a second spawn (§4.3).
-   ;; Sentinel + test-equal, not test-assert over a guard defaulting to #f
-   ;; (AGENTS.md's named #f trap; Task 8's review caught the same shape in
-   ;; the 'ENOENT/'EPERM rows and this suite has followed the fix since).
+   ;; pipe-already-used: a consumed pipe refuses a second spawn.
+   ;; Sentinel + test-equal, not test-assert over a guard defaulting to #f:
+   ;; a guard that sees no raise answers its body's value, and test-assert
+   ;; passes any value but #f, so a spawn that went through would pass.
    (test-equal "a connected pipe refuses reuse" 'pipe-already-used
      (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
        (uv-spawn! loop "/bin/cat" '("cat")
@@ -475,25 +477,25 @@
                                            (eq? 'closed (uv-handle-state stdin-pipe))
                                            (eq? 'closed (uv-handle-state stdout-pipe))))
                            128))))
-;; the suite-end counter rows discharge Task 5's forward obligation: the
-;; pipes' read buffer freed via the STREAM arm of the close dispatcher.
+;; The suite-end counter rows also hold the pipes' read buffers: they are
+;; freed by the STREAM arm of the close dispatcher.
 
-;; --- stdio-setup spawn failure: the second ADR-0015 failure trigger -------
-;; (ADR-0015; post-spike addition) (inherit-stream <unconnected pipe>) makes
-;; uv_spawn fail while initialising stdio, BEFORE any fork/exec: process.c's
-;; UV_INHERIT_STREAM arm reads a never-opened stream's fd, gets -1, and
-;; returns UV_EINVAL out through uv_spawn's `error:` label. Task 8's
-;; mutation probe 6 shipped the direct-free arm UNTESTED
-;; (.plans/process-stage-5-mutation-log.md); this scenario is its forward
-;; obligation, and the probe is re-run against it (see the mutation log).
+;; --- stdio-setup spawn failure: the second failure trigger --------------
+;; (inherit-stream <unconnected pipe>) makes uv_spawn fail while
+;; initialising stdio, BEFORE any fork/exec: process.c's UV_INHERIT_STREAM
+;; arm reads a never-opened stream's fd, gets -1, and returns UV_EINVAL out
+;; through uv_spawn's `error:` label. On a libuv that unlinks the handle
+;; there, this scenario drives the direct-free arm: with
+;; clean-up-failed-spawn! forced to close through the protocol instead, its
+;; row on the late handle's survival fails.
 ;;
 ;; WHICH CLEANUP ARM THIS TRIGGER TAKES IS A LIBUV-VERSION QUESTION, NOT A
 ;; PLATFORM ONE, and this suite must not hardcode either answer:
 ;;
 ;;   * libuv >= 1.52.0 unlinks the handle on the way out -- upstream commit
 ;;     3e9ae1bc "unix: remove handle from queue on uv_spawn() error"
-;;     (#4980, 2025-12-26) added `uv__queue_remove(&process->handle_queue)`
-;;     as the error: label's first statement. The handle is gone from
+;;     (libuv#4980) added `uv__queue_remove(&process->handle_queue)` as
+;;     the error: label's first statement. The handle is gone from
 ;;     loop->handle_queue, so this binding takes the DIRECT-FREE arm and
 ;;     nothing is ever counted.
 ;;   * libuv < 1.52.0 has no such statement, so the handle uv__handle_init
@@ -501,18 +503,17 @@
 ;;     when EINVAL comes back. Closing through the protocol is then the
 ;;     correct cleanup, so this binding takes the EXEC-CLASS arm: the handle
 ;;     is registered and counted, and `process` returns to baseline only
-;;     after the loop turns (ADR-0015 decision 3 -- the free is async).
-;;     Measured, not inferred: CI's pkg-config leg takes this arm, on
-;;     Ubuntu 24.04's apt libuv 1.48.0 and on 26.04's 1.51.0 (a mirror of
-;;     the job, 2026-10-08); its vendored leg (1.52.1) and macOS's homebrew
-;;     libuv (1.52.1) take the other.
+;;     after the loop turns (the free is async). Measured, not inferred:
+;;     CI's pkg-config leg takes this arm, on Ubuntu 24.04's apt libuv
+;;     1.48.0 and on 26.04's 1.51.0; its vendored leg (1.52.1) and macOS's
+;;     homebrew libuv (1.52.1) take the other.
 ;;
-;; That divergence is exactly what ADR-0015 decision 2 exists to absorb --
-;; the class is decided BY ASKING THE LOOP, never by the errno and never by
-;; a version table -- so this scenario asserts the same class-INDEPENDENT
-;; observables the 'ENOENT scenario does (counters balance once the loop has
-;; turned; no registry entry survives; a handle registered after the failure
-;; is still properly linked) and records which arm ran informationally.
+;; The binding absorbs that divergence by its design: the class is decided
+;; BY ASKING THE LOOP, never by the errno and never by a version table --
+;; so this scenario asserts the same class-INDEPENDENT observables the
+;; 'ENOENT scenario does (counters balance once the loop has turned; no
+;; registry entry survives; a handle registered after the failure is still
+;; properly linked) and records which arm ran informationally.
 ;; Asserting one arm's timing would be asserting a build-time fact about the
 ;; libuv underneath, which is not a property of this binding.
 (with-loop
@@ -530,7 +531,7 @@
    (test-equal "inherit-stream of an unconnected pipe fails at spawn with 'EINVAL"
      'EINVAL raised)
    (test-equal "no options block leaked" 0 (live-count 'spawn-options))
-   (test-assert "the failure took exactly one of ADR-0015's two arms"
+   (test-assert "the failure took exactly one of the two cleanup arms: no process counted, or one"
      (or (= procs-at-raise procs-before)
          (= procs-at-raise (+ procs-before 1))))
    (test-assert "[informational] stdio-setup failure class recorded"
@@ -540,11 +541,12 @@
                          'exec-class-close-through-protocol))
             (newline)
             #t))
-   ;; ADR-0015's second observable, and THE row that kills an arm-collapse
-   ;; mutant on either libuv: the wrong cleanup splices a LATER-registered
-   ;; LIVE handle out of loop->handle_queue (spike SQ1 Observation 2,
-   ;; "late handle survived #f"). uv_walk -- through the `walk` dispatcher
-   ;; (libuv process) installs -- is the measured instrument.
+   ;; The second class-independent observable, and THE row that fails a
+   ;; cleanup that always takes the same arm, on either libuv: the wrong
+   ;; cleanup splices a LATER-registered LIVE handle out of
+   ;; loop->handle_queue (measured: uv_walk then misses the late handle).
+   ;; uv_walk -- through the `walk` dispatcher (libuv process) installs --
+   ;; is the measured instrument.
    ;;
    ;; ORDER IS LOAD-BEARING, and getting it wrong is how this row silently
    ;; stops testing anything: the damage is done by the FAILED handle's
@@ -573,21 +575,20 @@
        (not (handle-in-loop-queue? loop late))))
    (test-equal "no registry entry leaked on the failure path"
      registry-before (registry-count))
-   ;; §4.3's amended consumed-pipe contract: a pipe named in ANY raising
-   ;; spawn's stdio specs is marked connected, whichever spec form named
-   ;; it -- this scenario's own RED against the pre-fix mark-consumed-
-   ;; pipes! (which matched only (pipe h dir)) is what exposed that the
-   ;; inherit-stream form had been left out; see the mutation log / task
-   ;; report for the fix. Deliberately NOT asserting a real fd here: the
-   ;; setup class closes libuv's own socketpair fds before this record
-   ;; could see one (§4.3's own caveat forbids that assertion).
+   ;; The consumed-pipe contract: a pipe named in ANY raising spawn's stdio
+   ;; specs is marked connected, whichever spec form named it. A
+   ;; mark-consumed-pipes! that matched only (pipe h dir) leaves the
+   ;; inherit-stream form out, and fails this row. Deliberately NOT
+   ;; asserting a real fd here: the setup class closes libuv's own
+   ;; socketpair fds before this record could see one, so the contract
+   ;; promises no fd.
    (test-assert "the named pipe is marked connected even on the failure path"
      (pipe-connected? unconnected))
    (uv-close! unconnected)
    (test-equal "the consumed-but-fdless pipe still closes cleanly"
      'satisfied (run-until loop (lambda () (eq? 'closed (uv-handle-state unconnected))) 64))))
 
-;; --- pipe-wrong-loop (§4.3) ------------------------------------------------
+;; --- pipe-wrong-loop -----------------------------------------------------
 (with-loop
  (lambda (loop)
    (let* ((other (make-uv-loop))
@@ -607,7 +608,7 @@
          'no-raise))
      (uv-loop-teardown! other))))
 
-;; --- duplex (§9.2: sole coverage of the OR'd direction bits) --------------
+;; --- duplex (the only coverage of the OR'd direction bits) ---------------
 (with-loop
  (lambda (loop)
    (define duplex-pipe (make-uv-pipe loop))
@@ -615,7 +616,7 @@
    (define exit-result 'not-yet)
    (define eof 'not-yet)
    ;; The child reads fd 0 and writes fd 0 -- a socketpair end is
-   ;; bidirectional (V3): cat's stdout is redirected back onto fd 0.
+   ;; bidirectional: cat's stdout is redirected back onto fd 0.
    (define proc
      (uv-spawn! loop "/bin/sh" '("sh" "-c" "/bin/cat >&0")
                 (list (cons 'stdio (list (list 'pipe duplex-pipe 'duplex))))
@@ -635,9 +636,8 @@
      (utf8->string (collector-bytes out)))
    (test-equal "the child exits after its duplex end closed"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 8192))
-   ;; The eof sentinel was captured-but-unasserted (v0.3 final-review
-   ;; follow-up): an (error err) delivery after the ninth byte was
-   ;; invisible. Independent wait, matching the argv/env/cwd scenario's
+   ;; Without this row, an (error err) delivery after the ninth byte would
+   ;; be invisible. Independent wait, matching the argv/env/cwd scenario's
    ;; "either order" shape -- the child's exit and its end's EOF are
    ;; separate observations.
    (test-equal "duplex read reaches EOF once the child's end closed"
@@ -649,7 +649,7 @@
                                            (eq? 'closed (uv-handle-state duplex-pipe))))
                            128))))
 
-;; --- extra fd, slot 3 (§9.2: >3-slot stdio + libuv's own 0-2 padding) ----
+;; --- extra fd, slot 3 (>3-slot stdio + libuv's own 0-2 padding) ---------
 (with-loop
  (lambda (loop)
    (define fd3-pipe (make-uv-pipe loop))
@@ -671,8 +671,7 @@
    (test-equal "x" (utf8->string (collector-bytes out)))
    (test-equal "the child exits"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
-   ;; Captured-but-unasserted until the v0.3 follow-up wave: same
-   ;; independent-wait shape as the duplex scenario's eof row.
+   ;; The same independent-wait shape as the duplex scenario's eof row.
    (test-equal "the fd-3 pipe reaches EOF once the child's end closed"
      'satisfied (run-until/ticking loop (lambda () (eq? eof 'eof)) 4096))
    (uv-close! proc) (uv-close! fd3-pipe)
@@ -682,7 +681,7 @@
                                            (eq? 'closed (uv-handle-state fd3-pipe))))
                            128))))
 
-;; --- inherit-fd (§9.2: child writes an inherited temp-file fd) -----------
+;; --- inherit-fd (child writes an inherited temp-file fd) ----------------
 ;; tests/tmp/ is .gitignored, so a fresh checkout (any CI runner) does NOT
 ;; have it and open-file-output-port below would raise unhandled, aborting
 ;; the whole suite mid-run. Created here rather than assumed. The
@@ -715,7 +714,7 @@
    (test-equal "the process handle finishes closing"
      'satisfied (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 64))))
 
-;; --- inherit-stream (§9.2: sole coverage; loopback TCP, ADR-0010) --------
+;; --- inherit-stream (the only coverage; loopback TCP) -------------------
 (with-loop
  (lambda (loop)
    ;; Every DEFINE up front (R6RS body order): accepted/connected/proc start
@@ -740,7 +739,8 @@
      'satisfied (run-until/ticking loop (lambda () (and (uv-tcp? accepted)
                                                         (eq? 'ok connected))) 2048))
    ;; Gated on the seed: without a peer, the rows below fail by name instead
-   ;; of the spawn aborting the suite (AGENTS.md).
+   ;; of the spawn aborting the suite, which would lose every later row's
+   ;; evidence.
    (when (uv-tcp? accepted)
      (set! proc
        (uv-spawn! loop "/bin/sh" '("sh" "-c" "printf over-the-socket")
@@ -757,9 +757,8 @@
    (test-equal "the child exits"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
    ;; UV_INHERIT_STREAM dups the fd into the child; the PARENT's accepted
-   ;; end stays open, so the child's exit alone cannot EOF the client --
-   ;; the sentinel was captured-but-unasserted because nothing here made
-   ;; EOF observable. Closing the accepted end is what lets the row exist:
+   ;; end stays open, so the child's exit alone cannot EOF the client.
+   ;; Closing the accepted end is what lets the row exist:
    ;; the child's dup is gone (exit waited above), so this close releases
    ;; the last copy and the client's read must reach EOF.
    (when (uv-tcp? accepted) (uv-close! accepted))
@@ -770,7 +769,7 @@
    ;; suite-end counter/registry rows are what confirm it). accepted is
    ;; closed above, where the eof row needs it.
 
-;; --- kill by handle: deterministic blocked child (§9.2) ------------------
+;; --- kill by handle: deterministic blocked child -------------------------
 (with-loop
  (lambda (loop)
    (define stdin-pipe (make-uv-pipe loop))
@@ -785,10 +784,10 @@
    (test-assert "liveness probe 0 returns without raising while blocked"
      (begin (uv-process-kill! proc 0) #t))
    (uv-process-kill! proc 'sigterm)
-   (test-equal "sigterm death delivers (0 sigterm) — V5's shape"
+   (test-equal "sigterm death delivers (0 sigterm)"
      'satisfied (run-until/ticking loop (lambda () (pair? exit-result)) 4096))
    (test-equal '(0 sigterm) exit-result)
-   (test-assert "pid still readable between exit and close (§4.5)"
+   (test-assert "pid still readable between exit and close"
      (positive? (uv-process-pid proc)))
    (uv-close! proc) (uv-close! stdin-pipe)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
@@ -837,7 +836,7 @@
    (uv-close! proc) (uv-close! stdin-pipe)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
 
-;; --- uv-os-getpid (v0.4, ADR-0017 D8) -------------------------------------
+;; --- uv-os-getpid -------------------------------------------------------
 (test-equal "uv-os-getpid answers a positive exact integer, stable across calls"
   'stable-positive
   (let ((a (uv-os-getpid)) (b (uv-os-getpid)))
@@ -845,7 +844,7 @@
         'stable-positive
         'wrong)))
 
-;; --- detached (§9.2: no-hang + counters only; never reaped) --------------
+;; --- detached (no-hang + counters only; never reaped) -------------------
 (with-loop
  (lambda (loop)
    (define proc
@@ -867,7 +866,7 @@
      (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 3")
                 (lambda (s g)
                   (collect)
-                  ;; close from INSIDE on-exit -- the documented pattern (§6)
+                  ;; close from INSIDE on-exit -- the documented pattern
                   (uv-close! proc (lambda () (set! states 'closed-from-exit))))))
    (test-equal "close-from-on-exit completes"
      'satisfied (run-until/ticking loop
@@ -880,11 +879,11 @@
    (define proc (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0") #f))
    (run-until/ticking loop (lambda () (process-exited? proc)) 4096)))
    ;; with-loop tears down; the suite-end counter/registry rows assert the
-   ;; sweep closed it (Task 5's handle-kinds forward obligation).
+   ;; sweep closed it, which it does only while process is in handle-kinds.
 
 (with-loop
  (lambda (loop)
-   ;; a raise inside on-exit is stored and re-raised by uv-run (S8 seam).
+   ;; a raise inside on-exit is stored and re-raised by uv-run.
    (define-condition-type &exit-probe &error make-exit-probe exit-probe?)
    (define proc
      (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0")
@@ -895,13 +894,13 @@
          (uv-run loop 'once)
          (if (< i 2048) (drain (+ i 1)) 'never-raised))))
    ;; The exit dispatcher calls on-exit last, so a raise there skips none
-   ;; of its own steps (#45).
+   ;; of its own steps.
    (test-equal "the record was marked exited before on-exit raised"
      'exited (if (process-exited? proc) 'exited 'not-exited))
    (uv-close! proc)
    (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 128)))
 
-;; --- term-signal outside the bound set passes through RAW (§4.4) ---------
+;; --- term-signal outside the bound set passes through RAW ----------------
 (with-loop
  (lambda (loop)
    (define exit-result 'not-yet)
@@ -920,13 +919,13 @@
 ;; --- the caller's data changing during the call ---------------------------
 ;; uv-spawn! reads what its caller passed (file, args, env, cwd and the stdio
 ;; specs) once, into copies nothing else can reach, and checks, sizes and
-;; fills its options block from those alone. It used to check the caller's
-;; data, size the block from it, and read it again to fill the block, and an
-;; engine's timer handler (or another thread) could change it in between.
-;; Strings and lists that grew were written past the block's end, a stdio
-;; list that grew wrote a container over argv, a pipe swapped in after the
-;; check reached libuv unchecked, and a NUL set after the check cut the
-;; child's strings short.
+;; fills its options block from those alone. A spawn that checked the
+;; caller's data, sized the block from it, and read it again to fill the
+;; block would let an engine's timer handler (or another thread) change it
+;; in between: strings and lists that grew would be written past the
+;; block's end, a stdio list that grew would write a container over argv, a
+;; pipe swapped in after the check would reach libuv unchecked, and a NUL
+;; set after the check would cut the child's strings short.
 ;;
 ;; Each sweep runs a spawn in an engine at rising fuel. At the first expiry it
 ;; changes the caller's data, then resumes the spawn. Fuel 1 expires before
@@ -1061,8 +1060,8 @@
 ;; Spawns in an engine with FUEL ticks, makes the variant's change at the
 ;; first expiry, resumes, and starts reading the child's report. A spawn
 ;; still running at the driver's cap answers its give-up, so a read that
-;; came to loop fails its run by name instead of hanging the suite: until
-;; #81 this resumed without a cap.
+;; came to loop fails its run by name instead of hanging the suite, as a
+;; resume without a cap would.
 (define (start-run! variant fuel)
   (let* ((pipe (make-uv-pipe sweep-loop))
          (data ((sweep-variant-setup variant) pipe))
@@ -1246,23 +1245,25 @@
 ;; The read above makes the caller's data private, but what a stdio spec
 ;; names is a handle, and the handle stays the caller's. Between the checks
 ;; and uv_spawn an engine's timer handler can close it, consume a pipe in a
-;; spawn of its own, or tear the loop down. uv-spawn! checked them on entry
-;; and then handed libuv what it had checked:
-;; - a pipe closed in between was opened into its closing handle, and
-;;   nothing ever closed that descriptor;
+;; spawn of its own, or tear the loop down. A spawn that checked them on
+;; entry and then handed libuv what it had checked would go wrong each of
+;; these ways:
+;; - a pipe closed in between is opened into its closing handle, and
+;;   nothing ever closes that descriptor;
 ;; - a pipe closed and freed in between, with a new pipe made at its
-;;   address, connected the child to the new pipe;
-;; - a pipe consumed in between made libuv fork and then fail to open it,
-;;   ADR-0015 decision 5's unclassifiable state, its handle left to leak;
-;; - a loop torn down in between leaked the options block and the process
-;;   handle, reached uv_spawn freed, or failed its teardown with EBUSY on a
-;;   process the spawn had not registered yet;
+;;   address, connects the child to the new pipe;
+;; - a pipe consumed in between makes libuv fork and then fail to open it:
+;;   a running child whose handle libuv has unlinked, which neither cleanup
+;;   suits, so the handle is left to leak;
+;; - a loop torn down in between leaks the options block and the process
+;;   handle, reaches uv_spawn freed, or fails its teardown with EBUSY on a
+;;   process the spawn has not registered yet;
 ;; - a loop handed to another thread in between, by uv-run on that thread,
-;;   was spawned on from this one, racing the loop's own thread on libuv's
-;;   handle queue (#79).
-;; Now the step that calls uv_spawn checks the loop, its owner and every
-;; stdio handle again, and in the same step marks the pipes and registers the process,
-;; or cleans up after a failure.
+;;   is spawned on from this one, racing the loop's own thread on libuv's
+;;   handle queue.
+;; So the step that calls uv_spawn checks the loop, its owner and every
+;; stdio handle again, and in the same step marks the pipes and registers
+;; the process, or cleans up after a failure.
 ;;
 ;; Each sweep runs a spawn in an engine at rising fuel, as above. At the
 ;; first expiry it notes whether the spawn has registered its process yet,
@@ -1271,10 +1272,10 @@
 ;; change found the spawn complete. If not, the spawn was refused under the
 ;; change's own name, and nothing was marked, left allocated or started.
 ;; Each batch must also leave the options blocks, processes, registry, the
-;; binding's blocks and the open descriptors as it found them: a pipe opened
-;; into a closing handle shows up only as a descriptor nobody closes. A sweep stops after its
-;; first wrong run, since a spawn that reached a freed loop could take the
-;; suite down with it.
+;; binding's blocks and the open descriptors as it found them: a pipe
+;; opened into a closing handle shows up only as a descriptor nobody
+;; closes. A sweep stops after its first wrong run, since a spawn that
+;; reached a freed loop could take the suite down with it.
 
 (define (fd-count) (length (directory-list "/dev/fd")))
 
@@ -1426,9 +1427,9 @@
     '((closed loop) not-yet torn-down not-yet ())
     '((spawned) not-yet torn-down not-yet ())
     '((spawned) (7 #f) unchanged not-yet ()))
-   ;; A spawn libuv forks for and fails, its handle still in the loop
-   ;; (ADR-0015's exec class): the cleanup registers the handle and closes
-   ;; it, so the teardown must find it registered or never see it.
+   ;; A spawn libuv forks for and fails, its handle still in the loop (the
+   ;; exec class): the cleanup registers the handle and closes it, so the
+   ;; teardown must find it registered or never see it.
    (make-state-variant
     'tear-down-loop-of-a-failed-spawn
     "a failed spawn whose loop was torn down during the call was refused as closed, or had handed its handle to the loop's close first"
@@ -1690,12 +1691,12 @@
 ;; The rows above look for wrong verdicts and must find none, which says
 ;; nothing unless each sweep saw its change land at every point from the
 ;; start of the call to its end: at every fuel from 1 to a run no expiry
-;; reached. #60 also asked that some change find the options block built,
-;; the last point before the step; the step now makes the block, so no
-;; change can, and the drop sweeps below hold that nothing is allocated
-;; before it. A spawn that succeeds has nothing after its step that its
-;; changes land in, so all its runs but the last are refused; a failed
-;; spawn's refusal is raised after its step, and some changes land there.
+;; reached. No change can find the options block built, the last point
+;; before the step, since the step makes the block; the drop sweeps below
+;; hold that nothing is allocated before it. A spawn that succeeds has
+;; nothing after its step that its changes land in, so all its runs but
+;; the last are refused; a failed spawn's refusal is raised after its
+;; step, and some changes land there.
 (test-equal "each state sweep saw its change land at every fuel from the start of the call, and ended in a run no expiry reached"
   (map (lambda (v) (list (state-variant-name v) 'before 'every-fuel 'untouched)) state-variants)
   (map (lambda (sweep)
@@ -1710,14 +1711,14 @@
 ;; A scheduler can drop a task at its engine's expiry, as a timeout does,
 ;; and never resume it. Nothing after the expiry then runs: no guard's
 ;; handler, and no dynamic-wind exit but those taken at the suspension
-;; itself. Whatever
-;; uv-spawn! holds at that moment and has not handed to libuv or the loop is
-;; lost. It allocated the process handle, then built the options block, and
-;; only then entered the step that spawns, so a drop in between lost the
-;; handle, or the handle and the options block: 124 of 190 dropped runs on
-;; a473313. Now the step allocates both, builds the options block, spawns
-;; and frees it. Before the step the verb holds nothing a drop can strand,
-;; and after it the loop holds the process.
+;; itself. Whatever uv-spawn! holds at that moment and has not handed to
+;; libuv or the loop is lost. A spawn that allocated the process handle,
+;; then built the options block, and only then entered the step that
+;; spawns would lose the handle to a drop in between, or the handle and
+;; the options block: 124 of 190 dropped runs did. So the step allocates
+;; both, builds the options block, spawns and frees it. Before the step the
+;; verb holds nothing a drop can strand, and after it the loop holds the
+;; process.
 ;;
 ;; Each sweep runs a spawn in an engine at rising fuel, each run on a loop
 ;; of its own, and drops the engine at its first expiry, noting whether the
@@ -1875,9 +1876,9 @@
 ;; The step registers the process before uv_spawn, with registry-add!, as a
 ;; constructor's step registers its handle before the init. A registration
 ;; refused there is answered with nothing forked: both blocks freed and no
-;; pipe marked. Registered after uv_spawn, as it was, the refusal raised from
-;; the step with the child running and its handle in the loop, unregistered,
-;; where no teardown could close it (#68's review).
+;; pipe marked. Registered after uv_spawn instead, a refusal would raise
+;; from the step with the child running and its handle in the loop,
+;; unregistered, where no teardown could close it.
 ;;
 ;; A fresh block is never registered already, so the row makes one that is:
 ;; it allocates blocks of a process handle's size through the shim, leaves an
@@ -1887,20 +1888,20 @@
 ;; How many, and where, is glibc's doing. Its calloc hands out the oldest
 ;; free block of a size first, and skips the thread's cache, where the first
 ;; 7 frees of each size go. With 8 blocks freed in a row, a free block of a
-;; process handle's size left by the suite's earlier spawns came first, and
-;; CI's vendored pass spawned (2026-10-07: two runs, one on main's own code).
-;; A heap seeded with 16 such blocks spawned 19 times in 20 that way. So each
-;; planted block now lies between two spacers, kept until the spawn is
-;; over, which stop glibc merging it with a freed neighbour, and allocating
-;; squatted-blocks of these pairs takes up the older free blocks first: the
-;; seeded heap spawned 0 times in 20 (.plans/spawn-drop-mutation-log.md).
+;; process handle's size left by the suite's earlier spawns comes first,
+;; and on CI's vendored pass the spawn went through. A heap seeded with 16
+;; such blocks spawned 19 times in 20 that way. So each planted block lies
+;; between two spacers, kept until the spawn is over, which stop glibc
+;; merging it with a freed neighbour, and allocating squatted-blocks of
+;; these pairs takes up the older free blocks first: the seeded heap
+;; spawned 0 times in 20.
 ;;
 ;; Neither memory tool hands a freed block back, Memcheck's freelist and
 ;; ASan's quarantine both hold it, so under either the row asks only that
 ;; the spawn ran and left nothing. Which run this is, under-memory-tool?
 ;; asks the allocator as well as the environment: asked of the environment
-;; alone, a plain run that inherited ASAN_OPTIONS from a shell took the
-;; weaker row, and failed a correct build, whose spawn was refused.
+;; alone, a plain run that inherits ASAN_OPTIONS from a shell would take
+;; the weaker row, and fail a correct build, whose spawn is refused.
 (define squatted-blocks 64)
 
 ;; squatted-spawn : -> list
@@ -1963,9 +1964,10 @@
 ;; --- one pipe named twice in one spawn -------------------------------------
 ;; libuv opens each (pipe p dir) spec's end into p after it forks, so a pipe
 ;; named twice is opened twice, and the second open fails with the child
-;; already running: ADR-0015 decision 5's unclassifiable state, which leaks
-;; the process handle. It is refused before anything is allocated, so the
-;; pipe stays free for a spawn that names it once.
+;; already running: a live child whose handle libuv has unlinked, which
+;; neither cleanup suits, so the process handle leaks. It is refused before
+;; anything is allocated, so the pipe stays free for a spawn that names it
+;; once.
 (with-loop
  (lambda (loop)
    (let* ((p (make-uv-pipe loop))
@@ -2088,10 +2090,11 @@
       seen))
 
 ;; race-sweep : -> (list rounds-run (list-of bad-round) mixed-rounds)
-;; Every exit, a raise included, stops the narrower and joins it. Until its
-;; thread has exited, an explicit collection raises "cannot collect when
-;; multiple threads are active", and the suite's last one did, under load,
-;; while the narrower was on its way out after signalling it had stopped.
+;; Every exit, a raise included, stops the narrower and joins it. While its
+;; thread has not exited, an explicit collection raises "cannot collect
+;; when multiple threads are active", and the suite's last one can, under
+;; load, while the narrower is on its way out after signalling it has
+;; stopped.
 (define (race-sweep)
   (let* ((arg (make-string race-length #\a))
          (loop (make-uv-loop))
@@ -2151,11 +2154,11 @@
         (list (car race) (cadr race)))))
 
 ;; --- a list another thread changes during the call --------------------------
-;; tests/spawn-list-races.sls has the races, and why each is shaped as it is
-;; (#66 items 2 and 3). Every call in them is refused before anything is
-;; allocated, so they leave no handle, block or registry entry behind, which
-;; the suite's last rows hold. The races skip under Valgrind, which runs one
-;; thread at a time.
+;; tests/spawn-list-races.sls has the races, and why each is shaped as it
+;; is. Every call in them is refused before anything is allocated, so they
+;; leave no handle, block or registry entry behind, which the suite's last
+;; rows hold. The races skip under Valgrind, which runs one thread at a
+;; time.
 ;;
 ;; list-race-rows is the one list of the races, each with its row's name:
 ;; the races run, and their rows are made, from it, so a race added to it
@@ -2226,16 +2229,16 @@
 
 ;; --- what a refused spawn allocates for its args -----------------------------
 ;; Counting a list allocates nothing (proper-length), where a guarded length
-;; (#51's shape) allocates a guard on every call and a condition for every
-;; list it refuses, which no other row sees: a guarded count refuses the
-;; same lists for the same reasons. So args improper or circular must be
+;; allocates a guard on every call and a condition for every list it
+;; refuses, which no other row sees: a guarded count refuses the same lists
+;; for the same reasons. So args improper or circular must be
 ;; refused at what args of () cost: each call is refused at the same check,
 ;; for the same reason, with nothing read from its args. A difference, not
 ;; a figure, so it is 0 on every platform. And args that are read cost
 ;; their read and nothing more: a pair, a copy and its UTF-8 a string, made
 ;; directly by the second row. That row holds the check's NUL scan
-;; (nul-free?), which allocates nothing; the scan it replaced cost a
-;; refused three-string spawn 64 B. tests/uv-meter.sls is the meter.
+;; (nul-free?) to allocating nothing: a scan that cost a refused
+;; three-string spawn 64 B fails it. tests/uv-meter.sls is the meter.
 
 ;; refused-spawn-cost : uv-loop -> (object -> (list reason bytes))
 ;; A meter of one refused spawn on LOOP given its args: the reason it was
@@ -2285,8 +2288,8 @@
 ;; --- the malformed lists at --optimize-level 3 -------------------------------
 ;; A program compiled at --optimize-level 3 compiles these libraries from
 ;; source at that level too, where Chez's length, car and cdr check nothing:
-;; a read that counted a list with length walked a circular one forever,
-;; with interrupts disabled, and read through an improper one.
+;; a read that counts a list with length walks a circular one forever,
+;; with interrupts disabled, and reads through an improper one.
 ;; tests/spawn-level-3-child.sps runs the malformed lists at level 3 in a
 ;; process of its own (tests/uv-level-3.sls kills it at its deadline, and
 ;; its rows then fail with killed-at-cap). The cross-thread races run at the

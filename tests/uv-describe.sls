@@ -1,6 +1,6 @@
 #!r6rs
 ;;; A raised object's message, for a row to carry as evidence: one copy for
-;;; every suite and test library (#81). tests/uv-evidence.sls exports it too.
+;;; every suite and test library. tests/uv-evidence.sls exports it too.
 ;;;
 ;;; PURE: (rnrs) and display-condition only, so the pure suites can use it
 ;;; (PURE_TESTS; make check-purity holds it).

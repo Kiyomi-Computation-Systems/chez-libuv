@@ -3,9 +3,9 @@
 ;;; assigns to being read, other than in its own assignment.
 ;;;
 ;;; A placeholder that a callback sets and no row reads checks nothing, and
-;;; reads as though something did. test-tcp.sps's graise-peer was set by an
-;;; accept callback and listed in test-seed-gates' peer census, and no row
-;;; read it; seven more of its shape stood beside it (#89).
+;;; reads as though something did: a peer that an accept callback sets, and
+;;; that test-seed-gates' peer census lists, gates nothing if no row reads
+;;; it.
 ;;;
 ;;; The walk reads scope, because the suites reuse names across sections
 ;;; (test-process.sps binds proc in 19 places): a read of another binding

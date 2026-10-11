@@ -2,19 +2,18 @@
 ;;; SRFI-64 suite for the owner check on every verb that makes something on
 ;;; a loop: the handle constructors (make-uv-timer, -tcp, -pipe, -signal,
 ;;; -async), uv-accept!, uv-spawn!, uv-getaddrinfo! and uv-getnameinfo!, and
-;;; on uv-cancel!, which a lookup's completion races (#79; ADR-0019's #79
-;;; amendment).
+;;; on uv-cancel!, which a lookup's completion races.
 ;;;
 ;;; A loop belongs to one thread: the one that made it, then whichever
-;;; thread most recently entered uv-run on it (docs/api.md). Until #79 only
-;;; make-uv-async checked that. The others called libuv's init from any
-;;; thread, and an init links the handle into the loop's handle queue, which
-;;; the loop's own thread unlinks from as it finishes closes: a second
-;;; thread making timers on a loop the first was running corrupted that
-;;; queue in 11 of 13 runs, and the teardown still answered ok. The DNS
-;;; verbs count their request in the loop with a plain increment, which the
-;;; loop's thread decrements, so the loop could exit early or never. The
-;;; registry lock (#70) guards the binding's table, not libuv's lists.
+;;; thread most recently entered uv-run on it (docs/api.md). Without the
+;;; check, a verb calls libuv's init from any thread, and an init links the
+;;; handle into the loop's handle queue, which the loop's own thread unlinks
+;;; from as it finishes closes: a second thread making timers on a loop the
+;;; first was running corrupted that queue in 11 of 13 runs, and the
+;;; teardown still answered ok. The DNS verbs count their request in the
+;;; loop with a plain increment, which the loop's thread decrements, so an
+;;; unchecked lookup can make the loop exit early or never. The registry
+;;; lock guards the binding's table, not libuv's lists.
 ;;;
 ;;; So each verb here is called from a thread that does not own the loop,
 ;;; and must be refused with &uv-wrong-thread, naming itself, the owner and
@@ -234,8 +233,8 @@
 ;; Takes LOOP back to this thread by running it, waits for a child or a
 ;; lookup a call started, and tears the loop down. A call that was refused
 ;; started nothing, and leaves nothing active on the loop: its cell is
-;; never settled, and a wait on it would tick to its cap, about 24 s a row
-;; (2026-10-09). So the wait is made only while libuv holds something.
+;; never settled, and a wait on it would tick to its cap, about 24 s a row.
+;; So the wait is made only while libuv holds something.
 (define (finish! loop ctx)
   (guard (e (#t (list 'finish-raised (describe e))))
     (uv-run loop 'nowait)
@@ -307,9 +306,9 @@
 
 ;; --- a loop handed to another thread --------------------------------------------
 ;; The loop is made and prepared here, and handed to another thread, which
-;; runs it once and then calls the verb: that thread owns it now, and makes
-;; what the verb makes. Then this thread, its maker, calls the verb and is
-;; refused, naming the other thread as the owner.
+;; runs it once and then calls the verb: that thread then owns it, and
+;; makes what the verb makes. Then this thread, its maker, calls the verb
+;; and is refused, naming the other thread as the owner.
 
 ;; handoff-run : verb -> (or 'made-there-refused-here list)
 (define (handoff-run v)

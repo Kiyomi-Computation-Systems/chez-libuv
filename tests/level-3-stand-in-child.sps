@@ -16,7 +16,7 @@
 ;;;            stdout's end loses the line
 ;;;   quiet-exit  prints nothing and exits with status 3
 ;;;   abort    prints nothing and aborts: SIGABRT, as a Chez spawned with
-;;;            the wrong argv[0] dies (AGENTS.md)
+;;;            the wrong argv[0] dies, finding no boot file named after it
 ;;;   datum-then-exit  prints a whole datum, then exits with status 5
 ;;;   hush     prints a line on stderr, closes its stdout and stderr, then
 ;;;            sleeps 60 s: both pipes end long before the child does
@@ -45,8 +45,8 @@
     (load-shared-object "libc.so.6")))
 
 ;; close-fd! : integer -> void
-;; Closes file descriptor FD. Closing Chez's port does not: the runner saw
-;; stdout end only when the child exited.
+;; Closes file descriptor FD. Closing Chez's port does not: with only the
+;; port closed, the runner sees stdout end only when the child exits.
 (define (close-fd! fd)
   (load-libc!)
   ((foreign-procedure "close" (int) int) fd))

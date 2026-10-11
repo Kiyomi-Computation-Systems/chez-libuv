@@ -1,16 +1,16 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv private conditions) -- design spec S9.
+;;; SRFI-64 suite for (libuv private conditions), the &uv-* hierarchy.
 ;;;
-;;; This is the first PURE suite in the repo: it imports no native code, so
-;;; `make check-purity` runs it with CHEZ_LIBUV_SHIM poisoned to prove the
-;;; &uv-* hierarchy never reaches (libuv private native).
+;;; This is a PURE suite: it imports no native code, so `make check-purity`
+;;; runs it with CHEZ_LIBUV_SHIM poisoned to prove the &uv-* hierarchy never
+;;; reaches (libuv private native).
 (import (rnrs)
         (srfi :64)
         (libuv private conditions))
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
-;; runner so its fail count can drive the exit status (AGENTS.md).
+;; runner so its fail count can drive the exit status.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -35,7 +35,8 @@
 
 ;; --- &uv-errno-error (errno code message) -------------------------------
 ;; errno is the portable uv_err_name_r symbol; code is the raw platform
-;; int (diagnostics only, per ADR-0006); message is uv_strerror_r's text.
+;; int (diagnostics only: callers match on the symbol); message is
+;; uv_strerror_r's text.
 ;; Three distinct-typed sentinels so a field swap cannot hide behind two
 ;; fields sharing a type.
 
@@ -70,7 +71,8 @@
     'no-raise))
 
 ;; --- &uv-handle-closed (kind) --------------------------------------------
-;; kind is one of 'tcp | 'timer | 'loop; 'timer exercises the closed set.
+;; kind is the closed handle's kind ('timer, 'tcp, 'pipe, 'process,
+;; 'signal or 'async) or 'loop; 'timer exercises the closed set.
 
 (test-equal "handle-closed predicate accepts its own instance"
   #t
@@ -112,11 +114,10 @@
 
 ;; --- &uv-libuv-unavailable: a SUBTYPE of &uv-shim-unavailable --------------
 ;; The libuv shared object failing to load is a different failure from the
-;; shim failing to load, but v0.1 raised both as &uv-shim-unavailable with
-;; the path field as the only discriminant (README.org's condition table
-;; promised a subtype consideration). The subtype keeps the old contract --
-;; every uv-shim-unavailable? guard still matches -- while letting a caller
-;; ask the sharper question. Deliberately NOT in the sibling matrix below:
+;; shim failing to load. As a subtype, it keeps &uv-shim-unavailable's
+;; contract -- every uv-shim-unavailable? guard still matches it -- while
+;; letting a caller ask the sharper question without reading the path
+;; field to tell the two apart. Deliberately NOT in the sibling matrix below:
 ;; it is a subtype, not a sibling, and the matrix's "own predicate only"
 ;; rule does not apply to it.
 
@@ -235,9 +236,10 @@
     'no-raise))
 
 ;; --- &uv-callback-error (cause) --------------------------------------------
-;; Standalone round-trip first, with an arbitrary sentinel cause (design
-;; spec S8 never requires cause to itself be a condition -- composition
-;; with a real condition is covered separately, below).
+;; Standalone round-trip first, with an arbitrary sentinel cause (cause
+;; need not be a condition: uv-run wraps a raised non-condition without
+;; composing it -- composition with a real condition is covered
+;; separately, below).
 
 (test-equal "callback-error predicate accepts its own instance"
   #t
@@ -271,10 +273,10 @@
     'no-raise))
 
 ;; --- &uv-wrong-thread (who expected actual) --------------------------------
-;; #20 (threading arc): raised when a loop/handle verb runs off the loop's
-;; owning thread. who is the verb symbol; expected is the owner thread id;
-;; actual is the caller's. expected and actual are both integers, so distinct
-;; nonzero sentinels catch an expected/actual swap that a type check cannot.
+;; Raised when a loop/handle verb runs off the loop's owning thread. who
+;; is the verb symbol; expected is the owner thread id; actual is the
+;; caller's. expected and actual are both integers, so distinct nonzero
+;; sentinels catch an expected/actual swap that a type check cannot.
 
 (test-equal "wrong-thread predicate accepts its own instance"
   #t
@@ -307,7 +309,7 @@
     'no-raise))
 
 ;; --- &uv-stack-exhausted (who headroom floor) ------------------------------
-;; #94: raised when a run is refused because its thread's C stack has less
+;; Raised when a run is refused because its thread's C stack has less
 ;; headroom than the run's floor. who is the verb; headroom and floor are
 ;; byte counts, so distinct sentinels catch a headroom/floor swap.
 
@@ -335,8 +337,8 @@
 ;; --- Subtype + sibling discrimination matrix -------------------------------
 ;; Every &uv-* type (other than the root) must satisfy uv-error? AND its own
 ;; predicate, and must NOT satisfy any sibling's predicate. Looping over the
-;; full instances x predicates matrix covers every pair, not just the one
-;; example the brief names (handle-closed vs errno-error).
+;; full instances x predicates matrix covers every pair, not just one
+;; example pair such as handle-closed vs errno-error.
 ;;
 ;; &uv-libuv-unavailable is deliberately ABSENT from this catalog: it is a
 ;; subtype of &uv-shim-unavailable, not a sibling, so the matrix's "own
@@ -404,7 +406,7 @@
         sibling-catalog)))
   sibling-catalog)
 
-;; --- Composed conditions (design spec S8, store-and-reraise) ---------------
+;; --- Composed conditions (store and re-raise) ------------------------------
 ;; `uv-run` re-raises a stored callback error wrapped as &uv-callback-error
 ;; *composed* with the original condition via `(condition (make-uv-callback-error
 ;; cause) cause)`, so a guard written against the original condition type

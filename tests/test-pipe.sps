@@ -1,8 +1,8 @@
 #!r6rs
 ;;; SRFI-64 suite for (libuv pipe) — construction and lifecycle only:
-;;; a v0.3 pipe is unconnected until uv-spawn! consumes it (THE SPEC §4.6),
-;;; so everything a pipe DOES is covered by test-stream.sps (verb gating)
-;;; and test-process.sps (stdio). NOT pure; never add to PURE_TESTS.
+;;; a pipe is unconnected until uv-spawn! consumes it, so everything a pipe
+;;; DOES is covered by test-stream.sps (verb gating) and test-process.sps
+;;; (stdio). NOT pure; never add to PURE_TESTS.
 (import (rnrs)
         (srfi :64)
         (libuv loop)

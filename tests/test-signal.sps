@@ -1,13 +1,15 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv signal) -- v0.4 (design spec
-;;; .plans/2026-08-22-chez-libuv-v0.4-signal-design.md §9.3, ADR-0017).
+;;; SRFI-64 suite for (libuv signal).
 ;;;
-;;; HARNESS RULES (§9.1/§9.2): every wait whose predicate depends on a
-;;; callback is run-until/ticking with an iteration cap; sentinels are
-;;; symbols, never #f or 0; every callback (collect)s; EVERY self-sent
-;;; signal has a continuous GUARD watcher armed on its signum (EV-3: an
-;;; unwatched self-send lands on SIG_DFL and kills this suite) -- except in
-;;; the spawned child whose death IS the assertion.
+;;; HARNESS RULES: every wait whose predicate depends on a callback is
+;;; run-until/ticking with an iteration cap; sentinels are symbols, never
+;;; #f or 0; every callback (collect)s; EVERY self-sent signal has a
+;;; continuous GUARD watcher armed on its signum -- except in the spawned
+;;; child whose death IS the assertion. When the last watcher on a signum
+;;; stops, libuv leaves SIG_DFL, not the handler that was there before, so
+;;; an unwatched self-send kills this suite. The guard also gives each
+;;; negative row a positive event to wait for: send once, run until the
+;;; guard's counter moves, then assert the probed watcher's count.
 ;;;
 ;;; NOT pure: (libuv loop) reaches (libuv private native). Never add this
 ;;; to the Makefile's PURE_TESTS.
@@ -44,7 +46,7 @@
 
 (define signal-base (live-count 'signal))
 
-;; Mode is deliberately not public (§4.4); the suite observes "no mode
+;; Mode is deliberately not public; the suite observes "no mode
 ;; pinned" behaviorally: BOTH verbs still being willing to validate past
 ;; the mode check is what an unpinned handle looks like. This probe asks
 ;; with a deliberately-invalid callback so nothing is ever armed: reaching
@@ -58,7 +60,7 @@
   (not (and (gate-passes? uv-signal-start!)
             (gate-passes? uv-signal-start-oneshot!))))
 
-;; --- construction and close (the whole ADR-0007 lifecycle) --------------
+;; --- construction and close (the whole explicit-close lifecycle) --------
 (define l0 (make-uv-loop))
 (define s0 (make-uv-signal l0))
 
@@ -80,7 +82,7 @@
 (test-equal "close is idempotent and the state stays 'closed"
   'closed (uv-handle-state s0))
 
-;; --- the teardown sweep (handle-kinds membership, spec §5.1) ------------
+;; --- the teardown sweep (handle-kinds membership) ------------------------
 (define s1 (make-uv-signal l0))
 (uv-loop-teardown! l0)
 (test-equal "teardown swept the open signal handle to 'closed"
@@ -89,7 +91,7 @@
 (test-equal "signal counter balanced after teardown"
   signal-base (live-count 'signal))
 
-;; --- the refusal matrix (§4.2, ADR-0017) --------------------------------
+;; --- the refusal matrix -------------------------------------------------
 (define l2 (make-uv-loop))
 (define sv (make-uv-signal l2))
 
@@ -141,7 +143,11 @@
 (test-equal "a refused start pinned no mode"
   'no-mode (if (not (signal-mode-via-behavior sv)) 'no-mode 'pinned))
 
-;; --- mode fixedness (D10, EV-8 -- measured) -----------------------------
+;; --- mode fixedness -----------------------------------------------------
+;; libuv's oneshot flag is one-way per handle: a oneshot start sets it,
+;; only uv_signal_init clears it, and a same-signum start leaves it as it
+;; is. So the first start fixes the handle's mode, and the other mode's
+;; verb is refused rather than half obeyed.
 ;; sv becomes continuous; the oneshot verb must then refuse, armed or not.
 (define sv-fired '())
 (uv-signal-start! sv 'sigusr1 (lambda (s) (set! sv-fired (cons s sv-fired)) (collect)))
@@ -161,7 +167,7 @@
     (uv-signal-start-oneshot! sv 'sigusr1 (lambda (s) s))
     'no-raise))
 
-;; The mode is checked in the start's step, after its arguments (#86), so a
+;; The mode is checked in the start's step, after its arguments, so a
 ;; start that has both faults is refused for its callback.
 (test-equal "a start in the other mode whose callback is not a procedure is refused for the callback"
   '(uv-signal-start-oneshot! on-signal-not-a-procedure)
@@ -186,25 +192,28 @@
   '(satisfied (sigusr1))
   (list (run-until/ticking l2 (lambda () (pair? sv-fired)) 512) sv-fired))
 
-;; EV-6: two watchers on one signum both fire on one delivery.
+;; Two watchers on one signum both fire on one delivery.
 (define twin-fired '())
 (define twin (make-uv-signal l2))
 (uv-signal-start! twin 'sigusr1
                   (lambda (s) (set! twin-fired (cons s twin-fired)) (collect)))
 (set! sv-fired '())
 (uv-kill! (uv-os-getpid) 'sigusr1)
-(test-equal "both watchers on one signum fire once each (EV-6)"
+(test-equal "both watchers on one signum fire once each"
   '(satisfied (sigusr1) (sigusr1))
   (list (run-until/ticking l2
                            (lambda () (and (pair? sv-fired) (pair? twin-fired)))
                            512)
         sv-fired twin-fired))
 
-;; --- stop is idempotent (EV-2); closed handles refuse by state ----------
+;; --- stop is idempotent; closed handles refuse by state -----------------
+;; uv_signal_stop answers 0 on a watcher never started. The stops run
+;; outside the row, so one that raised would abort the suite there: the
+;; row itself only records that both returned.
 (define never-started (make-uv-signal l2))
 (uv-signal-stop! never-started)
 (uv-signal-stop! never-started)
-(test-assert "stop on a never-started watcher is rc 0, twice (EV-2)"
+(test-assert "stop on a never-started watcher is rc 0, twice"
   #t)
 
 (uv-close! never-started)
@@ -220,8 +229,8 @@
   signal-base (live-count 'signal))
 
 ;; ========================================================================
-;; The measured-behavior sections (spike/signal/FINDINGS.md; every EV cited
-;; was measured on both platforms -- a red row here indicts the binding).
+;; The measured-behavior sections: each holds a libuv behavior measured
+;; alike on macOS and Linux, so a red row here indicts the binding.
 ;; ========================================================================
 (define l3 (make-uv-loop))
 (define g3-fired 0)   ; the section guard: continuous on sigusr1, armed throughout
@@ -233,7 +242,7 @@
     (uv-kill! (uv-os-getpid) 'sigusr1)
     (run-until/ticking l3 (lambda () (> g3-fired before)) 512)))
 
-;; --- oneshot: exactly once, rearm-outside works (EV-2, spike leg1) ------
+;; --- oneshot: exactly once, rearm-outside works -------------------------
 (define once-fired 0)
 (define once (make-uv-signal l3))
 (uv-signal-start-oneshot! once 'sigusr1
@@ -242,14 +251,15 @@
 (test-equal "…exactly once" 1 once-fired)
 (test-equal "a second send reaches only the guard" 'satisfied (send-usr1-and-wait-guard!))
 (test-equal "the oneshot stayed disarmed (auto-disarm)" 1 once-fired)
-(uv-signal-stop! once)   ; rc 0 on an auto-disarmed watcher (EV-2)
+(uv-signal-stop! once)   ; rc 0 on an auto-disarmed watcher
 (uv-signal-start-oneshot! once 'sigusr1
                           (lambda (s) (set! once-fired (+ once-fired 1)) (collect)))
 (test-equal "rearm from OUTSIDE the callback delivers again"
   'satisfied (send-usr1-and-wait-guard!))
 (test-equal "…and again exactly once" 2 once-fired)
 
-;; --- EV-9: an in-callback rearm is silently undone ----------------------
+;; --- an in-callback rearm is silently undone ----------------------------
+;; libuv's oneshot auto-stop runs after the signal callback returns.
 (define incb-fired 0)
 (define incb (make-uv-signal l3))
 (define (incb-cb s)
@@ -259,18 +269,20 @@
   (collect))
 (uv-signal-start-oneshot! incb 'sigusr1 incb-cb)
 (test-equal "in-callback-rearm oneshot fires" 'satisfied (send-usr1-and-wait-guard!))
-(test-equal "the in-callback rearm did NOT take effect (EV-9): second send silent"
+(test-equal "the in-callback rearm did NOT take effect: second send silent"
   'satisfied (send-usr1-and-wait-guard!))
 (test-equal "…count still 1" 1 incb-fired)
 
-;; --- EV-1a: continuous rearm across a signum change ---------------------
+;; --- continuous rearm across a signum change ----------------------------
+;; A signum change is a stop and a start inside uv_signal_start.
 (define sw-fired-1 0)
 (define sw-fired-2 0)
 (define sw (make-uv-signal l3))
 (uv-signal-start! sw 'sigusr1 (lambda (s) (set! sw-fired-1 (+ sw-fired-1 1)) (collect)))
 (test-equal "armed on the old signum" 'satisfied (send-usr1-and-wait-guard!))
 (test-equal "…delivered" 1 sw-fired-1)
-;; Switch signum while armed -- and arm a sigusr2 guard FIRST (§9.2).
+;; Switch signum while armed -- and arm a sigusr2 guard FIRST, by the
+;; guard rule above.
 (define g3b-fired 0)
 (define g3b (make-uv-signal l3))
 (uv-signal-start! g3b 'sigusr2 (lambda (s) (set! g3b-fired (+ g3b-fired 1)) (collect)))
@@ -279,11 +291,16 @@
   'satisfied (send-usr1-and-wait-guard!))
 (test-equal "…switched watcher silent on old signum" 1 sw-fired-1)
 (uv-kill! (uv-os-getpid) 'sigusr2)
-(test-equal "…and fires on the new signum (EV-1a)"
+(test-equal "…and fires on the new signum"
   'satisfied (run-until/ticking l3 (lambda () (positive? sw-fired-2)) 512))
 
-;; --- EV-1b: same-signum restart swaps the callback, keeps pending -------
-;; ITS OWN DRAIN, apart from the stop-suppression probe below (§6).
+;; --- same-signum restart swaps the callback, keeps pending --------------
+;; libuv swaps only the callback: the OS handler stays registered, and a
+;; delivery pending at the restart reaches the new callback.
+;; ITS OWN DRAIN, apart from the stop-suppression probe below: libuv
+;; suppresses a stopped watcher's pending delivery by comparing signums at
+;; dispatch, not by purging it, so a same-signum rearm before the next run
+;; can bring a delivery from before the stop back.
 (define swap-old 0)
 (define swap-new 0)
 (define swap (make-uv-signal l3))
@@ -294,10 +311,14 @@
                     (lambda (s) (set! swap-new (+ swap-new 1)) (collect)))
   (test-equal "the guard proves the pending delivery was dispatched"
     'satisfied (run-until/ticking l3 (lambda () (> g3b-fired before)) 512)))
-(test-equal "the swap preserved the pending delivery for the NEW callback (EV-1b)"
+(test-equal "the swap preserved the pending delivery for the NEW callback"
   '(0 1) (list swap-old swap-new))
 
-;; --- EV-5: send -> stop -> run suppression (the discriminating shape) ---
+;; --- send -> stop -> run suppression (the discriminating shape) --------
+;; A delivery pending when its watcher stops is suppressed for it. B, on
+;; the same signum, shows the event was dispatched, so A's silence is
+;; suppression and not a delivery still to come; B also keeps libuv's
+;; disposition installed.
 (define ev5-a 0)
 (define ev5-b 0)
 (define ev5-A (make-uv-signal l3))
@@ -308,7 +329,7 @@
 (uv-signal-stop! ev5-A)                       ; stop A BEFORE the next run
 (test-equal "B's delivery proves the event was dequeued"
   'satisfied (run-until/ticking l3 (lambda () (positive? ev5-b)) 512))
-(test-equal "A's silence proves suppression (EV-5)" 0 ev5-a)
+(test-equal "A's silence proves suppression" 0 ev5-a)
 
 ;; --- a raising callback rides store-and-reraise, counters balance -------
 (define boom (make-uv-signal l3))
@@ -321,7 +342,10 @@
       (if (< i 512) (begin (uv-run l3 'once) (drain (+ i 1))) 'never-raised))))
 (uv-signal-stop! boom)
 
-;; --- EV-10: close with a delivery pending -------------------------------
+;; --- close with a delivery pending --------------------------------------
+;; uv_close stops an armed watcher, and a signal handle's close callback
+;; may be deferred across loop iterations while trapped signals drain, so
+;; the wait counts no particular iteration.
 (define ev10-fired 0)
 (define ev10 (make-uv-signal l3))
 (uv-signal-start! ev10 'sigusr1
@@ -329,15 +353,15 @@
 (define g3-before-ev10 g3-fired)              ; snapshot BEFORE the send
 (uv-kill! (uv-os-getpid) 'sigusr1)            ; pending for ev10 AND guard g3
 (uv-close! ev10)                              ; close BEFORE the next run
-(test-equal "the close drains (iteration-agnostic: signal closes may defer, EV-10)"
+(test-equal "the close drains (iteration-agnostic: signal closes may defer)"
   'satisfied
   (run-until/ticking l3 (lambda () (eq? (uv-handle-state ev10) 'closed)) 512))
 (test-equal "the closing watcher's callback was suppressed" 0 ev10-fired)
 (test-assert "the guard still got THIS delivery (delta, not cumulative)"
   (> g3-fired g3-before-ev10))
 
-;; --- EV-4: an armed watcher keeps the loop alive ------------------------
-(test-assert "the loop is alive while watchers are armed (EV-4)"
+;; --- an armed watcher keeps the loop alive ------------------------------
+(test-assert "the loop is alive while watchers are armed"
   (uv-loop-alive? l3))
 
 (uv-loop-teardown! l3)
@@ -345,8 +369,8 @@
   signal-base (live-count 'signal))
 
 ;; ========================================================================
-;; End-to-end graceful shutdown: the SQ-S2 spike probe, graduated (§9.3).
-;; Three-ack handshake (SQ-S2-F1): kill #2 gates on DISARMED, never GOT1.
+;; End-to-end graceful shutdown, with tests/signal-child.sps.
+;; Three-ack handshake: the second kill gates on DISARMED, never GOT1.
 ;; ========================================================================
 (define chez-exe (getenv "CHEZ_LIBUV_TEST_CHEZ"))
 
@@ -364,8 +388,8 @@
                    ;; "chez": Chez resolves its boot files by the invoked
                    ;; name, so argv[0] "chez" against a scheme-named install
                    ;; hunts for a nonexistent chez.boot and dies of SIGABRT
-                   ;; before its first write (measured: the PR #7 Linux CI
-                   ;; failure; spike/e2e-diag legs E/F were the A/B pair).
+                   ;; before its first write, silently even with stderr
+                   ;; inherited.
                    (list chez-exe "--program" "tests/signal-child.sps")
                    (list (cons 'stdio (list 'ignore
                                             (list 'pipe child-out 'from-child))))
@@ -379,8 +403,8 @@
       ;; Every gate FAILS BY NAME when the child exits early, carrying the
       ;; exit payload -- and the kills are guarded on the child being alive
       ;; -- so a dead child fails one row with evidence instead of crashing
-      ;; the whole suite on a later ESRCH uv-kill! (the original CI failure
-      ;; mode, which hid all evidence).
+      ;; the whole suite on a later ESRCH uv-kill!, which would hide all
+      ;; evidence, the child's exit status included.
       (define (await-acks n cap)
         (let ((w (run-until/ticking
                   l4 (lambda () (or (>= (ack-lines) n) (pair? done))) cap)))
@@ -399,7 +423,7 @@
       (test-equal "the child armed and acked READY"
         'acked (await-acks 1 4096))
 
-      (test-equal "kill #1 sent to a live child"
+      (test-equal "the first kill is sent to a live child"
         'sent (kill-child!))
 
       (test-equal "the child acked delivery (GOT1, from inside the callback)"
@@ -408,7 +432,7 @@
       (test-equal "the child acked disarm (DISARMED, from a later dispatch)"
         'acked (await-acks 3 4096))
 
-      (test-equal "kill #2 sent to a live child, gated on DISARMED"
+      (test-equal "the second kill is sent to a live child, gated on DISARMED"
         'sent (kill-child!))
 
       (test-equal "the child exited"

@@ -1,6 +1,6 @@
 #!r6rs
-;;; SRFI-64 suite for the (libuv) facade -- design spec S3's module layout
-;;; ("src/libuv.sls  # (libuv) facade: re-exports + uv-version(-compatible?)").
+;;; SRFI-64 suite for the (libuv) facade, src/libuv.sls: its re-exports and
+;;; its own uv-version and uv-version-compatible?.
 ;;;
 ;;; This suite imports (libuv) and NOTHING ELSE from this project that could
 ;;; supply one of the facade's own names, and that is its whole point: every
@@ -29,11 +29,11 @@
         (libuv)
         (rename (only (libuv private native) uv-version)
                 (uv-version libuv-packed-version))
-        ;; (collect) only, so this suite's timer callback obeys design spec
-        ;; S11's "every timer callback calls (collect)" like every other. It
-        ;; is not a name the facade could be expected to supply, so it cannot
-        ;; stand in for a dropped re-export. Nor is describe, from the pure
-        ;; (uv-describe), which reaches nothing of the binding's.
+        ;; (collect) only, so this suite's timer callbacks call (collect) on
+        ;; every fire, as every other suite's do. It is not a name the facade
+        ;; could be expected to supply, so it cannot stand in for a dropped
+        ;; re-export. Nor is describe, from the pure (uv-describe), which
+        ;; reaches nothing of the binding's.
         (only (chezscheme) collect)
         (uv-describe))
 
@@ -154,7 +154,7 @@
 
 ;; Constructors and the remaining accessors, exercised directly -- these are
 ;; the ones a caller needs in order to build the conditions this binding
-;; hands to asynchronous callbacks (design spec S9).
+;; hands to asynchronous callbacks.
 (test-equal "the re-exported condition constructors and accessors round-trip"
   '(ECONNRESET -104 "connection reset by peer" tcp "/nope" 1 2 uv-write! bad-span)
   (let ((errno-e (make-uv-errno-error 'ECONNRESET -104 "connection reset by peer"))
@@ -238,10 +238,10 @@
 ;; FIRST 'once call: libuv only arms a BLOCKING poll timeout for a
 ;; UV_RUN_ONCE iteration that ran no pending callbacks of its own that same
 ;; iteration, so an iteration that raced past that check can return without
-;; the timer having come due yet. A bare single 'once call observed exactly
-;; that under load (CI run 5 -- flaked on the re-arm row below, five runs
-;; in): the assertion read stale not because the timer was late, but because
-;; that one iteration didn't wait for it. Stepping with a cap absorbs a miss
+;; the timer having come due yet. A bare single 'once call did exactly that
+;; under load, failing the re-arm row below once in five CI runs: the
+;; assertion read stale not because the timer was late, but because that one
+;; iteration didn't wait for it. Stepping with a cap absorbs a miss
 ;; like that for the cost of one more (still due-time-blocking) iteration
 ;; instead of failing outright -- the same principle the tcp drain loop
 ;; below already uses, applied here to a plain timer fire.
@@ -252,8 +252,8 @@
 
 ;; AT LEAST one, not EXACTLY one. ht is a REPEATING timer (1ms initial, 7ms
 ;; repeat), so the exact count is a function of how fast the host got back
-;; into the loop -- a wall-clock dependency in disguise, and the one thing
-;; S11 forbids. Measured under Valgrind on aarch64 (`make test-memory-docker`):
+;; into the loop -- a wall-clock dependency in disguise, which no row here
+;; may have. Measured under Valgrind on aarch64 (`make test-memory-docker`):
 ;; the initial AND the first repeat are both already due by the time the loop
 ;; processes timers, so a single 'once fires the callback TWICE and an
 ;; `(test-equal 1 ht-fires)` fails on a completely clean tree. CI's faster
@@ -306,9 +306,9 @@
 ;; directly, and a helper standing between this suite and the facade is
 ;; exactly what would let a dropped re-export go unnoticed.
 ;;
-;; #f is never an expected value here (AGENTS.md): each callback's `err` is
-;; mapped to a symbol, and each observer is seeded with a symbol no success
-;; path can produce.
+;; #f is never an expected value here, since SRFI-64 also answers #f for a
+;; raise: each callback's `err` is mapped to a symbol, and each observer is
+;; seeded with a symbol no success path can produce.
 (define (facade-err->symbol err)
   (cond ((not err) 'no-error)
         ((uv-errno-error? err) (uv-errno-error-errno err))
@@ -375,9 +375,9 @@
 
 ;; The chain goes on only from a successful connect. A connect still pending
 ;; when the drain below gives up completes at the suite's teardown, as
-;; 'ECANCELED, and going on then, on the closing client, raised
-;; &uv-handle-closed out of uv-loop-teardown! and aborted the suite (measured
-;; 2026-10-06, by forcing the drain to give up).
+;; 'ECANCELED, and going on then, on the closing client, raises
+;; &uv-handle-closed out of uv-loop-teardown! and aborts the suite (measured
+;; by forcing the drain to give up).
 (test-equal "uv-tcp-connect! is re-exported and starts the client's connect"
   'started
   (guard (e (#t (list 'raised (describe e))))
@@ -393,41 +393,39 @@
                                       (set! f-write-err werr))))))
     'started))
 
-;; Bounded by iteration count, never by a clock (design spec S11). The whole
-;; chain above is driven by callbacks the loop itself delivers.
+;; Bounded by iteration count, never by a clock. The whole chain above is
+;; driven by callbacks the loop itself delivers.
 ;;
 ;; BOTH ends are waited for, not just the client's chain: the listening
 ;; socket's readability and the client's connect completion are separate poll
 ;; events, and libuv does not promise them in the same iteration. Draining
-;; only until the client's chain completed left the accept unobserved on some
-;; runs and passed on others -- measured, not theorised.
+;; only until the client's chain completes leaves the accept unobserved on
+;; some runs and passes on others -- measured, not theorised.
 ;;
 ;; The client shuts down only after the peer's read is stopped, so the read
 ;; uv-read-stop! stops is still running: libuv ends a read at EOF
 ;; (vendor/libuv/src/unix/stream.c's uv__stream_eof), and stopping one that
 ;; has ended returns at once. The read then restarts to take the EOF.
 ;;
-;; THE TICKER IS WHAT MAKES THE BOUND REAL (final-review triage, Task 9
-;; Minors). Without it, `uv-run 'once` BLOCKS waiting for an event, so a
-;; mutation that silences the I/O chain -- a dropped connect delivery, a
-;; miswired dispatcher -- left this suite HANGING instead of failing: the
-;; iteration bound was never reached because iterations stopped arriving.
-;; A repeating facade-only timer guarantees every 'once returns, so a dead
-;; chain now burns through its iterations and the rows below fail BY
-;; NAME. Built from facade exports alone -- (uv-testing)'s run-until/ticking
-;; is exactly this, but that library imports (libuv tcp) directly and may
-;; not stand between this suite and the facade.
+;; THE TICKER IS WHAT MAKES THE BOUND REAL. Without it, `uv-run 'once`
+;; BLOCKS waiting for an event, so a mutation that silences the I/O chain --
+;; a dropped connect delivery, a miswired dispatcher -- leaves this suite
+;; HANGING instead of failing: the iteration bound is never reached because
+;; iterations stop arriving. A repeating facade-only timer guarantees every
+;; 'once returns, so a dead chain burns through its iterations and the rows
+;; below fail BY NAME. Built from facade exports alone -- (uv-testing)'s
+;; run-until/ticking is exactly this, but that library imports (libuv tcp)
+;; directly and may not stand between this suite and the facade.
 ;;
 ;; THE SAME TICKER MAKES THE CAP A TIME BUDGET. Each tick spends an
-;; iteration, so the cap counts milliseconds, not events. These TCP drains, the
-;; dns and resolve->connect drains and the spawn drain wait on the kernel or the
-;; threadpool, and load can slow those while the ticker keeps its pace: under
-;; a loopback flood (2026-10-06), handshakes outlasted a cap of 32 in up to 18
+;; iteration, so the cap counts milliseconds, not events. These TCP drains,
+;; the dns and resolve->connect drains and the spawn drain wait on the kernel
+;; or the threadpool, and load can slow those while the ticker keeps its
+;; pace: under a loopback flood, handshakes outlast a cap of 32 in up to 18
 ;; runs of 20. delivery-cap is four seconds or more. Under the heaviest flood
-;; measured, a working chain used under a quarter of it, and a dead chain
-;; spends all of it, then fails by name
-;; (.plans/facade-drain-caps-mutation-log.md). The timer drains above and
-;; the close drain at the end keep 32: 'once waits there for the suite's own
+;; measured, a working chain uses under a quarter of it, and a dead chain
+;; spends all of it, then fails by name. The timer drains above and the
+;; close drain at the end keep 32: 'once waits there for the suite's own
 ;; timer or close, so those caps count events.
 (define delivery-cap 4000)
 
@@ -505,15 +503,19 @@
 (test-equal "the restarted read fired no error callback"
   'on-error-never-fired f-read-error)
 
-;; --- v0.5 buffer-size surfaces, reached through the facade only -----------
+;; --- buffer-size surfaces, reached through the facade only ----------------
 ;; EACH NAME MUST BE EXERCISED, not merely called: a bare invocation would
-;; only reprove that the re-export expands (already covered at :19-23),
-;; nothing about behaviour. Every row below both calls the facade re-export
-;; AND asserts on what it returns -- tracking direction for the two buffer
-;; setters, the idle-stream zero for the write-queue gauge, the connected
-;; peer's address and port -- and the flow-task-2/3/4 mutation logs record
-;; real `src/` mutations that flip these rows to FAIL, which is what proves
-;; they are load-bearing rather than name-mention rows.
+;; only reprove that the re-export expands (the header's expand-time check
+;; covers that), nothing about behaviour. Every row below both calls the
+;; facade re-export AND asserts on what it returns -- tracking direction for
+;; the two buffer setters, the idle-stream zero for the write-queue gauge,
+;; the connected peer's address and port. Real `src/` mutations flip these
+;; rows to FAIL, which is what makes them load-bearing rather than
+;; name-mention rows: a getter that hands libuv a nonzero int cell sets the
+;; buffer instead of reading it and answers that constant (both buffer
+;; rows); a write-queue gauge stubbed to a constant 4096 (the gauge row); a
+;; peer-address that calls uv_tcp_getsockname instead of uv_tcp_getpeername
+;; answers the client's own port (the peer row).
 (test-equal "the facade's send-buffer getter and setter track at two points"
   'tracks-upward
   (begin (uv-send-buffer-size! fclient 8192)
@@ -533,7 +535,7 @@
 
 ;; The port is read in the tested expression: an expected value is
 ;; evaluated outside the row's catch, and on a client that never connected
-;; the read raises (AGENTS.md's plumbing trap).
+;; the read raises, which outside the catch would abort the suite.
 (test-equal "the facade's sockname-address answers this end's own name"
   'its-own-name
   (let-values (((a p) (uv-tcp-sockname-address fclient)))
@@ -575,8 +577,8 @@
 ;; --- the re-exported dns surface ----------------------------------------
 ;; Same rule as every block above: each name here has to come from
 ;; src/libuv.sls or this file does not expand. One driven numeric forward
-;; lookup exercises the re-export end to end -- hermetic per ADR-0013:
-;; numeric-only, so no resolver configuration, no network, no /etc/hosts
+;; lookup exercises the re-export end to end -- hermetic: numeric-only,
+;; so no resolver configuration, no network, no /etc/hosts
 ;; policy can decide the answer -- and the remaining names are exercised
 ;; directly. addrinfo-chain->list is a test seam of (libuv dns) and
 ;; deliberately NOT a facade export, so it must not appear here.
@@ -633,9 +635,9 @@
 
 ;; uv-getnameinfo! and uv-cancel!, driven together. The cancel's answer is
 ;; a RACE (this suite does not pin the threadpool), so the row asserts the
-;; branch-paired consequence, never the boolean alone -- the tolerant
-;; shape design spec v0.2 S9 prescribes: cancel won => 'EAI_CANCELED with
-;; host and service absent; cancel lost => the real numeric reverse.
+;; branch-paired consequence, never the boolean alone: cancel won =>
+;; 'EAI_CANCELED with host and service absent; cancel lost => the real
+;; numeric reverse.
 (define n-err 'callback-never-fired)
 (define n-host 'callback-never-fired)
 (define n-serv 'callback-never-fired)
@@ -704,20 +706,20 @@
 (test-equal "the facade's dns loop tore down cleanly"
   'not-open (if (uv-loop-open? dl) 'open 'not-open))
 
-;; --- resolve -> connect: the composition ADR-0012 promises --------------
-;; ADR-0012's first consequence -- "uv-addrinfo-address/uv-addrinfo-port
-;; compose directly with uv-tcp-connect!'s existing parameters:
-;; resolution-to-connection needs no adapter" -- asserted end to end, on
-;; the record's OWN accessor answers, never on the literals they came
-;; from: a loopback listener binds port 0, the kernel's real port is
-;; resolved back hermetically (numeric-host/numeric-serv, ADR-0013 -- no
+;; --- resolve -> connect: a resolved record feeds uv-tcp-connect! --------
+;; uv-addrinfo-address and uv-addrinfo-port compose directly with
+;; uv-tcp-connect!'s parameters: resolution-to-connection needs no adapter.
+;; Asserted end to end, on the record's OWN accessor answers, never on the
+;; literals they came from: a loopback listener binds port 0, the kernel's
+;; real port is resolved back hermetically (numeric-host/numeric-serv -- no
 ;; resolver configuration in the oracle), and the FIRST 'inet record's
 ;; address and port feed uv-tcp-connect! verbatim. The accept firing is
 ;; what proves the composed connect reached THIS listener: a record port
 ;; one off would ECONNREFUSED on loopback and the accept would never come
-;; (watched to fail exactly so -- dns-stage-6 mutation log, MC), and a
-;; literal-for-accessor swap is invisible to this row by construction
-;; (recorded honestly there as MA, not claimed covered).
+;; (watched to fail exactly so). Replacing the accessor calls with the
+;; literals they came from is invisible to this row by construction, since
+;; the answer for a numeric literal IS the literal: that swap is uncovered
+;; here.
 (define cl (make-uv-loop))
 (define cserver (make-uv-tcp cl))
 
@@ -801,7 +803,7 @@
 (uv-timer-stop! c-ticker)
 (uv-loop-teardown! cl)
 
-(test-equal "resolve->connect: the record's own address and port drive uv-tcp-connect! to the listener (ADR-0012)"
+(test-equal "resolve->connect: the record's own address and port drive uv-tcp-connect! to the listener"
   '(no-error an-inet-record no-error a-tcp closed closed)
   (list c-resolve-err
         (if (uv-addrinfo? c-rec) 'an-inet-record c-rec)
@@ -841,7 +843,8 @@
 (test-assert "uv-process-pid is exported"
   (procedure? uv-process-pid))
 
-;; v0.4: the pid query rides the process block (ADR-0017 D8).
+;; uv-os-getpid is exported from (libuv process), so it is checked with the
+;; process surface.
 (test-equal "uv-os-getpid is re-exported and answers a positive exact integer"
   'positive
   (if (and (integer? (uv-os-getpid)) (exact? (uv-os-getpid))
@@ -849,7 +852,7 @@
       'positive
       'wrong))
 
-;; v0.4 signal block (design spec §4.6): one exercised row per export.
+;; The signal surface: one exercised row per export.
 (define sig-loop (make-uv-loop))
 (define sig-h (make-uv-signal sig-loop))
 
@@ -868,7 +871,7 @@
     (uv-signal-start! sig-h 'sigfoo (lambda (s) s))
     'no-raise))
 
-(uv-signal-stop! sig-h)   ; rc 0 on a never-started watcher (EV-2)
+(uv-signal-stop! sig-h)   ; rc 0 on a never-started watcher
 (uv-close! sig-h)
 (uv-loop-teardown! sig-loop)
 

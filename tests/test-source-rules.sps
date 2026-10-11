@@ -1,13 +1,13 @@
 #!r6rs
 ;;; SRFI-64 suite for rules about src/ that only a reading of the source can
-;;; hold (#48's review).
+;;; hold.
 ;;;
 ;;; 1. A stream's data field has one writer. libuv's alloc callback, the
 ;;;    shim's chez_uv_alloc_cb, trusts data to point at the stream's uv_buf_t
 ;;;    descriptor, and hands libuv whatever it finds there as the buffer to
 ;;;    read into. A second writer could make that any memory at all: one that
-;;;    pointed data at the handle itself passed every other suite, and libuv
-;;;    was then told to read 4.3 GB into the handle. So uv-handle-set-data is
+;;;    points data at the handle itself passes every other suite, and libuv
+;;;    is then told to read 4.3 GB into the handle. So uv-handle-set-data is
 ;;;    called from one place in src/.
 ;;;
 ;;; 2. Every entry native.sls takes from the shim is checked first. A shim
@@ -16,20 +16,20 @@
 ;;;    "chez_uv_..." name native.sls resolves goes through shim-procedure or
 ;;;    shim-entry, never a bare foreign-procedure or foreign-entry. The
 ;;;    fixtures in tests/test-shim-loading.sps can each reach one entry only:
-;;;    with the other 46 resolved bare, every suite still passed.
+;;;    with every other entry resolved bare, every suite still passes.
 ;;;
 ;;; 3. No string crosses the FFI as a string argument. Chez encodes a
 ;;;    string, wstring or utf-N argument during the foreign call: it counts,
 ;;;    allocates and encodes, so a string changed after it was checked
-;;;    reaches C changed, and an embedded NUL cuts it short (#51, #61). A
-;;;    string crosses as its C string's bytes, passed as u8*.
+;;;    reaches C changed, and an embedded NUL cuts it short. A string
+;;;    crosses as its C string's bytes, passed as u8*.
 ;;;
 ;;; 4. No __collect_safe foreign call takes an argument in Scheme memory:
 ;;;    u8*, u16*, u32*, scheme-object or its alias ptr, ftype-pointer, or
 ;;;    ftype-scheme-object-pointer. A collect-safe call deactivates its
 ;;;    thread, so another thread's collection can move the object while C
-;;;    reads it, and copies made that way were corrupted under a concurrent
-;;;    collection (#35). Chez accepts these types there without a word. It
+;;;    reads it, and copies made that way are corrupted under a concurrent
+;;;    collection. Chez accepts these types there without a word. It
 ;;;    refuses a string argument there itself.
 ;;;
 ;;; 5. Every foreign call in src/ is one rules 3 and 4 read: a
@@ -42,19 +42,18 @@
 ;;;    are complete for this Chez: every parameter type its expander accepts
 ;;;    is a string type, an address type, or a scalar this suite lists.
 ;;;
-;;; 6. Process-wide state is shared by every loop's thread. ADR-0019 kept
-;;;    the handle registry unlocked because only a loop's own thread uses
-;;;    that loop's handles, but the registry is one table for every loop,
-;;;    and two loops run on two threads at once corrupted it (#70). So this
-;;;    suite lists, saying how threads share it, each variable a library in
-;;;    src/ defines at its top level that the library assigns, changes in
-;;;    place (passes first to a procedure whose name ends in !), or makes,
-;;;    while its body runs, with a table, a box, a vector, a parameter, a
-;;;    lock or a guardian, or as a closure over a variable it assigns. It
-;;;    lists each static variable in the C shim too, and the shim keeps no
-;;;    thread-local storage: glibc mallocs a dlopened library's on each
-;;;    thread's first use, and the memory gate counted that block as
-;;;    suppressed (#94). A new one fails here
+;;; 6. Process-wide state is shared by every loop's thread. Only a loop's
+;;;    own thread uses that loop's handles, but the handle registry is one
+;;;    table for every loop, and two loops run on two threads at once
+;;;    corrupt it unless it is locked. So this suite lists, saying how
+;;;    threads share it, each variable a library in src/ defines at its top
+;;;    level that the library assigns, changes in place (passes first to a
+;;;    procedure whose name ends in !), or makes, while its body runs, with
+;;;    a table, a box, a vector, a parameter, a lock or a guardian, or as a
+;;;    closure over a variable it assigns. It lists each static variable in
+;;;    the C shim too, and the shim keeps no thread-local storage: glibc
+;;;    mallocs a dlopened library's on each thread's first use, and the
+;;;    memory gate counts such a block as suppressed. A new one fails here
 ;;;    until it is listed. Each word for how threads share a variable is
 ;;;    checked against the source, by where the variable is written or by
 ;;;    what makes it. The registry and the orphan list are used only inside
@@ -62,24 +61,24 @@
 ;;;    and registry-lock is named only there; the shim's counters change
 ;;;    only through count_add. What the scan cannot see: a structure changed
 ;;;    only through a procedure that takes it as an argument, or by a macro
-;;;    whose name does not end in ! (.plans/registry-lock-mutation-log.md).
+;;;    whose name does not end in !.
 ;;;
 ;;; 7. A loop's claim is taken and given back only through claim-loop! and
-;;;    release-loop! (#78). set-loop-holder!, which sets the mark outright,
-;;;    is for the tests' forgeries: src/ never calls it. A call there could
-;;;    clear a claim another thread holds, as call-with-uv-loop's exit did
-;;;    until #78's review, or leave one no call will give back.
+;;;    release-loop!. set-loop-holder!, which sets the mark outright, is for
+;;;    the tests' forgeries: src/ never calls it. A call there could clear a
+;;;    claim another thread holds, as one in call-with-uv-loop's exit would,
+;;;    or leave one no call will give back.
 ;;;
 ;;; 8. A verb that checks its handle's owner on entry checks it again in
 ;;;    its step. Every verb entering through require-open-handle checks on
 ;;;    entry that this thread owns the loop, and an engine can suspend it
 ;;;    after that while the loop is handed to another thread. So its step
 ;;;    takes the handle's pointer from owned-handle-ptr, which checks again.
-;;;    The stream verbs and the process kill and pid took open-handle-ptr
-;;;    until #86, and a kill resumed after a handoff signalled its process
-;;;    from a thread that no longer owned the loop. So this suite holds each
-;;;    route from a handle record to its pointer to the definitions that
-;;;    take it, named and counted, whether called or passed as a value:
+;;;    A step that takes open-handle-ptr instead does not: uv-process-kill!
+;;;    resumed after a handoff then signals its process from a thread that
+;;;    does not own the loop. So this suite holds each route from a handle
+;;;    record to its pointer to the definitions that take it, named and
+;;;    counted, whether called or passed as a value:
 ;;;    - open-handle-ptr, which asks only whether the handle is open:
 ;;;      owned-handle-ptr, and three steps that need no owner check of their
 ;;;      own. begin-close! is uv-close!'s step, loop-thread-only by contract
@@ -103,13 +102,13 @@
 ;;;    accessor imported under another name.
 ;;;
 ;;; 9. A refusal for the wrong thread names the owner its check compared
-;;;    against (#102). An owner check that finds another thread owning the
-;;;    loop answers an owner-mismatch holding that owner and the caller,
-;;;    and &uv-wrong-thread is built from it. Until #102 the check answered
-;;;    'wrong-thread, and the refusal read the owner again once the step
-;;;    was over: a loop handed on and back to the caller in between was
-;;;    named as owned by the very thread it refused. So this suite holds,
-;;;    named and counted as rule 8's routes are:
+;;;    against. An owner check that finds another thread owning the loop
+;;;    answers an owner-mismatch holding that owner and the caller, and
+;;;    &uv-wrong-thread is built from it. A check that answered a bare
+;;;    'wrong-thread would leave the refusal to read the owner again once
+;;;    the step was over, and a loop handed on and back to the caller in
+;;;    between would be named as owned by the very thread it refused. So
+;;;    this suite holds, named and counted as rule 8's routes are:
 ;;;    - make-uv-wrong-thread to wrong-thread-refusal, which builds from an
 ;;;      owner-mismatch, and its definition in conditions.sls;
 ;;;    - the owner field's accessor, loop-owner-thread, to
@@ -119,14 +118,14 @@
 ;;;      with it only once it has ruled out an owner-mismatch, and to
 ;;;      native.sls's signal-symbol->int. A pointer check's answer, and a
 ;;;      step's, can be an owner-mismatch, which symbol? would take for a
-;;;      pointer and hand to libuv, so they are tested with refused?. #109
-;;;      turned eight steps' open-handle-ptr into owned-handle-ptr. A step
-;;;      that kept its symbol? through such a change fails the handoff
-;;;      sweeps only for a verb whose step, not its entry check, refuses
-;;;      once an engine has handed the loop on, as 25 of the 39 swept
-;;;      verbs' steps do: uv-tcp-bind!'s handed the record to uv_tcp_bind,
-;;;      which raised inside the step and left interrupts disabled. For the
-;;;      other 14 only this rule sees it.
+;;;      pointer and hand to libuv, so they are tested with refused?. A
+;;;      step whose open-handle-ptr becomes owned-handle-ptr while it keeps
+;;;      its symbol? test fails the handoff sweeps only for a verb whose
+;;;      step, not its entry check, refuses once an engine has handed the
+;;;      loop on, as 25 of the 39 swept verbs' steps do: uv-tcp-bind!'s
+;;;      hands the record to uv_tcp_bind, which raises inside the step and
+;;;      leaves interrupts disabled. For the other 14 only this rule sees
+;;;      it.
 ;;;    - the hand-back sweep's list (tests/test-owner-refusal.sps) to the
 ;;;      verbs (libuv) exports that reach an owner check: those whose
 ;;;      definition names require-loop-thread, owned-loop-ptr,
@@ -136,7 +135,7 @@
 ;;;    What the scan cannot see: a name imported under another one.
 ;;;
 ;;; 10. A completing callback's entry leaves the registry in its seam, and
-;;;    only there (#87). The seams of a close and of a request's completion
+;;;    only there. The seams of a close and of a request's completion
 ;;;    find their pointer's entry and delete it in one use of the lock
 ;;;    (registry-take-accepted!), and put back an entry their dispatcher
 ;;;    refuses. A dispatcher that deleted it again would take the lock twice
@@ -154,16 +153,16 @@
 ;;;      put-back in registry-take-accepted!.
 ;;;
 ;;; 11. Every uv_run starts in run-step!, where the C stack's headroom is
-;;;    checked first (#94). An escape from a callback leaves its uv_run's
-;;;    frames on the thread's stack for good, and a run made that deep
-;;;    crashes the thread, or on macOS hangs it (#95). run-step! claims
-;;;    the loop through claim-loop-for-run!, which refuses a run below its
-;;;    floor, so a uv_run made anywhere else would go unchecked. So this
-;;;    suite holds uv-loop-run, the foreign call, and claim-loop-for-run!
-;;;    to run-step!, named once each.
+;;;    checked first. An escape from a callback leaves its uv_run's frames
+;;;    on the thread's stack for good, and a run made that deep crashes the
+;;;    thread, or on macOS hangs it. run-step! claims the loop through
+;;;    claim-loop-for-run!, which refuses a run below its floor, so a
+;;;    uv_run made anywhere else would go unchecked. So this suite holds
+;;;    uv-loop-run, the foreign call, and claim-loop-for-run! to run-step!,
+;;;    named once each.
 ;;;
-;;; 12. A release shim exports nothing the tests call into libuv through
-;;;    (#127; ADR-0002's eighth kind). The pool hold that test-dns queues on
+;;; 12. A release shim exports nothing the tests call into libuv through.
+;;;    The pool hold that test-dns queues on
 ;;;    the threadpool is compiled only in a dev shim, and
 ;;;    tests/check-prod.sps fails a release shim that exports any entry on
 ;;;    its list. A list kept by hand misses an entry added later, and an
@@ -1608,7 +1607,7 @@
 
 ;; Live: a scan that missed either kind of call, the convention or the
 ;; types would pass rules 3 and 4 below with nothing found. native.sls
-;; makes 60 foreign-procedure and 50 shim-procedure calls.
+;; makes 60 foreign-procedure and 52 shim-procedure calls.
 (test-equal "the foreign-call scan is live: it reads native.sls's calls of both kinds, uv_run's __collect_safe and the u8* arguments"
   'live
   (let ((collect-safe (map call-entry (filter collect-safe? calls)))

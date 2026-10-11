@@ -1,13 +1,12 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv tcp) -- design spec S5 (the handle lifecycle,
-;;; extended to a second handle type), S6 (the read path: one reusable
-;;; per-handle buffer, an infallible alloc_cb, copy-out at the boundary,
-;;; UV_EOF kept distinct from errors, read-stop/read-start backpressure), S7
-;;; (the write path: one foreign-alloc per write, freed before on-complete),
-;;; S8 (callback boundary discipline), S10 (the debug counters) and S11 /
-;;; ADR-0010 (loopback only: bind 127.0.0.1:0, read the real port back,
-;;; connect from the same loop and process; no subprocess client, no fixed
-;;; port, no external network).
+;;; SRFI-64 suite for (libuv tcp): the handle lifecycle, extended to a
+;;; second handle type; the read path (one reusable per-handle buffer, an
+;;; infallible alloc_cb, copy-out at the boundary, UV_EOF kept distinct from
+;;; errors, read-stop/read-start backpressure); the write path (one
+;;; foreign-alloc per write, freed before on-complete); callback boundary
+;;; discipline; and the debug counters. Loopback only: bind 127.0.0.1:0,
+;;; read the real port back, connect from the same loop and process; no
+;;; subprocess client, no fixed port, no external network.
 ;;;
 ;;; THE WRITE ROWS COME FIRST AND ARE STILL VERIFIED BY COMPLETION rather
 ;;; than by what arrived at the other end: the kernel buffers a few bytes for
@@ -56,8 +55,8 @@
               uv-req-size uv-buf-base uv-buf-len uv-buf-set! copy-in! copy-out
               shim-compiled-version)
         ;; uv-eof and errno-symbol->value are read from the SHIM's table, not
-        ;; transcribed (ADR-0005): the read dispatcher's arms are driven with
-        ;; the same values libuv would deliver.
+        ;; transcribed: the read dispatcher's arms are driven with the same
+        ;; values libuv would deliver.
         (only (libuv private constants)
               uv-write-req-type sizeof-uv-buf-t uv-eof errno-symbol->value
               uv-tcp-type uv-named-pipe-type constant-ref)
@@ -71,7 +70,8 @@
               make-engine)
         (only (uv-sweep) capped))
 
-;; SRFI-64's default runner sets no process exit status (AGENTS.md).
+;; SRFI-64 sets no process exit status, so the suite's last line exits by
+;; this runner's fail count.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -89,9 +89,9 @@
 ;; Captured before this suite allocates anything.
 (define registry-count-at-start (registry-count))
 
-;; A callback's `err` argument is #f on success, and #f is the value
-;; AGENTS.md names as the worst possible expected value: it is what a missing
-;; key, a defaulting accessor and an SRFI-64-swallowed exception all produce.
+;; A callback's `err` argument is #f on success, and #f is the worst
+;; possible expected value: it is what a missing key, a defaulting accessor
+;; and an SRFI-64-swallowed exception all produce.
 ;; So every assertion below compares a SYMBOL, and this is the one place the
 ;; mapping happens. 'callback-never-fired is the seed every observer starts
 ;; at, and no success path can produce it.
@@ -106,18 +106,16 @@
 
 ;; The cap for a ticking wait that spans a loopback handshake. Every 1 ms
 ;; tick spends an iteration, so a ticking cap is a time budget, and during
-;; other runs' loopback floods a handshake has outlasted 64 of them
-;; (2026-10-06).
+;; other runs' loopback floods a handshake has outlasted 64 of them.
 (define handshake-cap 4000)
 
 ;; The cap for a ticking wait on a delivery to a connected peer: data, an
 ;; EOF, a reset, or a write's completion. It is a time budget like
 ;; handshake-cap, and the same size. During an 8-pair loopback flood these
 ;; waits took up to 1529 ticks (the 1 MiB transfer) and failed by name at
-;; their old caps, 64 and the transfer's 1024; 4000 is 2.6 times the longest
-;; (.plans/tcp-delivery-cap-mutation-log.md). Only a wait that fails spends
-;; it, and tests/test-seed-gates.sps keeps every ticking wait's cap at or
-;; above that longest delivery.
+;; caps of 64, and of 1024 for the transfer; 4000 is 2.6 times the longest.
+;; Only a wait that fails spends it, and tests/test-seed-gates.sps keeps
+;; every ticking wait's cap at or above that longest delivery.
 (define delivery-cap 4000)
 
 (test-begin "tcp")
@@ -158,7 +156,7 @@
   'same (if (eq? l (uv-handle-loop t0)) 'same 'different))
 
 ;; positive? is the discriminating part: 0 is what the freeing site leaves
-;; behind (design spec S10).
+;; behind.
 (test-equal "make-uv-tcp stores a non-null handle pointer"
   'positive
   (if (and (integer? (handle-ptr t0)) (exact? (handle-ptr t0))
@@ -229,9 +227,9 @@
 ;; real size and READS IT BACK, refusing a sockaddr too small to contain
 ;; sin_port. The refusal arm is not reachable through this API (libuv writes
 ;; 16 for AF_INET and 28 for AF_INET6, both comfortably above the port's
-;; end -- the mutation log records it as mutation-only). What IS reachable,
-;; and what this row exists for, is the other direction: the check must not
-;; be written so strictly that a real address is refused. An IPv6 handle is
+;; end, so only a mutation reaches it). What IS reachable, and what this row
+;; exists for, is the other direction: the check must not be written so
+;; strictly that a real address is refused. An IPv6 handle is
 ;; the discriminating case, because its sockaddr_in6 is a DIFFERENT size from
 ;; the sockaddr_in every other row here produces -- a check spelled
 ;; `(= namelen (sizeof-sockaddr-in))` passes the whole suite except this row.
@@ -280,10 +278,10 @@
     (uv-tcp-bind! (make-uv-timer l) "127.0.0.1" 0)
     'no-raise))
 
-;; uv-write! moved to (libuv stream) in Task 7 (ADR-0014): its kind check now
-;; widens to uv-stream-record?, so the reason a non-stream handle is refused
-;; with is 'not-a-uv-stream, not 'not-a-uv-tcp -- test-stream.sps carries the
-;; full gating matrix; this row stays as the regression canary through the
+;; uv-write! lives in (libuv stream), and (libuv tcp) re-exports it. Its
+;; kind check is uv-stream-record?, so the reason a non-stream handle is
+;; refused with is 'not-a-uv-stream, not 'not-a-uv-tcp -- test-stream.sps
+;; carries the full gating matrix; this row checks the gate through the
 ;; re-export.
 (test-equal "uv-write! refuses a handle of another kind, naming who and why"
   '(uv-write! not-a-uv-stream)
@@ -299,7 +297,7 @@
 ;; UV_EBADF (vendor/libuv/src/unix/core.c, one code path for both supported
 ;; platforms). MEASURED on this platform, then locked in: the point of the
 ;; row is that the rc is CHECKED at all rather than ignored, and it is
-;; asserted as a SYMBOL (ADR-0006), never as the raw -9.
+;; asserted as a SYMBOL, never as the raw -9.
 (test-equal "uv-tcp-getsockname-port on an unbound handle surfaces libuv's errno"
   'EBADF
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
@@ -316,7 +314,7 @@
 ;; number.
 ;;
 ;; A fixed port can be occupied by something else on the machine, which is
-;; precisely what ADR-0010 avoids everywhere else. So it is tried against a
+;; precisely why every other row binds port 0. So it is tried against a
 ;; small candidate list, EADDRINUSE moving on to the next -- and if every
 ;; candidate is busy the row fails loudly rather than passing vacuously.
 (define fixed-port-candidates '(46137 46339 46541 46743 46945))
@@ -371,7 +369,7 @@
   registry-count-at-start (registry-count))
 
 ;; --- listen / connect / accept, end to end -------------------------------
-;; One loop, both endpoints, no subprocess (ADR-0010).
+;; One loop, both endpoints, no subprocess.
 (define el (make-uv-loop))
 
 (define connection-err 'connection-cb-never-fired)
@@ -402,8 +400,9 @@
 ;; is "the in-flight write request is registered against its handle's loop";
 ;; both exist because a connect request that is never registered shows up as
 ;; a suite that BLOCKS (the completion becomes an orphan and no callback ever
-;; runs) rather than as a named failure -- see .plans/stage-4-mutation-log.md,
-;; mutation 19.
+;; runs) rather than as a named failure: with the connect's registration
+;; skipped, this suite blocks at its next plain run-until, ticking waits in
+;; other suites spend their caps, and only this row names the cause.
 (test-equal "the in-flight connect request is registered against its handle's loop"
   'same
   (if (eq? el (registry-loop-of (req-ptr connect-request))) 'same 'different))
@@ -456,9 +455,9 @@
 
 ;; --- uv-accept! with nothing pending: the failure path, for real ---------
 ;; libuv answers EAGAIN when no connection is queued. That is the accept
-;; failure design spec risk #8 describes, reachable without a stub: the
-;; freshly-init'd client's memory can only be released by close_cb, so the
-;; binding must route it through the NORMAL close path before re-raising.
+;; failure path, reachable without a stub: the freshly-init'd client's
+;; memory can only be released by close_cb, so the binding must route it
+;; through the NORMAL close path before re-raising.
 (define tcp-live-before-failed-accept (live-count 'tcp))
 
 (define failed-accept
@@ -482,10 +481,10 @@
 (test-equal "the failed accept's client was closed through the normal close path"
   tcp-live-before-failed-accept (live-count 'tcp))
 
-;; --- write, verified by completion (reading is Stage 5) ------------------
+;; --- write, verified by completion --------------------------------------
 ;; The peer is accepted but never read from, so these five bytes sit in the
 ;; kernel's socket buffer. That is enough for uv_write to complete, which is
-;; the property this stage can check.
+;; the property this section checks; the read path below checks the bytes.
 (define write-err 'write-cb-never-fired)
 (define write-fires 0)
 (define write-req-live-inside 'on-complete-never-ran)
@@ -501,7 +500,7 @@
                (collect)
                (set! write-fires (+ write-fires 1))
                (set! write-err err)
-               ;; Design spec S7: the block is freed BEFORE on-complete runs.
+               ;; The block is freed BEFORE on-complete runs.
                ;; Both observations are taken from INSIDE the callback, which
                ;; is the only place the ordering is visible at all.
                (set! write-req-live-inside (live-count 'write-req))
@@ -515,12 +514,12 @@
   'same
   (if (eq? el (registry-loop-of (req-ptr first-write))) 'same 'different))
 
-;; The caller's bytevector is free the instant uv-write! returns (design
-;; spec S7: the copy into the foreign block is already complete). Mutating
-;; it here is the assertion -- if the binding had kept a reference into the
-;; Scheme heap, this is where it would corrupt the in-flight write. What the
-;; PEER received is Stage 5's business; what is checked here is that the
-;; write still completes cleanly and that this process survives it.
+;; The caller's bytevector is free the instant uv-write! returns (the copy
+;; into the foreign block is already complete). Mutating it here is the
+;; assertion -- if the binding had kept a reference into the Scheme heap,
+;; this is where it would corrupt the in-flight write. What the PEER
+;; received is the read path's business, below; what is checked here is
+;; that the write still completes cleanly and that this process survives it.
 (bytevector-u8-set! payload 0 (char->integer #\X))
 (bytevector-u8-set! payload 4 (char->integer #\Z))
 
@@ -549,9 +548,10 @@
   0 (live-count 'write-req))
 
 ;; --- write argument validation, all of it BEFORE any allocation ----------
-;; AGENTS.md's right-to-left trap: this must not depend on which argument of
-;; the assertion runs first. `let*` sequences the three observations
-;; explicitly, so the recorded before/after counters are unambiguous.
+;; Compiled Chez code can evaluate a call's arguments right to left, so this
+;; must not depend on which argument of the assertion runs first. `let*`
+;; sequences the three observations explicitly, so the recorded before/after
+;; counters are unambiguous.
 (define span-probe
   (let* ((before-count (live-count 'write-req))
          (before-registry (registry-count))
@@ -571,7 +571,7 @@
 (test-equal "an out-of-range span is refused before anything is allocated"
   '((uv-write! span-out-of-range) (0 0) 0) span-probe)
 
-;; The copy refuses a span that no longer fits with uv-write!'s own refusal
+;; The copy refuses a span that does not fit with uv-write!'s own refusal
 ;; and frees its block, so the row above passes even without the verb's end
 ;; bound: the copy refuses 99 after allocating. Only that bound refuses an
 ;; end past fixnum range cleanly. Without it, foreign-alloc refuses the
@@ -619,7 +619,7 @@
 
 ;; --- a written span, not the whole bytevector ----------------------------
 ;; WHAT WAS ACTUALLY COPIED is checked here, on this side of the wire.
-;; Reading is Stage 5, so the peer's view is not available -- but the write
+;; Nothing reads the peer here, so its view is not available -- but the write
 ;; block is, until its completion frees it, and the block is where the copy
 ;; landed. So the loop is deliberately NOT run between uv-write! and the
 ;; three assertions below: the request is still in flight, so its block is
@@ -642,9 +642,9 @@
 (test-equal "the write block's uv_buf_t carries the SPAN's length, not the bytevector's"
   3 (uv-buf-len span-buf))
 
-;; Design spec S7's single block: the payload pointer must address memory
-;; inside the request's own allocation, never the Scheme heap and never a
-;; second allocation.
+;; One block per write: the payload pointer must address memory inside the
+;; request's own allocation, never the Scheme heap and never a second
+;; allocation.
 (test-equal "the payload pointer addresses memory inside the request's own block"
   'inside
   (let ((base (uv-buf-base span-buf)))
@@ -652,11 +652,11 @@
 
 ;; The UPPER bound, which the row above cannot see: a payload placed past
 ;; the block's end still satisfies "after the block start, after the
-;; uv_buf_t" while copy-in! corrupts whatever the allocator put next
-;; (final-review triage, Task 8 Minors). The block's end is redone from the
-;; same constants uv-write! sizes it with -- span-buf is already
-;; block + aligned req size, so the end is that plus sizeof(uv_buf_t) plus
-;; the span's own 3 bytes -- not read back out of the binding.
+;; uv_buf_t" while copy-in! corrupts whatever the allocator put next. The
+;; block's end is redone from the same constants uv-write! sizes it with --
+;; span-buf is already block + aligned req size, so the end is that plus
+;; sizeof(uv_buf_t) plus the span's own 3 bytes -- not read back out of the
+;; binding.
 (test-equal "the payload's last byte lies inside the request's own block too"
   'inside
   (let ((base (uv-buf-base span-buf))
@@ -667,8 +667,7 @@
 
 ;; The bytes themselves. A copy that read from offset 0 instead of `start`
 ;; would put "012" here -- same length, same completion, wrong payload, and
-;; invisible to every other row in this suite until Stage 5 can read the
-;; peer's end.
+;; invisible to every row that does not read the peer's end.
 (test-equal "the copied bytes are the requested span, not the head of the bytevector"
   (string->utf8 "234")
   (copy-out (uv-buf-base span-buf) (uv-buf-len span-buf)))
@@ -711,7 +710,7 @@
 ;; Writing to a shut-down stream fails. WHICH failure is libuv's business:
 ;; the synchronous uv_write may refuse it outright, or accept it and report
 ;; an errno to the completion callback. Both are recorded as failures here,
-;; and the observed one is written into the mutation log -- what must NOT
+;; and the observed one is printed on an informational line -- what must NOT
 ;; happen is a clean success.
 (define post-shutdown-sync 'no-sync-raise)
 (define post-shutdown-async 'post-shutdown-write-never-completed)
@@ -733,7 +732,7 @@
              cap))
 
 ;; RECORDED, not asserted: which of the two legal failures this platform
-;; produced. The mutation log carries the observed value; the assertion below
+;; produced. This line carries the observed value; the assertion below
 ;; carries the contract.
 (display "  [informational] write after shutdown: sync=")
 (display post-shutdown-sync)
@@ -795,8 +794,9 @@
   (let-values (((a p) (uv-tcp-peer-address pa-client))) (list a p)))
 
 ;; The direction that catches getpeername implemented as getsockname. Two
-;; independent ports also shrink the byte-order blind spot (tcp.sls:125-129
-;; records why read-net-u16 exists) from ~1/256 to ~1/65536.
+;; independent ports also shrink the byte-order blind spot (read-net-u16 in
+;; src/libuv/private/native.sls says why it exists) from ~1/256 to
+;; ~1/65536.
 (test-equal "the accepted handle's peer port is the client's own local port"
   (list "127.0.0.1" (uv-tcp-getsockname-port pa-client))
   (let-values (((a p) (uv-tcp-peer-address pa-peer))) (list a p)))
@@ -818,16 +818,17 @@
     (let-values (((pa pp) (uv-tcp-peer-address pa-peer)))
       (if (and (equal? ca pa) (= cp pp)) 'agree (list 'differ ca cp pa pp)))))
 
-;; The port agrees with the existing convenience, which is the whole claim
-;; that one is now a narrowing of this rather than a separate capability.
+;; The port agrees with uv-tcp-getsockname-port, which is the whole claim
+;; that that convenience is a narrowing of this rather than a separate
+;; capability.
 (test-equal "sockname-address's port agrees with uv-tcp-getsockname-port"
   'agree
   (let-values (((a p) (uv-tcp-sockname-address pa-client)))
     (if (= p (uv-tcp-getsockname-port pa-client)) 'agree (list 'differ p))))
 
 ;; And UNLIKE the peer side, this needs no connection -- the ephemeral-port
-;; case ADR-0010 depends on. The asymmetry is libuv's, so it is asserted
-;; rather than left to a comment.
+;; case every bind to port 0 depends on. The asymmetry is libuv's, so it is
+;; asserted rather than left to a comment.
 (test-equal "a bound but unconnected handle HAS a local name"
   'has-a-local-name
   (let ((u (make-uv-tcp pa-loop)))
@@ -845,13 +846,13 @@
       (uv-tcp-peer-address u)
       'no-raise)))
 
-;; --- two-write ordering (design spec S13.5) --------------------------------
+;; --- two-write ordering ---------------------------------------------------
 ;; What the BINDING owns: FIFO submission order and per-request completion
-;; routing. Non-interleaving itself is structural (head-of-queue drain,
-;; unix/stream.c:1043) and is logged as an uncovered property, not asserted.
+;; routing. Non-interleaving itself is structural (the head-of-queue drain
+;; in unix/stream.c's uv__write) and is left uncovered, not asserted.
 (define pa-col (make-byte-collector))
 ;; Gated on the seed: without a peer, the row below fails by name instead of
-;; this line aborting the suite (AGENTS.md).
+;; this line aborting the suite.
 (when (uv-tcp? pa-peer)
   (uv-read-start! pa-peer (lambda (bv s e) (collect-span! pa-col bv s e) (collect))
                   (lambda () #f) (lambda (c) #f)))
@@ -953,9 +954,9 @@
 (test-equal "the refused reads on a closed handle allocated no buffer"
   0 (live-count 'read-buffer))
 
-;; The close dispatcher frees the per-handle read buffer (design spec S5's
-;; "pop registry entry -> free read buffer -> free handle pointer"), on a
-;; handle that never started reading, so only the install put it there. The
+;; The close dispatcher frees the per-handle read buffer (pop the registry
+;; entry, free the read buffer, free the handle pointer), on a handle that
+;; never started reading, so only the install put it there. The
 ;; buffer is a real foreign-alloc, so a close that forgot it leaks (Valgrind)
 ;; and a close that freed it twice traps (ASan).
 (define buffered-tcp (make-uv-tcp cl))
@@ -978,7 +979,7 @@
 (uv-loop-teardown! cl)
 
 ;; --- close with a write still in flight ----------------------------------
-;; Design spec S5: request callbacks tolerate a 'closing handle -- an
+;; Request callbacks tolerate a 'closing handle -- an
 ;; in-flight write completing with 'ECANCELED lands there. BOTH orderings
 ;; are legal (the write may already have been handed to the kernel when the
 ;; close starts), so this asserts the disjunction and RECORDS which one this
@@ -1069,12 +1070,13 @@
 ;; --- the same race, forced to the ECANCELED side -------------------------
 ;; The row above records whichever ordering the platform produced, and on a
 ;; five-byte write that is "the kernel already took it" -- so the 'ECANCELED
-;; arm design spec S5 exists for would never actually run. Four megabytes to
-;; a peer that is not reading does not fit in any socket buffer, so the write
-;; is still QUEUED INSIDE LIBUV when uv-close! arrives, and the completion
-;; has to come back as a cancellation. That is the arm under test: a request
-;; callback delivered to a handle that is already 'closing, carrying a
-;; nonzero status that becomes a condition OBJECT rather than a raise.
+;; arm a request dispatcher keeps for a closing handle would never actually
+;; run. Four megabytes to a peer that is not reading does not fit in any
+;; socket buffer, so the write is still QUEUED INSIDE LIBUV when uv-close!
+;; arrives, and the completion has to come back as a cancellation. That is
+;; the arm under test: a request callback delivered to a handle that is
+;; already 'closing, carrying a nonzero status that becomes a condition
+;; OBJECT rather than a raise.
 (define ql (make-uv-loop))
 (define q-peer 'never-accepted)
 (define q-connect-err 'connect-cb-never-fired)
@@ -1119,10 +1121,10 @@
                256)
     (err->symbol q-write-err)))
 
-;; Design spec S5: "private dispatchers still tolerate this state: in-flight
-;; request callbacks (e.g. 'ECANCELED writes) land here". Sampled from inside
-;; the completion, which is the only place the handle's state at delivery
-;; time is observable.
+;; The private dispatchers tolerate a 'closing handle: in-flight request
+;; callbacks ('ECANCELED writes, say) land there. Sampled from inside the
+;; completion, which is the only place the handle's state at delivery time
+;; is observable.
 (test-equal "the cancelled write was delivered to a handle that was already 'closing"
   'closing q-state-inside)
 
@@ -1135,7 +1137,7 @@
   registry-count-at-start (registry-count))
 
 ;; --- a refused connection ------------------------------------------------
-;; The deterministic loopback refusal ADR-0010 allows: bind a socket to an
+;; A deterministic loopback refusal with no fixed port: bind a socket to an
 ;; ephemeral port, read the port back, close it, and connect there. Nothing
 ;; is listening, so the kernel refuses. A rebind by another process in the
 ;; window is theoretically possible, so the assertion is on the SHAPE (an
@@ -1172,10 +1174,10 @@
 (uv-loop-teardown! rl)
 
 ;; --- a raise from inside a request callback ------------------------------
-;; The store-and-reraise policy (design spec S8) applies to the new
-;; dispatchers exactly as it does to the timer's: a raise inside on-complete
-;; is caught, stored, and re-raised by uv-run wrapped as &uv-callback-error
-;; composed with the original condition.
+;; The store-and-reraise policy applies to the request dispatchers exactly
+;; as it does to the timer's: a raise inside on-complete is caught, stored,
+;; and re-raised by uv-run wrapped as &uv-callback-error composed with the
+;; original condition.
 (define gl (make-uv-loop))
 
 (define gserver (make-uv-tcp gl))
@@ -1212,12 +1214,12 @@
 (uv-loop-teardown! gl)
 
 ;; =========================================================================
-;; --- THE READ PATH (design spec S6) --------------------------------------
+;; --- THE READ PATH -------------------------------------------------------
 ;; =========================================================================
-;; Everything below is Stage 5: uv-read-start! / uv-read-stop!, the per-handle
-;; buffer, the alloc and read dispatchers, copy-out at the boundary, UV_EOF
-;; kept distinct from errors, and the backpressure contract the HTTP layer
-;; above this library is going to be built on.
+;; Everything below: uv-read-start! / uv-read-stop!, the per-handle buffer,
+;; the alloc and read dispatchers, copy-out at the boundary, UV_EOF kept
+;; distinct from errors, and the backpressure contract a server built on
+;; this library relies on.
 
 ;; --- argument validation, all of it BEFORE any allocation ----------------
 (define vl (make-uv-loop))
@@ -1253,8 +1255,8 @@
     (uv-read-start! vtcp ignore-data ignore-eof 'not-a-procedure)
     'no-raise))
 
-;; uv-read-start! / uv-read-stop! moved to (libuv stream) in Task 7
-;; (ADR-0014) too: same widened kind check, same reason symbol change.
+;; uv-read-start! and uv-read-stop! live in (libuv stream) too: the same
+;; kind check, so the same reason symbol.
 (test-equal "uv-read-start! refuses a handle of another kind, naming who and why"
   '(uv-read-start! not-a-uv-stream)
   (guard (e ((uv-invalid-argument? e)
@@ -1271,8 +1273,8 @@
     (uv-read-stop! (make-uv-timer vl))
     'no-raise))
 
-;; AGENTS.md's right-to-left trap again: `let*` sequences the before/after
-;; observations explicitly rather than trusting argument evaluation order.
+;; Again `let*` sequences the before/after observations explicitly rather
+;; than trusting argument evaluation order.
 (define read-size-probe
   (let* ((before (live-count 'read-buffer))
          (outcome (guard (e ((uv-invalid-argument? e)
@@ -1306,7 +1308,7 @@
 ;; uv_tcp_init does not create a socket, so this handle is not readable and
 ;; libuv refuses the start. MEASURED on this platform, then locked in, like
 ;; the EBADF row above: the point is that the rc is CHECKED, and that it
-;; arrives as a SYMBOL (ADR-0006) rather than as a raw negative int.
+;; arrives as a SYMBOL rather than as a raw negative int.
 (test-equal "uv-read-start! on a stream that is not connected surfaces libuv's errno"
   'ENOTCONN
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
@@ -1315,9 +1317,9 @@
     'no-raise))
 
 ;; The buffer is the HANDLE's, not the read's: a start that libuv refused has
-;; still allocated it, and it is not unwound here, because design spec S6
-;; makes the close dispatcher the only place it may ever be freed. Both
-;; halves of that are asserted -- it exists now, and it is gone after close.
+;; still allocated it, and it is not unwound here, because the close
+;; dispatcher is the only place it may ever be freed. Both halves of that
+;; are asserted -- it exists here, and it is gone after close.
 (test-equal "seed: the refused start had already allocated the handle's read buffer"
   1 (live-count 'read-buffer))
 
@@ -1332,9 +1334,9 @@
 ;; --- one write, read at the other end ------------------------------------
 ;; The first row in this suite that observes a payload from the PEER's side
 ;; rather than from the write block. `(bv start end)` is asserted as a
-;; framing, not just as content: design spec S6 hands on-data a SPAN so a
-;; future zero-copy variant can answer a sub-range of a larger buffer, and
-;; today's copy must therefore be a bytevector whose whole length is the span.
+;; framing, not just as content: on-data is handed a SPAN so a zero-copy
+;; variant could answer a sub-range of a larger buffer, and the copy must
+;; therefore be a bytevector whose whole length is the span.
 (define sl (make-uv-loop))
 (define s-in (make-byte-collector))
 (define s-frames '())
@@ -1365,9 +1367,9 @@
               (collect)
               (when (not err)
                 (set! s-peer (uv-accept! sserver))
-                ;; Legal from inside a callback, and required here: design
-                ;; spec S8 lists uv-read-start! among the operations that may
-                ;; run inside one.
+                ;; Legal from inside a callback, and required here:
+                ;; uv-read-start! is among the operations that may run inside
+                ;; one.
                 (uv-read-start! s-peer s-on-data s-on-eof s-on-error))))
 
 (define sclient (make-uv-tcp sl))
@@ -1376,7 +1378,7 @@
 
 ;; Only a connected stream is written to: a handshake still pending at
 ;; teardown completes as 'ECANCELED, and writing then, on the closing stream,
-;; raises out of uv-loop-teardown! (measured 2026-10-06).
+;; raises out of uv-loop-teardown! (measured).
 (connect-loopback! sclient sport
                    (lambda (err)
                      (collect)
@@ -1410,7 +1412,7 @@
 
 ;; --- stop, start, and the ONE buffer -------------------------------------
 ;; Gated on the seed, here and at each call on s-peer below: without a peer,
-;; the rows fail by name instead of the call aborting the suite (AGENTS.md).
+;; the rows fail by name instead of the call aborting the suite.
 (define s-buffer-before-cycles
   (if (uv-tcp? s-peer) (stream-read-buf s-peer) 'never-accepted))
 
@@ -1457,10 +1459,10 @@
 ;; --- the DEFAULT buffer size, pinned -------------------------------------
 ;; The rows above fix their own sizes explicitly; this is the only row in the
 ;; suite that observes what a size-LESS uv-read-start! actually allocates.
-;; s-peer was started size-lessly at :1227, so its buffer is the default.
+;; s-peer was started size-lessly in sserver's listen callback above, so
+;; its buffer is the default.
 ;;
-;; v0.5 does not change this number. The row exists so the milestone that
-;; does cannot change it silently.
+;; The row exists so that no change to this number passes silently.
 (test-equal "a size-less read-start allocates default-read-buffer-size"
   65536 (stream-read-buf-len s-peer))
 
@@ -1512,7 +1514,7 @@
 ;; Gated on the first delivery, which proves the connect callback has issued
 ;; its write. A handshake that completes after this shutdown instead runs
 ;; that write on a stream already shut, and the EPIPE it raises would surface
-;; from the wait below, aborting the suite (measured 2026-10-06).
+;; from the wait below, aborting the suite (measured).
 (when (eq? s-outcome 'satisfied)
   (uv-shutdown! sclient (lambda (err) (collect) (set! s-shutdown-err err))))
 
@@ -1538,14 +1540,15 @@
   (list (err->symbol s-write-err) (err->symbol s-shutdown-err)))
 
 ;; --- the read dispatcher's arms, reached directly ------------------------
-;; Two of design spec S6's four `nread` cases cannot be produced on demand
-;; through libuv: `0` is its "nothing to read this time" (a socket that was
-;; readable a moment ago answering EAGAIN), and WHICH errno arrives is the
-;; kernel's business. So the dispatcher is called here exactly as the
-;; trampoline calls it -- with the handle's own pointer -- which runs the
-;; shipped code path rather than a copy of it. tests/test-timer.sps uses the
-;; same technique for the timer dispatcher's state check, and for the same
-;; reason: without it these arms have no assertion at all.
+;; Two of the four `nread` cases (positive, 0, UV_EOF, another negative
+;; errno) cannot be produced on demand through libuv: `0` is its "nothing
+;; to read this time" (a socket that was readable a moment ago answering
+;; EAGAIN), and WHICH errno arrives is the kernel's business. So the
+;; dispatcher is called here exactly as the trampoline calls it -- with the
+;; handle's own pointer -- which runs the library's own code path rather
+;; than a copy of it. tests/test-timer.sps uses the same technique for the
+;; timer dispatcher's state check, and for the same reason: without it these
+;; arms have no assertion at all.
 ;;
 ;; The `buf` argument is passed as 0 deliberately. The read dispatcher takes
 ;; its bytes from the handle's own buffer field -- the buffer alloc_cb handed
@@ -1570,20 +1573,21 @@
   (list s-data-fires s-eof-fires))
 
 ;; reading? records CALLER INTENT -- started and not yet stopped -- not
-;; libuv's live read state (the handles.sls record comment; final-review
-;; triage decision). At this point s-peer has been delivered a real EOF
-;; (the shutdown section above) AND an error (the ENOBUFS arm just now),
-;; and the flag must have survived both: only uv-read-stop! clears it.
+;; libuv's live read state (the stream record's comment in
+;; src/libuv/private/handles.sls). At this point s-peer has been delivered
+;; a real EOF (the shutdown section above) AND an error (the ENOBUFS arm
+;; just above), and the flag must have survived both: only uv-read-stop!
+;; clears it.
 (test-equal "reading? is caller intent: it survives EOF and error delivery until uv-read-stop!"
   '(reading not-reading)
   (list (if (stream-reading? s-peer) 'reading 'not-reading)
         (begin (uv-read-stop! s-peer)
                (if (stream-reading? s-peer) 'reading 'not-reading))))
 
-;; Design spec S5's tolerance rule, on the read path: a read completion can
-;; be queued behind a uv_close, and the handle it names is 'closing by the
-;; time it is delivered. Refusing to deliver there would drop the EOF a
-;; caller's own bookkeeping may be waiting for.
+;; The 'closing tolerance, on the read path: a read completion can be
+;; queued behind a uv_close, and the handle it names is 'closing by the time
+;; it is delivered. Refusing to deliver there would drop the EOF a caller's
+;; own bookkeeping may be waiting for.
 (when (uv-tcp? s-peer)
   (set-handle-state! s-peer 'closing)
   ((dispatcher-ref 'read) (handle-ptr s-peer) (uv-eof) 0))
@@ -1594,18 +1598,18 @@
 (when (uv-tcp? s-peer) (set-handle-state! s-peer 'open))
 
 ;; --- libuv's alloc callback, called as libuv calls it ---------------------
-;; Since #45 libuv's alloc callback is the shim's chez_uv_alloc_cb. It answers
-;; the uv_buf_t descriptor a stream's data field points at, and the empty
-;; buffer when data is NULL (ADR-0002, amended 2026-10-05). The descriptor
-;; sits in the stream's own handle block, at the first 16-byte boundary after
-;; libuv's handle, and data points at it from the stream's creation. It is
-;; empty until the first read start installs the read buffer, and the close
-;; dispatcher empties it again before it frees that buffer.
+;; libuv's alloc callback is the shim's chez_uv_alloc_cb. It answers the
+;; uv_buf_t descriptor a stream's data field points at, and the empty buffer
+;; when data is NULL. The descriptor sits in the stream's own handle block,
+;; at the first 16-byte boundary after libuv's handle, and data points at it
+;; from the stream's creation. It is empty until the first read start
+;; installs the read buffer, and the close dispatcher empties it again
+;; before it frees that buffer.
 ;;
 ;; The rows call alloc-cb-entry, the address uv-read-start-native hands
 ;; uv_read_start, with a uv_buf_t of their own. Its scratch is seeded with
-;; values no success path can leave behind (AGENTS.md), so "the callback
-;; wrote nothing" cannot pass for "the callback wrote an empty buffer".
+;; values no success path can leave behind, so "the callback wrote nothing"
+;; cannot pass for "the callback wrote an empty buffer".
 (define shim-alloc-cb
   (foreign-procedure alloc-cb-entry (uptr size_t uptr) void))
 
@@ -1646,7 +1650,7 @@
 
 ;; A stream's handle block carries its descriptor past libuv's own handle, so
 ;; that the read buffer can be exactly the payload: a 64 KiB buffer behind a
-;; 16-byte header took the next malloc size class on macOS, 81,920 B.
+;; 16-byte header would take the next malloc size class on macOS, 81,920 B.
 ;; Compared inside the tested expression, as the alloc-answer row below is:
 ;; SRFI-64 evaluates a row's expected value outside its catch, so reading
 ;; s-peer there aborts the suite when the seed failed.
@@ -1691,8 +1695,8 @@
                     'told (cadr s-alloc-answer)))))
 
 ;; ...and the block is that length and no more: the read buffer is its
-;; payload. Behind a 16-byte header, a 64 KiB buffer took the next macOS
-;; size class, 81,920 B. glibc rounds to 16 bytes and the memory gates'
+;; payload. Behind a 16-byte header, a 64 KiB buffer would take the next
+;; macOS size class, 81,920 B. glibc rounds to 16 bytes and the memory gates'
 ;; allocators to none, so only macOS can see a header here.
 (test-equal "the read buffer's block is its length, within one malloc granule"
   'payload-only
@@ -1814,10 +1818,10 @@
 ;; Wherever the sweep below suspends one, the descriptor must agree with the
 ;; record: no buffer and an empty descriptor, or the record's buffer, whole.
 ;; Then a second start runs and the first resumes, and once the stream
-;; closes no buffer may be left unfreed. Measured before the fix (#48's
-;; review): suspended between recording the block and pointing data at it,
-;; the stream answered UV_ENOBUFS to every read, for good once the engine
-;; was dropped; and a second start meanwhile leaked a buffer.
+;; closes no buffer may be left unfreed. Measured with an install that is
+;; not one step: suspended between recording the block and pointing data at
+;; it, the stream answers UV_ENOBUFS to every read, for good once the engine
+;; is dropped; and a second start meanwhile leaks a buffer.
 ;;
 ;; Each start runs on a fresh unconnected tcp, which installs its buffer and
 ;; then has the start refused (ENOTCONN), so no read can interfere.
@@ -1949,9 +1953,9 @@
 (free! s-scratch-buf)
 
 ;; The orphan arm of the read dispatcher: a callback for a pointer the
-;; registry does not know must not raise into a C frame (spike FINDINGS Q2:
-;; exit 255, no teardown) and must leave a record behind, because a silent
-;; swallow is worse than the crash.
+;; registry does not know must not raise into a C frame (an unguarded raise
+;; there ends the process with exit status 255 and no teardown) and must
+;; leave a record behind, because a silent swallow is worse than the crash.
 (define read-orphans-before (length (orphan-callback-events)))
 
 (test-equal "a read callback for an unregistered pointer does not raise"
@@ -1976,14 +1980,14 @@
   registry-count-at-start (registry-count))
 
 ;; --- a chunked 1 MiB transfer, byte for byte -----------------------------
-;; The payload integrity claim the write-path rows had to defer: sixteen
-;; 64 KiB writes of seeded, deterministic bytes (uv-testing's LCG -- never a
-;; clock and never `random`, so a failure is reproducible), accumulated on the
-;; other end and compared with bytevector=?.
+;; The payload integrity claim the write-path rows leave to the read side:
+;; sixteen 64 KiB writes of seeded, deterministic bytes (uv-testing's LCG --
+;; never a clock and never `random`, so a failure is reproducible),
+;; accumulated on the other end and compared with bytevector=?.
 ;;
-;; EVERY on-data callback calls (collect), which is design spec S11's
-;; GC-pressure axis applied to the read path: sixteen full collections with
-;; libuv's C frames live below the Scheme callback, on every run.
+;; EVERY on-data callback calls (collect), which is GC pressure applied to
+;; the read path: sixteen full collections with libuv's C frames live below
+;; the Scheme callback, on every run.
 (define ml (make-uv-loop))
 (define m-chunk 65536)
 (define m-chunks 16)
@@ -2054,10 +2058,9 @@
 ;; UNCONDITIONAL, not failure-gated. A red row here prints its actual value
 ;; (the hook at the top of this suite), but no row carries the byte count
 ;; or the reader's on-error as the drain ended, and a passing run gets a
-;; baseline to compare with. The line exists because an intermittent
-;; failure of these three rows on CI's Linux Valgrind leg (never reproduced
-;; on macOS, nor in 5/5 aarch64 Valgrind runs) could not be diagnosed from
-;; the log at all, when the rows printed only their names.
+;; baseline to compare with. These three rows have failed intermittently on
+;; CI's Linux Valgrind leg (never reproduced on macOS, nor in 5 of 5 aarch64
+;; Valgrind runs), and their names alone leave such a failure undiagnosable.
 ;;
 ;; The three rows fail TOGETHER whenever the transfer falls short, so the
 ;; discriminating question is which of the two causes did it: the drain ran
@@ -2121,11 +2124,11 @@
   registry-count-at-start (registry-count))
 
 ;; --- backpressure: read-stop from inside on-data -------------------------
-;; THE CONTRACT THIS LIBRARY EXISTS TO PROVIDE (design spec S6, and S8's list
-;; of what is legal inside a callback). A reader that stops must stop
-;; RECEIVING -- the bytes stay in the kernel's buffer and on-data does not
-;; fire again -- and a reader that starts again must get exactly the bytes it
-;; did not take, in order.
+;; THE CONTRACT THIS LIBRARY EXISTS TO PROVIDE. uv-read-stop! is legal
+;; inside a callback, and here it runs inside on-data. A reader that stops
+;; must stop RECEIVING -- the bytes stay in the kernel's buffer and on-data
+;; does not fire again -- and a reader that starts again must get exactly
+;; the bytes it did not take, in order.
 ;;
 ;; "The callback did not fire" is only a claim if the loop really iterated
 ;; while it was not firing, so a 1 ms repeating timer runs alongside and
@@ -2220,9 +2223,9 @@
 ;; Restarting with the same three callbacks: the buffer and the stored
 ;; callbacks are reused, and the bytes held back arrive now, in order. The
 ;; restart is a row, not plumbing: it raises EALREADY when the first chunk
-;; never arrived to stop the read (seen during a loopback flood,
-;; 2026-10-06), and without a peer it raises for want of one. Either way the
-;; rows after it then fail by name instead of the suite aborting (AGENTS.md).
+;; never arrived to stop the read (seen during a loopback flood), and
+;; without a peer it raises for want of one. Either way the rows after it
+;; then fail by name instead of the suite aborting.
 (test-equal "the stopped reader restarts with the same three callbacks"
   'restarted
   (begin (uv-read-start! b-peer b-on-data b-on-eof b-on-error)
@@ -2248,18 +2251,17 @@
   registry-count-at-start (registry-count))
 
 ;; --- a connection reset by the peer --------------------------------------
-;; Design spec S12's 'ECONNRESET row. A plain close sends FIN, which is EOF
-;; and not a reset, so the reset has to be provoked: a socket closed while
-;; unread data is still sitting in its receive queue sends RST instead (the
-;; abortive close of RFC 1122 4.2.2.13, implemented by both Darwin and
-;; Linux). So the SERVER writes, the client never reads a byte, and the
-;; client is closed once those bytes are seen waiting in its receive queue.
+;; A plain close sends FIN, which is EOF and not a reset, so the reset has
+;; to be provoked: a socket closed while unread data is still sitting in its
+;; receive queue sends RST instead (the abortive close of RFC 1122
+;; 4.2.2.13, implemented by both Darwin and Linux). So the SERVER writes,
+;; the client never reads a byte, and the client is closed once those bytes
+;; are seen waiting in its receive queue.
 ;;
 ;; WHAT IS ASSERTED IS THE DISPATCH, NOT THE KERNEL'S CHOICE OF ERRNO. That
 ;; the failure reaches on-error as an &uv-errno-error carrying a SYMBOL --
 ;; rather than reaching on-eof, and rather than being raised into libuv's own
-;; stack -- is this binding's contract. The observed symbol is printed and
-;; recorded in the mutation log.
+;; stack -- is this binding's contract. The observed symbol is printed.
 (define xl (make-uv-loop))
 (define x-peer 'never-accepted)
 (define x-error 'on-error-never-fired)
@@ -2271,11 +2273,11 @@
 ;; (queued-bytes tcp n) -> how many bytes, up to n, sit unread in tcp's
 ;; receive queue, read with recv(2)'s MSG_PEEK so that they stay there. When
 ;; it cannot look, it answers a list naming what refused: (handle closing)
-;; or (handle closed) for a handle no longer open, (uv_fileno <status>) or
+;; or (handle closed) for a handle that is not open, (uv_fileno <status>) or
 ;; (recv -1) for a call that failed. An empty queue is (recv -1) too: libuv's
 ;; sockets are non-blocking, so recv answers at once instead of waiting for
 ;; bytes. Never raises: a look that fails reaches the precondition row with
-;; its evidence instead of aborting the suite (AGENTS.md).
+;; its evidence instead of aborting the suite.
 ;;
 ;; MSG_PEEK is 2 on Darwin, Linux and the BSDs. A flag that drained the queue
 ;; would hand the close an empty one, which the precondition row reads.
@@ -2335,7 +2337,7 @@
 ;; The client never calls uv-read-start!, so these bytes stay unread in its
 ;; receive queue -- which is exactly what makes the close below abortive.
 ;; Gated on the seed: without a peer, the rows below fail by name instead of
-;; the write aborting the suite (AGENTS.md).
+;; the write aborting the suite.
 (when (uv-tcp? x-peer)
   (uv-write! x-peer (make-bytevector 4096 88)
              (lambda (err) (collect) (set! x-write-err err))))
@@ -2353,10 +2355,9 @@
 ;; A COMPLETED WRITE IS NOT A QUEUED READ. The write callback means libuv
 ;; handed the bytes to the server's socket; the kernel delivers them to the
 ;; client's receive queue after that, and under load that can outlast any
-;; fixed number of loop turns. This section used to take two 'nowait turns
-;; here and close. Under a loopback flood, up to one suite run in five then
-;; closed on an empty queue, sent a FIN, and failed the two contract rows
-;; below with EOF (.plans/reset-precondition-mutation-log.md). So the close
+;; fixed number of loop turns. A close after two 'nowait turns here, under a
+;; loopback flood, finds an empty queue in up to one suite run in five,
+;; sends a FIN, and fails the two contract rows below with EOF. So the close
 ;; waits until the queue is seen to hold every byte, capped and counted in
 ;; loop steps like every other wait here.
 (define x-queue-wait
@@ -2407,11 +2408,10 @@
         x-eof-fires))
 
 ;; MEASURED on this platform, then locked in -- the same treatment as the
-;; EBADF, EAGAIN and ECONNREFUSED rows above, and design spec S12's named
-;; exit criterion for this stage. If a platform ever answers something else
-;; here, THIS is the row to re-measure: the row above it is the portable
-;; contract (the dispatch), and this one is the kernel's answer on the
-;; machines this project tests on.
+;; EBADF, EAGAIN and ECONNREFUSED rows above. If a platform ever answers
+;; something else here, THIS is the row to re-measure: the row above it is
+;; the portable contract (the dispatch), and this one is the kernel's answer
+;; on the machines this project tests on.
 (test-equal "the errno an abortive close produces here is 'ECONNRESET"
   'ECONNRESET x-error)
 
@@ -2425,17 +2425,20 @@
 (test-equal "the reset loop tore down cleanly"
   registry-count-at-start (registry-count))
 
-;; --- the dispatchers Stages 4 and 5 installed through the seam -----------
-;; Stage 3 left six raising stubs behind (tests/test-timer.sps); Stage 4
-;; replaced four of them by name and Stage 5 the last two, with no second
-;; install-callback-dispatchers! call. One of those two, alloc, has since
-;; left Scheme: the shim answers libuv's alloc callback (#45). Asking "is it still a stub?" on an
-;; UNREGISTERED pointer cannot tell the two apart -- a stub's raise is
-;; contained by the seam and recorded as an orphan, which is also what a real
-;; dispatcher does with a pointer it cannot resolve. So the question is put
-;; with a REGISTERED pointer: a stub's raise then lands on that pointer's
-;; loop and surfaces from uv-run as &uv-callback-error, where a real
-;; dispatcher leaves the error cell alone.
+;; --- the tcp and stream dispatchers, installed through the seam ----------
+;; A callback type whose library has not installed its dispatcher holds a
+;; raising stub (tests/test-timer.sps), which a library replaces by name,
+;; with no second install-callback-dispatchers! call. The real connection,
+;; write-done, shutdown, connect and read dispatchers take their stubs'
+;; places in (libuv private handles); libuv's alloc callback is the shim's
+;; own C function and has no dispatcher.
+;; Asking "is it still a stub?" on an UNREGISTERED pointer cannot tell the
+;; two apart -- a stub's raise is contained by the seam and recorded as an
+;; orphan, which is also what a real dispatcher does with a pointer it
+;; cannot resolve. So the question is put with a REGISTERED pointer: a
+;; stub's raise then lands on that pointer's loop and surfaces from uv-run
+;; as &uv-callback-error, where a real dispatcher leaves the error cell
+;; alone.
 (define dl (make-uv-loop))
 (define dtcp (make-uv-tcp dl))
 (define dispatch-orphans-before (length (orphan-callback-events)))
@@ -2446,7 +2449,7 @@
 ((dispatcher-ref 'connect)    (handle-ptr dtcp) 0)
 ((dispatcher-ref 'read)       (handle-ptr dtcp) 0 0)
 
-(test-equal "the dispatchers Stages 4 and 5 installed are real, not Stage 3's raising stubs"
+(test-equal "the connection, request and read dispatchers are installed, not the raising stubs"
   'no-raise
   (guard (e (#t (list 'raised e)))
     (uv-run dl 'nowait)
@@ -2465,8 +2468,8 @@
         (cons 'connect (handle-ptr dtcp)))
   (list-tail (orphan-callback-events) dispatch-orphans-before))
 
-;; Each request seam takes its pointer's entry in the step that finds it
-;; (#87), and puts back an entry whose object is not a request. The teardown
+;; Each request seam takes its pointer's entry in the step that finds it,
+;; and puts back an entry whose object is not a request. The teardown
 ;; below finds the handle only through its entry.
 (test-equal "the request seams left the handle's registry entry in place"
   'still-registered
@@ -2481,7 +2484,7 @@
     'torn-down))
 
 ;; =========================================================================
-;; --- VECTORED WRITE (uv-write*!, the name ADR-0009 reserved) -------------
+;; --- VECTORED WRITE (uv-write*!) ------------------------------------------
 ;; =========================================================================
 ;; The scatter-gather counterpart of uv-write!: ONE request block whose
 ;; payload holds the N copied spans and an N-entry uv_buf_t[], handed to
@@ -2489,10 +2492,10 @@
 ;; count -- uv-write! is the caller that pins it at 1). Completion and the
 ;; free-before-on-complete discipline are uv-write!'s, unchanged: the whole
 ;; thing is one foreign-alloc, freed as a unit by the shared write-done
-;; dispatcher (ADR-0009's amendment). A segment is a whole bytevector or an
-;; explicit (bv start end) span. libuv refuses nbufs < 1 (unix/stream.c:1309),
-;; so an empty segment list is refused HERE, at the boundary, with a named
-;; reason rather than forwarded as a platform EINVAL.
+;; dispatcher. A segment is a whole bytevector or an explicit (bv start end)
+;; span. libuv refuses nbufs < 1 (unix/stream.c:1309), so an empty segment
+;; list is refused HERE, at the boundary, with a named reason rather than
+;; forwarded as a platform EINVAL.
 (define wv-loop (make-uv-loop))
 (define wv-server (make-uv-tcp wv-loop))
 (define wv-port (bind-loopback! wv-server))
@@ -2517,7 +2520,7 @@
                      handshake-cap))
 
 ;; --- argument validation, all of it BEFORE any allocation ----------------
-;; The same right-to-left trap as uv-write!'s span rows (AGENTS.md): a `let*`
+;; The same argument-order care as uv-write!'s span rows: a `let*`
 ;; sequences the before/after counter reads, so a refusal that allocated
 ;; nothing is distinguishable from one that allocated and then leaked. Every
 ;; row below asserts BOTH the (who reason) pair and "(0 0) 0" -- write-req
@@ -2553,8 +2556,8 @@
                  (lambda (err) #f)))))
 
 ;; The verb reads the list and each span one pair at a time, checking each
-;; pair as it reads it (#64), so these are the shapes that walk must refuse
-;; as the old list? and length checks did.
+;; pair as it reads it, so these are the shapes that walk must refuse, as
+;; list? and length checks would.
 ;;
 ;; capped (tests/uv-sweep.sls) runs its call in an engine whose resumes
 ;; are capped: a call that never ends answers the driver's give-up, so a
@@ -2592,10 +2595,10 @@
              (list "hello" 0 5))))
 
 ;; A list holding two malformed segments is refused for the first of them:
-;; the walk parses it in order (#64). Chez's map, which the walk replaced,
-;; parsed a list of three in the order 3, 1, 2 and so named the last of
-;; these. Positions 1 and 3, both ways round, tell the two apart; at
-;; positions 1 and 2 they agree.
+;; the walk parses it in order. Chez's map, measured, parses a list of three
+;; in the order 3, 1, 2, so a parse with map would name the last of these.
+;; Positions 1 and 3, both ways round, tell the two apart; at positions 1
+;; and 2 they agree.
 (test-equal "a list with two malformed segments is refused for the first of them"
   '(((uv-write*! segment-not-a-bytevector) (0 0) 0)
     ((uv-write*! segment-span-out-of-range) (0 0) 0))
@@ -2743,7 +2746,7 @@
 
 ;; Seeded by index, like every other payload in this suite: two runs compare
 ;; the same bytes. Only [100,600) of the middle segment is sent, so a span
-;; that shipped the whole bytevector would arrive 400 bytes too long here.
+;; that sent the whole bytevector would arrive 400 bytes too long here.
 (define rt-a (seeded-bytes 700 41))
 (define rt-b (seeded-bytes 900 42))
 (define rt-c (seeded-bytes 333 43))
@@ -2875,7 +2878,7 @@
 ;; SO_REUSEPORT load balancing exists on Linux 3.9+, the *BSDs, Solaris 11.4
 ;; and AIX 7.2.5+, but NOT macOS -- there libuv answers UV_ENOTSUP for the
 ;; same call (uv.h's uv_tcp_flags comment). So the outcome is BRANCH-PAIRED,
-;; the shape design spec v0.2 S9 prescribes (cf. the getnameinfo cancel row):
+;; like test-facade.sps's getnameinfo cancel row:
 ;;   supported => the flagged bind SUCCEEDS and a SECOND handle binds the SAME
 ;;                port, the thing only a real reuseport bind allows;
 ;;   unsupported => the flagged bind is refused with an errno, which is itself
@@ -2887,8 +2890,8 @@
 ;; floor's SYSTEM libuv, 1.48, the shim was compiled without the flag
 ;; (libuv-shim.c gates UV_TCP_REUSEPORT on UV_VERSION_HEX), and
 ;; uv-tcp-reuseport raises &uv-constant-unavailable naming it at the point of
-;; use (ADR-0005's lazy constant-ref path). CI's floor job runs exactly that,
-;; on Ubuntu 24.04 (#90). So the row asks the shim which libuv it was
+;; use (it is looked up lazily, through constant-ref). CI's floor job runs
+;; exactly that, on Ubuntu 24.04. So the row asks the shim which libuv it was
 ;; compiled against, and below 1.49 only the named refusal passes, never a
 ;; plain bind with the flag dropped. Flags resolve to a bitmask before any
 ;; allocation, so the two malformed-flags rows leave nothing behind.

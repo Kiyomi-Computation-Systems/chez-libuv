@@ -2,7 +2,7 @@
 ;;; SRFI-64 suite for the constructors split or dropped by an engine: the
 ;;; handle constructors (make-uv-timer, -tcp, -pipe, -signal, -async),
 ;;; uv-accept!, which makes the client it accepts into, make-uv-loop and
-;;; call-with-uv-loop (ADR-0019's decision 3 amendment of 2026-10-06).
+;;; call-with-uv-loop.
 ;;;
 ;;; NOT pure: it drives real loops. Never add this to the Makefile's
 ;;; PURE_TESTS.
@@ -53,21 +53,22 @@
 
 ;; --- what a run must leave as it found it ------------------------------------
 ;; A green-thread scheduler on the loop thread runs each task in an engine,
-;; and a task's fuel can run out anywhere inside a constructor. Two things
-;; can then go wrong, and both did in every constructor here before each
-;; became one interrupt-free step (try-construct-handle, try-construct-loop):
-;; - Split: another task tore the loop down, freeing the uv_loop_t, and the
-;;   constructor resumed past its open check and initialised its handle on
-;;   the freed loop. Or the teardown found the handle initialised but not
-;;   yet registered, could not close it, and failed with EBUSY for good.
+;; and a task's fuel can run out anywhere inside a constructor. Unless the
+;; constructor is one interrupt-free step (try-construct-handle,
+;; try-construct-loop), two things can then go wrong:
+;; - Split: another task tears the loop down, freeing the uv_loop_t, and the
+;;   constructor resumes past its open check and initialises its handle on
+;;   the freed loop. Or the teardown finds the handle initialised but not
+;;   yet registered, cannot close it, and fails with EBUSY for good.
 ;; - Dropped, as a timeout drops a task: whatever the constructor had made
-;;   and not yet registered was lost. A block, or a handle linked into the
-;;   loop that no teardown could close: uv_loop_close failed with EBUSY for
+;;   and not yet registered is lost. A block, or a handle linked into the
+;;   loop that no teardown can close: uv_loop_close fails with EBUSY for
 ;;   good, and for an async, which keeps the loop alive, the teardown's
-;;   drain would never have returned. A dropped make-uv-loop lost the loop
-;;   and its descriptors. And a drop in the init gate's with-mutex left its
-;;   lock held for good, so another thread's next constructor would have
-;;   waited on it forever.
+;;   drain never returns. A dropped make-uv-loop loses the loop and its
+;;   descriptors. And a drop in the exit of the init gate's with-mutex
+;;   leaves its lock held for good, so another thread's next constructor
+;;   waits on it forever, unless the lock is taken and released with
+;;   interrupts disabled.
 ;;
 ;; Each sweep runs a constructor in an engine at rising fuel. Fuel 1 expires
 ;; before the constructor's own checks, and the sweep stops at the first run
@@ -79,8 +80,8 @@
 (uv-loop-teardown! (make-uv-loop))
 
 ;; lock-free? : -> boolean
-;; Whether another thread can take the init gate's lock now. The lock is
-;; recursive, so the thread that holds it cannot see it held.
+;; Whether another thread can take the init gate's lock at the call. The
+;; lock is recursive, so the thread that holds it cannot see it held.
 (define (lock-free?)
   (let ((m (make-mutex)) (c (make-condition)) (answer 'pending))
     (fork-thread
@@ -268,9 +269,9 @@
 
 ;; --- a loop that changes hands -------------------------------------------------
 ;; Every constructor is loop-thread-only, and checks the owner on entry and
-;; again in its step (ADR-0019; #79). Here the scheduler hands the loop to
-;; another thread at the expiry, as uv-run on that thread would, and the
-;; constructor resumes on this one:
+;; again in its step. Here the scheduler hands the loop to another thread
+;; at the expiry, as uv-run on that thread would, and the constructor
+;; resumes on this one:
 ;;   'refused              not yet made: &uv-wrong-thread;
 ;;   'made-before-handoff  made and registered while this thread owned it;
 ;;   'untouched            no expiry.

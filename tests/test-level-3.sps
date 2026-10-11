@@ -1,8 +1,8 @@
 #!r6rs
 ;;; SRFI-64 suite for tests/uv-child.sls's runner, child-run, and
-;;; tests/uv-level-3.sls's level-3-run on it, which test-addrinfo and
-;;; test-process use to run their level-3 children (#88). test-loop runs its
-;;; stranded child through child-run (#117). It runs
+;;; tests/uv-level-3.sls's level-3-run on it, through which test-addrinfo
+;;; and test-process run their level-3 children. test-loop runs its
+;;; stranded child through child-run. It runs
 ;;; tests/level-3-stand-in-child.sps, which misbehaves on purpose, under
 ;;; deadlines short enough for a row.
 ;;;
@@ -18,8 +18,7 @@
               collect-maximum-generation collect-request-handler void
               foreign-ref with-interrupts-disabled fork-thread parameterize))
 
-;; SRFI-64 sets no exit status; the runner's fail count drives it
-;; (AGENTS.md).
+;; SRFI-64 sets no exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -158,7 +157,7 @@
 
 ;; No collection runs in this suite unless a row asks for one. Chez's
 ;; collector reaps the ended children of open-process-ports and keeps no
-;; status (#128), so a collection could reap the zombie probe's child
+;; status, so a collection could reap the zombie probe's child
 ;; before the probe does, and clear a zombie a broken runner left before
 ;; the last row looks. The rows that need collections make them through
 ;; collecting or collect, and run before every other run.
@@ -175,16 +174,17 @@
     (test-equal "level-3 runner rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
-      ;; #128: Chez records every child open-process-ports starts, and each
+      ;; Chez records every child open-process-ports starts, and each
       ;; collection reaps the ones that have ended and keeps no status
       ;; (c/gc.c, the child_process list). One between a child's end and
-      ;; the runner's wait took the status, and test-level-3's flood row
-      ;; failed once on CI with (wait-failed). The precondition shows the
-      ;; collector does it: the runner's own wait is not what it measures.
-      ;; It collects every generation: the list of children moves up the
-      ;; generations with them, and a collection while the child still ran
-      ;; left it where a bare (collect) did not look, 1 run in 3. The wait
-      ;; must refuse with ECHILD, the child gone, and not for any reason.
+      ;; the runner's wait would take the status, and the wait would answer
+      ;; (wait-failed ECHILD): that is why the runner defers collections.
+      ;; The precondition shows the collector does it: the runner's own
+      ;; wait is not what it measures. It collects every generation: the
+      ;; list of children moves up the generations with them, and a
+      ;; collection while the child still runs leaves it where a bare
+      ;; (collect) does not look, 1 run in 3. The wait must refuse with
+      ;; ECHILD, the child gone, and not for any reason.
       (test-equal "precondition: a collection reaps an ended child of open-process-ports itself"
         'reaped-by-the-collector
         (let ((pid (spawn-true)))
@@ -205,7 +205,7 @@
         '((outlived . #t))
         (collecting (lambda () (child-run chez '() stand-in '(outlived) 20))))
 
-            ;; The deferral is the runner's alone: the suite's own handler, a
+      ;; The deferral is the runner's alone: the suite's own handler, a
       ;; procedure no default could be eq? to, is back once it returns.
       (test-equal "child-run puts back the collect-request-handler it found"
         'put-back
@@ -243,7 +243,7 @@
                         'put-back
                         (list 'left (collect-request-handler))))))))
 
-      ;; child-run hands its options to Chez ahead of --program (#117). Two
+      ;; child-run hands its options to Chez ahead of --program. Two
       ;; levels other than 3, so a runner that drops its options and one
       ;; that runs level 3 whatever it is given each fail a row.
       (test-equal "child-run runs the child with the options it is given"
@@ -276,9 +276,9 @@
 
         ;; A runner that polls without sleeping spends the whole wait on the
         ;; CPU, 4,982 ms in a 5 s wait, and a minute for each hung child in
-        ;; a real suite. One that sleeps between polls spent 13-19 ms
-        ;; (2026-10-09). The wait must have lasted, or a runner that
-        ;; answered early would pass whatever it spent.
+        ;; a real suite. One that sleeps between polls spends 13-19 ms. The
+        ;; wait must have lasted, or a runner that answered early would
+        ;; pass whatever it spent.
         (test-equal "the runner sleeps between polls: under 1,000 ms of CPU in a 10 s wait"
           'slept
           (let ((seconds (cadr stalled)) (ms (caddr stalled)))
@@ -301,17 +301,17 @@
         '(unreadable "garbage\n" "garbage child: no datum\n" (exit 0))
         (level-3-run chez stand-in '(garbage) 20))
 
-      ;; Both pipes' end is not the child's: one that closed them and kept
-      ;; running was answered unreadable at once, and left running. The
-      ;; stand-in's line is the precondition: a child killed before it
-      ;; closed its pipes would pass a runner that stops at their end. 10 s,
-      ;; as for stall.
+      ;; Both pipes' end is not the child's: a runner that took it for one
+      ;; would answer a child that closed them and kept running unreadable
+      ;; at once, and leave it running. The stand-in's line is the
+      ;; precondition: a child killed before it closed its pipes would pass
+      ;; a runner that stops at their end. 10 s, as for stall.
       (test-equal "a child that closes both pipes and keeps running is killed at the deadline"
         '((killed-at-cap "" "hush child: closing\n" (signal 9)) at-the-deadline)
         (in-time (timed-run 'hush 10) 10))
 
-      ;; #110: a child that dies before printing anything said nothing
-      ;; about why. Its status is the one datum that does.
+      ;; A child that dies before printing anything says nothing about
+      ;; why. Its status is the one datum that does.
       (test-equal "a child that exits 3 with no output answers its exit status"
         '(unreadable "" "" (exit 3))
         (level-3-run chez stand-in '(quiet-exit) 20))
@@ -327,8 +327,8 @@
 
       ;; With SIGCHLD ignored, the system reaps each child itself, and
       ;; waitpid refuses it. A runner that took the refusal for a child
-      ;; still running would wait out the deadline and kill a pid that was
-      ;; no longer its child.
+      ;; still running would wait out the deadline and kill a pid that had
+      ;; already stopped being its child.
       (test-equal "precondition: with SIGCHLD ignored, the system reaps a finished child itself"
         'reaped-by-the-system
         (with-sigchld-ignored
@@ -342,9 +342,9 @@
          (lambda () (level-3-run chez stand-in '(quiet-exit) 20))))))
 
 ;; Last, after every run: a child the runner never waited on stays a zombie
-;; until this process exits (#110). Collections are off from the
-;; collecting rows on, so no collection reaps one first: the row holds
-;; every run after them.
+;; until this process exits. Collections are off from the collecting rows
+;; on, so no collection reaps one first: the row holds every run after
+;; them.
 (test-equal "no child is left unreaped: every run's child was waited on"
   'none-left
   (let collect ((zombies '()))

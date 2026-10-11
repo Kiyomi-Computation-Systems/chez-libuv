@@ -1,7 +1,6 @@
 #!r6rs
 ;;; SRFI-64 suite for the real CHEZ_LIBUV_SHIM wiring in
-;;; (libuv private native) -- design spec S4 rule 1 ("path resolution is
-;;; validated, never searched").
+;;; (libuv private native): path resolution is validated, never searched.
 ;;;
 ;;; Why subprocesses. native.sls's shim-file / uv-loaded / shim-loaded
 ;;; top-level definitions run exactly once per process, while the library
@@ -13,7 +12,7 @@
 ;;; gets a fresh `chez --program` child.
 ;;;
 ;;; What an exit code alone CANNOT show: whether a failure was the structured
-;;; &uv-shim-unavailable condition design spec S4 requires, or a raw dlopen
+;;; &uv-shim-unavailable condition the loader must raise, or a raw dlopen
 ;;; error escaping uncaught -- both exit non-zero through Chez's default
 ;;; handler. So every failing case also greps the child's captured stderr for
 ;;; the condition type's own name, which Chez's default condition report
@@ -25,8 +24,8 @@
 ;;;
 ;;; Deliberately POSIX-shell-dependent (uses /bin/sh via `system`, env-var
 ;;; prefixes, and redirection), on the same footing as `make test-memory`'s
-;;; Valgrind/DYLD_INSERT_LIBRARIES machinery. Windows is already deferred
-;;; beyond v0.1 (ADR-0004); revisit if that changes.
+;;; Valgrind/DYLD_INSERT_LIBRARIES machinery. The binding does not support
+;;; Windows; revisit this if it does.
 (import (rnrs)
         (srfi :64)
         (libuv private config)   ; shim-path: a known-good absolute path
@@ -35,7 +34,7 @@
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
-;; runner so its fail count can drive the exit status (AGENTS.md).
+;; runner so its fail count can drive the exit status.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -102,7 +101,7 @@
   (test-equal "no override: the generated config.sls path loads and initialises (exit 0)"
     0 code)
   ;; The marker proves the probe ran to completion, not merely that something
-  ;; exited 0. A sentinel no failure path produces (AGENTS.md).
+  ;; exited 0. A sentinel no failure path produces.
   (test-equal "no override: the probe reached the end of its body"
     #t (contains? out "PROBE-OK: native loaded and initialised")))
 
@@ -115,9 +114,10 @@
 ;; --- the failure matrix --------------------------------------------------
 ;; Each case asserts BOTH that the child failed and that it failed with the
 ;; structured condition. Checking only the exit code would pass against a
-;; raw dlopen error escaping uncaught, which is precisely the regression
-;; design spec S4 rule 1 forbids. Answers the child's stderr, for a row that
-;; asks more of the same refusal.
+;; raw dlopen error escaping uncaught, which is precisely what the loader
+;; must never let out: it refuses every unusable path as
+;; &uv-shim-unavailable. Answers the child's stderr, for a row that asks
+;; more of the same refusal.
 (define (check-rejected label override)
   (let-values (((code out err) (run-probe override)))
     (test-equal (string-append label ": fails closed (non-zero exit)")
@@ -136,16 +136,17 @@
 (check-rejected "an empty override" "")
 
 ;; A real shared library that loads cleanly but lacks the shim's exports --
-;; libuv's own, here -- stands in for a shim built from older sources. Such a
-;; shim used to fail the whole import with a bare "no entry for ..."
-;; assertion (review of #36); every shim binding now checks its entry first.
+;; libuv's own, here -- stands in for a shim built from older sources. Every
+;; shim binding checks its entry first (shim-entry in native.sls), so such a
+;; shim is refused as &uv-shim-unavailable rather than failing the whole
+;; import with a bare "no entry for ..." assertion.
 (check-rejected "a loadable library without the shim's exports"
                 (car uv-library-paths))
 
 ;; --- a shim built from older sources ---------------------------------------
 ;; The library above lacks every export, so it is refused at the first. A
 ;; consumer who upgrades without rebuilding has a shim that lacks only the
-;; newest, libuv's alloc callback (#45). The Makefile's STALE_SHIM is that
+;; newest, libuv's alloc callback. The Makefile's STALE_SHIM is that
 ;; shim: this one's source with chez_uv_alloc_cb renamed away.
 (define stale-shim
   (string-append (path-parent (path-parent shim-path))

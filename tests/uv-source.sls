@@ -15,7 +15,8 @@
   ;; sls-file? : string -> boolean
   ;; A library source: named *.sls, and not a dotfile. Editors leave dotfiles
   ;; with the same suffix beside the sources (an Emacs lock file is a dangling
-  ;; symlink named .#native.sls), and reading one crashed a whole suite.
+  ;; symlink named .#native.sls), and reading one raises and aborts a whole
+  ;; suite.
   (define (sls-file? name)
     (let ((n (string-length name)))
       (and (> n 4)

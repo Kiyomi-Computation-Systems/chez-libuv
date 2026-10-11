@@ -5,9 +5,8 @@
 ;;;
 ;;; A loopback section starts its peer as a placeholder, which the server's
 ;;; accept callback replaces with the accepted handle. A handshake that misses
-;;; its cap leaves the placeholder in place (test-tcp.sps, 2026-10-06, under
-;;; load), and two shapes then cost a suite its summary and every row after
-;;; the failure:
+;;; its cap, as one can under load, leaves the placeholder in place, and two
+;;; shapes then cost a suite its summary and every row after the failure:
 ;;;
 ;;; 1. A form that hands the placeholder to a verb outside every row raises,
 ;;;    and the suite dies with exit 255. Such a form may name a placeholder
@@ -34,24 +33,24 @@
 ;;; 3. A ticking wait should not give up early in the first place.
 ;;;    run-until/ticking spends an iteration on every 1 ms tick, so its cap is
 ;;;    a time budget, and `cap` (64) makes it one of about 64 ms. During an
-;;;    8-pair loopback flood, deliveries to a connected peer outlasted that,
-;;;    and the waits capped at 64 failed by name
-;;;    (.plans/tcp-delivery-cap-mutation-log.md). So no ticking wait may give
-;;;    up sooner than the longest delivery measured there,
+;;;    8-pair loopback flood, deliveries to a connected peer outlast that,
+;;;    and waits capped at 64 fail by name. So no ticking wait may give up
+;;;    sooner than the longest delivery measured under that flood,
 ;;;    flooded-delivery-ticks: its cap, a literal or a name test-tcp.sps
 ;;;    defines as one, must allow at least that many ticks. `cap` stays the
 ;;;    budget of a plain run-until, whose iterations count events.
-;;;    Rule 3 holds test-tcp.sps alone: only its ticking waits were measured
-;;;    under a flood.
+;;;    Rule 3 holds test-tcp.sps alone: only its ticking waits have been
+;;;    measured under a flood.
 ;;;
 ;;; 4. A suite that calls an address or DNS verb calls it only where a raise
 ;;;    from it fails a row: in a row's tested expression, in a procedure the
 ;;;    suite defines (whose calls are then held to this rule), or in the body
 ;;;    of a guard with an else or #t clause that raises nothing again. A
 ;;;    verb that raises anywhere else ends the suite at that form, with no
-;;;    summary and none of the evidence after it. Under #61's mutation MA8,
-;;;    test-dns.sps died at its first lookup and test-tcp.sps at its first
-;;;    bind; under MV1, test-dns.sps died at its synthetic sockaddr (#64).
+;;;    summary and none of the evidence after it. A mutation under which the
+;;;    address verbs raise, such as c-string-bytes dropping its terminator,
+;;;    ends a suite that breaks this rule at its first such call: a lookup,
+;;;    a bind, or a synthetic sockaddr built outside a row.
 ;;;    The rule reads what runs at once: the top-level forms, the body of
 ;;;    every lambda that is not a callback, a quasiquote's unquoted parts,
 ;;;    and a verb passed as a value. It reads each callback's body too,
@@ -59,13 +58,13 @@
 ;;;    from the wait that runs it. It does not follow procedures a suite
 ;;;    imports: tests/uv-testing.sls's bind-loopback! and connect-loopback!
 ;;;    call uv-tcp-bind! and uv-tcp-connect!, and test-tcp.sps still dies at
-;;;    its first loopback fixture when every address is refused
-;;;    (.plans/ffi-and-plumbing-rules-mutation-log.md).
+;;;    its first loopback fixture when every address is refused.
 ;;;
 ;;; Neither of the first two rules sees a callback that raises inside a later
-;;; wait, which a late handshake can cause. That was checked by forcing each seed to fail, in a
-;;; scratch clone (.plans/tcp-seed-gates-mutation-log.md and
-;;; .plans/sibling-seed-gates-mutation-log.md); make test does not repeat it.
+;;; wait, which a late handshake can cause. The gates against that depend on
+;;; the order of runtime events, which a reading of the source cannot show:
+;;; forcing each seed to fail, in a scratch copy, checks them, and make test
+;;; does not.
 ;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 (import (rnrs)
@@ -301,8 +300,7 @@
   (walk form))
 
 ;; The longest a delivery took during an 8-pair loopback flood, in ticks: the
-;; 1 MiB transfer's drain (.plans/tcp-delivery-cap-mutation-log.md). Rule 3's
-;; floor.
+;; 1 MiB transfer's drain, measured. Rule 3's floor.
 (define flooded-delivery-ticks 1529)
 
 ;; integer-definitions : (list-of datum) -> (list-of (symbol . integer))

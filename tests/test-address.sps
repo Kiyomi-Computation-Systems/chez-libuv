@@ -1,7 +1,7 @@
 #!r6rs
 ;;; SRFI-64 suite for the address string that uv-tcp-bind!, uv-tcp-connect!
-;;; and uv-getnameinfo! hand libuv (ADR-0012's vocabulary, ADR-0009's
-;;; "what a call checks, it copies").
+;;; and uv-getnameinfo! hand libuv: a presentation-form string such as "::1",
+;;; with the port passed separately. What a call checks is what it copies.
 ;;;
 ;;; Each call reads the caller's string once, into a private copy, and hands
 ;;; libuv only that copy's bytes: its UTF-8 and one terminating NUL. A string
@@ -46,7 +46,8 @@
         ;; for references made without the binding.
         (only (chezscheme) collect foreign-procedure))
 
-;; SRFI-64's default runner sets no process exit status (AGENTS.md).
+;; SRFI-64 sets no process exit status, so the suite's last line exits by
+;; this runner's fail count.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -66,8 +67,8 @@
 (define registry-count-at-start (registry-count))
 (define counts-at-start (live-counts))
 
-;; #f is the worst possible expected value (AGENTS.md), so every err maps to
-;; a symbol.
+;; #f is the worst possible expected value: SRFI-64 turns a raise in a
+;; row's tested expression into #f. So every err maps to a symbol.
 (define (err->symbol err)
   (cond ((not err) 'no-error)
         ((uv-errno-error? err) (uv-errno-error-errno err))
@@ -130,7 +131,7 @@
 
 ;; libuv's own parse of an IPv6 address, called directly rather than through
 ;; the binding: what a connect's in-flight sockaddr is compared with, byte
-;; for byte, so no field offset is transcribed here (ADR-0005).
+;; for byte, so no field offset is transcribed here.
 (define raw-ip6-addr (foreign-procedure "uv_ip6_addr" (u8* int u8*) int))
 
 (define (libuv-ip6-parse s port)
@@ -270,12 +271,11 @@
                  (call argument)))))))
 
 ;; --- an address holding a NUL --------------------------------------------
-;; Before this was refused, each verb handed the caller's string to libuv
-;; through Chez's `string` argument, and C read it only up to the NUL:
-;; "127.0.0.1\x0;anything" was bound, connected to and reverse-resolved as
-;; 127.0.0.1. The DNS design refused exactly this prefix resolution for node
-;; names (v0.2 design §4.1); an address is refused the same way, wherever
-;; the NUL sits.
+;; C reads a string only up to its first NUL. Were such an address handed
+;; to libuv, "127.0.0.1\x0;anything" would be bound, connected to and
+;; reverse-resolved as 127.0.0.1. uv-getaddrinfo! refuses a node name holding
+;; a NUL for the same reason (node-contains-nul); an address is refused the
+;; same way, wherever the NUL sits.
 (define nul-addresses '("127.0.0.1\x0;anything" "::1\x0;" "\x0;"))
 
 (test-equal "uv-tcp-bind! refuses an address holding a NUL, which C would read as its end"
@@ -315,16 +315,16 @@
 ;; Two changes:
 ;;
 ;; - A NUL written at index 2 of "::1". The reading it makes is refused, so
-;;   a run that saw it must be refused for it. Before the fix the NUL reached
-;;   libuv, which read "::": uv-tcp-bind! bound every interface,
-;;   uv-tcp-connect! was handed the unspecified address, and uv-getnameinfo!
-;;   resolved "::".
+;;   a run that saw it must be refused for it. A NUL that reached libuv
+;;   would read as "::": uv-tcp-bind! would bind every interface,
+;;   uv-tcp-connect! would be handed the unspecified address, and
+;;   uv-getnameinfo! would resolve "::".
 ;;
 ;; - A long address, with one character widened. Chez's string->utf8, which
-;;   the old `string` argument also used, counts a string's bytes, allocates,
-;;   then encodes, and a character widened in between is encoded past what
-;;   was allocated: the last byte lands on the terminator or past the
-;;   allocation. To show that in what libuv parsed, the address is a
+;;   a foreign `string` argument also uses, counts a string's bytes,
+;;   allocates, then encodes, and a character widened in between is encoded
+;;   past what was allocated: the last byte lands on the terminator or past
+;;   the allocation. To show that in what libuv parsed, the address is a
 ;;   full-form IPv6 address, 200 characters of filler and a zone naming the
 ;;   loopback interface. With a zone, libuv parses only the first 39
 ;;   characters as the address (uv-common.c's uv_ip6_addr), so the filler is
@@ -426,12 +426,12 @@
    (list 'host (string-append "fe80::1%" zone))
    (list 'host (string-append "fe80::%" zone))))
 
-;; The flags sweeps. Before the fix each verb asked list? and then folded
-;; the list with fold-left, which walks a list made circular in between
-;; forever, or raises its own condition for one made improper. bind's only
-;; flag is reuseport, whose answer differs by platform and libuv, so its
-;; sweep starts from a flag it refuses everywhere: either refusal is right,
-;; for the reading the call made.
+;; The flags sweeps. A verb that asked list? and then folded the list with
+;; fold-left would walk a list made circular in between forever, or raise
+;; fold-left's own condition for one made improper. bind's only flag is
+;; reuseport, whose answer differs by platform and libuv, so its sweep
+;; starts from a flag it refuses everywhere: either refusal is right, for
+;; the reading the call made.
 (define (make-circular! flags)
   (let last ((p flags))
     (if (pair? (cdr p)) (last (cdr p)) (set-cdr! p flags))))

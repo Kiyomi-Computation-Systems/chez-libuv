@@ -1,6 +1,5 @@
 #!r6rs
-;;; SRFI-64 suite for the handle verbs an engine splits or drops (#86;
-;;; ADR-0019's decision 3 amendments):
+;;; SRFI-64 suite for the handle verbs an engine splits or drops:
 ;;; - the scratch verbs, which borrow a block for the call: uv-tcp-bind!,
 ;;;   uv-tcp-getsockname-port, uv-tcp-sockname-address, uv-tcp-peer-address,
 ;;;   and the four buffer-size verbs (uv-send-buffer-size,
@@ -15,21 +14,25 @@
 ;;;
 ;;; A green-thread scheduler on the loop thread runs each task in an engine,
 ;;; and a task's fuel can run out anywhere inside one of these verbs. Each
-;;; checked its handle or loop, then read its pointer and called libuv,
-;;; with interrupts enabled between. A scratch verb allocated its scratch in
-;;; between and freed it in a guard; a start stored its callback before its
-;;; call, and a signal start checked its mode before and fixed it after. So:
-;;; - Split: another task closed the handle, or handed its loop to another
-;;;   thread, or started the signal in the other mode, and the verb resumed
-;;;   past its checks. It called libuv with the freed handle, or with
-;;;   whatever handle took its address, or raced the new owner's thread on
-;;;   the handle; a signal start returned normally where it owed
-;;;   'signal-mode-fixed. A loop query split by its loop's teardown called
+;;; checks its handle or loop, reads its pointer and calls libuv in one
+;;; interrupt-free step (one-step): a scratch verb allocates and frees its
+;;; scratch inside that step, a start stores its callback there once libuv
+;;; has started it, and a signal start checks and fixes its mode there.
+;;; Spread across interrupt-enabled code instead -- a scratch verb
+;;; allocating its scratch before the call and freeing it in a guard, a
+;;; start storing its callback before its call, a signal start checking its
+;;; mode before and fixing it after -- a verb fails two ways:
+;;; - Split: another task closes the handle, or hands its loop to another
+;;;   thread, or starts the signal in the other mode, and the verb resumes
+;;;   past its checks. It calls libuv with the freed handle, or with
+;;;   whatever handle took its address, or races the new owner's thread on
+;;;   the handle; a signal start returns normally where it owes
+;;;   'signal-mode-fixed. A loop query split by its loop's teardown calls
 ;;;   libuv on the freed loop, or on a new loop given its address, and
-;;;   uv-update-time! split by a handoff wrote the clock of a loop another
-;;;   thread owned.
+;;;   uv-update-time! split by a handoff writes the clock of a loop another
+;;;   thread owns.
 ;;; - Dropped, as a timeout drops a task: no guard runs after the
-;;;   suspension, so the scratch was lost, or a start was left half made,
+;;;   suspension, so the scratch is lost, or a start is left half made,
 ;;;   its callback stored and nothing started. A loop query holds nothing
 ;;;   and makes one native call, so it has no drop sweep.
 ;;;
@@ -339,14 +342,13 @@
 ;; reach it. glibc's calloc takes no block from the thread's cache, where a
 ;; free of a small block goes first, so seven blocks of the handle's size
 ;; freed before the close fill that cache, and the handle's block goes
-;; where calloc looks (tests/test-request-steps.sps's cancel sweep, #75).
+;; where calloc looks (tests/test-request-steps.sps's cancel sweep).
 ;; macOS's malloc sometimes hands out other blocks first, so the run takes
 ;; blocks of that size until one lands at the freed address, frees just
-;; that one, and makes the handle, which takes it back. And now and then
-;; macOS keeps the freed block where no allocation on this thread finds it
-;; (one run against main's verbs, the same one in every suite run, the
-;; block free all along), so split-run starts a run whose handle missed
-;; again.
+;; that one, and makes the handle, which takes it back. And at times macOS
+;; keeps the freed block where no allocation on this thread finds it
+;; (measured: one run, the same one in every suite run, the block free all
+;; along), so split-run starts a run whose handle missed again.
 (define (block-size kind)
   (case kind
     ((timer) (uv-handle-size (uv-timer-type)))
@@ -419,7 +421,7 @@
 ;;   'untouched   no expiry: it ran whole and returned.
 ;; The premise: no expiry lands after a verb's step, whose native call is
 ;; its last act but for answering. A collection that came due inside the
-;; step would be taken where the step ends and spend fuel there (#68), so
+;; step would be taken where the step ends and spend fuel there, so
 ;; each attempt starts with a (collect). So a verb that returns, or raises
 ;; anything else, once resumed made its call after the change.
 ;;
@@ -585,7 +587,8 @@
   (if (integer? sv-port) sv-listening (list 'no-port sv-port)))
 
 ;; The sweeps that can only fail by name run first, the one a wrong run
-;; could fault in last (AGENTS.md: emit a sweep's row as soon as it ends).
+;; could fault in last, after the others' rows are out: a fault ends the
+;; process and takes every row not yet emitted with it.
 (define reuse-sweeps
   (map (lambda (verb) (cons verb (split-sweep verb 'reuse))) swept-verbs))
 (report! 'reuse reuse-sweeps)

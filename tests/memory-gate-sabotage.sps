@@ -4,9 +4,9 @@
 ;;; `make check-memory-gate` runs this program through `make test-memory` and
 ;;; requires the memory gate to FAIL on it, with the memory tool's own report
 ;;; of the planted defect in the output. A gate nobody has watched fail is a
-;;; comment: from #14 (2026-08-30) the Linux gate handed Valgrind timeout(1)
-;;; instead of Chez, and the macOS ASan preload had never reached Chez at all,
-;;; and every run stayed green (ADR-0003's 2026-09-27 amendment).
+;;; comment: a Linux gate that hands Valgrind timeout(1) instead of Chez, or
+;;; a macOS ASan preload that never reaches Chez, stays green on every run
+;;; while checking nothing.
 ;;;
 ;;; Deliberately NOT named tests/test-*.sps: that wildcard feeds TESTS and
 ;;; MEMORY_TESTS, and this program must never run as part of either gate.
@@ -42,12 +42,12 @@
 ;;;   escape         three call-with-uv-loop bodies, each left from a timer
 ;;;                  callback by a continuation captured outside it. Each
 ;;;                  escape strands the jmp_buf Chez's S_call_help mallocs
-;;;                  for the call from libuv into Scheme (#94), which the
+;;;                  for the call from libuv into Scheme, which the
 ;;;                  gate suppresses (tests/valgrind-chez.supp). Not a
 ;;;                  defect the gate must catch: check-memory-gate requires
 ;;;                  the gate to pass on it, with Valgrind counting three
-;;;                  blocks suppressed, so a suppression that no longer
-;;;                  matches fails by name. Loads the binding. Linux only.
+;;;                  blocks suppressed, so a suppression that stops
+;;;                  matching fails by name. Loads the binding. Linux only.
 ;;;   stray-escape   the same three escapes, from a program the gate does not
 ;;;                  list as one that escapes (MEMORY_ESCAPE_SUITES). Every
 ;;;                  other suite must end with nothing suppressed, so the

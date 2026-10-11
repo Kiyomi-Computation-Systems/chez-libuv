@@ -1,5 +1,5 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv private addrinfo) -- design spec v0.2 S4.2/S4.3.
+;;; SRFI-64 suite for (libuv private addrinfo).
 ;;;
 ;;; This is a PURE suite, the tests/test-conditions.sps pattern: it imports
 ;;; no native code, so `make check-purity` runs it with CHEZ_LIBUV_SHIM
@@ -12,8 +12,7 @@
 ;;; the copies both validators answer, which are what (libuv dns) allocates
 ;;; and writes from. The symbol->int mapping (AF_INET and friends) is
 ;;; deliberately NOT here -- it is boundary work in (libuv dns), tested by
-;;; tests/test-dns.sps, which is what keeps this module shim-free (design
-;;; spec v0.2 S3).
+;;; tests/test-dns.sps, which is what keeps this module shim-free.
 (import (rnrs)
         (rnrs mutable-pairs)
         (rnrs mutable-strings)
@@ -35,7 +34,7 @@
 
 ;; SRFI-64's default runner does not set a process exit code, so a failing
 ;; suite would still exit 0 and `make test` would report success. Hold the
-;; runner so its fail count can drive the exit status (AGENTS.md).
+;; runner so its fail count can drive the exit status.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -53,8 +52,9 @@
 ;; describe : object -> string
 ;; Every rejection row asserts (who reason) out of the raised
 ;; &uv-invalid-argument, with a distinct sentinel for "raised something
-;; else" and 'no-raise for "did not raise" -- never a bare #t/#f
-;; (AGENTS.md's truthiness and SRFI-64-swallows-raises traps).
+;; else" and 'no-raise for "did not raise" -- never a bare #t/#f: almost
+;; every value is true in Scheme, and SRFI-64 turns a raise in the tested
+;; expression into #f.
 (define (rejection thunk)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e)
@@ -76,7 +76,7 @@
 
 (test-begin "addrinfo")
 
-;; --- the uv-addrinfo record (design spec v0.2 S4.3) ----------------------
+;; --- the uv-addrinfo record ---------------------------------------------
 ;; make-uv-addrinfo is PUBLIC: the record holds no pointer, so a caller's
 ;; test double is legitimate -- the same reasoning under which the facade
 ;; exports the condition constructors. Six distinct-typed/valued sentinels,
@@ -112,8 +112,8 @@
 (test-equal "canonname accessor answers the canonname field"
   "sentinel-canonname" (uv-addrinfo-canonname rec))
 
-;; ALL fields immutable (design spec v0.2 S4.3) -- asserted through R6RS
-;; record inspection rather than stated in a comment (AGENTS.md). The
+;; ALL fields immutable -- asserted through R6RS record inspection rather
+;; than stated in a comment. The
 ;; expected value is a list, so a raise (SRFI-64's swallowed #f) cannot
 ;; satisfy it.
 (test-equal "every uv-addrinfo field is declared immutable"
@@ -121,7 +121,7 @@
   (let ((rtd (record-type-descriptor uv-addrinfo)))
     (map (lambda (k) (record-field-mutable? rtd k)) '(0 1 2 3 4 5))))
 
-;; --- validate-hints: the absent spellings (design spec v0.2 S4.2) --------
+;; --- validate-hints: the absent spellings -------------------------------
 ;; Omitted, #f, and '() all canonicalize to "no hints" -- the NULL-pointer
 ;; decision itself is dns.sls's, but the classification is symbolic and
 ;; lives here. 'absent and 'present are values only success produces.
@@ -193,11 +193,11 @@
               'shared
               'unshared))))
 
-;; What the copy costs. checked-flags measured the flag list with a guarded
-;; length, and a guard allocates a few hundred bytes a call even when
-;; nothing raises (#64 item 3): a flags entry cost 272 B more than a family
-;; entry. Read with read-proper-list, it costs what a family entry does,
-;; plus one pair a flag. tests/uv-meter.sls has the meter.
+;; What the copy costs. A guard allocates a few hundred bytes a call even
+;; when nothing raises: with the flag list measured by a guarded length, a
+;; flags entry costs 272 B more than a family entry. Read with
+;; read-proper-list, as checked-flags reads it, it costs what a family
+;; entry does, plus one pair a flag. tests/uv-meter.sls has the meter.
 
 (define (hints-bytes hints)
   (fewest-bytes (lambda () (validate-hints hints 'test-who))))
@@ -224,12 +224,12 @@
   '(test-who hints-not-an-alist)
   (rejection (lambda () (validate-hints '((family . inet) . tail) 'test-who))))
 
-(test-equal "an unknown key is refused (design spec S4.2's reason symbol)"
+(test-equal "an unknown key is refused, by its reason symbol"
   '(test-who unknown-hint-key)
   (rejection (lambda () (validate-hints '((family . inet) (color . blue))
                                         'test-who))))
 
-(test-equal "a duplicate key is refused (design spec S4.2's reason symbol)"
+(test-equal "a duplicate key is refused, by its reason symbol"
   '(test-who duplicate-hint-key)
   (rejection (lambda () (validate-hints '((family . inet) (family . inet6))
                                         'test-who))))
@@ -238,8 +238,8 @@
   '(test-who unknown-hint-family)
   (rejection (lambda () (validate-hints '((family . ipx)) 'test-who))))
 
-;; Closed sets, NO raw ints accepted (design spec S4.2): even the right
-;; platform integer is refused, because v0.2 binds what it tests.
+;; Closed sets, NO raw ints accepted: even the right platform integer is
+;; refused, because the binding offers only what its suites can test.
 (test-equal "a raw integer family is refused even if it is a real AF_ value"
   '(test-who unknown-hint-family)
   (rejection (lambda () (validate-hints '((family . 2)) 'test-who))))
@@ -249,9 +249,9 @@
   (rejection (lambda () (validate-hints '((socktype . seqpacket)) 'test-who))))
 
 ;; 'raw is in the DECODE vocabulary (a chain may contain SOCK_RAW entries)
-;; but deliberately NOT in the input set -- no offline-deterministic test
-;; can assert a raw-socket request, so it cannot be shipped honestly
-;; (ADR-0013, design spec S4.2 vs S4.3).
+;; but deliberately NOT in the input set -- the DNS suites never consult a
+;; resolver, and no offline-deterministic test can assert a raw-socket
+;; request, so the binding does not offer one.
 (test-equal "socktype raw is decode vocabulary, not input vocabulary"
   '(test-who unknown-hint-socktype)
   (rejection (lambda () (validate-hints '((socktype . raw)) 'test-who))))
@@ -275,8 +275,9 @@
                                         'test-who))))
 
 ;; AI_ADDRCONFIG is a real getaddrinfo flag that this binding deliberately
-;; does not carry (S1 non-goal; ADR-0013 rule 5): its semantics vary by
-;; libc and no offline-deterministic test can assert them. The refusal is
+;; does not carry: its semantics vary by libc (on an interface-less
+;; container glibc filters ::1 results under it), and no
+;; offline-deterministic test can assert them. The refusal is
 ;; what makes "never set in any suite" unbypassable through the public API.
 (test-equal "addrconfig is refused: deliberately unbound, not merely unknown"
   '(test-who unknown-hint-flag)
@@ -316,8 +317,8 @@
   (rejection (lambda () (validate-node-and-service 42 "80" 'test-who))))
 
 ;; service accepts strings or #f ONLY, never exact integers: the parameter
-;; is genuinely a name domain, and auto-number->string is a convenience the
-;; mirror rule does not owe (design spec v0.2 S4.2).
+;; is genuinely a name domain, and auto-number->string is a convenience a
+;; binding that mirrors uv_getaddrinfo's parameters does not owe.
 (test-equal "an integer service is refused: resolver text, not a port"
   '(test-who service-not-a-string-or-false)
   (rejection (lambda () (validate-node-and-service "127.0.0.1" 80 'test-who))))
@@ -327,10 +328,10 @@
   (rejection (lambda () (validate-node-and-service #f #f 'test-who))))
 
 ;; The NUL refusals guard a MEASURED behavior, not a hypothesis: Chez's
-;; `string` marshalling NUL-terminates, and the spike observed
+;; `string` marshalling NUL-terminates, and a probe observed
 ;; uv_getaddrinfo("127.0.0.1\x0;.evil", "80") resolve successfully to
 ;; 127.0.0.1 -- a hostile string resolving as its prefix, plausibly and
-;; wrongly (spike/dns/FINDINGS.md Q1 observation (b); design spec v0.2 S4.1).
+;; wrongly.
 (test-equal "an embedded NUL in node is refused"
   '(test-who node-contains-nul)
   (rejection (lambda ()
@@ -404,17 +405,18 @@
    (list 'spine-made-improper 'hints-not-an-alist '(hints-not-an-alist)
          (lambda (hints) (set-cdr! (cdr hints) 'tail)))
    ;; The spine again: read by read-proper-list, whose one walk finds a
-   ;; cycle however the list is cut. Chez's list?, which the validator asked
-   ;; first until #66, walks two pointers, and a self-loop made at each of
-   ;; the first two pairs at one expiry could leave them on separate cycles,
-   ;; where the call never returned: the driver's give-up.
+   ;; cycle however the list is cut. A validator that asks Chez's list?
+   ;; first walks two pointers, and a self-loop made at each of the first
+   ;; two pairs at one expiry can leave them on separate cycles, where the
+   ;; call never returns: the driver's give-up.
    (list 'spine-split-in-two 'hints-not-an-alist '(hints-not-an-alist)
          (lambda (hints)
            (let ((first hints) (second (cdr hints)))
              (set-cdr! first first)
              (set-cdr! second second))))
-   ;; A spine made circular once list? had answered was walked to its first
-   ;; repeated key and refused as a duplicate, a reason no version earns.
+   ;; A spine made circular once a list? check has answered is walked to
+   ;; its first repeated key and refused as a duplicate, a reason neither
+   ;; the hints as given nor as changed earns.
    (list 'spine-made-circular 'hints-not-an-alist '(hints-not-an-alist)
          (lambda (hints) (set-cdr! (cddr hints) hints)))
    ;; The flags: walked no further than the list was long when found
@@ -525,7 +527,7 @@
 ;; next (measured). The validator copies with interrupts disabled, so no
 ;; handler runs inside the copy. What lies next needs no filling: without
 ;; the copy's fence the sweep fails with or without strings allocated after
-;; the collection (macOS and Linux arm64, #89).
+;; the collection (macOS and Linux arm64).
 (define trunc-length 512)
 
 (define truncation-sweep
@@ -553,8 +555,8 @@
 ;; It only ever narrows, because a race that narrows leaves the end of
 ;; string->utf8's answer unwritten, while one that widens writes past it, and
 ;; the evidence would go with the heap. Encoding the node as the caller holds
-;; it failed a quarter of this row's rounds, and 14-40% in the probe the row
-;; came from; the copy, none (macOS arm64). Each round must answer the bytes
+;; it fails about a quarter of this row's rounds, and 14-40% in a standalone
+;; probe; the copy fails none (macOS arm64). Each round must answer the bytes
 ;; of race-length characters, each an a or a λ.
 ;;
 ;; Each round starts its call once the narrower has turned the node's first
@@ -670,16 +672,17 @@
         (list race-rounds '())
         (list (car race-result) (cadr race-result)))))
 
-;; --- at --optimize-level 3 (#66) ----------------------------------------
+;; --- at --optimize-level 3 ---------------------------------------------
 ;; A program compiled at --optimize-level 3 compiles these libraries from
 ;; source at that level too, where Chez's length, car and cdr check nothing.
-;; checked-flags measured its list with a guarded length, which at level 3
-;; walked a circular flag list forever: no guard could catch that, and no
-;; engine could stop it. tests/flags-level-3-child.sps runs validate-hints
-;; at level 3 in a process of its own and prints what it answered, in two
-;; children so a hang takes only its own rows (tests/uv-level-3.sls runs
-;; each under a deadline; its rows then fail with killed-at-cap). Each runs
-;; in under a second.
+;; A flag list measured with a guarded length is walked forever at level 3
+;; when it is circular: no guard can catch that, and no engine can stop it.
+;; checked-flags reads it with read-proper-list instead.
+;; tests/flags-level-3-child.sps runs validate-hints at level 3 in a
+;; process of its own and prints what it answered, in two children so a
+;; hang takes only its own rows (tests/uv-level-3.sls runs each under a
+;; deadline; its rows then fail with killed-at-cap). Each runs in under a
+;; second.
 (define level-3-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
 (define level-3-program "tests/flags-level-3-child.sps")
 (define level-3-lists

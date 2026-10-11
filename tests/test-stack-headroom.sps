@@ -1,11 +1,10 @@
 #!r6rs
-;;; The C stack headroom check (#94;
-;;; .plans/2026-10-09-escape-headroom-check-design.md). A continuation that
-;;; escapes a callback leaves its uv_run's C frames on the thread's stack
-;;; for the thread's life, and enough of them overflow it: SIGSEGV, or on
-;;; macOS a hang (#95). So every uv_run the binding makes first measures the
-;;; thread's headroom: uv-run is refused under run-stack-floor, and a
-;;; teardown's drain under teardown-stack-floor, with &uv-stack-exhausted.
+;;; The C stack headroom check. A continuation that escapes a callback
+;;; leaves its uv_run's C frames on the thread's stack for the thread's
+;;; life, and enough of them overflow it: SIGSEGV, or on macOS a hang. So
+;;; every uv_run the binding makes first measures the thread's headroom:
+;;; uv-run is refused under run-stack-floor, and a teardown's drain under
+;;; teardown-stack-floor, with &uv-stack-exhausted.
 ;;;
 ;;; Every row that fills a stack does it in tests/stack-headroom-child.sps,
 ;;; a process of its own under tests/uv-level-3.sls's deadline, on a thread
@@ -19,7 +18,8 @@
         (only (libuv private handles) run-stack-floor teardown-stack-floor)
         (only (chezscheme) getenv))
 
-;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
+;; SRFI-64's default runner does not set a process exit code, so the suite
+;; ends with its own exit, below.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 

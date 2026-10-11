@@ -1,6 +1,6 @@
 #!r6rs
-;;; SRFI-64 suite for v0.5's flow-control surfaces. Task 1 writes the
-;;; cross-stream isolation section; Tasks 2 and 3 append.
+;;; SRFI-64 suite for the flow-control surfaces: cross-stream isolation,
+;;; OS socket buffer sizes, and the write-queue gauge.
 ;;;
 ;;; NOT pure: reaches (libuv private native). Never add to PURE_TESTS.
 (import (rnrs)
@@ -74,7 +74,9 @@
 (define cli   (list->vector (reverse clients)))
 
 ;; Distinct payloads per survivor. A SHARED sentinel is the trap
-;; test-echo.sps:163-172 names by title.
+;; test-echo.sps's row "seed: the eight client payloads are pairwise
+;; distinct" names: a server that crossed two streams would still hand each
+;; reader bytes that compare equal to what it expects.
 (define (payload-for i) (seeded-bytes 256 (+ 7000 (* i 131))))
 
 (test-equal "seed: the survivors' payloads are pairwise distinct"
@@ -83,11 +85,11 @@
         (if (equal? (payload-for 1) (payload-for 3)) 'same 'distinct)
         (if (equal? (payload-for 2) (payload-for 3)) 'same 'distinct)))
 
-;; Reader 0, the one that closes itself, and its collector. Until the seed
-;; above accepts it, the reader is a placeholder and its collector stays
-;; empty, and each use of the reader outside a row is gated on it: a failed
-;; seed then fails the rows below by name instead of aborting the suite
-;; between them (AGENTS.md).
+;; Reader 0, the one that closes itself, and its collector. If the seed
+;; above did not accept it, the reader is a placeholder and its collector
+;; stays empty, and each use of the reader outside a row is gated on it: a
+;; failed seed then fails the rows below by name instead of aborting the
+;; suite between them, where the rows' evidence would never print.
 (define closing-peer
   (if (positive? (vector-length peers)) (vector-ref peers 0) 'not-accepted))
 (define closing-col
@@ -109,9 +111,10 @@
                   (lambda (c) #f)))
 (uv-write! (vector-ref cli 0) (seeded-bytes 32 1) (lambda (err) #f))
 
-;; THE GATE. close-dispatch frees on a LATER loop iteration than the
-;; uv-close! call (handles.sls:984-996), so a post-close write issued at
-;; close-ISSUE time can complete before the window under test opens.
+;; THE GATE. close-dispatch (src/libuv/private/handles.sls) frees the
+;; handle from libuv's close callback, on a LATER loop iteration than the
+;; uv-close! call, so a post-close write issued at close-ISSUE time can
+;; complete before the window under test opens.
 (test-equal "gate: the closed reader reached 'closed before survivors are written to"
   '(satisfied fired closed)
   (let ((r (run-until/ticking loop
@@ -247,8 +250,8 @@
 ;; NATIVE FAILURE, one row per wrapper. An unconnected pipe passes the kind
 ;; allowlist but has no fd, so uv_send_buffer_size reaches getsockopt(-1) and
 ;; answers EBADF -- AFTER the int cell is allocated. These four rows are what
-;; give the Valgrind lane a failure path to walk; without them §8's
-;; free-on-every-path claim is untested.
+;; give the Valgrind lane a failure path to walk; without them nothing tests
+;; that the wrappers free the cell on every path, the failing one included.
 (define bpipe (make-uv-pipe bloop))
 
 (test-equal "the send getter surfaces the native failure on a pipe with no fd"
@@ -355,8 +358,9 @@
            (uv-write! cclient chunk (lambda (err) (set! completions (+ completions 1))))
            (set! submissions (+ submissions 1))
            ;; Sampled synchronously after uv-write! returns and BEFORE any
-           ;; uv-run: stream.sls:100-104 submits inline, so this is the
-           ;; moment the queue is deepest.
+           ;; uv-run: uv-write! hands the request to libuv inline
+           ;; (start-write! in src/libuv/stream.sls), so this is the moment
+           ;; the queue is deepest.
            (let ((q (uv-stream-write-queue-size cclient)))
              (if (positive? q) q (begin (uv-run cloop 'nowait) (push (+ i 1)))))))))
 

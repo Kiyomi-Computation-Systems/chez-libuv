@@ -3,8 +3,8 @@
 ;;; that level Chez compiles length, car and cdr with no checks, and the
 ;;; libraries this imports are compiled from source at the same level. A
 ;;; validator that leaves a malformed list to one of them reads through a
-;;; non-pair, or walks a circular list forever where no engine can stop it
-;;; (#66). So this runs in a process of its own, which the suite kills if it
+;;; non-pair, or walks a circular list forever where no engine can stop it.
+;;; So this runs in a process of its own, which the suite kills if it
 ;;; outlasts its deadline (tests/uv-level-3.sls). It runs the flag lists its
 ;;; arguments name, and prints what it saw as one datum, an alist, for the
 ;;; suite to check row by row: its optimize level, and the object file each

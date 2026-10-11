@@ -6,9 +6,9 @@
 ;;;
 ;;; (libuv private native) resolves and loads libuv plus the shim exactly
 ;;; once per process, while its library body is evaluated -- which is the
-;;; whole point of design spec S4 rule 3 (load-shared-object is a definition
-;;; placed ahead of every foreign-procedure binding, because Chez resolves an
-;;; entry point when the defining expression is EVALUATED). Chez defers that
+;;; whole point of placing load-shared-object as a definition ahead of every
+;;; foreign-procedure binding: Chez resolves an entry point when the defining
+;;; expression is EVALUATED. Chez defers that
 ;;; instantiation until the first use of one of the library's bindings, and a
 ;;; `guard` wrapped around that first use does not catch a resolution failure:
 ;;; the exception is raised before the guard's dynamic extent begins. So a

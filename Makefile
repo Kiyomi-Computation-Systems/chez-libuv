@@ -370,12 +370,12 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	echo "vendor read-path facts ok: ZERO_READ set=$$zr cleared=$$zc, read_buffer assigned=$$rb"; \
 	echo "vendor read-path facts ok: tcp WSARecv sites=$$wr, pipe CancelIoEx=$$pc GetOverlappedResult=$$pg"
 
-# The source, build files and user docs state facts, not where they came
-# from: no design or decision records, issue or PR numbers, probe
+# The source, tests, build files and user docs state facts, not where they
+# came from: no design or decision records, issue or PR numbers, probe
 # programs, dates or release numbers. CHANGELOG.md and git history keep
 # the provenance. The script tests its own pattern on planted references
 # before it scans, so a pattern edited into uselessness fails here first.
-check-history: ## Fail if source, build files or user docs cite plans, issues, dates or release numbers
+check-history: ## Fail if source, tests, build files or user docs cite plans, issues, dates or release numbers
 	@scripts/check-history-refs
 
 # Nothing outside private/ may see a raw uv_* symbol or pointer.
