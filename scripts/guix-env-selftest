@@ -2,7 +2,8 @@
 # Runs INSIDE the pinned container, as `make check-guix-inside`. Not a
 # launcher: `make check-guix` runs tests/guix-env-launcher.sh on the host,
 # then this through scripts/guix-env. Asserts what the environment exists
-# for (ADR-0020). Each failure names its assertion.
+# for: the pinned toolchain, an isolated HOME, no git credentials and a
+# loopback-only network. Each failure names its assertion.
 set -u
 
 if [ -z "${GUIX_ENVIRONMENT:-}" ]; then

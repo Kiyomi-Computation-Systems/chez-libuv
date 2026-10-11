@@ -1,4 +1,4 @@
-;;; Development toolchain for chez-libuv (ADR-0020).
+;;; Development toolchain for chez-libuv.
 ;;;
 ;;; Enter it with scripts/guix-env, which pins Guix to channels.scm and runs
 ;;; this manifest in a container with no network. Plain
@@ -15,7 +15,7 @@
 ;; Chez at this project's floor, 10.4.1 (README.org, ci.yml's
 ;; CHEZ_FLOOR_VERSION). The pin packages 10.4.0, so this is Guix's own
 ;; recipe at the v10.4.1 tag. The first `scripts/guix-env` builds it, in
-;; about two minutes; later ones reuse the store item (ADR-0020).
+;; about two minutes; later ones reuse the store item.
 ;;
 ;; - Its boot files are rebuilt from the same source: Chez refuses to build
 ;;   from boot files of another version. The input keeps
@@ -74,14 +74,13 @@
          libuv-for-node-lts))
   (specifications->manifest
    '(;; pkg-config finds the libuv above; gcc-toolchain links the shim
-     ;; against it (ADR-0001, ADR-0002). cmake builds the vendored libuv
-     ;; for the HAVE_PKG=no leg.
+     ;; against it. cmake builds the vendored libuv for the HAVE_PKG=no leg.
      "pkg-config" "gcc-toolchain" "cmake"
-     ;; The memory gate (ADR-0003).
+     ;; The memory gate (make test-memory).
      "valgrind"
      ;; `make deps`, `make vendor` and `make check-pins` read the
      ;; repository and its submodules. The container gives git no
-     ;; identity, credentials or network (ADR-0020).
+     ;; identity, credentials or network.
      "git"
      ;; What the Makefile, the scripts and the suites' children shell out
      ;; to. The container has nothing else.

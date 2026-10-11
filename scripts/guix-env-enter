@@ -1,7 +1,7 @@
 #!/bin/sh
-# Runs INSIDE the container, as the first command scripts/guix-env starts
-# (ADR-0020). Exports what the Makefile and the suites take from the
-# profile, then runs the command:
+# Runs INSIDE the container, as the first command scripts/guix-env starts.
+# Exports what the Makefile and the suites take from the profile, then
+# runs the command:
 #
 #   CHEZ  the profile's scheme, the real binary: the Makefile's default,
 #         `chez`, is not in the profile, a symlink named chez breaks Chez's

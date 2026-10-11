@@ -10,6 +10,13 @@
 * Project should be portable across amd64 and arm64
 * Plans live in `/.plans`, decision records in `/.plans/decisions`
 * `/docs` is only for user facing documentation, not project plans or specs.
+* Shipped files state facts, not their history. Comments in `src/`, the
+  docs, README.org, NOTICE, SECURITY.md and the build files never cite
+  issue or PR numbers, decision records, `.plans/` or `spike/` paths,
+  dates or release numbers: state the fact or the hazard itself, in the
+  present tense. Provenance belongs in commit messages, PR descriptions
+  and CHANGELOG.md. `make check-history` holds this, and `make test` runs
+  it; `tests/` is not covered yet.
 * Add entries to `CHANGELOG.md` for each release
 * Makefile should have a `help` command which lists all of the make commands.
 * Library should be distributable with Akku.

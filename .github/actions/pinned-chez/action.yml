@@ -12,23 +12,23 @@ inputs:
 runs:
   using: composite
   steps:
-    # apt's chezscheme on Ubuntu 26.04 is 10.0.0 (24.04's was 9.5.8) --
+    # apt's chezscheme on Ubuntu 26.04 is 10.0.0 (24.04's is 9.5.8) --
     # below this project's declared floor (README.org). Built from source
     # instead. The release tarball ships prebuilt "pb" (portable bytecode)
     # boot files, so `configure && make` self-hosts the native boot files
     # with no pre-existing Chez required -- and the result is cached on the
     # pinned version and the runner image, so only a version bump or a new
     # image ever pays the build cost again.
-    # -v2: the v1 key cached a build that never finished (see the disable
-    # flags below) -- bumping the suffix means the retry can't be served a
-    # poisoned cache entry from the failed run under the old key.
+    # -v2: the key's suffix, to bump when an entry is bad (a build that never
+    # finished, say) -- a new suffix means no run can be served the poisoned
+    # entry under the old key.
     #
     # restore/save rather than the combined actions/cache@v4: the combined
     # action writes the cache from an implicit post-job step, and GitHub
-    # skips that step when the job fails. Every red run -- a failing suite,
-    # a Valgrind report, a flake -- therefore threw away a ~10-minute Chez
-    # build and made the NEXT run pay for it again, which is the opposite
-    # of what a cache is for on a repository that is out of minutes. Saving
+    # skips that step when the job fails. With it, every red run -- a
+    # failing suite, a Valgrind report, a flake -- throws away a ~10-minute
+    # Chez build and makes the NEXT run pay for it again, which is the
+    # opposite of what a cache is for when CI minutes are limited. Saving
     # explicitly, immediately after the build succeeds, banks it no matter
     # what the suites do afterwards.
     #
@@ -68,7 +68,8 @@ runs:
         # --disable-x11 --disable-curses: the expeditor (Chez's REPL line
         # editor) otherwise #includes X11/Xlib.h and curses.h/term.h at
         # compile time -- headers this minimal runner's toolchain doesn't
-        # have (confirmed: v1 died at exactly that X11 include, error 2).
+        # have (confirmed: without these flags the build dies at exactly
+        # that X11 include, error 2).
         # Both flags turn into #define DISABLE_X11 / DISABLE_CURSES in the
         # generated config.h, which routes expeditor.c around those
         # #includes entirely (X11's is `#ifdef LIBX11`-gated, and version.h

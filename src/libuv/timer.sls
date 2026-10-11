@@ -39,12 +39,12 @@
 
   ;; uv-timer-start! : uv-timer procedure exact-nonnegative-integer
   ;;                   exact-nonnegative-integer -> unspecified
-  ;; libuv counts timeout-ms from the loop's CACHED now (uv-now), which a
+  ;; libuv counts timeout-ms from the loop's CACHED time (uv-now), which a
   ;; callback that held the loop has left behind; such a caller refreshes it
-  ;; with uv-update-time! before arming, or the timer comes due early (#28).
+  ;; with uv-update-time! before arming, or the timer comes due early.
   ;; One interrupt-free step checks again that this thread owns the loop and
   ;; that the timer is open, arms it, and stores the callback once libuv has
-  ;; armed it (#86). A timer fires only inside uv-run, so even a zero delay
+  ;; armed it. A timer fires only inside uv-run, so even a zero delay
   ;; cannot fire between the two, and no engine can split the start from
   ;; those checks or drop it half made (tests/test-handle-steps.sps).
   (define (uv-timer-start! timer on-timeout timeout-ms repeat-ms)
@@ -67,8 +67,8 @@
         (raise (step-refusal rc 'uv-timer-start! timer)))))
 
   ;; Each verb below is one interrupt-free step too, which checks again that
-  ;; this thread owns the loop and that the timer is open (#86): no engine
-  ;; can split the call from those checks (tests/test-handle-steps.sps).
+  ;; this thread owns the loop and that the timer is open: no engine can
+  ;; split the call from those checks (tests/test-handle-steps.sps).
 
   ;; uv-timer-stop! : uv-timer -> unspecified
   ;; Keep the callback so uv-timer-again! can re-arm a stopped timer.

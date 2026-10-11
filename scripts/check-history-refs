@@ -1,0 +1,128 @@
+#!/bin/sh
+# Fail when a shipped file cites the project's plans or timeline: its
+# design and decision records, issue and PR numbers, probe programs,
+# dates, or its own release numbers. Comments and docs state the fact
+# itself; CHANGELOG.md and git history keep where it came from.
+#
+# Usage: scripts/check-history-refs [file ...]
+# With no files it checks the source, build files and user docs.
+#
+# The pattern is tested before it is used: every planted reference below
+# must match and every lookalike must not, or the check fails first.
+set -eu
+cd "$(dirname "$0")/.."
+
+plans='[.]plans|spike/|ADR[- ]?[0-9]'
+issue='(^|[^[:alnum:]&$])#[0-9]+([^[:alnum:]]|$)|(^|[^[:alnum:]])([Ii]ssues?|PR)[ #]*[0-9]|/(issues|pull)/[0-9]'
+date='(^|[^0-9])20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]([^0-9]|$)'
+release='(^|[^[:alnum:].])(v0[.][0-9]|0[.][1-9][0-9]*[.][0-9])'
+
+# This project's own releases, read from CHANGELOG.md's "## X.Y.Z"
+# headings, so the check knows them past 0.x without taking a dependency's
+# version (libuv 1.48.0) for one. The 0.x rule above also catches a 0.x
+# release named before it ships.
+releases=
+if [ -f CHANGELOG.md ]; then
+  releases=$(sed -n 's/^## \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+               CHANGELOG.md)
+fi
+if [ -z "$releases" ]; then
+  echo "check-history-refs: no '## X.Y.Z' release headings in CHANGELOG.md" >&2
+  exit 2
+fi
+own=
+for r in $releases; do
+  rest=${r#*.}
+  escaped=$(printf '%s' "$r" | sed 's/[.]/[.]/g')
+  own="${own:+$own|}$escaped|v${r%%.*}[.]${rest%%.*}"
+done
+own="(^|[^[:alnum:].])($own)([^[:alnum:]]|\$)"
+pattern="$plans|$issue|$date|$release|$own"
+
+planted='see the plans directory: .plans/x.md
+see spike/flow/FINDINGS.md
+per ADR-0019
+per ADR0019
+per ADR 19
+fixed in (#78)
+#45 says
+see issue 41
+Issue #41 again
+in PR 43
+in PR#43
+https://github.com/o/r/issues/41
+https://github.com/o/r/pull/43
+measured 2026-10-06
+since v0.5
+in 0.9.0'
+lookalikes='(bind! s "0.0.0.0" 0)
+Chez Scheme 10.4.1, libuv 1.48.0
+(bitwise-and raw #x7f) #t #f #\a #vu8(1 2)
+#include <uv.h>
+&#39; $#
+192.0.2.1
+printf("%" PRIu64, n); a tissue 3 thick
+Copyright (c) 2026'
+
+# The releases read from CHANGELOG.md must name its latest one, by itself.
+latest=$(printf '%s\n' "$releases" | head -n 1)
+found=$(printf 'in %s\nsince v%s\n' "$latest" "${latest%.*}" \
+          | grep -cE "$own" || true)
+if [ "$found" != 2 ]; then
+  echo "check-history-refs: the release pattern read from CHANGELOG.md does" >&2
+  echo "not match its latest release, $latest, as X.Y.Z and as vX.Y." >&2
+  exit 2
+fi
+
+missed=$(printf '%s\n' "$planted" | grep -vE "$pattern" || true)
+caught=$(printf '%s\n' "$lookalikes" | grep -E "$pattern" || true)
+if [ -n "$missed" ] || [ -n "$caught" ]; then
+  echo "check-history-refs: the pattern is broken." >&2
+  [ -z "$missed" ] || printf 'not matched, but must be:\n%s\n' "$missed" >&2
+  [ -z "$caught" ] || printf 'matched, but must not be:\n%s\n' "$caught" >&2
+  exit 2
+fi
+
+if [ $# -eq 0 ]; then
+  # Untracked files count too, so a new file is checked before its commit.
+  # A tracked file deleted from the working tree is skipped. This file is
+  # left out: its planted references are the point.
+  list=$(git -c core.quotePath=false ls-files --cached --others \
+           --exclude-standard -- src docs README.org NOTICE SECURITY.md \
+           Makefile scripts manifest.scm channels.scm docker) || {
+    echo "check-history-refs: git could not list the files to check" >&2
+    exit 2
+  }
+  # Split the list on newlines only, so a name may hold spaces.
+  saved_ifs=$IFS
+  IFS='
+'
+  set -f
+  set --
+  for f in $list; do
+    if [ "$f" != scripts/check-history-refs ] && [ -f "$f" ]; then
+      set -- "$@" "$f"
+    fi
+  done
+  set +f
+  IFS=$saved_ifs
+fi
+
+# With no files grep would read standard input and find nothing.
+if [ $# -eq 0 ]; then
+  echo "check-history-refs: no files to check" >&2
+  exit 2
+fi
+
+# grep answers 1 for no match and 2 for a file it could not read; only 1
+# is a pass.
+status=0
+grep -nHE "$pattern" "$@" || status=$?
+case $status in
+  0) echo "check-history-refs: the lines above cite plans, issues, dates or" >&2
+     echo "release numbers. State the fact itself instead." >&2
+     exit 1 ;;
+  1) echo "check-history-refs: $# files cite no plans, issues, dates or releases" ;;
+  *) echo "check-history-refs: grep could not read every file (status $status)" >&2
+     exit 2 ;;
+esac

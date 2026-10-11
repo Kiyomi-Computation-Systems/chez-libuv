@@ -1,9 +1,10 @@
 # API reference
 
-One line per export. Argument lists, span conventions, error behaviour and
-the lifecycle state machine are in the design specs under
-[`.plans/`](../.plans/) (v0.1 §5–§9 and the per-milestone specs); these
-tables exist so you can see the whole surface at once, not to restate it.
+One line per export, so you can see the whole surface at once; the text
+between the tables gives the rules. Where a line does not spell out a
+procedure's arguments, the signature comment above its definition in
+`src/libuv/` does. The three rules every program depends on are in the
+[quickstart](quickstart.md#the-three-rules).
 
 Importing the umbrella library `(libuv)` gives you everything below — it is
 a facade that re-exports every public binding by name. The per-module
@@ -26,11 +27,10 @@ libraries exist for narrower imports.
 | `uv-loop-teardown!` | Close every handle, drain, then close the loop |
 | `call-with-uv-loop` | The above as a scope; tears down on every exit path |
 
-**One thread per loop**
-([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)).
-A loop and its handles belong to one thread: the one that created the loop,
-then whichever thread most recently ran it or tore it down — so a loop can be
-built on one thread and handed to a dedicated loop thread, which keeps it
+**One thread per loop.** A loop and its handles belong to one thread: the
+one that created the loop, then whichever thread most recently ran it or
+tore it down — so a loop can be built on one thread and handed to a
+dedicated loop thread, which keeps it
 after `uv-run` returns. Every verb that operates on an open handle, every
 verb that makes something on a loop (the handle constructors, `uv-accept!`,
 `uv-spawn!`, `uv-getaddrinfo!` and `uv-getnameinfo!`), `uv-cancel!` and
@@ -46,10 +46,9 @@ Scheme threads allocate and collect freely.
 
 Several threads can each run a loop of their own at the same time, a thread
 per core for instance. What the loops share is the binding's table from
-libuv's pointers back to handles and requests, which has one lock (#70; until
-then, two loops on two threads corrupted it). Every constructor, callback and
-close holds it for a table operation or two, with interrupts disabled, so no
-engine can be suspended holding it.
+libuv's pointers back to handles and requests, which has one lock. Every
+constructor, callback and close holds it for a table operation or two, with
+interrupts disabled, so no engine can be suspended holding it.
 
 - On one thread the lock costs about 30 ns each time and allocates nothing.
 - Threads that do nothing but make, fire and close handles contend for it:
@@ -65,18 +64,14 @@ engine can be suspended holding it.
   at 1,000,000 on macOS arm64, most of it the copy. Every other loop's
   thread waits that out at its next constructor, callback or close.
 
-ADR-0019's amendment to decision 4 weighs this lock against a table for each
-loop.
-
 **One call inside a loop at a time.** `uv-run`, `uv-loop-close!` and
 `uv-loop-teardown!` each claim the loop, atomically, before they call libuv
 on it, and give the claim back when they are done. While one call holds it,
 the others are refused `'loop-running`, from any thread. Running one loop
 from two threads is still a caller bug, since the loop belongs to one
 thread, but the second call is refused by name and changes nothing, not even
-the loop's owner. Until #78 both calls could get in: two of the loop's
-callbacks ran at once on two threads, `invalid memory reference` was raised
-out of `uv-run`, or both threads hung inside libuv.
+the loop's owner. Two calls never both get in, so the loop's callbacks
+never run on two threads at once.
 
 - A run and a teardown take the loop over; a close does not, so a close
   refused `'EBUSY` leaves the loop with its owner.
@@ -252,22 +247,22 @@ it writes the address while the copy is taken, the copy can hold some of
 those writes and not others. What libuv gets is still checked for a NUL
 and is still one C string, and nothing written after the copy reaches it.
 
-`uv-write!`, `uv-shutdown!`, `uv-read-start!` and `uv-read-stop!` moved to
-`(libuv stream)` in v0.3 (below); `(libuv tcp)` re-exports all four
-unchanged, so existing importers compile without touching an import line.
+`uv-write!`, `uv-write*!`, `uv-shutdown!`, `uv-read-start!`,
+`uv-read-stop!` and `uv-stream-write-queue-size` are defined in
+`(libuv stream)` (below); `(libuv tcp)` re-exports all six, so a program
+that imports only `(libuv tcp)` has them.
 
 ## Streams — `(libuv stream)`
 
-Extracted from `(libuv tcp)` in v0.3 (design spec §4.6) so the gating
-predicate is stream-*kind*, not tcp-kind: these verbs accept any open tcp or
-pipe handle.
+The gating predicate is stream-*kind*, not tcp-kind: these verbs accept any
+open tcp or pipe handle.
 
 | Export | |
 |---|---|
 | `uv-write!` | Write a bytevector or a span of one. The payload is copied during the call, at `memcpy` speed. On a threaded Chez, the whole call holds off other threads' garbage collections: the copy, and libuv's `uv_write`, which on an idle socket hands the kernel as much as it will take before returning. On macOS loopback that was 0.2 to 0.9 ms for 1 MiB and 2.4 to 4.4 ms for 4 MiB. That matters only for single writes of a MiB or more |
 | `uv-write*!` | Vectored write: one request over a list of segments, each a bytevector or a `(bv start end)` span. All segments are copied into one block and sent as `uv_write` with `nbufs = N`. One completion for the whole write. The list must be non-empty |
 | `uv-shutdown!` | Shut the write side down; the read side stays open |
-| `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required |
+| `uv-read-start!` | Start reading: `on-data` `(bv start end)`, `on-eof` `()`, `on-error` `(condition)`. All three required. An optional fifth argument sizes the read buffer (default 65536 bytes); the first start fixes it (see Flow control) |
 | `uv-read-stop!` | Stop reading — backpressure. Idempotent; the buffer and callbacks are kept for the next start |
 | `uv-stream-write-queue-size` | Queued write bytes libuv is holding for this stream. Allocation-free. See Flow control, below |
 
@@ -293,11 +288,9 @@ loop to another thread, or never resume it at all. Each verb makes its
 checks, its allocation and its native call in one step that no engine timer
 interrupts. A verb resumed after its stream was closed raises
 `&uv-handle-closed` without touching it, and one resumed after its loop was
-handed to another thread raises `&uv-wrong-thread`. Before, a write or a
-shutdown resumed after a handoff made its call on a stream the other
-thread now owned, and returned normally. A verb whose engine is never
-resumed leaves nothing behind: either it had not begun, or libuv holds its
-request and the request's completion frees it. That is the verb's own
+handed to another thread raises `&uv-wrong-thread`. A verb whose engine is
+never resumed leaves nothing behind: either it had not begun, or libuv
+holds its request and the request's completion frees it. That is the verb's own
 promise. If the verb ran inside a callback, the dropped engine leaves the
 callback as an escape leaves it, at the cost given under
 [the loop](#the-loop--libuv-loop).
@@ -323,11 +316,7 @@ process, or a failed spawn has been cleaned up.
 `uv-process-kill!` and `uv-process-pid` make both promises too. One resumed
 after its process was closed raises `&uv-handle-closed` without touching
 it, and one resumed after its loop was handed to another thread raises
-`&uv-wrong-thread`. Before, a kill resumed after a close signalled whatever
-process a later spawn had been given the closed handle's address, and
-returned normally, and `uv-process-pid` answered that process's pid; a kill
-resumed after a handoff signalled its process from a thread that no longer
-owned the loop. Neither verb allocates, so one whose engine is never
+`&uv-wrong-thread`. Neither verb allocates, so one whose engine is never
 resumed leaves nothing behind.
 
 `uv-tcp-connect!`, `uv-getaddrinfo!`, `uv-getnameinfo!` and `uv-cancel!`
@@ -335,12 +324,11 @@ make both promises as well. A connect resumed after its client was closed
 raises `&uv-handle-closed` for the client, and a lookup resumed after its
 loop was torn down raises it for the loop; any of the four resumed after
 its loop was handed to another thread raises `&uv-wrong-thread`. A cancel
-resumed after its request completed answers `#f` without touching it.
-Before, each of the four could call libuv on what the change had freed, or
-on the other thread's loop. A connect or a lookup whose engine is never
-resumed either had not begun, or libuv holds its request, which the
-request's completion frees, as the client's close or the loop's teardown
-brings about; `uv-cancel!` allocates nothing.
+resumed after its request completed answers `#f` without touching it. A
+connect or a lookup whose engine is never resumed either had not begun, or
+libuv holds its request, which the request's completion frees, as the
+client's close or the loop's teardown brings about; `uv-cancel!` allocates
+nothing.
 
 `uv-tcp-bind!`, `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
 `uv-tcp-peer-address` and the four buffer-size verbs
@@ -349,12 +337,7 @@ brings about; `uv-cancel!` allocates nothing.
 its call, and makes it, calls libuv and frees it in its step. One resumed
 after its handle was closed raises `&uv-handle-closed`, and one resumed
 after its loop was handed to another thread raises `&uv-wrong-thread`.
-Before, one resumed after a close raised `null-handle-pointer`, or called
-libuv on whatever handle had been given the closed one's address; one
-resumed after a handoff made its call on a handle the other thread now
-owned; and one
-whose engine was never resumed lost its block, or both of its blocks. Now
-it leaves nothing behind.
+One whose engine is never resumed leaves nothing behind.
 
 The timer verbs (`uv-timer-start!`, `uv-timer-stop!`, `uv-timer-again!`,
 `uv-timer-repeat`, `uv-timer-set-repeat!`), the signal verbs
@@ -365,39 +348,33 @@ stores its callback there, once libuv has accepted it. One resumed after
 its handle was closed raises `&uv-handle-closed`, one resumed after its
 loop was handed to another thread raises `&uv-wrong-thread`, and a signal
 start resumed after its handle was started in the other mode raises
-`'signal-mode-fixed`. Before, one resumed after a close could call libuv
-on the freed handle, or on whatever handle had been given its address;
-one resumed after a handoff made its call on a handle the other thread
-now owned; and a signal start resumed after the other mode was fixed
-returned normally. A start whose engine was never resumed could leave its
-callback stored and nothing started. None of them allocates: one whose
-engine is never resumed had either not begun or finished.
+`'signal-mode-fixed`. None of them allocates: one whose engine is never
+resumed had either not begun or finished.
 
 The loop queries (`uv-stop!`, `uv-now`, `uv-loop-alive?`,
 `uv-update-time!`) make both promises too. Each checks its loop again and
 calls libuv in its step. One resumed after its loop was torn down raises
 `&uv-handle-closed` for the loop, and `uv-update-time!` resumed after its
 loop was handed to another thread raises `&uv-wrong-thread`; the other
-three are loop-thread-only by contract, unchecked. Before, one resumed
-after a teardown called libuv on the freed loop, or on a new loop given
-its address: `uv-stop!` set that loop's stop flag, `uv-update-time!`
-moved its clock, and `uv-now` and `uv-loop-alive?` answered from it.
-`uv-update-time!` resumed at one point raised `null-loop-pointer`
-instead, and resumed after a handoff it wrote the clock of a loop the
-other thread now owned. None of them allocates: one whose engine is never
-resumed had either not begun or finished.
+three are loop-thread-only by contract, unchecked. None of them allocates:
+one whose engine is never resumed had either not begun or finished.
 
-The other verbs do not promise this yet
-([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md),
-decision 3, amended 2026-10-06). Until they do, close a handle only from
-the task that is using it, and do not abandon an engine inside
-`call-with-uv-loop`'s teardown on the way out of its body.
+The other exports have rules of their own, under
+[the loop](#the-loop--libuv-loop) for runs, closes and teardowns and under
+[Async](#async--libuv-async) for `uv-async-send!`, or touch no handle or
+loop that could change under them. `uv-close!` begins its close in one
+step, so one resumed after its handle was closed does nothing. It checks
+no thread, though: one resumed after its loop was handed to another thread
+closes the handle from a thread that does not own the loop, so do not hand
+a loop on while an engine is suspended inside `uv-close!` on one of its
+handles. And do not abandon an engine inside `call-with-uv-loop`'s
+teardown on the way out of its body: nothing else can tear that loop down.
 
 ## Flow control
 
-v0.5 adds no new libuv subsystem and changes no default: it makes three
-per-connection memory surfaces visible and adjustable, and gives write
-callers the one congestion signal they cannot derive themselves. At high
+The binding makes three per-connection memory surfaces visible and
+adjustable, and gives write callers the one congestion signal they cannot
+derive themselves. At high
 connection counts these surfaces are the difference between a server whose
 memory is legible and one that grows silently.
 
@@ -424,8 +401,7 @@ confirmation that the requested number took effect.
 
 **`SO_RCVBUF` is a ceiling, not memory the kernel has charged — and the
 difference is most of the story.** Measured on Debian bookworm (aarch64,
-libuv 1.52.1) with `spike/flow/13-rcvbuf-cost.ss`; figures are that host's,
-the shape is structural:
+libuv 1.52.1); figures are that host's, the shape is structural:
 
 | Per connection | Bytes | vs the 64 KiB read buffer |
 |---|---|---|
@@ -446,9 +422,7 @@ arrives, and not reclaimed until close.
 
 `tcp_rmem[1]` was 131072 on the measured host. A commonly cited 87 KB is the
 older default; both are sysctl-tunable, so measure on the target kernel
-rather than trusting either. Full method, honest limits, and the reason this
-was measured after the fact rather than before are in
-[`spike/flow/FINDINGS.md`](../spike/flow/FINDINGS.md).
+rather than trusting either.
 
 **The read-buffer sizing contract is a tradeoff, not a recommendation.**
 The buffer is allocated by the first `uv-read-start!` and freed only by the
@@ -456,12 +430,10 @@ close dispatcher; its size is fixed by that first call, irreversibly — a
 later call with a differing explicit size raises `'buffer-size-fixed`, and a
 call that omits the size is always accepted, which is what makes
 `uv-read-stop!` → `uv-read-start!` the cheap operation read-side
-backpressure needs. 64 KiB is libuv's own suggestion and the current default.
+backpressure needs. 64 KiB is libuv's own suggestion and the default.
 
-The tradeoff has now been measured (`spike/flow/14-readbuf-default.ss`,
-Debian bookworm/aarch64; full method and limits in
-[`spike/flow/FINDINGS.md`](../spike/flow/FINDINGS.md)), and it is more
-one-sided than it looks.
+Measured on Debian bookworm (aarch64), the tradeoff is more one-sided than
+it looks.
 
 **Memory scales linearly and is the term that clearly differentiates.** The
 buffer is committed at the first `uv-read-start!` whether or not a byte ever
@@ -478,12 +450,10 @@ socket, a 4 KiB buffer produced 16× as many `on-data` deliveries as a 64 KiB
 one, exactly as expected. Garbage collection stayed at two or three
 collections at every size, each sub-millisecond.
 
-The first measurement found no throughput difference either, but about 97%
-of its CPU time was byte-at-a-time copying, which cost the same at every
-size and hid the difference. Issue #35 replaced that copying with `memcpy`.
-Measured again after #35 (drain time only, same image), 16 MiB drained in a
-median 13.6 / 10.0 / 8.6 ms at 4096 / 16384 / 65536. So a 4 KiB buffer takes
-about 1.6× as long as 64 KiB, roughly 1.3 µs per extra delivery.
+Drain time does differ. Measured on the same host (drain time only), 16 MiB
+drained in a median 13.6 / 10.0 / 8.6 ms at 4096 / 16384 / 65536. So a
+4 KiB buffer takes about 1.6× as long as 64 KiB, roughly 1.3 µs per extra
+delivery.
 
 Note also that *total bytes* allocated cannot vary with buffer size: each
 delivery allocates exactly `nread` bytes, so a given transfer produces the
@@ -499,16 +469,15 @@ delivery size for reads that fill it: under small-message traffic the
 delivery size is set by what arrives, so the buffer does not affect object
 count at all.
 
-**In practice.** Many connections carrying small messages — the case this
-milestone was built for — is where a smaller buffer is close to free and the
-saving is linear; 4096 or 16384 are reasonable there. Bulk transfer keeps
+**In practice.** Many connections carrying small messages is where a
+smaller buffer is close to free and the saving is linear; 4096 or 16384
+are reasonable there. Bulk transfer keeps
 64 KiB, where the memory is amortised over far fewer connections and where
 the per-delivery time above shows. If you retain deliveries across reads,
 treat the object-count question as open.
 
-This still is not a change to the default: v0.5 pinned 65536 with a test
-rather than moving it, so that a later milestone can move it deliberately
-and with its own decision record.
+The default stays 65536 whatever the traffic; choose a smaller size per
+stream, at its first `uv-read-start!`.
 
 **The read-stop/read-start pairing invariant.** `uv-read-stop!` goes through
 the same open-handle gate as every other stream verb, while `read-dispatch`
@@ -556,7 +525,7 @@ to them.
 
 ## Pipes — `(libuv pipe)`
 
-Deliberately minimal (design spec §1): no `bind`/`connect`/`listen`, no
+Deliberately minimal: no `bind`/`connect`/`listen`, no
 `ipc=1` fd-passing. A fresh pipe's only purpose is to be named in
 `uv-spawn!`'s `stdio` options as a child's stdio end, or closed.
 
@@ -579,8 +548,7 @@ Deliberately minimal (design spec §1): no `bind`/`connect`/`listen`, no
 `file`/`args` are libuv's own execvp/argv contract — unresolved and
 unvalidated by the binding. The `options` alist covers `env` (a list of
 `"K=V"` strings, libuv's own format, not an alist encoding), `cwd`,
-`stdio`, `detached`, and `uid`/`gid`. Nine behaviours worth knowing before
-the design spec (§4–§6):
+`stdio`, `detached`, and `uid`/`gid`. Nine behaviours worth knowing:
 
 - **The spawn surface.** Each child fd (index = slot; 0/1/2 are
   stdin/stdout/stderr, libuv pads short lists to three `ignore`s) is one
@@ -595,15 +563,14 @@ the design spec (§4–§6):
 - **Exit ≠ close.** `on-exit` firing stops the handle but does not close
   it; the caller still calls `uv-close!` — typically from inside
   `on-exit` — before the handle's memory is reclaimed. Exactly the tcp
-  discipline (ADR-0007), applied to a handle instead of a stream.
+  discipline, applied to a handle instead of a stream.
 - **A second `uv-close!` silently discards its callback.** The close path
   guards on the handle being `'open`, so a close issued against a handle
   that is already `'closing` stores nothing and the supplied `on-close`
   never runs — this applies to every handle kind, not just processes. A
   server that deregisters a connection from `on-close` must own *every*
   close initiation for that handle; the protocol for doing that is server-
-  layer design, not binding design — see
-  [`.plans/chez-http-server-architecture.md`](../.plans/chez-http-server-architecture.md).
+  layer design, not binding design.
 - **Killed-by-signal is `(0 sigterm)`, not `(-1 …)`.** `on-exit` receives
   `(exit-status term-signal)` as results, never a condition — there is no
   error argument. `exit-status` is libuv's `WEXITSTATUS` on a normal exit
@@ -620,8 +587,7 @@ the design spec (§4–§6):
   survives the parent and is never reaped by us.
 - **A failed `uv-spawn!` cleans up internally; only its pipes need the
   caller's attention.** libuv's spawn-failure path has two different
-  correct cleanups depending on how far the child got before failing
-  ([ADR-0015](../.plans/decisions/0015-spawn-copy-lifetime-and-failure-path.md));
+  correct cleanups depending on how far the child got before failing;
   the binding picks the right one at runtime, and the caller only ever
   sees the raise. Any pipe named in any of the spawn's stdio specs is
   marked *connected* by the binding even when the spawn raised — libuv
@@ -671,12 +637,11 @@ interleaving libuv spawns with Chez's `system`/`open-process-ports` across
 four orderings showed no conflict — 110/110 libuv `exit_cb`s delivered
 intact and every Chez call returned its own correct result — measured on
 Linux's SIGCHLD-based child-reaping path, the one path where a stolen wait
-can silently drop a callback (`spike/process/FINDINGS.md` SQ2).
+can silently drop a callback.
 
 ## Signals — `(libuv signal)`
 
-Completes the pair the process module's `uv-kill!` started
-([ADR-0017](../.plans/decisions/0017-signal-watching-vocabulary-and-mode.md)).
+Watches signals; the process module's `uv-kill!` sends them.
 
 | Export | |
 |---|---|
@@ -691,8 +656,7 @@ The watchable set is the closed vocabulary minus `sigkill`/`sigstop`
 sending-only. A watcher's *mode* is fixed by its first start verb, and the
 other verb thereafter raises `'signal-mode-fixed`; changing mode is
 `uv-close!` + `make-uv-signal` (the vendored `UV_SIGNAL_ONE_SHOT` flag is a
-one-way per-handle ratchet, measured in
-[the v0.4 spike](../spike/signal/FINDINGS.md)). Delivery is not close: the
+one-way per-handle ratchet). Delivery is not close: the
 caller always `uv-close!`s the handle.
 
 Graceful shutdown, the driving use case — first `SIGTERM` drains, a second
@@ -708,8 +672,7 @@ one kills (the disposition reverts to `SIG_DFL` once the oneshot fires):
 (uv-run loop 'default)
 ```
 
-**Measured caveat** (both platforms,
-[FINDINGS](../spike/signal/FINDINGS.md) SQ-S1): watching `sigint` takes
+**Measured caveat** (on both macOS and Linux): watching `sigint` takes
 SIGINT away from the Chez runtime — while the watcher is armed, Ctrl-C is
 delivered to the loop callback and Chez's keyboard interrupt never fires;
 after `uv-signal-stop!` (or oneshot auto-disarm) the disposition is
@@ -746,9 +709,9 @@ no c-ares, no record types, no caching.
 and errors reach the callback as ordinary `&uv-errno-error` conditions whose
 `errno` is the `EAI_*` symbol (`'EAI_NONAME`, `'EAI_AGAIN`,
 `'EAI_CANCELED`, …); there are no DNS-specific condition types. Six
-behaviours worth knowing before the design spec:
+behaviours worth knowing:
 
-- **This is the binding's first threadpool-backed feature.** The resolver
+- **This is the binding's one threadpool-backed feature.** The resolver
   calls run on libuv's worker threads — pure C; no Scheme ever runs off the
   loop thread — and completions are delivered on the loop thread like every
   other callback. The pool is sized by `UV_THREADPOOL_SIZE`, which libuv
@@ -770,8 +733,7 @@ behaviours worth knowing before the design spec:
   read their flag lists once, as `uv-write*!` reads its segment list: a
   list changed once during the read is folded as it was or as the change
   left it, or refused when that version is not a list.
-- **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**
-  ([ADR-0012](../.plans/decisions/0012-address-vocabulary.md)): a
+- **IPv6 scope IDs are dropped from `uv-getaddrinfo!`'s results**: a
   link-local result renders as `"fe80::1"` with its zone silently absent.
   `uv-getnameinfo!`'s host is the system resolver's own rendering, which
   on macOS and glibc names a link-local address's zone: `"fe80::1%lo0"`.
@@ -782,11 +744,11 @@ behaviours worth knowing before the design spec:
   already running. A `getaddrinfo(3)` already running in a worker cannot be
   interrupted, so that drain iteration waits it out, up to the OS
   resolver's own timeout.
-- **`uv-loop-close!` delivers a pending callback error** (a v0.2 behaviour
-  change, not DNS-specific): after a successful close it re-raises a stored
-  pending callback error composed as `&uv-callback-error`, exactly as
-  `uv-run`'s exit does — previously a caller who skipped the next `uv-run`
-  and went straight to close lost the error silently. The loop is closed
+- **`uv-loop-close!` delivers a pending callback error** (not
+  DNS-specific): after a successful close it re-raises a stored pending
+  callback error composed as `&uv-callback-error`, exactly as `uv-run`'s
+  exit does, so a caller who skips the next `uv-run` and goes straight to
+  close does not lose the error. The loop is closed
   when the raise escapes; a close refused with `'EBUSY` still delivers
   nothing, and the error stays pending.
 
@@ -802,8 +764,7 @@ behaviours worth knowing before the design spec:
 
 Each timer verb refuses another kind of handle with `&uv-invalid-argument`,
 reason `'not-a-uv-timer`, and anything that is not a handle with
-`'not-a-uv-handle`. Before, they took any handle as a timer: given a TCP
-handle, `uv-timer-set-repeat!` wrote into its struct.
+`'not-a-uv-handle`.
 
 ## Async — `(libuv async)`
 
@@ -817,13 +778,12 @@ under [the loop](#the-loop--libuv-loop), above.
 | `uv-async-send!` | Wake the loop so it runs `on-wake`. Callable from **any** thread: `uv_async_send` is libuv's one thread-safe call, and this is the one verb exempt from the thread rule. Sends coalesce — N sends may yield one `on-wake` — so `on-wake` should drain a queue of your own, and tolerate finding it empty, rather than assume one item per send |
 | `uv-async?` | Type predicate (defined in `(libuv handle)`) |
 
-Three behaviours worth knowing before the
-[threading design](../.plans/2026-09-19-chez-libuv-threading-design.md) (§6):
+Three behaviours worth knowing:
 
 - **An open async keeps the loop alive.** Like any active handle it keeps
   `uv-run 'default` from returning (short of `uv-stop!`), and there is no
-  `uv_unref` binding to exempt it (the design's §12 defers one), so close the
-  async to let the loop finish.
+  `uv_unref` binding to exempt it, so close the async to let the loop
+  finish.
 - **A send that races the close is refused.** Each async handle has a lock
   that `uv-async-send!` and `uv-close!` both take, so a send from any thread
   either completes before a close begins or raises `&uv-handle-closed`
@@ -854,9 +814,7 @@ Three behaviours worth knowing before the
 
 Every condition type comes with its predicate, its constructor and its field
 accessors; the constructors are public because a caller's own `on-error` may
-want to build or re-raise one
-([ADR-0006](../.plans/decisions/0006-error-codes-are-symbols.md) is why the
-discriminant is a symbol).
+want to build or re-raise one.
 
 | Condition | Fields | Raised when |
 |---|---|---|
@@ -869,20 +827,16 @@ discriminant is a symbol).
 | `&uv-constant-unavailable` | `name` | The shim has no constant under that name |
 | `&uv-invalid-argument` | `who` `reason` | A caller error, refused leaving nothing allocated |
 | `&uv-callback-error` | `cause` | A callback raised; composed with the original condition |
-| `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the id of the thread the verb's check found owning the loop, `actual` the caller's. The two always differ, even if the loop has changed hands again since the check ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
+| `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the id of the thread the verb's check found owning the loop, `actual` the caller's. The two always differ, even if the loop has changed hands again since the check |
 | `&uv-stack-exhausted` | `who` `headroom` `floor` | A run was refused because its thread had `headroom` bytes of C stack left, under the `floor` it needs: 131,072 for `uv-run`, 65,536 for a teardown's drain. Escapes from callbacks spend that stack, and the thread gets it back only by ending |
 
-v0.3, v0.4, v0.5, v0.7 and v0.8 added no new condition types; v0.6 added
-one, and v0.9 `&uv-stack-exhausted`, which only a run raises — every
+Only a run raises `&uv-stack-exhausted`. Every
 `(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv
-handle)`/`(libuv async)` failure raises one of the three above
+handle)`/`(libuv async)` failure raises one of three of the types above
 (`&uv-errno-error`, `&uv-handle-closed`, `&uv-invalid-argument`), or
-`&uv-wrong-thread` off the loop's thread; the closed set of
-`&uv-invalid-argument` reason symbols (`'stdio-spec-unknown`,
-`'pipe-already-used`, `'signal-unknown`, `'signal-unwatchable`,
-`'signal-mode-fixed`, `'buffer-size-fixed`, `'buffer-size-out-of-range`
-(reused from `uv-read-start!`, not new to v0.5), `'not-a-socket-handle`
-(the one reason symbol v0.5 actually adds),
-`'sockaddr-too-small-for-a-port`, and the rest of the validation walk) is
-in the per-milestone design specs (v0.3 §4.7; v0.4 §4.2/§4.6; v0.5 §4.2),
-not repeated here.
+`&uv-wrong-thread` off the loop's thread. An `&uv-invalid-argument`'s
+`reason` is one of a closed set of symbols, among them
+`'stdio-spec-unknown`, `'pipe-already-used`, `'signal-unknown`,
+`'signal-unwatchable`, `'signal-mode-fixed`, `'buffer-size-fixed`,
+`'buffer-size-out-of-range`, `'not-a-socket-handle` and
+`'sockaddr-too-small-for-a-port`; the full set is not listed here.

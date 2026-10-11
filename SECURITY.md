@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 0.4.x (latest) | ✅ |
-| < 0.4 | ❌ |
+| The latest release (see [CHANGELOG.md](CHANGELOG.md)) | ✅ |
+| Earlier releases | ❌ |
 
 ## Reporting a vulnerability
 

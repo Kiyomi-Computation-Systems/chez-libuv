@@ -83,7 +83,7 @@
     (cause uv-callback-error-cause))
 
   ;; &uv-wrong-thread fields: symbol exact-integer exact-integer
-  ;; Raised when a loop/handle verb runs off the loop's owning thread (#20).
+  ;; Raised when a loop/handle verb runs off the loop's owning thread.
   ;; who is the verb; expected is the owner thread id; actual is the caller's.
   (define-condition-type &uv-wrong-thread &uv-error
     make-uv-wrong-thread uv-wrong-thread?
@@ -93,8 +93,8 @@
 
   ;; &uv-stack-exhausted fields: symbol exact-integer exact-integer
   ;; Raised when a uv_run is refused because its thread's C stack has less
-  ;; headroom left than the run's floor (#94): who is the verb refused,
-  ;; headroom the bytes the thread had left, floor the bytes the run needed.
+  ;; headroom left than the run's floor: who is the verb refused, headroom
+  ;; the bytes the thread had left, floor the bytes the run needed.
   ;; A continuation that escapes a callback leaves its uv_run's C frames on
   ;; the stack until the thread ends, so the headroom comes back only then,
   ;; or when an engine resumed inside a callback returns.

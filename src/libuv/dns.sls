@@ -15,6 +15,16 @@
           (libuv private handles)
           (libuv private addrinfo))
 
+  ;; uv-addrinfo? : object -> boolean
+  ;; uv-addrinfo-family : uv-addrinfo -> symbol
+  ;; uv-addrinfo-socktype : uv-addrinfo -> (or symbol exact-integer)
+  ;; uv-addrinfo-protocol : uv-addrinfo -> (or symbol exact-integer)
+  ;; uv-addrinfo-address : uv-addrinfo -> (or string #f)
+  ;; uv-addrinfo-port : uv-addrinfo -> exact-nonnegative-integer
+  ;; uv-addrinfo-canonname : uv-addrinfo -> (or string #f)
+  ;; The result record's predicate and accessors, defined with
+  ;; make-uv-addrinfo in (libuv private addrinfo) and exported from here.
+
   ;; Validated symbols map to compiler-derived platform constants.
   (define (family-symbol->int sym)
     (case sym
@@ -93,17 +103,19 @@
       ((loop node service hints on-complete)
        (start-getaddrinfo! loop node service hints on-complete))))
 
+  ;; start-getaddrinfo! : uv-loop (or string #f) (or string #f) (or alist #f)
+  ;;                      procedure -> uv-dns-request
   ;; Every argument is read once, by the validators, and everything from the
   ;; allocation on uses their copies: node and service as the bytes C reads,
   ;; the hints as the ints the block receives. So nothing the caller can
   ;; still change reaches C (tests/test-dns.sps's sweeps).
   ;; Loop-thread-only: libuv counts the request in the loop with a plain
   ;; increment the loop's thread decrements, so from another thread the
-  ;; loop could exit early or never (#79). Checked on entry, and again in
-  ;; one interrupt-free step with the loop's pointer, the allocation, the
-  ;; hints, the registration, the count and uv_getaddrinfo (#85). So no
-  ;; engine can split the lookup from its checks, or drop it holding a
-  ;; request libuv has not taken (tests/test-request-steps.sps).
+  ;; loop could exit early or never. Checked on entry, and again in one
+  ;; interrupt-free step with the loop's pointer, the allocation, the
+  ;; hints, the registration, the count and uv_getaddrinfo. So no engine
+  ;; can split the lookup from its checks, or drop it holding a request
+  ;; libuv has not taken (tests/test-request-steps.sps).
   (define (start-getaddrinfo! loop node service hints on-complete)
     (require-open-loop loop 'uv-getaddrinfo!)
     (require-loop-thread loop 'uv-getaddrinfo!)
@@ -146,6 +158,7 @@
          (memq (req-kind x) '(getaddrinfo getnameinfo))
          #t))
 
+  ;; nameinfo-flag-symbols->int : (listof symbol) -> exact-nonnegative-integer
   ;; The flag list is read once (fold-flags).
   (define (nameinfo-flag-symbols->int flags)
     (fold-flags flags 'uv-getnameinfo! 'nameinfo-flags-not-a-list
@@ -161,8 +174,8 @@
 
   ;; uv-getnameinfo! : uv-loop string exact-nonnegative-integer procedure
   ;;                   -> uv-dns-request
-  ;; uv-getnameinfo! : uv-loop string exact-nonnegative-integer list procedure
-  ;;                   -> uv-dns-request
+  ;; uv-getnameinfo! : uv-loop string exact-nonnegative-integer
+  ;;                   (listof symbol) procedure -> uv-dns-request
   ;; on-complete receives (error-or-#f host service); both strings are #f on
   ;; failure, including cancellation.
   (define uv-getnameinfo!
@@ -172,6 +185,8 @@
       ((loop ip port flags on-complete)
        (start-getnameinfo! loop ip port flags on-complete))))
 
+  ;; start-getnameinfo! : uv-loop string exact-nonnegative-integer
+  ;;                      (listof symbol) procedure -> uv-dns-request
   ;; The address is read once, by validate-address, and libuv parses that
   ;; copy (tests/test-address.sps). Loop-thread-only, and one interrupt-free
   ;; step from the owner check to uv_getnameinfo, as uv-getaddrinfo! is.
@@ -213,15 +228,15 @@
   ;; fires. False covers work already running or already completed.
   ;; Loop-thread-only, checked: from another thread, the loop's thread could
   ;; complete the request and free its block between the pointer's read and
-  ;; uv_cancel (#79). The owner check, the pointer's read and uv_cancel are
-  ;; one interrupt-free step (#85): an engine suspended between the read and
-  ;; the call, while its scheduler ran the loop, handed uv_cancel the freed
-  ;; block, and one suspended while the loop changed hands cancelled on the
-  ;; other thread's loop (tests/test-request-steps.sps). The step's check is
-  ;; the only one: nothing is read or made before it, so a check on entry
-  ;; too could never refuse a call the step would not (as for the
-  ;; constructors, ADR-0019's #79 amendment). After the step it only
-  ;; answers, calling nothing for 0 or EBUSY.
+  ;; uv_cancel. The owner check, the pointer's read and uv_cancel are one
+  ;; interrupt-free step. Otherwise an engine suspended between the read and
+  ;; the call, while its scheduler ran the loop, would hand uv_cancel the
+  ;; freed block, and one suspended while the loop changed hands would
+  ;; cancel on the other thread's loop (tests/test-request-steps.sps). The
+  ;; step's check is the only one: nothing is read or made before it, so a
+  ;; check on entry too could never refuse a call the step would not, as
+  ;; for the handle constructors that make nothing before their step. After
+  ;; the step it only answers, calling nothing for 0 or EBUSY.
   (define (uv-cancel! req)
     (unless (uv-dns-request? req)
       (raise (make-uv-invalid-argument 'uv-cancel!

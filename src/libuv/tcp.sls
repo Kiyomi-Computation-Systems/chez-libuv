@@ -18,6 +18,7 @@
           (libuv private handles)
           (libuv stream))
 
+  ;; require-open-tcp : object symbol -> uv-tcp
   ;; Passing another handle kind to a libuv TCP function is undefined.
   (define (require-open-tcp tcp who)
     (unless (uv-tcp-record? tcp)
@@ -41,7 +42,7 @@
   ;; bind-flags->bits : (listof symbol) symbol -> exact-integer
   ;; Fold a bind-flag list into the unsigned bitmask uv_tcp_bind's third
   ;; argument takes, reading the list once (fold-flags). 'reuseport is the
-  ;; only flag today; any other symbol is a named refusal. 'reuseport on a
+  ;; only flag; any other symbol is a named refusal. 'reuseport on a
   ;; libuv without UV_TCP_REUSEPORT surfaces as &uv-constant-unavailable from
   ;; uv-tcp-reuseport (see (libuv private constants)), never as a silent bind
   ;; with the flag dropped.
@@ -61,9 +62,9 @@
   ;; lacks it) is refused with nothing allocated. The address is read once, by
   ;; validate-address, and libuv parses that copy (tests/test-address.sps).
   ;; One interrupt-free step checks again that this thread owns the loop and
-  ;; that the client is open, and allocates the sockaddr, fills it, binds and
-  ;; frees it (#86). So no engine can split the bind from those checks, or
-  ;; drop it holding the sockaddr (tests/test-handle-steps.sps).
+  ;; that the handle is open, and allocates the sockaddr, fills it, binds and
+  ;; frees it. So no engine can split the bind from those checks, or drop it
+  ;; holding the sockaddr (tests/test-handle-steps.sps).
   (define uv-tcp-bind!
     (case-lambda
       ((tcp ip port) (bind! tcp ip port '()))
@@ -97,10 +98,10 @@
   ;; TCP's port, or its address and port when ADDRESS?, as NATIVE
   ;; (uv_tcp_getsockname or uv_tcp_getpeername) reports them. One
   ;; interrupt-free step checks again that this thread owns the loop and
-  ;; that the client is open, and allocates the sockaddr and its in/out
+  ;; that the handle is open, and allocates the sockaddr and its in/out
   ;; length in one block, asks libuv, reads the answer out and frees the
-  ;; block (#86). So no engine can split the call from those checks, or drop
-  ;; it holding the block (tests/test-handle-steps.sps).
+  ;; block. So no engine can split the call from those checks, or drop it
+  ;; holding the block (tests/test-handle-steps.sps).
   (define (query-sockaddr tcp native address? who)
     (require-open-tcp tcp who)
     (let* ((storage (sizeof-sockaddr-storage))
@@ -156,7 +157,7 @@
   ;; uv-listen! : uv-tcp exact-nonnegative-integer procedure -> unspecified
   ;; The backlog is a C int. One interrupt-free step checks again that this
   ;; thread owns the loop and that the server is open, listens, and stores
-  ;; the callback once libuv is listening (#86). A connection is delivered
+  ;; the callback once libuv is listening. A connection is delivered
   ;; only inside uv-run, so none can arrive between the two, and no engine
   ;; can split the listen from those checks or drop it half made
   ;; (tests/test-handle-steps.sps).
@@ -213,7 +214,7 @@
   ;; The address is read once, by validate-address, and libuv parses that copy.
   ;; One interrupt-free step checks again that this thread owns the loop and
   ;; that the client is open, and allocates, fills, registers and counts the
-  ;; request and starts it (#85). So no engine can split the connect from
+  ;; request and starts it. So no engine can split the connect from
   ;; those checks, or drop it holding a request libuv has not taken
   ;; (tests/test-request-steps.sps).
   (define (uv-tcp-connect! tcp ip port on-connect)
@@ -248,7 +249,7 @@
   ;; uv-tcp-nodelay! : uv-tcp boolean -> unspecified
   ;; Require a boolean because Scheme's 0 is true while C's 0 is false. The
   ;; call is one interrupt-free step that checks again that this thread owns
-  ;; the loop and that the client is open (#86), as uv-tcp-keepalive!'s is.
+  ;; the loop and that the handle is open, as uv-tcp-keepalive!'s is.
   (define (uv-tcp-nodelay! tcp enable?)
     (require-open-tcp tcp 'uv-tcp-nodelay!)
     (unless (boolean? enable?)

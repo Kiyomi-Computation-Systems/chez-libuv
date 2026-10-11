@@ -1,0 +1,70 @@
+chez-libuv
+Copyright (c) 2026, Kiyomi Computation Systems LLC
+
+This product is licensed under the BSD 3-Clause License; see LICENSE.
+
+Apart from the git submodules under vendor/, this repository contains no
+third-party code. The components below are the third-party software it
+builds with, links against, or tests with. Each keeps its own license, and
+the full texts are in the files named.
+
+
+libuv
+-----
+https://github.com/libuv/libuv
+Location: vendor/libuv (git submodule, pinned)
+Used: linked by the C shim. The build uses a system libuv when pkg-config
+finds one at version 1.48.0 or later; otherwise it builds this copy as a
+shared library and links the shim against it. A distribution that ships
+that library ships libuv, and must carry its notices.
+
+  Copyright (c) 2015-present libuv project contributors.
+  Licensed under the MIT License (vendor/libuv/LICENSE).
+
+  Parts of libuv originating from https://github.com/joyent/libuv:
+  Copyright Joyent, Inc. and other Node contributors.
+  Licensed under the MIT License (vendor/libuv/LICENSE-extra).
+
+  Externally maintained code inside libuv (vendor/libuv/LICENSE-extra):
+  - tree.h, from FreeBSD: copyright Niels Provos, BSD 2-Clause License.
+  - inet_pton and inet_ntop (src/inet.c): copyright Internet Systems
+    Consortium, Inc., ISC License.
+
+  Some libuv files carry the ISC License in their own headers instead of
+  MIT, among them src/queue.h and src/heap-inl.h (Copyright (c) 2013 Ben
+  Noordhuis) and src/idna.c (Copyright libuv contributors). Each file's
+  header is its notice.
+
+  libuv's documentation (vendor/libuv/docs) is licensed under the Creative
+  Commons Attribution 4.0 International License (vendor/libuv/LICENSE-docs).
+  chez-libuv does not build or distribute it.
+
+
+chez-srfi
+---------
+https://github.com/arcfide/chez-srfi
+Location: vendor/chez-srfi (git submodule, pinned; also named in Akku.lock)
+Used: by the test suites only, for SRFI 64 and the SRFIs it imports. The
+library itself, (libuv), imports nothing from it, and Akku.manifest lists
+it as a development dependency, which a project that depends on
+chez-libuv does not install.
+
+  Copyright (c) 2008-2010 Derick Eddington, MIT-style license, for the
+  files he wrote (vendor/chez-srfi/LICENSE). Files written by others keep
+  the notices they carry, among them:
+  - SRFI 64 reference implementation: Copyright (c) 2005, 2006 Per Bothner,
+    MIT License (vendor/chez-srfi/%3a64/testing-impl.scm).
+  - SRFI 1 reference implementation: Copyright (c) 1998, 1999 Olin Shivers,
+    and Copyright (c) 2018 Jéssica Milaré, permissive notices
+    (vendor/chez-srfi/%3a1/srfi-1-reference.scm).
+  - Chez Scheme compatibility and SRFI 39 files: Copyright (c) 2012 Aaron
+    W. Hsu, ISC-style license (vendor/chez-srfi/%3a39/parameters.chezscheme.sls,
+    private/include/compat.chezscheme.sls,
+    private/platform-features.chezscheme.sls).
+
+
+Not bundled
+-----------
+Chez Scheme (https://github.com/cisco/ChezScheme) is required to run
+chez-libuv and is licensed under the Apache License 2.0. It is not included
+in this repository, and the build does not bundle it.

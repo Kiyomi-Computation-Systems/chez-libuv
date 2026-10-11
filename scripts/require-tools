@@ -11,8 +11,7 @@
 # Prints one "make GOAL: TOOL not found." line per missing TOOL, to
 # stderr, then one hint line, and exits 2:
 #   - guix on PATH, outside any Guix environment: run it in the project's
-#     container, scripts/guix-env, which holds the whole toolchain
-#     (ADR-0020);
+#     container, scripts/guix-env, which holds the whole toolchain;
 #   - otherwise: install the missing tools.
 # Silent, and exits 0, when every TOOL is found.
 set -eu

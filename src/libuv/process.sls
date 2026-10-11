@@ -1,7 +1,8 @@
 #!r6rs
 ;;; Child processes remain handles after exit and still require uv-close!.
 ;;; Stdio pipe directions are named from the parent: to-child, from-child,
-;;; or duplex. A failed spawn consumes every pipe it was given.
+;;; or duplex. A spawn that reaches uv_spawn consumes every pipe it was
+;;; given, whether it succeeds or fails; one refused before it marks none.
 (library (libuv process)
   (export uv-spawn! uv-process-kill! uv-kill! uv-process-pid uv-os-getpid)
   (import (rnrs)
@@ -11,7 +12,10 @@
           (libuv private handles)
           (only (libuv private lists) read-proper-list let-fixed-list)
           (only (libuv private c-string) read-utf8 nul-free?)
-          ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
+          ;; Ahead of (chezscheme), as in every library in src/ that
+          ;; imports it, so a non-threaded Chez is refused by name before
+          ;; any (chezscheme) import is processed
+          ;; (tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) with-interrupts-disabled))
 
@@ -22,10 +26,11 @@
   ;; options block's sizing and filling, and the marking of pipes all read the
   ;; request, never the caller's data again. Read twice, that data could change
   ;; in between, from an engine's timer handler or another thread: a string or
-  ;; list that grew after the block was sized from it was written past the
-  ;; block's end, a stdio list that grew wrote a container over argv, a pipe
-  ;; swapped in after the check reached libuv, and a NUL set after the check
-  ;; cut a C string short (test-process.sps's changing-data sweeps).
+  ;; list that grew after the block was sized from it would be written past
+  ;; the block's end, a stdio list that grew would write a container over
+  ;; argv, a pipe swapped in after the check would reach libuv, and a NUL set
+  ;; after the check would cut a C string short (test-process.sps's
+  ;; changing-data sweeps).
   ;;
   ;; The read is one interrupt-free step, so to an engine it happens at one
   ;; instant. That does not hold another thread off, so the read never
@@ -40,19 +45,19 @@
   ;;   before it is read through, and its end required after them, counted
   ;;   and walked once more when the walk contradicts the count. Measured
   ;;   with list? and then length, a list another thread changed in between
-  ;;   made length raise its own condition, and one cut or made longer
-  ;;   during the walk was read as a list the caller never had: the part
-  ;;   before the cut, or the stale length's worth of the longer list. At
-  ;;   --optimize-level 3, where length checks nothing, it read through the
-  ;;   cut, and a list made circular for good during length was walked
-  ;;   forever with interrupts disabled (#66).
+  ;;   would make length raise its own condition, and one cut or made longer
+  ;;   during the walk would be read as a list the caller never had: the
+  ;;   part before the cut, or the stale length's worth of the longer list.
+  ;;   At --optimize-level 3, where length checks nothing, the walk would
+  ;;   read through the cut, and a list made circular for good during length
+  ;;   would be walked forever with interrupts disabled.
   ;; - Each field of a stdio spec and of an options entry is read once,
   ;;   after its pair is found to be one (read-stdio-spec, read-option).
   ;; So whatever another thread does, the read raises nothing, never reads
   ;; through a non-pair, and ends once the changes stop. A list it finds
   ;; malformed is kept as #f, a stdio spec of no known shape as a spec of
-  ;; kind #f, and the checks refuse them afterwards in the order they have
-  ;; always run. A list changed once during the read is read as it was
+  ;; kind #f, and the checks refuse them afterwards, in the checks' fixed
+  ;; order. A list changed once during the read is read as it was
   ;; before the change or after it; one changed several times can be read as
   ;; a mix of its versions, as a string can, or found malformed though every
   ;; version was a list (docs/api.md). test-process.sps's cross-thread list
@@ -63,7 +68,7 @@
   ;; keeps with-interrupts-disabled all the same: should an edit make the
   ;; read raise, that unwinds the step and the change fails its rows by
   ;; name, where a bare pair would leave interrupts off for good and
-  ;; test-process would hang (#73's review).
+  ;; test-process would hang.
 
   ;; file is a bytevector, or #f for a non-string. args is a list of
   ;; (bytevector or #f), or #f for anything but a proper list as the read
@@ -99,8 +104,8 @@
   ;; Each pair of a spec is read once, a pipe spec's tail with
   ;; let-fixed-list. Its (cdr rest), checked as a pair and then read again as
   ;; (cddr rest) and (cadr rest), could be a non-pair by the second read:
-  ;; Chez's own cddr or cadr raised there, and at --optimize-level 3 the read
-  ;; went through it (#66).
+  ;; Chez's own cddr or cadr would raise there, and at --optimize-level 3
+  ;; the read would go through it.
   (define (read-stdio-spec spec)
     (cond
       ((eq? spec 'ignore) (make-stdio-spec 'ignore #f #f))
@@ -229,9 +234,12 @@
      specs))
 
   ;; libuv opens each (pipe ...) spec's end into its pipe after it forks, so
-  ;; a pipe named twice fails its second open with the child running:
-  ;; ADR-0015 decision 5's unclassifiable state. One spawn consumes a pipe
-  ;; once.
+  ;; a pipe named twice fails its second open with the child running, and
+  ;; uv_spawn returns its handle started but unlinked from the loop's handle
+  ;; queue: a state neither of clean-up-failed-spawn!'s cleanups is right
+  ;; for, so it leaves the native handle intact, removes its registry entry
+  ;; so that no teardown closes it, and answers
+  ;; 'spawn-failure-state-unclassifiable. One spawn consumes a pipe once.
   (define (require-distinct-pipes! specs who)
     (let scan ((specs specs) (seen '()))
       (unless (null? specs)
@@ -427,6 +435,9 @@
   ;; uv-spawn! : uv-loop string (listof string) (or procedure #f) -> uv-process
   ;; uv-spawn! : uv-loop string (listof string) (or alist #f) (or procedure #f)
   ;;             -> uv-process
+  ;; ON-EXIT, when given, is called as (on-exit exit-status term-signal):
+  ;; EXIT-STATUS an exact integer, and TERM-SIGNAL #f on a normal exit, else
+  ;; the signal's symbol or its raw integer (exit-dispatch).
   (define uv-spawn!
     (case-lambda
       ((loop file args on-exit)
@@ -463,28 +474,31 @@
   ;; The checks above see the loop and the stdio handles as they were on
   ;; entry, and the loop and the handles stay the caller's: an engine's timer
   ;; handler can close a handle, consume a pipe in a spawn of its own, or
-  ;; tear the loop down before uv_spawn runs. libuv then opened a closing
-  ;; pipe's end into it, a descriptor nothing ever closed; reached a freed
-  ;; pipe through an address another pipe could hold by then; forked, then
-  ;; failed to open a consumed pipe (ADR-0015 decision 5's state); or spawned
-  ;; on a freed loop. A teardown between uv_spawn and the registration left
-  ;; the process in the loop where the teardown could not close it. And the
-  ;; handler can hand the loop to another thread, whose uv_run then races
-  ;; uv_spawn on libuv's handle queue (#79).
+  ;; tear the loop down before uv_spawn runs. libuv would then open a
+  ;; closing pipe's end into it, a descriptor nothing ever closes; reach a
+  ;; freed pipe through an address another pipe could hold by then; fork,
+  ;; then fail to open a consumed pipe (the unclassifiable state
+  ;; require-distinct-pipes! describes); or spawn on a freed loop. Were
+  ;; the registration a step of its own after uv_spawn, a teardown between
+  ;; them would leave the process in the loop where the teardown cannot
+  ;; close it. And the handler can
+  ;; hand the loop to another thread, whose uv_run would then race uv_spawn
+  ;; on libuv's handle queue.
   ;;
   ;; And an engine can be dropped, as a timeout drops a task, and never
   ;; resumed. Nothing after its expiry runs, so what the verb held then and
-  ;; had not handed on was lost: the process handle and the options block,
-  ;; allocated and built before the step (test-process.sps's drop sweeps).
+  ;; had not handed on would be lost: the process handle and the options
+  ;; block, were they allocated and built before the step
+  ;; (test-process.sps's drop sweeps).
   ;;
   ;; So one interrupt-free step checks the loop, its owner and each handle
   ;; again, allocates the process handle and the options block, fills the
-  ;; block, hands libuv the pointers it just checked, spawns, frees the
-  ;; options block, marks the pipes, and registers the process or cleans up
-  ;; after a failure. An engine that expires during uv-spawn! is suspended or dropped
-  ;; before the step, holding nothing, or after it, when the loop holds the
-  ;; process or the failure is cleaned up (test-process.sps's state and drop
-  ;; sweeps).
+  ;; block, registers the process, hands libuv the pointers it just checked,
+  ;; spawns, frees the options block, marks the pipes, and counts the
+  ;; process or cleans up after a failure. An engine that expires during
+  ;; uv-spawn! is suspended or dropped before the step, holding nothing, or
+  ;; after it, when the loop holds the process or the failure is cleaned up
+  ;; (test-process.sps's state and drop sweeps).
   ;;
   ;; The step answers the process or a status, and the verb raises after it
   ;; (spawn-refusal). A refused step frees what it allocated. Its
@@ -495,10 +509,10 @@
   ;; broken: the failure cleanup's close, a one-step of its own
   ;; (begin-close!), should uv_close fault.
   ;; with-interrupts-disabled, a dynamic-wind, costs 96 B a spawn over
-  ;; one-step, a bare interrupt pair, as it did on a473313. It re-enables
-  ;; interrupts after a raise in the step's own body, a fault in uv_spawn
-  ;; among them, which arrives as a Scheme condition; after a raise inside
-  ;; the close's nested one-step they stay disabled.
+  ;; one-step, a bare interrupt pair. It re-enables interrupts after a raise
+  ;; in the step's own body, a fault in uv_spawn among them, which arrives
+  ;; as a Scheme condition; after a raise inside the close's nested one-step
+  ;; they stay disabled.
 
   ;; spawn-step! : uv-loop (or procedure #f) options-layout spawn-request
   ;;               spawn-options -> (or uv-process status)
@@ -531,9 +545,9 @@
   ;; uv_spawn on the loop at LOOP-ADDRESS; the options block freed; the pipes
   ;; marked; and the process counted, or the failure cleaned up. A refused
   ;; registration frees both blocks and is answered, with nothing forked and
-  ;; no pipe marked. Registered after uv_spawn, it raised from the step with
-  ;; the child running and its handle in the loop, out of the teardown's
-  ;; reach (#68's review).
+  ;; no pipe marked. Were the process registered after uv_spawn, a refused
+  ;; registration would come with the child already running and its handle
+  ;; in the loop, out of the teardown's reach.
   (define (spawn-from-block! loop loop-address ptr block specs on-exit)
     (let* ((proc (%make-uv-process-record ptr loop on-exit))
            (registered (registry-add! ptr 'process loop proc)))
@@ -549,8 +563,9 @@
                 (clean-up-failed-spawn! loop proc rc))))))
 
   ;; stdio-refusal : (listof stdio-spec) -> (or status #f)
-  ;; The first spec the entry checks would now refuse for its handle's state:
-  ;; open-handle-ptr's refusal paired with the handle, or 'pipe-already-used.
+  ;; The first spec the entry checks would refuse for its handle's state as
+  ;; the step finds it: open-handle-ptr's refusal paired with the handle, or
+  ;; 'pipe-already-used.
   (define (stdio-refusal specs)
     (exists (lambda (spec)
               (let ((h (stdio-spec-handle spec)))
@@ -605,13 +620,14 @@
   ;; the loop and that the process is open (owned-handle-ptr), read its
   ;; pointer and call libuv in one interrupt-free step (one-step), as the
   ;; stream verbs do. Split by an engine between the open check and the
-  ;; call, each reached a handle a close had freed meanwhile, and a spawn
-  ;; given the freed address was signalled in the process's place, or had
-  ;; its pid answered (#71); a kill resumed after a handoff signalled the
-  ;; process from a thread that no longer owned its loop (#86;
-  ;; tests/test-process-steps.sps). The step answers a status, and the verb
-  ;; raises after it (step-refusal): a process closed meanwhile is refused
-  ;; with &uv-handle-closed, and a loop handed on with &uv-wrong-thread.
+  ;; call, each could reach a handle a close had freed meanwhile, and a
+  ;; spawn given the freed address would be signalled in the process's
+  ;; place, or have its pid answered; and a kill resumed after a handoff
+  ;; would signal the process from a thread that does not own its loop
+  ;; (tests/test-process-steps.sps). The step answers a status, and the
+  ;; verb raises after it (step-refusal): a process closed meanwhile is
+  ;; refused with &uv-handle-closed, and a loop handed on with
+  ;; &uv-wrong-thread.
 
   ;; uv-process-kill! : uv-process (or symbol 0) -> unspecified
   ;; Sending a signal after exit can race operating-system pid reuse.

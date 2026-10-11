@@ -2,7 +2,8 @@
 
 [[https://github.com/Kiyomi-Computation-Systems/chez-libuv/actions/workflows/ci.yml][https://github.com/Kiyomi-Computation-Systems/chez-libuv/actions/workflows/ci.yml/badge.svg]]
 
-Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
+R6RS bindings to [[https://libuv.org][libuv]] for Chez Scheme: an event loop, TCP, timers,
+DNS, child processes, pipes and signals.
 
 #+begin_quote
 ✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
@@ -10,57 +11,71 @@ Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme.
 
 * What it is
 
-A legible, low-level mirror of libuv: the event loop, TCP sockets, timers,
-DNS, child processes with pipe stdio, and signal watching. The public API
-follows libuv's own verb set — ~accept~, ~read-start~, ~write~,
-~shutdown~, ~timer~, ~getaddrinfo~, ~spawn~, ~close~ — closely enough that
-a caller who knows libuv recognises the Scheme surface immediately.
+A thin, legible mirror of libuv. The API follows libuv's own verbs
+(~accept~, ~read-start~, ~write~, ~shutdown~, ~timer~, ~getaddrinfo~,
+~spawn~, ~close~) closely enough that a caller who knows libuv recognises
+it at once.
 
-It is transport only: it parses nothing, understands no protocol above raw
-bytes, and provides no connection-state or backpressure policy of its own —
-those belong to the layers built on top of these primitives. The full
-design, with twenty accepted decision records, lives under
-[[file:.plans/][.plans/]].
+It is transport only. It parses nothing, understands no protocol above
+raw bytes, and has no connection-state or backpressure policy of its own.
+Those belong to the layers built on top of it.
 
-* Status
+* Why it is built this way
 
-*v0.9.0* — event loop (with ~uv-update-time!~ to refresh its cached clock
-after a callback that held it, before arming a deadline, and a run refused
-with ~&uv-stack-exhausted~ before its thread's C stack runs out), TCP
-(bind with an optional reuseport flag, listen, accept, connect, reads with
-backpressure, scalar and vectored writes, shutdown, nodelay, keepalive,
-local and peer addresses), timers, DNS
-(~getaddrinfo~, ~getnameinfo~, ~cancel~), child processes (the full
-~uv_spawn~ stdio vocabulary) with minimal pipes, signal watching
-(continuous and oneshot), flow control (read/write buffer sizing, the
-write-queue congestion gauge — see ~docs/api.md~'s Flow control section),
-and threading: a loop thread blocks in ~uv-run~ without freezing garbage
-collection for other Scheme threads, with a ~uv_async~ cross-thread wakeup
-and enforced per-loop thread affinity
-([[file:.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md][ADR-0019]]).
-No filesystem, no UDP, no zero-copy I/O
-([[file:.plans/decisions/0009-copy-at-the-boundary.md][ADR-0009]]). CI
-covers Linux on both dependency-acquisition paths, with Valgrind as the
-memory gate
-([[file:.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md][ADR-0003]]);
-macOS is supported and tested, but locally rather than on a paid runner.
-Windows is deferred, not designed out
-([[file:.plans/decisions/0004-windows-deferred-design-clean.md][ADR-0004]]).
+- *Closing is explicit.* A handle stays open until you close it, and
+  callbacks run only inside ~uv-run~. No guardian or finalizer tears down
+  native state behind your back, so a handle's lifetime is visible in
+  your code.
+- *Bytes are copied at the boundary.* Every read delivers a fresh
+  bytevector, and every write copies its bytes before libuv sees them. No
+  Scheme object is shared with C while libuv holds it.
+- *Errors have names.* libuv's error codes arrive as symbols
+  (~'ECONNREFUSED~) inside R6RS conditions, and every refusal the binding
+  makes names its reason, by condition type (~&uv-handle-closed~) or by a
+  reason symbol (~'loop-running~).
+- *A blocked loop does not stall the collector.* A thread waiting in
+  ~uv-run~ lets other Scheme threads collect garbage. Each loop belongs to
+  one thread at a time, the one that created it or last ran it. Every
+  verb that makes something on it, and every verb on its open handles
+  except ~uv-close!~ and ~uv-async-send!~, raises ~&uv-wrong-thread~ from
+  any other thread. ~uv-async-send!~ is how another thread wakes it.
+- *Native calls are checked.* A verb on a closed handle or loop raises
+  ~&uv-handle-closed~ instead of touching freed memory, even when an
+  engine stops it part way; closing one twice does nothing. A run raises
+  ~&uv-stack-exhausted~ instead of starting when its thread has less than
+  128 KiB of C stack left.
 
-* Install
+* What it covers
 
-Prerequisites:
+| Module            | Binds                                                            |
+|-------------------+------------------------------------------------------------------|
+| ~(libuv)~         | Everything below, the condition types and the version queries    |
+| ~(libuv loop)~    | Loops: run, stop, the cached clock, close and teardown           |
+| ~(libuv handle)~  | What every handle shares, and TCP and pipe socket buffer sizes   |
+| ~(libuv timer)~   | One-shot and repeating timers                                    |
+| ~(libuv tcp)~     | Bind, listen, accept, connect, nodelay, keepalive, addresses     |
+| ~(libuv stream)~  | Reads with backpressure, scalar and vectored writes, shutdown    |
+| ~(libuv pipe)~    | Pipes for child-process stdio                                    |
+| ~(libuv process)~ | Child processes with libuv's full stdio vocabulary, and kill     |
+| ~(libuv signal)~  | Signal watching, continuous or one-shot                          |
+| ~(libuv async)~   | Waking a loop from another thread                                |
+| ~(libuv dns)~     | ~getaddrinfo~, ~getnameinfo~ and cancellation                    |
 
-- *Chez Scheme* 10.4.1 or later, threaded: Chez's default build, so
-  anything not configured with ~--nothreads~ (the binary is ~chez~). A
-  non-threaded Chez is refused at import, with a message saying so.
-- *libuv 1.48.0* or later in the 1.x series — either a system package
-  ~pkg-config~ can see (e.g. ~brew install libuv~, or Ubuntu 24.04's
-  ~libuv1-dev~), or nothing at all: the build falls back to a pinned,
-  vendored libuv submodule automatically. It falls back the same way when
-  the system's libuv is older than 1.48.0, as Debian 12's 1.44.2 is.
+There is no filesystem API, no UDP and no zero-copy I/O. Linux and macOS
+are supported; Windows is not.
 
-Then:
+* Requirements
+
+- *Chez Scheme* 10.4.1 or later, threaded. That is Chez's default build:
+  anything not configured with ~--nothreads~. A non-threaded Chez is
+  refused at import, with a message saying so.
+- *libuv 1.48.0* or later in the 1.x series, as a system package
+  ~pkg-config~ can see (~brew install libuv~, Ubuntu 24.04's
+  ~libuv1-dev~). Without one, or when the system's libuv is older than
+  1.48.0, the build uses the pinned libuv in ~vendor/libuv~.
+- A C compiler and ~make~. Building the vendored libuv also needs ~cmake~.
+
+* Build
 
 #+begin_src sh
 git clone --recursive https://github.com/Kiyomi-Computation-Systems/chez-libuv.git
@@ -70,23 +85,19 @@ make build
 
 ~make build~ compiles the small C shim and generates
 ~src/libuv/private/config.sls~, which records absolute paths for /this/
-machine. That file is deliberately not in the repository, so every clone
-runs ~make build~ once before ~(import (libuv))~ resolves. Run it again after
-every upgrade: the shim's exports change between releases, and a shim built
-from older sources fails the import with ~&uv-shim-unavailable~. ~make help~
-lists all targets; [[file:docs/building.md][docs/building.md]] has the full
-story, release builds included.
+machine. That file is not in the repository, so every clone runs
+~make build~ once before ~(import (libuv))~ resolves. Run it again after
+every upgrade: a shim built from older sources fails the import with
+~&uv-shim-unavailable~. ~make help~ lists every target, and
+[[file:docs/building.md][docs/building.md]] covers acquisition paths,
+~CHEZ_LIBUV_SHIM~ and release builds.
 
-** Using Akku
+Install from a git checkout as above. The shim and ~config.sls~ are
+per-machine build products, so a source-only install cannot work. Akku
+manages the Scheme dependency of the test suites (~chez-srfi~); ~(libuv)~
+itself depends on nothing beyond ~(rnrs)~.
 
-Akku manages this project's Scheme-level dependency (~chez-srfi~, used by
-the test suites only — ~(libuv)~ itself depends on nothing beyond ~(rnrs)~).
-The package is not yet on the Akku index; until it is, consume it as a git
-checkout exactly as above. A source-only install cannot work anywhere:
-the native shim and the generated ~config.sls~ are per-machine build
-products.
-
-** Running your program
+* Use
 
 Chez needs ~src~ on its library path:
 
@@ -95,8 +106,6 @@ CHEZSCHEMELIBDIRS=src chez --program your-script.sps
 #+end_src
 
 ~make dev~ starts a REPL with everything wired.
-
-* A taste
 
 #+begin_src scheme
 (import (rnrs) (libuv))
@@ -118,35 +127,38 @@ CHEZSCHEMELIBDIRS=src chez --program your-script.sps
 (uv-loop-teardown! loop)
 #+end_src
 
-The real walkthrough — an echo server and client on one loop, and the
-three rules every program here depends on — is
-[[file:docs/quickstart.md][docs/quickstart.md]].
+[[file:docs/quickstart.md][docs/quickstart.md]] walks through an echo
+server and client on one loop, and the three rules every program here
+depends on.
+
+* Test
+
+~make test~ runs the default suites; the root-only and threading-stress
+suites have targets of their own (~make help~). On Linux,
+~make HAVE_PKG=no test-memory~ runs the suites under Valgrind, which is
+the memory gate; on macOS the same target uses AddressSanitizer, which
+checks addresses but not leaks. On a Guix host, ~scripts/guix-env make test~
+runs them in a pinned container. CI runs on Linux; macOS is tested locally.
+[[file:docs/building.md][docs/building.md]] describes each gate, and
+[[file:CONTRIBUTING.md][CONTRIBUTING.md]] the test discipline.
 
 * Documentation
 
 | [[file:docs/quickstart.md][Quickstart]]         | An echo server start to finish, and the rules that make it work |
-| [[file:docs/api.md][API reference]]             | Every export of every module, one line each, with semantics     |
+| [[file:docs/api.md][API reference]]             | Every export of every module, with its semantics                |
 | [[file:docs/building.md][Building & testing]]   | Acquisition paths, ~CHEZ_LIBUV_SHIM~, release builds, test gates |
 | [[file:CHANGELOG.md][CHANGELOG]]                | Per-release history                                             |
-| [[file:.plans/][Design specs & ADRs]]           | Why it is built this way, with the evidence                     |
 
 * Contributing
 
-See [[file:CONTRIBUTING.md][CONTRIBUTING.md]] for the build/test workflow
-and conventions, and [[file:SECURITY.md][SECURITY.md]] for reporting
+See [[file:CONTRIBUTING.md][CONTRIBUTING.md]] for the build and test
+workflow, and [[file:SECURITY.md][SECURITY.md]] for reporting
 vulnerabilities privately.
 
 * License
 
-BSD 3-Clause. See ~LICENSE~.
-
-Third-party software arrives as git submodules under its own licenses —
-[[https://github.com/libuv/libuv][libuv]] (MIT; see ~vendor/libuv/LICENSE~
-and ~LICENSE-extra~) and
-[[https://github.com/arcfide/chez-srfi][chez-srfi]] (permissive; see
-~vendor/chez-srfi/LICENSE~; test suites only). Nothing third-party is
-copied into this tree. If you redistribute binaries or archives that
-bundle libuv, carry its license texts.
+BSD 3-Clause; see [[file:LICENSE][LICENSE]]. Third-party components and
+their licenses are listed in [[file:NOTICE][NOTICE]].
 
 -----
 

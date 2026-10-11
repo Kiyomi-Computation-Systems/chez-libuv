@@ -156,11 +156,11 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
 
   /* Version-gated bind flag. UV_TCP_REUSEPORT (TCP SO_REUSEPORT with load
    * balancing) is an enum constant, so it is invisible to #ifdef; it is guarded
-   * by libuv's version instead, which arrived in 1.49.0 (UV_VERSION_HEX
-   * 0x013100). Below that the name is simply absent from this table and
-   * chez_uv_constant returns 0 for it, which surfaces in Scheme as
-   * &uv-constant-unavailable at the point of use (ADR-0005) -- a named refusal,
-   * never a silent bind with the flag dropped. */
+   * by libuv's version instead: the flag arrived in libuv 1.49.0
+   * (UV_VERSION_HEX 0x013100). Below that the name is simply absent from this
+   * table and chez_uv_constant returns 0 for it, which surfaces in Scheme as
+   * &uv-constant-unavailable at the point of use -- a named refusal, never a
+   * silent bind with the flag dropped. */
 #if UV_VERSION_HEX >= 0x013100
   { "UV_TCP_REUSEPORT", UV_TCP_REUSEPORT },
 #endif
@@ -263,9 +263,9 @@ void chez_uv_alloc_cb(uv_handle_t *handle, size_t suggested_size,
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
 /* Each loop's thread updates these counters, and a program can run a loop
- * on each of several threads (#70). So every update is one atomic add:
- * with plain += and -=, two loop threads lost updates, and the counts no
- * longer balanced (tests/test-loop-threads.sps's balance row). Relaxed
+ * on each of several threads. So every update is one atomic add: with
+ * plain += and -=, two loop threads would lose updates, and the counts
+ * would not balance (tests/test-loop-threads.sps's balance row). Relaxed
  * order is enough, as a count orders nothing else. GCC and Clang have these
  * builtins under -std=c99. */
 #if !defined(__GNUC__) && !defined(__clang__)
@@ -409,19 +409,22 @@ long chez_uv_live_block(void) { return 0; }
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
-/* A pool hold, in dev builds only, for tests/test-dns.sps (#127): a
- * threadpool item that keeps the worker running it until the caller
- * releases it, or until its bound passes. With the pool pinned to one
- * worker, and that worker inside a hold, a lookup queued after it cannot
- * start until the release, and stays cancellable. Two of the suite's rows
- * bet on that state without a hold, and on one CI run the teardown row
- * lost all 16 of its draws.
+/* A pool hold, in dev builds only, for tests/test-dns.sps: a threadpool
+ * item that keeps the worker running it until the caller releases it, or
+ * until its bound passes. With the pool pinned to one worker, and that
+ * worker inside a hold, a lookup queued after it cannot start until the
+ * release, and stays cancellable. Without a hold, two of the suite's rows
+ * would bet on that state, and a bet can lose: the teardown row has lost
+ * all 16 of its draws on CI.
  *
  * The caller allocates the block, zeroed, at chez_uv_debug_pool_hold_size
  * bytes, and frees it only once the hold has finished: until then the
  * worker or the loop can still touch it. So the shim keeps no state of its
- * own (rule 6 of tests/test-source-rules.sps). A release build has none of
- * these entries (ADR-0002's dev-only kind; tests/check-prod.sps). */
+ * own (rule 6 of tests/test-source-rules.sps). These are the shim's only
+ * exports that call into libuv, and the binding never calls them. They
+ * are compiled only under -DCHEZ_LIBUV_DEBUG_COUNTERS, with no release
+ * stub, and tests/check-prod.sps fails a release shim that exports any
+ * of them. */
 struct chez_uv_pool_hold {
   uv_work_t req; /* first, so a callback's uv_work_t * is the block */
   uv_mutex_t mutex;
@@ -578,8 +581,9 @@ uintptr_t chez_uv_stack_pointer(void) {
  * gives no way to read it. On Linux the main thread's costs about 22 us,
  * since glibc reads /proc/self/maps for it, so Scheme keeps it per thread
  * (native.sls's stack-headroom). The shim keeps nothing itself: a
- * thread-local here is a block glibc mallocs on each thread's first use,
- * which the memory gate counted (rule 6 of tests/test-source-rules.sps). */
+ * thread-local here would be a block glibc mallocs on each thread's first
+ * use, which the memory gate would count (rule 6 of
+ * tests/test-source-rules.sps). */
 uintptr_t chez_uv_stack_bottom(void) {
 #if defined(__APPLE__)
   pthread_t self = pthread_self();

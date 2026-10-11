@@ -5,4 +5,4 @@
   (synopsis "Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme")
   (authors "Kiyomi Computation Systems LLC")
   (license "BSD-3-Clause")
-  (depends ("chez-srfi" "^0.0.0-akku.181.7879b52")))
+  (depends/dev ("chez-srfi" "^0.0.0-akku.181.7879b52")))

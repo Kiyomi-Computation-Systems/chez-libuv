@@ -33,10 +33,12 @@
       (raise (make-uv-invalid-argument who 'not-a-uv-signal)))
     (require-open-handle sig who))
 
+  ;; start-signal! : uv-signal symbol procedure (or 'continuous 'oneshot)
+  ;;                 procedure symbol -> unspecified
   ;; One interrupt-free step checks again that this thread owns the loop,
   ;; that the handle is open and that its mode is still WANTED-MODE or
   ;; unfixed, starts it, and stores the callback and fixes the mode once
-  ;; libuv has started it (#86). A failed start fixes no mode. A signal is
+  ;; libuv has started it. A failed start fixes no mode. A signal is
   ;; delivered only inside uv-run, so none can reach the handle between
   ;; the start and the store, and no engine can split the start from those
   ;; checks or drop it half made (tests/test-handle-steps.sps).
@@ -71,7 +73,7 @@
                    uv-signal-start-oneshot-native 'uv-signal-start-oneshot!))
 
   ;; uv-signal-stop! : uv-signal -> unspecified
-  ;; One interrupt-free step, as a start is (#86).
+  ;; One interrupt-free step, as a start is.
   (define (uv-signal-stop! sig)
     (require-signal-handle sig 'uv-signal-stop!)
     (handle-call! sig 'uv-signal-stop! uv-signal-stop))

@@ -1,6 +1,6 @@
 # chez-libuv
 #
-# On a Guix host, run targets through the pinned container (ADR-0020):
+# On a Guix host, run targets through the pinned Guix container:
 #   scripts/guix-env make <target>
 
 # In the container, scripts/guix-env-enter exports both: the profile's real
@@ -26,8 +26,8 @@ else
   # strict mode -- notably pthread_rwlock_t, which libuv's own
   # <uv/unix.h> uses and which our -std=c99 (kept deliberately strict,
   # see CFLAGS_BASE below) would otherwise leave undeclared. macOS's
-  # headers expose it regardless of -std, which is why this was invisible
-  # until Linux CI's glibc caught it. _POSIX_C_SOURCE=200809L (POSIX.1-2008)
+  # headers expose it regardless of -std, so a macOS build never shows the
+  # problem; only a glibc build does. _POSIX_C_SOURCE=200809L (POSIX.1-2008)
   # is what pthread_rwlock_t needs; _DEFAULT_SOURCE restores the other
   # glibc/BSD extensions a bare _POSIX_C_SOURCE would otherwise suppress.
   CFLAGS_POSIX := -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -45,7 +45,8 @@ CFLAGS_DEV  := $(CFLAGS_BASE) -g -O0 -DCHEZ_LIBUV_DEBUG_COUNTERS
 CFLAGS_PROD := $(CFLAGS_BASE) -O2
 
 # Which flags link the shim. dev is the default, so `make build` and
-# `make test` behave exactly as they always have; `prod` re-enters make with
+# `make test` link the debug shim, with the allocation counters the suites
+# read (-DCHEZ_LIBUV_DEBUG_COUNTERS); `prod` re-enters make with
 # FLAVOR=prod so the whole graph -- shim, config.sls, stamps -- agrees on one
 # flavor. GUARDED, because this variable's one failure mode is a typo silently
 # falling back to dev and shipping a debug build under a release name.
@@ -58,8 +59,8 @@ else
   $(error FLAVOR must be dev or prod, got '$(FLAVOR)')
 endif
 
-# --- version floor / supported range (ADR-0001's "both must fall inside the
-# version range validated at init") ---------------------------------------
+# --- version floor / supported range (a system libuv and the vendored one
+# must both fall inside the version range validated at init) --------------
 # UV_RANGE_LO/HI are DERIVED from UV_FLOOR_MAJOR/MINOR below, in one place --
 # no second copy of the packed-hex number exists anywhere else in this repo.
 # The hex digits are built once (UV_RANGE_LO_HEX/UV_RANGE_HI_HEX) and reused
@@ -67,8 +68,9 @@ endif
 # "#x..." spelling written into config.sls.
 #
 # 1.48.0 is Ubuntu 24.04 LTS's libuv, and CI's floor job links exactly it.
-# The floor was 1.44.0 until #90, a version no run had tested: against
-# Debian 12's 1.44.2, two test-lifecycle rows fail (ADR-0001's amendment).
+# No libuv below it is tested. Debian 12's 1.44.2 orders a close against a
+# timer differently, which two test-lifecycle rows assert, and a build
+# linked against a libuv below the floor refuses itself at load.
 UV_FLOOR_MAJOR  := 1
 UV_FLOOR_MINOR  := 48
 UV_FLOOR_DOTTED := $(UV_FLOOR_MAJOR).$(UV_FLOOR_MINOR).0
@@ -78,7 +80,7 @@ UV_RANGE_HI_HEX := $(shell printf '%02xffff' $(UV_FLOOR_MAJOR))
 UV_RANGE_LO     := 0x$(UV_RANGE_LO_HEX)
 UV_RANGE_HI     := 0x$(UV_RANGE_HI_HEX)
 
-# --- native dependency discovery (ADR-0001) --------------------------
+# --- native dependency discovery -------------------------------------
 # A system libuv is used only when it meets the floor. One below it is
 # passed over for the vendored build, as a missing one is: a shim linked
 # against it would refuse itself at load (&uv-version-incompatible).
@@ -89,15 +91,12 @@ ifeq ($(HAVE_PKG),yes)
   UV_CFLAGS := $(shell pkg-config --cflags libuv)
   UV_LIBS   := $(shell pkg-config --libs libuv)
   UV_LIBDIR := $(shell pkg-config --variable=libdir libuv)
-  # ONE library on this path -- libuv ships a single shared object, unlike
-  # cmark-gfm's core+extensions split, so there is no CMARK_CLI-shaped
-  # second artifact and no differential-testing variable to carry over.
+  # ONE library on this path: libuv ships a single shared object.
   UV_DLLS   := $(UV_LIBDIR)/libuv.$(SHLIB_EXT)
 else
   UV_CFLAGS := -I$(VENDOR_DIR)/include
-  # libuv's CMake drops the built shared object at the BUILD ROOT (no
-  # per-target lib/ subdirectory the way cmark-gfm's split src/+extensions/
-  # tree does), so there is exactly one vendored libdir, not two.
+  # libuv's CMake drops the built shared object at the BUILD ROOT, with no
+  # per-target lib/ subdirectory, so there is exactly one vendored libdir.
   UV_VENDOR_LIBDIR := $(abspath $(VENDOR_BUILD))
   UV_LIBS   := -L$(UV_VENDOR_LIBDIR) -luv -Wl,-rpath,$(UV_VENDOR_LIBDIR)
   UV_DLLS   := $(UV_VENDOR_LIBDIR)/libuv.$(SHLIB_EXT)
@@ -107,18 +106,13 @@ SRFI_SRC     := vendor/chez-srfi
 SRFI_LIBS    := $(BUILD_DIR)/scheme-libs
 CHEZ_LIBDIRS := src:tests:$(SRFI_LIBS)
 
-# The root lane (design spec v0.3 §9.4): privileged-but-deterministic
-# setuid/setgid tests, run ONLY by an explicit `sudo make test-root` --
-# never by the default suite, never under the memory gate. The filter-out
-# below is what keeps a `tests/test-*.sps` wildcard from silently running
-# it unprivileged (where it would loudly exit 1 and fail `make test`).
-# --- per-suite timeout (T2a) -----------------------------------------------
+# --- per-suite timeout -----------------------------------------------------
 # `make test` and `make test-memory` run suites SERIALLY, so one suite that
-# hangs takes the whole run with it. That is not hypothetical: a v0.5 mutation
-# probe (suppressing the write completion callback) made test-tcp.sps block
-# forever in a uv-run waiting on a completion that could never arrive, and the
-# run died at the outer timeout having produced no failing-row output at all.
-# A hang and a failure looked identical, which is the actual cost.
+# hangs takes the whole run with it. That is not hypothetical: suppress the
+# write completion callback and test-tcp.sps blocks forever in a uv-run
+# waiting on a completion that can never arrive. Without a per-suite cap the
+# run dies at an outer timeout having produced no failing-row output at all,
+# and a hang looks identical to a failure, which is the actual cost.
 #
 # timeout(1) is GNU coreutils and stock macOS DOES NOT SHIP IT. Homebrew
 # installs it as `timeout` when coreutils is installed with default names, and
@@ -127,22 +121,26 @@ CHEZ_LIBDIRS := src:tests:$(SRFI_LIBS)
 # results, just without the HUNG diagnosis.
 #
 # Exit 124 is timeout(1)'s "I killed it" status and is reported DISTINCTLY.
-# Folding it into the ordinary failure path would defeat the point -- the
-# whole reason this exists is that a hang and a failure are different problems
-# that looked the same.
+# Folding it into the ordinary failure path would defeat the point -- this
+# exists because a hang and a failure are different problems that otherwise
+# look the same.
 TIMEOUT_BIN    := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
 # Generous: the slowest plain suite is well under a minute. The memory lane
 # gets its own, because Valgrind is 20-50x slower and shares these loops.
 SUITE_TIMEOUT        ?= 300
 MEMORY_SUITE_TIMEOUT ?= 900
 
+# The root lane: privileged-but-deterministic setuid/setgid tests, run ONLY
+# by an explicit `sudo make test-root` -- never by the default suite, never
+# under the memory gate. The filter-out in TESTS below is what keeps a
+# `tests/test-*.sps` wildcard from silently running it unprivileged (where
+# it would loudly exit 1 and fail `make test`).
 ROOT_TESTS   := tests/test-process-setuid.sps
 
-# STRESS_TESTS fork real OS threads and are timing-dependent (ADR-0010
-# companion): kept OFF the default gate via `make test-threading`, exactly as
-# ROOT_TESTS are gated behind `make test-root`. tests/test-async-fence.sps
-# forks threads too, but none of its verdicts depends on timing, so it stays
-# in TESTS (ADR-0010, amended 2026-09-28).
+# STRESS_TESTS fork real OS threads and are timing-dependent: kept OFF the
+# default gate via `make test-threading`, exactly as ROOT_TESTS are gated
+# behind `make test-root`. tests/test-async-fence.sps forks threads too, but
+# none of its verdicts depends on timing, so it stays in TESTS.
 STRESS_TESTS := tests/test-threading-stress.sps
 
 TESTS        := $(filter-out $(ROOT_TESTS) $(STRESS_TESTS),$(wildcard tests/test-*.sps))
@@ -169,12 +167,12 @@ PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
 # test-memory runs every suite but the pure ones. A pure suite loads no
 # native code, as check-purity proves, so under Valgrind or ASan it checks
 # Chez alone and none of the binding: about 7 s a suite under Valgrind on
-# CI, 58 s for the seven (2026-10-09). A suite that starts reaching native
+# CI (58 s for seven of them). A suite that starts reaching native
 # code fails check-purity until it comes off PURE_TESTS, which puts it back
 # here.
 MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 
-.PHONY: all build deps require-toolchain relink-guard check-pins check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside
+.PHONY: all build deps require-toolchain relink-guard check-pins check-history check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside
 
 .DEFAULT_GOAL := help
 
@@ -189,13 +187,13 @@ MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 # description; this just collects them. Keeping the description ON the
 # target line (enforced by check-help) means a target can never go
 # undocumented without also going unbuildable-looking, i.e. it is a check,
-# not a comment (AGENTS.md).
+# not a comment.
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_.-]+:.*?## / { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # A target dropped from its own `## ` line, or renamed without updating
-# .PHONY, silently stops being discoverable via `make help`. This is the
-# comment-vs-check AGENTS.md rule applied to the help system itself.
+# .PHONY, silently stops being discoverable via `make help`. check-help
+# fails on that, where a comment asking for `## ` lines would not.
 check-help: ## Fail if any .PHONY target is undocumented in `make help`
 	@missing=0; \
 	targets=$$(awk '/^\.PHONY:/ { $$1 = ""; print }' Makefile); \
@@ -213,7 +211,7 @@ deps-info: ## Report which libuv acquisition path and artifacts are active
 	@echo "uv dlls      : $(UV_DLLS)"
 	@echo "version range: [$(UV_RANGE_LO),$(UV_RANGE_HI)] (floor $(UV_FLOOR_DOTTED))"
 
-# The pinned Guix container (ADR-0020). check-guix runs on the host: the
+# The pinned Guix container. check-guix runs on the host: the
 # launcher's own tests, which run no Guix, then the self-test inside the
 # container, which ends by running check-help and test there.
 check-guix: ## Test scripts/guix-env on the host, then the toolchain inside the container
@@ -227,7 +225,7 @@ check-guix-inside: ## (inside the container) Assert the pinned toolchain, isolat
 all: build ## Alias for build
 
 # relink-guard FIRST, and the order is load-bearing: it deletes a shim whose
-# provenance no longer matches what was asked for, and make only stats
+# provenance does not match what was asked for, and make only stats
 # $(SHIM) when it reaches it -- after that recipe has run. See the guard's
 # own comment for why the stamps cannot do this on their own.
 build: require-toolchain relink-guard $(SHIM) $(CONFIG_SLS) ## Build the shim and generate config.sls
@@ -242,20 +240,21 @@ require-toolchain: ## Fail early, naming the Guix container, when the compiler, 
 
 # Scheme dependencies. chez-srfi is vendored as a submodule pinned to the SAME
 # commit Akku.lock names (7879b52). Keep them equal: bumping the Akku dependency
-# without re-pinning the submodule means consumers and CI test different code,
-# and nothing here would notice. Akku itself is
+# without re-pinning the submodule means an Akku install and CI test different
+# code, and nothing here would notice. Akku itself is
 # deliberately NOT on this path: it has no prebuilt binary, and its downloader
 # fails on some hosts with CURLE_URL_MALFORMED. Akku.manifest/Akku.lock remain
-# the consumer-facing declaration.
+# the declaration Akku reads; chez-srfi is a development dependency there, so
+# a project that depends on chez-libuv does not install it.
 #
 # chez-srfi ships Akku's percent-encoded filenames (%3a64.sls). Chez resolves
 # (srfi :64) only from the decoded spelling, so link both into a build tree and
 # leave the submodule's own working tree untouched.
-# The submodule pin and Akku.lock name the same chez-srfi commit, and nothing
-# else enforces that. They drifted within minutes of the rule being written: a
-# `git submodule update --init` (from `deps`, below) resets the working tree to
-# the RECORDED gitlink, silently undoing a manual detach that had not been
-# staged yet. So this is a check, not a comment.
+# The submodule pin and Akku.lock name the same chez-srfi commit, and only
+# check-pins enforces that. They drift easily: a `git submodule update
+# --init` (from `deps`, below) resets the working tree to the RECORDED
+# gitlink, silently undoing a manual detach that has not been staged yet. So
+# the rule is a check, not a comment.
 #
 # Always relinks rather than using a stamp file: a stamp keyed on nothing the
 # submodule pin touches would leave stale symlinks after a re-pin. `ln -sfn` is
@@ -291,7 +290,7 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	case "$$rec" in \
 	  "$$lock"*) echo "pins agree: chez-srfi $$lock" ;; \
 	  *) echo "PIN DRIFT: submodule $$rec but Akku.lock names $$lock." >&2; \
-	     echo "Consumers install what Akku.lock names; CI tests the submodule." >&2; \
+	     echo "An Akku install gets what Akku.lock names; CI tests the submodule." >&2; \
 	     exit 1 ;; \
 	esac
 	@if [ ! -f $(VENDOR_DIR)/include/uv/version.h ]; then \
@@ -371,8 +370,16 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	echo "vendor read-path facts ok: ZERO_READ set=$$zr cleared=$$zc, read_buffer assigned=$$rb"; \
 	echo "vendor read-path facts ok: tcp WSARecv sites=$$wr, pipe CancelIoEx=$$pc GetOverlappedResult=$$pg"
 
-# Nothing outside private/ may see a raw uv_* symbol or pointer (design spec
-# section 3). test-conditions.sps exercises the pure &uv-* condition
+# The source, build files and user docs state facts, not where they came
+# from: no design or decision records, issue or PR numbers, probe
+# programs, dates or release numbers. CHANGELOG.md and git history keep
+# the provenance. The script tests its own pattern on planted references
+# before it scans, so a pattern edited into uselessness fails here first.
+check-history: ## Fail if source, build files or user docs cite plans, issues, dates or release numbers
+	@scripts/check-history-refs
+
+# Nothing outside private/ may see a raw uv_* symbol or pointer.
+# test-conditions.sps exercises the pure &uv-* condition
 # hierarchy only, so its import chain must never reach
 # (libuv private native), which loads a shared object. Poisoning
 # CHEZ_LIBUV_SHIM with a path that looks absolute but does not exist is the
@@ -410,8 +417,8 @@ endif
 # Which acquisition path last built the shim. The name encodes the mode, so
 # flipping HAVE_PKG makes the prerequisite change identity and forces a relink.
 # Without this, `make HAVE_PKG=no build && make build` leaves the vendored-linked
-# shim in place -- make sees the .c unchanged and skips it -- so the two exit-gate
-# runs would silently test the same artifact twice.
+# shim in place -- make sees the .c unchanged and skips it -- so a pkg-config
+# run and a vendored run would silently test the same artifact twice.
 ACQ_MODE  := $(if $(filter yes,$(HAVE_PKG)),pkgconfig,vendored)
 ACQ_STAMP := $(BUILD_DIR)/.acquisition-$(ACQ_MODE)
 
@@ -447,20 +454,20 @@ $(SHIM): src/libuv-shim.c src/libuv-shim.h $(ACQ_STAMP) $(FLAVOR_STAMP) | $(LIB_
 	$(call LINK_SHIM,)
 
 # THE STAMPS ABOVE RECORD THE PROVENANCE; THIS TARGET ENFORCES IT. Depending
-# on them was not enough, and that was MEASURED rather than assumed:
+# on them is not enough, and that is MEASURED rather than assumed:
 #
 #   make 3.81 -- the make macOS ships, and therefore the one that runs
-#   `make prod && make test` here -- compares mtimes at ONE-SECOND
+#   `make prod && make test` on a macOS box -- compares mtimes at ONE-SECOND
 #   granularity and treats "equal" as up to date. A flavor flip recreates the
 #   stamp in the same second as the previous link often enough to matter
 #   (`make prod && make test` is exactly that shape), and the shim is then
 #   NOT relinked: the dev suites run against the release artifact, or a
 #   release is packaged from a dev relink -- the failure the whole mechanism
-#   exists to prevent. Observed directly: `make prod` followed immediately by
-#   `make test` recreated build/.flavor-dev, skipped the link, and failed 45
-#   counter rows across five suites against the -O2 shim. make 4.x compares
-#   sub-second timestamps and gets it right, so the defect is invisible on
-#   Linux and live on macOS.
+#   exists to prevent. Observed directly, without this guard: `make prod`
+#   followed immediately by `make test` recreated build/.flavor-dev, skipped
+#   the link, and failed 45 counter rows across five suites against the -O2
+#   shim. make 4.x compares sub-second timestamps and gets it right, so the
+#   defect is invisible on Linux and live on macOS.
 #
 # Removing the artifact is not subject to any of that. A missing shim is
 # rebuilt whatever the clock said.
@@ -472,8 +479,8 @@ relink-guard: ## Delete the shim when the build flavor or acquisition path chang
 	fi
 
 # A shim built from older sources, for tests/test-shim-loading.sps: this
-# shim's own source with its newest export, libuv's alloc callback (#45),
-# renamed away. So it loads cleanly and has every entry but that one, which
+# shim's own source with its newest export, libuv's alloc callback, renamed
+# away. So it loads cleanly and has every entry but that one, which
 # is what a consumer has after upgrading without `make build`, and the
 # import must refuse it with &uv-shim-unavailable naming the shim. The suite
 # finds it beside build/lib by this path.
@@ -484,12 +491,11 @@ $(STALE_SHIM): src/libuv-shim.c src/libuv-shim.h $(SHIM)
 	$(call LINK_SHIM,-Dchez_uv_alloc_cb=chez_uv_alloc_cb_withheld)
 
 # config.sls carries the shim's ABSOLUTE path so the loader never searches.
-# Kept as a canned recipe from when `prod` linked the shim itself and had to
-# generate this file without recursing via `$(MAKE) $(CONFIG_SLS)` -- that
-# recursion re-evaluated $(SHIM)'s rule at the default flavor and relinked the
-# release artifact as a debug build. `prod` now re-enters `build` with
-# FLAVOR=prod instead, so the rule below is the only caller; see `prod`'s own
-# comment for why that history is worth keeping written down.
+# A canned recipe, and the rule below is its only caller. Never regenerate
+# config.sls by recursing via `$(MAKE) $(CONFIG_SLS)` after linking a
+# release shim: that recursion re-evaluates $(SHIM)'s rule at the default
+# flavor and relinks the release artifact as a debug build. `prod` re-enters
+# `build` with FLAVOR=prod instead; see `prod`'s own comment.
 define GEN_CONFIG_SLS
 	@mkdir -p $(dir $(CONFIG_SLS))
 	@printf '%s\n' \
@@ -519,11 +525,11 @@ $(CONFIG_SLS): $(SHIM) Makefile
 # error that names clang-tidy, not this Makefile, so it is easy to mistake
 # for an unrelated toolchain problem. Explicitly OFF here.
 #
-# -DCMAKE_POLICY_VERSION_MINIMUM=3.5 is NOT carried over from cmark-gfm's
-# Makefile: that flag works around cmark-gfm's CMakeLists declaring an old
-# cmake_minimum_required that trips a policy-version warning under newer
-# CMake. libuv's own CMakeLists requires cmake >= 3.10 and does not hit
-# that warning, so the flag has nothing to work around here.
+# No -DCMAKE_POLICY_VERSION_MINIMUM=3.5: that flag works around a
+# CMakeLists declaring an old cmake_minimum_required, which trips a
+# policy-version warning under newer CMake. libuv's own CMakeLists requires
+# cmake >= 3.10 and does not hit that warning, so the flag has nothing to
+# work around here.
 vendor: ## Build the vendored libuv fallback (used when HAVE_PKG=no)
 	@scripts/require-tools "$(GOAL)" git cmake
 	git submodule update --init --recursive
@@ -538,10 +544,9 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 
 # Each suite sets its own exit status. Keep going after a failure so one
 # broken suite cannot hide the others, then fail the target if any failed.
-# $(TESTS) is a $(wildcard), so a later task's new tests/test-*.sps file is
-# picked up automatically -- no edit needed here, same reasoning as
-# PURE_TESTS above.
-test: build deps check-pins $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
+# $(TESTS) is a $(wildcard), so a new tests/test-*.sps file is picked up
+# automatically -- no edit needed here.
+test: build deps check-pins check-history $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
 	@test -n "$(TIMEOUT_BIN)" || echo "note: no timeout(1) on PATH; a hung suite will not be capped (brew install coreutils)"
 	@fail=0; \
 	for t in $(TESTS); do \
@@ -578,9 +583,9 @@ test-threading: build deps check-pins ## Run the threaded GC-freedom stress suit
 #
 # NO `build deps` PREREQUISITES, deliberately: this target runs under sudo,
 # and on the vendored path $(SHIM) depends on the PHONY `vendor`, so a
-# `build` prerequisite relinked the shim -- as root -- on EVERY run,
+# `build` prerequisite would relink the shim -- as root -- on EVERY run,
 # leaving root-owned artifacts in build/ (plus root-owned symlinks from
-# `deps`). The recipe's first stanza is a CHECK, not a rebuild (AGENTS.md):
+# `deps`). The recipe's first stanza is a CHECK, not a rebuild:
 # every artifact `build deps` would have made must already exist, and the
 # two provenance stamps must match THIS invocation's FLAVOR/HAVE_PKG --
 # the same identity relink-guard enforces, asserted here instead of acted
@@ -614,9 +619,9 @@ test-root: check-pins ## Run the root-gated setuid/setgid suite (needs sudo; `ma
 ASAN_DYLIB_PATTERN ?= $(dir $(shell xcrun --find clang))../lib/clang/*/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
 
 # The gate's Valgrind suppressions: Chez's own costs, never the binding's.
-# One today, the jmp_buf Chez strands for each callback left without
-# returning (#94); the file says why, and ADR-0003's amendment of 2026-10-09
-# records it. check-memory-gate's escape mode requires it to match, and its
+# There is one, the jmp_buf Chez strands for each callback left without
+# returning; the file says why. check-memory-gate's escape mode requires it
+# to match, and its
 # leak and possible-leak modes require it to hide nothing they plant.
 VALGRIND_SUPPRESSIONS := $(CURDIR)/tests/valgrind-chez.supp
 
@@ -629,7 +634,7 @@ VALGRIND_SUPPRESSIONS := $(CURDIR)/tests/valgrind-chez.supp
 # one that exits before exec reports the block its parent held at the fork.
 #   test-loop          its rows that escape a callback, and its rows that
 #                      resume engines out of nesting order, which abandon
-#                      a callback each (#94)
+#                      a callback each
 #   test-loop-claim    a teardown on another thread whose close callback escapes
 #   test-async-fence   engine sweeps, which drop engines inside callbacks
 #   test-loop-threads  the same
@@ -654,14 +659,14 @@ ifeq ($(UNAME_S),Linux)
 # Valgrind fails a run on the leak kinds --errors-for-leak-kinds names (its
 # default adds "possible") and prints loss records only for the kinds
 # --show-leak-kinds names. Left at the default, a possibly-lost block fails
-# the gate with nothing in the log but a summary total. No suite's own
-# process has one today (measured 2026-09-28; only forked children that
-# never gate do), but a pointer into the middle of a block, held in the
+# the gate with nothing in the log but a summary total. Measured, no suite's
+# own process has one (only forked children that never gate do), but a
+# pointer into the middle of a block, held in the
 # Scheme heap, is enough to make one. check-memory-gate's possible-leak mode
 # holds the two lists consistent.
 #
-# --undef-value-errors=no: NOT a weakening of the leak gate -- ADR-0003
-# scopes this gate to leaks, and undefined-value tracking is a DIFFERENT
+# --undef-value-errors=no: NOT a weakening of the leak gate -- this gate
+# is scoped to leaks, and undefined-value tracking is a DIFFERENT
 # Memcheck check (Value 4, not the allocation-tracking Leak checks this
 # target exists for). Confirmed on real CI output: with it on, Chez's own
 # JIT-generated code (anonymous frames inside S_call_help) throws hundreds
@@ -672,7 +677,6 @@ ifeq ($(UNAME_S),Linux)
 # structurally unable to tell a real bug from JIT noise here. Addressability
 # checking (invalid read/write, use-after-free, the leak checks above) stays
 # fully enabled and gating -- only the undefined-value class is scoped out.
-# See ADR-0003's amendment for the fuller record.
 #
 # CHEZ_LIBUV_UNDER_VALGRIND=1: tells tests/test-native.sps's dirty-memory
 # seed it is running under Memcheck, whose freelist (--freelist-vol,
@@ -680,17 +684,16 @@ ifeq ($(UNAME_S),Linux)
 # catch use-after-free -- so an alloc-after-free there can never observe the
 # just-freed block's leftover bytes. The property that seed exists to prove
 # (a plain allocator hands back dirty memory) is unobservable under Memcheck
-# by design, not by a bug in the seed; see the seed's own comment and the
-# stage-1 mutation log addendum for what that costs.
+# by design, not by a bug in the seed, so the plain `make test` run holds
+# it; see the seed's own comment.
 #
 # The per-suite cap wraps VALGRIND, never the reverse. Valgrind checks the
 # command it is handed and does not follow an exec (--trace-children=no), so
 # `valgrind ... timeout N scheme ...` checks timeout's two allocations while
-# Chez runs natively, unchecked, and exits 0. #14 wrote exactly that, and the
-# gate stayed green over everything from 2026-08-30 to 2026-09-27
-# (ADR-0003's amendment). `make check-memory-gate` plants a defect and
-# requires this recipe to fail on it; that check, not this comment, is what
-# holds the order.
+# Chez runs natively, unchecked, and exits 0: the gate stays green over
+# everything. `make check-memory-gate` plants a defect and requires this
+# recipe to fail on it; that check, not this comment, is what holds the
+# order.
 #
 # Valgrind writes to a log, printed once the suite ends, so that the
 # recipe can read the suite's own leak summary: the first process in the
@@ -726,7 +729,7 @@ ifeq ($(UNAME_S),Linux)
 	    *" $$t "*) ;; \
 	    *) if [ -n "$$supp" ] && [ "$$supp" != "0 bytes in 0 blocks" ]; then \
 	         echo "UNEXPECTED ESCAPE: $$t had $$supp suppressed as the jmp_buf Chez" >&2; \
-	         echo "strands when a callback is left without returning (#94). The suite is" >&2; \
+	         echo "strands when a callback is left without returning. The suite is" >&2; \
 	         echo "not in MEMORY_ESCAPE_SUITES: list it if a row means to escape, or find" >&2; \
 	         echo "the callback that no longer returns." >&2; \
 	         exit 1; \
@@ -735,7 +738,7 @@ ifeq ($(UNAME_S),Linux)
 	done
 else
 	@echo "macOS: ASan preload only; LeakSanitizer is unsupported on arm64."
-	@echo "Leak claims must come from Linux CI (ADR-0003)."
+	@echo "Leak claims must come from Linux CI."
 # The dylib is resolved FIRST and required non-empty: if the clang resource
 # dir glob ever misses (a new Xcode layout, a renamed runtime), an empty
 # DYLD_INSERT_LIBRARIES would run every suite with no sanitizer at all and
@@ -743,10 +746,10 @@ else
 # turns that into a loud failure naming the pattern that missed.
 #
 # DYLD_INSERT_LIBRARIES goes on the Chez command ITSELF, with nothing between.
-# Two mechanisms each drop it silently, both measured 2026-09-27:
+# Two mechanisms each drop it silently, both measured:
 #   - macOS purges every DYLD_* variable when it launches a SIP-protected
-#     binary. /bin/sh is one, and until 2026-09-27 this arm ran its loop
-#     under `sh -c`, so no suite since v0.1 ever loaded ASan.
+#     binary. /bin/sh is one, so a loop run under `sh -c` loads ASan into
+#     no suite at all.
 #   - ASan's Darwin runtime removes itself from DYLD_INSERT_LIBRARIES in
 #     whatever process it loads into (its strip_env default), so a wrapper
 #     such as timeout(1) gets ASan and the Chez it starts does not.
@@ -767,11 +770,10 @@ else
 endif
 
 # --- the memory gate must be able to FAIL ------------------------------------
-# A memory gate nobody has watched fail is a comment, and this one proved it:
-# from #14 until 2026-09-27 the Linux arm handed Valgrind timeout(1) instead
-# of Chez, the macOS arm's ASan preload never reached Chez at all, and both
-# stayed green through v0.6.0 and v0.7.0 (ADR-0003's 2026-09-27 amendment).
-# This target plants each defect the platform's tool must catch
+# A memory gate nobody has watched fail is a comment. A Linux arm that hands
+# Valgrind timeout(1) instead of Chez, or a macOS arm whose ASan preload
+# never reaches Chez, stays green while checking nothing (see test-memory's
+# comments). This target plants each defect the platform's tool must catch
 # (tests/memory-gate-sabotage.sps says which, and why) and runs the REAL
 # test-memory recipe on it through make, so what it judges is the recipe CI
 # and test-memory-docker run, not a copy of its command line.
@@ -801,23 +803,25 @@ endif
 # block, too, or the mode proved nothing.
 #
 # escape (Linux) is the other exception: three callback escapes, each
-# stranding a block Chez allocates (#94), which tests/valgrind-chez.supp
+# stranding a block Chez allocates, which tests/valgrind-chez.supp
 # suppresses. Run as one of MEMORY_ESCAPE_SUITES, the gate must pass on it,
 # and Valgrind's summary must count exactly three blocks suppressed: none
-# means the suppression no longer matches, more means it matches more than
+# means the suppression does not match, more means it matches more than
 # Chez's blocks. The leak and possible-leak modes hold the other side, that
 # it hides none of theirs. These three blocks are still reachable, so the
 # count cannot show that the suppression matches a definitely lost one, the
-# kind that gated test-loop-claim; the mode also requires each of the
-# file's match-leak-kinds lines to name definite (or all).
+# kind test-loop-claim's escape can strand, which would fail the gate
+# unsuppressed; the mode
+# also requires each of the file's match-leak-kinds lines to name definite
+# (or all).
 #
 # stray-escape (Linux) makes the same three escapes from a program missing
 # from MEMORY_ESCAPE_SUITES. The gate must fail on it and name the program,
 # or a callback the binding leaves without returning would be suppressed.
 #
-# And something must have been planted: until 2026-09-28,
-# `make check-memory-gate MEMORY_SABOTAGE_MODES=` looped over nothing and
-# printed MEMORY GATE CAN FAIL.
+# And something must have been planted: without the `ran` count,
+# `make check-memory-gate MEMORY_SABOTAGE_MODES=` would loop over nothing
+# and print MEMORY GATE CAN FAIL.
 #
 # The Linux libc-overrun and shim-overrun markers name only the planted
 # block, not where in it the bad store landed. How wide memset's and
@@ -835,11 +839,11 @@ endif
 # The recipe re-enters make through this alias, never through a literal
 # $(MAKE). make runs any recipe line that names $(MAKE) even under -n, -t or
 # -q (so that a recursive make can print its own recipes), and this recipe
-# is a single line. So `make -n check-memory-gate` really ran the planted
-# program, and ran a test-memory that only printed its commands and exited 0,
-# then reported the gate VACUOUS. Through the alias the line is an ordinary
-# one: a dry run prints it and runs nothing. Measured on make 3.81 and 4.3
-# (.plans/memory-gate-mutation-log.md).
+# is a single line. With a literal $(MAKE), `make -n check-memory-gate`
+# really runs the planted program, and runs a test-memory that only prints
+# its commands and exits 0, then reports the gate VACUOUS. Through the alias
+# the line is an ordinary one: a dry run prints it and runs nothing.
+# Measured on make 3.81 and 4.3.
 MEMORY_GATE_MAKE = $(MAKE)
 
 check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (the gate can go red)
@@ -887,7 +891,7 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	    supp=$$(grep -E "suppressed: [0-9,]+ bytes in [0-9,]+ blocks" $$log | head -1 | sed 's/.*suppressed: //'); \
 	    if [ $$rc -ne 0 ]; then \
 	      echo "SUPPRESSION NOT LIVE: make test-memory failed on the jmp_buf three callback" >&2; \
-	      echo "escapes strand in Chez (#94). Tail of $$log:" >&2; \
+	      echo "escapes strand in Chez. Tail of $$log:" >&2; \
 	      tail -n 30 $$log >&2; fail=1; \
 	    elif ! printf '%s\n' "$$supp" | grep -qF "$$marker"; then \
 	      echo "SUPPRESSION NOT LIVE: Valgrind suppressed \"$${supp:-nothing}\", not the three" >&2; \
@@ -896,7 +900,7 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	    elif grep -E '^[[:space:]]*match-leak-kinds:' $(VALGRIND_SUPPRESSIONS) | grep -qvwE 'definite|all'; then \
 	      echo "SUPPRESSION MISSES DEFINITE: a match-leak-kinds line in $(VALGRIND_SUPPRESSIONS)" >&2; \
 	      echo "leaves out definite, the one kind the gate fails on. This mode's blocks are" >&2; \
-	      echo "still reachable, so they match regardless; test-loop-claim's was definitely lost:" >&2; \
+	      echo "still reachable, so they match regardless; test-loop-claim's can be definitely lost:" >&2; \
 	      grep -nE 'match-leak-kinds:' $(VALGRIND_SUPPRESSIONS) >&2; fail=1; \
 	    else \
 	      echo "gate passes $$m, its jmp_bufs suppressed: $$supp"; \
@@ -922,36 +926,12 @@ check-memory-gate: build ## Verify test-memory FAILS on planted memory defects (
 	else echo "MEMORY GATE CHECK FAILED"; fi; \
 	exit $$fail
 
-# prod = the SAME graph as `build`, run at FLAVOR=prod after a clean, and
-# then judged by a program instead of by inspection. Each step is an explicit
-# recipe line, run by a sub-make, rather than a prerequisite list:
-#
-#   - it used to compile directly with $(CFLAGS_PROD), duplicating the link
-#     line, because $(SHIM)'s own rule hard-coded $(CFLAGS_DEV). The flavor
-#     stamp above removes that reason: one rule now links either flavor, and
-#     a flip forces the relink.
-#   - it must NOT recurse via `$(MAKE) $(CONFIG_SLS)` after linking. That
-#     recursion re-evaluated $(SHIM)'s rule at the DEFAULT flavor and
-#     silently relinked the release artifact with dev flags one step after
-#     producing it -- `make prod` exited 0 having shipped a debug build.
-#     (Caught by comparing the shim's md5 immediately after the -O2 link
-#     against its md5 once the target finished; they must be identical.)
-#     `build` in the sub-make below carries FLAVOR=prod through to
-#     config.sls, so there is nothing left to do afterwards.
-#   - `clean` is an explicit step rather than a prerequisite: as `prod: clean`
-#     plus a conditional `prod: vendor` the two merged into ONE prerequisite
-#     list ordered by where each stanza sat in this file -- vendor built
-#     build/vendor and clean then deleted it, out from under the link. The
-#     vendored gate now needs no prod-specific rule at all: $(SHIM) already
-#     depends on `vendor` when HAVE_PKG=no, inside the sub-make, after clean
-#     has finished.
 # --- the Linux memory gate, from a non-Linux development box ----------
-# ADR-0003 makes Linux Valgrind the SOLE memory gate, and macOS has no
-# LeakSanitizer on ARM64 -- so `make test-memory` on the primary development
-# platform is silent about the entire leak class. v0.5 measured the cost:
-# four independent leaks in the OS-buffer wrappers, every one invisible to a
-# fully green suite. Without this target the first thing that sees such a
-# defect is CI.
+# Linux Valgrind is the SOLE memory gate, and macOS has no LeakSanitizer on
+# ARM64 -- so `make test-memory` on a macOS development box is silent about
+# the entire leak class: a leak there passes unless a suite's own
+# assertions happen to catch it. Without this target the first thing that
+# sees such a defect is CI.
 #
 # The image is cached by Chez version, so only the first run pays for the
 # Chez build.
@@ -997,9 +977,9 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	@# libuv. The image's own libuv is Debian 12's 1.44.2, below the floor,
 	@# so detection passes it over anyway; HAVE_PKG=no keeps this the vendored
 	@# leg whatever the image's libuv becomes. The two do not behave
-	@# identically: run through pkg-config on 1.44.2, this target failed two
-	@# test-lifecycle rows that assert the close-vs-timer ordering newer
-	@# libuv has, rows CI passes every run (#90). A gate that silently tests a
+	@# identically: 1.44.2 lacks the close-vs-timer ordering two
+	@# test-lifecycle rows assert, and a build forced onto it through
+	@# pkg-config refuses itself at load. A gate that silently tests a
 	@# different libuv than CI invents failures CI cannot reproduce and misses
 	@# ones it would catch. Mirror the leg or do not claim to mirror it.
 	@#
@@ -1018,10 +998,10 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	      && make CHEZ=scheme HAVE_PKG=no check-memory-gate \
 	      && make CHEZ=scheme HAVE_PKG=no test-memory"'
 
-# --- a non-threaded Chez is refused by name (#41) ----------------------
+# --- a non-threaded Chez is refused by name ---------------------------
 # The binding needs a threaded Chez: Chez builds make-mutex and the rest of
-# its thread system only into threaded builds, and native.sls has imported
-# them since v0.1. On a --nothreads Chez that import used to fail with a bare
+# its thread system only into threaded builds, and native.sls imports them.
+# On a --nothreads Chez that import alone fails with a bare
 # "missing import for make-mutex". (libuv private require-threaded) replaces
 # it with a message naming the requirement, but only where it is imported
 # ahead of every (chezscheme) import, an order tests/test-require-threaded.sps
@@ -1069,16 +1049,38 @@ check-nothreads-docker: ## Verify a non-threaded Chez is refused by name at impo
 	    && su dev -c "sh /check-nothreads.sh /work-src"'
 
 
+# prod = the SAME graph as `build`, run at FLAVOR=prod after a clean, and
+# then judged by a program instead of by inspection. Each step is an explicit
+# recipe line, run by a sub-make, rather than a prerequisite list:
+#
+#   - it has no link line of its own: one rule links either flavor, and the
+#     flavor stamp and relink-guard above force the relink on a flip.
+#   - it must NOT recurse via `$(MAKE) $(CONFIG_SLS)` after linking. That
+#     recursion re-evaluates $(SHIM)'s rule at the DEFAULT flavor and
+#     silently relinks the release artifact with dev flags one step after
+#     producing it -- `make prod` exits 0 having shipped a debug build.
+#     (To see it: the shim's md5 immediately after the -O2 link must equal
+#     its md5 once the target finishes.)
+#     `build` in the sub-make below carries FLAVOR=prod through to
+#     config.sls, so there is nothing left to do afterwards.
+#   - `clean` is an explicit step rather than a prerequisite: as `prod: clean`
+#     plus a conditional `prod: vendor`, the two would merge into ONE
+#     prerequisite list ordered by where each stanza sits in this file --
+#     vendor builds build/vendor and clean then deletes it, out from under
+#     the link. The vendored leg needs no prod-specific rule at all: $(SHIM)
+#     already depends on `vendor` when HAVE_PKG=no, inside the sub-make,
+#     after clean has finished.
 prod: ## Rebuild the shim with optimizations and verify the release artifact
 	$(MAKE) clean
 	$(MAKE) build FLAVOR=prod
 	$(MAKE) check-prod
 
-# Proves the artifact that survived to the end of `make prod` is the prod one
-# (a check beats a comment, AGENTS.md): a shim carrying
+# Proves the artifact that survived to the end of `make prod` is the prod one,
+# by running it rather than trusting the recipe: a shim carrying
 # -DCHEZ_LIBUV_DEBUG_COUNTERS reports live allocation counts while a loop and
 # a bound tcp handle are alive, a prod shim's queries are a constant 0
-# (src/libuv-shim.c), and only a dev shim exports the pool hold (#127). tests/check-prod.sps establishes that the scope really
+# (src/libuv-shim.c), and only a dev shim exports the pool hold.
+# tests/check-prod.sps establishes that the scope really
 # was live using two witnesses that do not go through the counters, so
 # all-zero cannot also mean "the probe allocated nothing".
 #

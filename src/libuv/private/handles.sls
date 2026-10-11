@@ -18,7 +18,7 @@
           try-construct-handle construct-handle try-construct-loop
           refused? loop-owner-mismatch
           make-owner-mismatch owner-mismatch? owner-mismatch-owner owner-mismatch-caller
-          ;; the C stack's headroom (#94)
+          ;; the C stack's headroom
           run-stack-floor teardown-stack-floor claim-loop-for-run!
 
           ;; loop record
@@ -81,7 +81,7 @@
           handle-in-loop-queue? walk-dispatch)
   (import (rnrs)
           ;; Ahead of (chezscheme): the mutex primitives exist only in a
-          ;; threaded Chez (#41; tests/test-require-threaded.sps).
+          ;; threaded Chez (tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) make-mutex mutex-acquire mutex-release
                 disable-interrupts enable-interrupts make-thread-parameter
@@ -110,11 +110,11 @@
 
   ;; Pointer fields are zeroed at their freeing sites; deferred errors are
   ;; newest first and reversed at the public boundary.
-  ;; owner-thread is the id of the only thread allowed to run this loop's verbs
-  ;; (#20). It is set to the creating thread here and transferred to the caller
-  ;; when a run or a teardown claims the loop (claim-loop!), so a loop may be
-  ;; created on one thread and run on another. eqv? against current-thread-id
-  ;; gates every handle verb.
+  ;; owner-thread is the id of the only thread allowed to run this loop's
+  ;; verbs. It is set to the creating thread here and transferred to the
+  ;; caller when a run or a teardown claims the loop (claim-loop!), so a loop
+  ;; may be created on one thread and run on another. eqv? against
+  ;; current-thread-id gates every handle verb.
   ;; run-mark is a box holding the id of the thread whose call holds the
   ;; loop's claim (claim-loop!), or #f.
   (define-record-type (uv-loop-record %make-uv-loop-record uv-loop?)
@@ -131,7 +131,7 @@
 
   ;; loop-holder : uv-loop -> (or exact-integer #f)
   ;; The id of the thread whose call holds LOOP's claim: a run, a step of a
-  ;; close or a teardown, or a run whose frame a callback left (#45).
+  ;; close or a teardown, or a run whose frame a callback left.
   (define (loop-holder loop) (unbox (loop-run-mark loop)))
 
   ;; loop-running? : uv-loop -> boolean
@@ -152,13 +152,12 @@
   ;; Takes LOOP's claim for this thread and answers its pointer, or what
   ;; stood in the way. A run, a close and each step of a teardown claim the
   ;; loop before they call libuv on it, and release it (release-loop!) when
-  ;; they are done, so no two calls on any threads are ever inside at once:
-  ;; until #78 the mark was checked and then set as two steps, and two
-  ;; threads that both passed the check ran uv_run on one loop at once (two
-  ;; callbacks at once, invalid memory references, a hang), or freed it under
-  ;; each other.
+  ;; they are done, so no two calls on any threads are ever inside at once.
+  ;; Were the mark checked and then set as two steps, two threads that both
+  ;; passed the check would run uv_run on one loop at once (two callbacks at
+  ;; once, invalid memory references, a hang), or free it under each other.
   ;; - A closed loop is answered at once, with no claim: it never reopens.
-  ;;   Claimed, even for the moment of the check, a closed loop refused
+  ;;   Claimed, even for the moment of the check, a closed loop would refuse
   ;;   another thread's close of it, which closing a closed loop must not.
   ;; - The mark is taken by compare-and-set, so two threads cannot both take
   ;;   it, and in one interrupt-free step (one-step), so no engine of this
@@ -166,8 +165,8 @@
   ;; - The mark names the holder's thread, so call-with-uv-loop's exit can
   ;;   tell a claim its own thread left from another thread's. Read as
   ;;   "marked, and owned by this thread", a close's claim, which leaves the
-  ;;   owner as it was, and a run's, taken before its owner is stored, both
-  ;;   looked like the exit's own (#78's review).
+  ;;   owner as it was, and a run's, taken before its owner is stored, would
+  ;;   both look like the exit's own.
   ;; - The loop's state is read again once the claim is held. A close sets
   ;;   it while holding the claim, so a run that claims after the close
   ;;   finds the loop closed, never a freed pointer.
@@ -222,12 +221,11 @@
     (memory-order-release)
     (set-box! mark #f))
 
-  ;; The C stack a uv_run needs left below it (#94;
-  ;; .plans/2026-10-09-escape-headroom-check-design.md). A continuation that
-  ;; escapes a callback leaves its uv_run's frames on the thread's stack for
-  ;; the thread's life, and enough of them overflow it: SIGSEGV, or on macOS
-  ;; a fault Chez catches, after which the thread can hang the next
-  ;; collection (#95).
+  ;; The C stack a uv_run needs left below it. A continuation that escapes a
+  ;; callback leaves its uv_run's frames on the thread's stack for the
+  ;; thread's life, and enough of them overflow it: SIGSEGV, or on macOS a
+  ;; fault Chez catches, after which the thread can hang the next
+  ;; collection.
   ;; - teardown-stack-floor is a teardown's drain's. The deepest path
   ;;   measured through a uv_run is 35.8 KiB (macOS arm64: libuv's poll,
   ;;   whose frame holds 32 KiB of events, then a collection inside an I/O
@@ -268,7 +266,7 @@
   ;; refusal is built from it (wrong-thread-refusal), never from a second
   ;; read of the loop's owner: the loop can change hands between the check
   ;; and the raise, and back to the caller, which a refusal built from a
-  ;; second read then named as the owner it was refused for (#102).
+  ;; second read would then name as the owner it was refused for.
   (define-record-type owner-mismatch (fields owner caller))
 
   ;; loop-owner-mismatch : uv-loop -> (or owner-mismatch #f)
@@ -407,8 +405,8 @@
        (lambda (ptr loop) ((pargs->new ptr 'signal loop) #f #f)))))
 
   ;; on-wake runs on the loop thread when a coalesced uv_async_send lands.
-  ;; fence is the handle's send fence (#33); see with-send-fence. The caller
-  ;; makes it, with make-send-fence: make-uv-async makes the record inside an
+  ;; fence is the handle's send fence; see with-send-fence. The caller makes
+  ;; it, with make-send-fence: make-uv-async makes the record inside an
   ;; interrupt-free step, where nothing may raise, and making a mutex raises
   ;; when it cannot be allocated.
   (define-record-type (uv-async-record %make-uv-async-record uv-async-record?)
@@ -446,17 +444,19 @@
       (raise (make-uv-invalid-argument who 'not-a-uv-handle)))
     handle)
 
-  ;; The entry check of every operational verb on a handle (design §6.3). The
-  ;; thread check comes first — a verb from the wrong thread is refused before
-  ;; its handle's open state is even consulted. It does not cover the verb's
+  ;; require-open-handle : object symbol -> uv-handle
+  ;; The entry check of every operational verb on a handle. The thread
+  ;; check comes first — a verb from the wrong thread is refused before its
+  ;; handle's open state is even consulted. It does not cover the verb's
   ;; native call, which an engine can suspend it before while the loop is
   ;; handed on, so the verb's step checks both again: with owned-handle-ptr,
   ;; or, in uv-accept! and uv-spawn!, the owner of the loop the step makes
   ;; something on (tests/test-source-rules.sps's rule 8). uv-close! does not
-  ;; come through here, and is unchecked. uv-async-send! is the one verb that
-  ;; does NOT come through here (it is libuv's sole thread-safe call); it
-  ;; validates kind on its own path in (libuv async), and checks open state
-  ;; inside the send fence.
+  ;; come through here: it is for the loop's thread all the same, but its
+  ;; thread is unchecked. uv-async-send!, the one verb any thread may call
+  ;; (it is libuv's sole thread-safe call), does not come through here
+  ;; either; it validates kind on its own path in (libuv async), and checks
+  ;; open state inside the send fence.
   (define (require-open-handle handle who)
     (require-handle handle who)
     (require-loop-thread (handle-loop handle) who)
@@ -464,6 +464,7 @@
       (raise (make-uv-handle-closed (handle-kind handle))))
     handle)
 
+  ;; handle-pointer : uv-handle symbol -> uptr
   ;; The checked accessor is the only route from a handle record to native code,
   ;; except inside an interrupt-free step (one-step, the send fence), where
   ;; nothing may raise: a step makes the same check with open-handle-ptr, or
@@ -482,27 +483,26 @@
   ;; it at once: a constructor or a request adds an entry, every callback's
   ;; seam looks its pointer up, a close or a completion deletes one, and a
   ;; teardown copies the whole table out to find its loop's entries. Chez's
-  ;; hashtables have no lock of their own, and two loops run on two threads
-  ;; at once corrupted this one in 4 of 4 runs (#70). So every access holds
-  ;; registry-lock, through with-registry-lock, and so does every access to
-  ;; the orphan list, which every loop's seams write too. Rule 6 of
-  ;; tests/test-source-rules.sps holds both to that.
+  ;; hashtables have no lock of their own, and unlocked, two loops run on
+  ;; two threads at once corrupt this one (4 of 4 runs measured). So every
+  ;; access holds registry-lock, through with-registry-lock, and so does
+  ;; every access to the orphan list, which every loop's seams write too.
+  ;; Rule 6 of tests/test-source-rules.sps holds both to that.
   ;;
-  ;; One lock, rather than a table per loop (ADR-0019, decision 4 as amended
-  ;; for #70). Uncontended, the lock costs about 30 ns an access on macOS
-  ;; arm64 and allocates nothing. Threads that only make, fire and close
-  ;; timers do contend for it: at 4 threads they ran 1.6 to 2.2 times slower
-  ;; than with a table per loop. And a teardown, or uv-loop-live-handles,
-  ;; holds it while it copies the whole table, every loop's entries: about
-  ;; 1.3 ms at 200,000 entries, which every other loop's thread waits out at
-  ;; its next registry use. A table per loop needs no lock of its own, and a
-  ;; seam could reach its loop from its own pointer (a handle's loop field,
-  ;; a request's handle or loop). But every seam would then read a table
-  ;; from loop pointers to loops that every thread shares, and the change
-  ;; reaches six libraries. Should contention ever show, the next step is
-  ;; several tables, chosen by pointer, each with a lock of its own; should
-  ;; the teardown's copy, an index of each loop's entries kept under the
-  ;; same lock.
+  ;; One lock, rather than a table per loop. Uncontended, the lock costs
+  ;; about 30 ns an access on macOS arm64 and allocates nothing. Threads
+  ;; that only make, fire and close timers do contend for it: at 4 threads
+  ;; they ran 1.6 to 2.2 times slower than with a table per loop. And a
+  ;; teardown, or uv-loop-live-handles, holds it while it copies the whole
+  ;; table, every loop's entries: about 1.3 ms at 200,000 entries, which
+  ;; every other loop's thread waits out at its next registry use. A table
+  ;; per loop needs no lock of its own, and a seam could reach its loop from
+  ;; its own pointer (a handle's loop field, a request's handle or loop).
+  ;; But every seam would then read a table from loop pointers to loops that
+  ;; every thread shares, and the change would reach six libraries. Should
+  ;; contention show, the remedy is several tables, chosen by pointer, each
+  ;; with a lock of its own; should the teardown's copy, an index of each
+  ;; loop's entries kept under the same lock.
   (define registry (make-eqv-hashtable))
 
   (define registry-lock (make-mutex))
@@ -514,8 +514,8 @@
   ;; never keep it. A thread that finds the lock taken waits for it inside
   ;; the same interrupt-free step, so it stays active, and a collection
   ;; waits for it in turn; that is safe because every holder runs a BODY
-  ;; that waits on nothing. The send fence (#33) and the registry's lock
-  ;; (#70) take this shape.
+  ;; that waits on nothing. The send fence (with-send-fence) and the
+  ;; registry's lock (with-registry-lock) take this shape.
   ;; - BODY must not raise or wait: a raise would leave the lock held and
   ;;   interrupts disabled.
   ;; - LOCK is evaluated before interrupts are disabled, so an accessor that
@@ -567,8 +567,9 @@
   ;; registry-take-accepted! writes the table too, but only to put back an
   ;; entry it took (rule 10 of tests/test-source-rules.sps holds both). It
   ;; validates the loop so callback containment can always find a valid
-  ;; error cell without raising from its handler. A refusal is answered, not raised, so a verb can register from
-  ;; inside an interrupt-free step (one-step).
+  ;; error cell without raising from its handler. A refusal is answered,
+  ;; not raised, so a verb can register from inside an interrupt-free step
+  ;; (one-step).
   (define (registry-add! ptr kind loop object)
     (cond ((not (valid-pointer? ptr)) 'null-or-invalid-pointer)
           ((not (uv-loop? loop)) 'loop-not-a-uv-loop)
@@ -626,18 +627,18 @@
   ;; native call they guard, and an engine is suspended, or dropped, either
   ;; before the step or after it, never inside.
   ;; - Split by an engine, a verb's open check stops covering its native
-  ;;   call: a close can free the handle in between (#33 for a send; the
-  ;;   stream verbs' sweeps in test-stream.sps). Dropped there, a verb
-  ;;   strands whatever it had allocated and not yet handed on.
+  ;;   call: a close can free the handle in between (the stream verbs'
+  ;;   sweeps in test-stream.sps). Dropped there, a verb strands whatever it
+  ;;   had allocated and not yet handed on.
   ;; - It is a bare disable-interrupts/enable-interrupts pair, not
   ;;   with-interrupts-disabled, which is a dynamic-wind: about 96 B a step
-  ;;   around a copy (ADR-0019's decision 3 amendment of 2026-10-06).
+  ;;   around a copy.
   ;; - BODY must not raise: interrupts would stay disabled for good. It
   ;;   checks what can fail and answers a status, makes only calls that are
   ;;   total for their arguments (alloc-block, registry-add!), and the verb
   ;;   raises after the step (step-refusal). A fault in a native call inside
-  ;;   it still leaves interrupts disabled; begin-close! has always accepted
-  ;;   that.
+  ;;   it still leaves interrupts disabled, a cost every step that calls
+  ;;   libuv accepts, begin-close!'s uv_close among them.
   ;; - BODY must not wait, except for a with-step-lock's lock (the
   ;;   registry's), whose holder waits on nothing. This thread stays active
   ;;   throughout, so another thread's collection waits for the step to end.
@@ -677,9 +678,9 @@
   ;;                  -> (or uptr 'loop-not-open 'no-loop-pointer owner-mismatch)
   ;; open-loop-ptr for a loop this thread owns: a step that makes something
   ;; on the loop also checks that this thread owns it, since the loop can be
-  ;; handed to another thread between the verb's entry and its init. From
-  ;; another thread, libuv's init raced the loop's own thread on its handle
-  ;; queue, and corrupted it with no error (#79). Every step that makes
+  ;; handed to another thread between the verb's entry and its init. Made
+  ;; from another thread, libuv's init would race the loop's own thread on
+  ;; its handle queue, and corrupt it with no error. Every step that makes
   ;; something on a loop takes the loop's pointer here, or its handle's
   ;; pointer from owned-handle-ptr, so none can skip the owner check, and so
   ;; does uv-update-time!'s, which writes the loop's clock. The step that
@@ -697,10 +698,11 @@
   ;; this thread owns the loop, first, as the verb's entry check does
   ;; (require-open-handle). An engine can suspend the verb after that check
   ;; while the loop is handed to another thread, and a call made then races
-  ;; that thread on the handle: a kill resumed there signalled its process
-  ;; (#86). An open handle's loop is open: a teardown closes every handle
-  ;; first. Another thread's loop answers what the check found
-  ;; (loop-owner-mismatch), for the refusal to name.
+  ;; that thread on the handle: a kill resumed there would signal its
+  ;; process from a thread that does not own the loop. An open handle's loop
+  ;; is open: a teardown closes every handle first. Another thread's loop
+  ;; answers what the check found (loop-owner-mismatch), for the refusal to
+  ;; name.
   (define (owned-handle-ptr handle)
     (or (loop-owner-mismatch (handle-loop handle))
         (open-handle-ptr handle)))
@@ -754,8 +756,8 @@
   ;; registry-deregister! : uptr -> object
   ;; Removes PTR's entry and answers its object, raising when PTR had none.
   ;; The lookup and the delete are one step under the lock; a missing entry
-  ;; is raised after it. Since #87 nothing in src/ calls it: a closing
-  ;; handle's or a completing request's seam takes its own entry
+  ;; is raised after it. Nothing in src/ calls it: a closing handle's or a
+  ;; completing request's seam takes its own entry
   ;; (registry-take-accepted!), and rule 10 of tests/test-source-rules.sps
   ;; keeps it that way. The suites register and deregister with it.
   (define (registry-deregister! ptr)
@@ -797,19 +799,21 @@
   ;; registry-take-accepted! : (object -> boolean) uptr -> (or registry-entry #f)
   ;; A seam's lookup, for a callback whose dispatcher completes what is
   ;; registered under PTR: a close, or a request's completion. It finds
-  ;; PTR's entry and deletes it in one use of the lock, where a lookup and
-  ;; the dispatcher's own delete took it twice (#87). ACCEPTS? is the test
-  ;; the dispatcher makes before it completes the object; an entry whose
-  ;; object it refuses is put back, in a second use, since that dispatcher
-  ;; raises or records an orphan and frees nothing, and the entry stays its
-  ;; owner's (the kind-mismatch rows of tests/test-dns.sps).
+  ;; PTR's entry and deletes it in one use of the lock, not one for a
+  ;; lookup and another for the dispatcher's own delete: every loop's
+  ;; thread shares the lock, and closes and completions are among its
+  ;; busiest paths. ACCEPTS? is the test the dispatcher makes before it
+  ;; completes the object; an entry whose object it refuses is put back, in
+  ;; a second use, since that dispatcher raises or records an orphan and
+  ;; frees nothing, and the entry stays its owner's (the kind-mismatch rows
+  ;; of tests/test-dns.sps).
   ;; - The kind check runs after the release: a lock's body calls only
   ;;   table operations (rule 6 of tests/test-source-rules.sps).
   ;; - The take, the check and the put-back are one interrupt-free step
   ;;   (one-step), so no engine is suspended or dropped between them: a
   ;;   dropped one would lose the entry for good, and teardown would never
-  ;;   find what it held (#116's review). Each ACCEPTS? is a record test,
-  ;;   total for any object, as everything in a step must be.
+  ;;   find what it held. Each ACCEPTS? is a record test, total for any
+  ;;   object, as everything in a step must be.
   ;; - No other entry can claim PTR in between: its block is still
   ;;   allocated, and only the loop's own thread, which is running this
   ;;   callback, closes or tears down what is registered on that loop.
@@ -820,6 +824,8 @@
          (with-registry-lock (hashtable-set! registry ptr entry)))
        entry)))
 
+  ;; getaddrinfo-req? : object -> boolean
+  ;; getnameinfo-req? : object -> boolean
   ;; The tests the DNS dispatchers make before completing: a request of
   ;; their own kind. Their seams take by the same procedures.
   (define (getaddrinfo-req? x) (and (uv-req? x) (eq? (req-kind x) 'getaddrinfo)))
@@ -854,11 +860,13 @@
                      (collect (+ i 1) handles (cons (vector-ref keys i) requests)))
                     (else (collect (+ i 1) handles requests))))))))
 
+  ;; registry-snapshot-for-loop : uv-loop -> (listof object)
   ;; Snapshot handles only. Requests stay out of the close sweep.
   (define (registry-snapshot-for-loop loop)
     (let-values (((handles requests) (loop-entries loop)))
       handles))
 
+  ;; cancel-requests! : (listof uptr) -> unspecified
   ;; Best-effort cancellation of handle-less DNS requests. Ignore return codes:
   ;; teardown drains either the cancellation or the real completion.
   (define (cancel-requests! request-ptrs)
@@ -868,6 +876,7 @@
     (let-values (((handles requests) (loop-entries loop)))
       (cancel-requests! requests)))
 
+  ;; loop-record-error! : uv-loop object -> unspecified
   ;; Never raise through a C callback frame. Store the first object and stop the
   ;; loop; retain later objects for inspection.
   (define (loop-record-error! loop obj)
@@ -883,8 +892,8 @@
 
   ;; An orphan callback has no owning loop on which to report an error. Every
   ;; loop's seams can record one, so the list is changed and read under the
-  ;; registry's lock: two threads recording at once lost 29 to 50 percent of
-  ;; their events without it (#70).
+  ;; registry's lock: without it, two threads recording at once lose 29 to
+  ;; 50 percent of their events (measured).
   (define orphan-events '())
 
   (define (record-orphan-callback! kind ptr)
@@ -897,9 +906,9 @@
   ;; while their handle is closing.
   ;;
   ;; A dispatcher receives the object registered under the callback's pointer,
-  ;; or #f, ahead of libuv's arguments: the seam has already looked it up
-  ;; (#45). It calls user code directly and last: the seam contains whatever
-  ;; user code raises, and a raise skips none of the dispatcher's own steps.
+  ;; or #f, ahead of libuv's arguments: the seam has already looked it up.
+  ;; It calls user code directly and last: the seam contains whatever user
+  ;; code raises, and a raise skips none of the dispatcher's own steps.
   (define (timer-dispatch handle handle-ptr)
     (if (uv-timer? handle)
         (when (eq? (handle-state handle) 'open)
@@ -907,6 +916,7 @@
             (when on-timeout (on-timeout handle))))
         (record-orphan-callback! 'timer handle-ptr)))
 
+  ;; status->err : exact-integer symbol -> (or condition #f)
   ;; Callback statuses become condition values; they are never raised here.
   (define (status->err status who)
     (if (zero? status) #f (uv-errno-condition status who)))
@@ -936,6 +946,7 @@
             (apply on-complete (status->err status who) extras)))
         (record-orphan-callback! name block-ptr)))
 
+  ;; abandon-taken-request! : uv-req -> unspecified
   ;; complete-taken-request!'s release, without a callback, for a request
   ;; its seam has already taken out of the registry: the getaddrinfo
   ;; dispatcher's conversion failure (rule 10 names it the only caller).
@@ -958,6 +969,7 @@
     (complete-taken-request! 'shutdown 'uv-shutdown! no-request-counter
                        req req-ptr status))
 
+  ;; read-dispatch : object uptr exact-integer uptr -> unspecified
   ;; nread is signed so UV_EOF cannot masquerade as a huge positive read. The
   ;; buffer argument is ignored; the registered handle owns the trusted base.
   (define (read-dispatch handle stream-ptr nread buf-ptr)
@@ -982,6 +994,7 @@
       (when on-error
         (on-error (uv-errno-condition nread 'uv-read-start!)))))
 
+  ;; close-dispatch : object uptr -> unspecified
   ;; The close callback is the sole handle-freeing site. Its seam has taken
   ;; the handle out of the registry, by uv-handle?, the test made here. Free
   ;; the read buffer and handle, zero the pointer, mark closed, then call
@@ -998,15 +1011,15 @@
             (when on-close (on-close))))
         (record-orphan-callback! 'close handle-ptr)))
 
+  ;; descriptor-offset : exact-positive-integer -> exact-positive-integer
   ;; A stream's handle block is libuv's handle, then, at the first 16-byte
-  ;; boundary after it, the uv_buf_t descriptor that the shim's alloc callback
-  ;; answers libuv with before every read (#45; ADR-0002, amended
-  ;; 2026-10-05). The handle's data points at it from creation, and it
-  ;; outlives every alloc callback because libuv is done with the handle
-  ;; block only once the close dispatcher frees it. The read buffer is then
-  ;; exactly its payload: behind a 16-byte header, a 64 KiB buffer took the
-  ;; next malloc size class on macOS, 81,920 B, while a 264 B uv_tcp_t and
-  ;; its 288 B block both take 320 B.
+  ;; boundary after it, the uv_buf_t descriptor that the shim's alloc
+  ;; callback answers libuv with before every read. The handle's data points
+  ;; at it from creation, and it outlives every alloc callback because
+  ;; libuv is done with the handle block only once the close dispatcher
+  ;; frees it. The read buffer is then exactly its payload: behind a 16-byte
+  ;; header, a 64 KiB buffer would take the next malloc size class on macOS,
+  ;; 81,920 B, while a 264 B uv_tcp_t and its 288 B block both take 320 B.
   (define (descriptor-offset handle-size) (align-16 handle-size))
 
   ;; stream-block-size : exact-positive-integer -> exact-positive-integer
@@ -1019,7 +1032,7 @@
   ;; stream's whole life: the one write of data in src/
   ;; (tests/test-source-rules.sps). try-construct-handle makes it inside its
   ;; step, on the block it has just made, so it checks nothing. The block is
-  ;; zeroed, so until the first read start the descriptor is the empty
+  ;; zeroed, so before the first read start the descriptor is the empty
   ;; buffer, which libuv reports as UV_ENOBUFS.
   (define (attach-stream-descriptor! stream ptr)
     (uv-handle-set-data ptr (stream-descriptor stream)))
@@ -1028,26 +1041,26 @@
   ;;                        procedure procedure
   ;;                        -> (or uv-handle symbol owner-mismatch exact-integer)
   ;; Makes a handle on LOOP in one interrupt-free step: the loop's open and
-  ;; owner checks and pointer (owned-loop-ptr), a block of SIZE bytes, the record MAKE-RECORD
-  ;; makes of the block, its registration, libuv's init (INIT!, given the
-  ;; loop's pointer and the block), a stream's descriptor, and the count
-  ;; (COUNT-NEW!). It answers the handle, or what stood in the way:
-  ;; 'loop-not-open, 'no-loop-pointer, an owner-mismatch, 'no-memory, a refused
-  ;; registration, or INIT!'s errno, and a refused step leaves nothing
-  ;; behind. MAKE-RECORD, INIT! and COUNT-NEW! must be total, as a step's
-  ;; calls are (one-step).
+  ;; owner checks and pointer (owned-loop-ptr), a block of SIZE bytes, the
+  ;; record MAKE-RECORD makes of the block, its registration, libuv's init
+  ;; (INIT!, given the loop's pointer and the block), a stream's descriptor,
+  ;; and the count (COUNT-NEW!). It answers the handle, or what stood in the
+  ;; way: 'loop-not-open, 'no-loop-pointer, an owner-mismatch, 'no-memory, a
+  ;; refused registration, or INIT!'s errno, and a refused step leaves
+  ;; nothing behind. MAKE-RECORD, INIT! and COUNT-NEW! must be total, as a
+  ;; step's calls are (one-step).
   ;; - The step is where the owner is checked, not the constructor's entry:
   ;;   an engine can suspend a constructor while the loop is handed to
   ;;   another thread (tests/test-constructors.sps's handoff sweeps).
-  ;; - Split by an engine, a constructor's open check stopped covering its
-  ;;   init: a teardown freed the loop in between, and the init linked the
-  ;;   handle into the freed uv_loop_t. A teardown between the init and the
-  ;;   registration could not close the handle, so uv_loop_close failed with
-  ;;   EBUSY for good.
-  ;; - Dropped, a constructor lost the block it had allocated, or left its
-  ;;   handle linked into the loop and unregistered: the same EBUSY, and for
-  ;;   an async, which keeps the loop alive, a teardown that never returned
-  ;;   (tests/test-constructors.sps).
+  ;; - Split by an engine, a constructor's open check would stop covering
+  ;;   its init: a teardown could free the loop in between, and the init
+  ;;   link the handle into the freed uv_loop_t. A teardown between an init
+  ;;   and a registration made after it could not close the handle, so
+  ;;   uv_loop_close would fail with EBUSY for good.
+  ;; - Dropped mid-way, a constructor would lose the block it had allocated,
+  ;;   or leave its handle linked into the loop and unregistered: the same
+  ;;   EBUSY, and for an async, which keeps the loop alive, a teardown that
+  ;;   never returns (tests/test-constructors.sps).
   (define (try-construct-handle loop size init! make-record count-new!)
     (one-step
      (let ((loop-ptr (owned-loop-ptr loop)))
@@ -1072,11 +1085,12 @@
   ;; try-construct-handle for a loop: one interrupt-free step makes the
   ;; block, the record, its registration, libuv's init (INIT!, given the
   ;; block) and the count. It answers the loop, or 'no-memory, a refused
-  ;; registration, or INIT!'s errno, leaving nothing behind. An engine
-  ;; dropped make-uv-loop between these and lost the block, or the loop with
-  ;; its descriptors. KEEP!, which must be total, is handed the loop inside
-  ;; the step, so a caller that tears the loop down however it is left,
-  ;; call-with-uv-loop, holds it from the step on.
+  ;; registration, or INIT!'s errno, leaving nothing behind. Were these
+  ;; separate steps, an engine dropped between them would lose
+  ;; make-uv-loop's block, or the loop with its descriptors. KEEP!, which
+  ;; must be total, is handed the loop inside the step, so a caller that
+  ;; tears the loop down however it is left, call-with-uv-loop, holds it
+  ;; from the step on.
   (define (try-construct-loop init! keep!)
     (let ((size (uv-loop-size)))
       (one-step
@@ -1173,6 +1187,7 @@
       ((async)   (count-async-free!))
       (else #f)))
 
+  ;; discard-failed-handle! : uv-handle -> unspecified
   ;; Direct free is valid only for a spawn failure libuv already unlinked.
   (define (discard-failed-handle! handle)
     (require-handle handle 'uv-discard-failed-handle!)
@@ -1187,9 +1202,9 @@
   ;; uv_walk is synchronous: it calls walk-dispatch on the thread that walks,
   ;; and returns when the walk is done. So a resettable cell can collect a
   ;; walk's pointers, one cell for each thread: a thread parameter. With one
-  ;; cell for every thread, a thread's walk lost the pointers it had
+  ;; cell for every thread, a thread's walk would lose the pointers it had
   ;; collected to another thread's reset, and a handle in its loop's queue
-  ;; was reported out of it (#70; tests/test-loop-threads.sps).
+  ;; would be reported out of it (tests/test-loop-threads.sps).
   (define walk-query-cell (make-thread-parameter '()))
 
   (define (walk-dispatch walked walked-ptr arg)
@@ -1200,11 +1215,12 @@
     (uv-walk-native (loop-ptr loop) 0)
     (and (memv (handle-ptr handle) (walk-query-cell)) #t))
 
-  ;; (with-send-fence async body ...) runs BODY holding ASYNC's send fence
-  ;; (#33), the lock that orders uv-async-send! against uv-close!. The send's
-  ;; open check and native call run inside it, and so does the close's whole
-  ;; step (begin-close!). So no close begins while a send is between its check
-  ;; and its call, and no send gets past the check once a close has begun.
+  ;; (with-send-fence async body ...) runs BODY holding ASYNC's send fence,
+  ;; the lock that orders uv-async-send! against uv-close!. The send's open
+  ;; check and native call run inside it, and so does the close's whole
+  ;; step (begin-close!). So no close begins while a send is between its
+  ;; check and its call, and no send gets past the check once a close has
+  ;; begun.
   ;;
   ;; The fence is a with-step-lock: taken and released only with interrupts
   ;; disabled, so no thread ever holds it where an engine can suspend it or a
@@ -1212,8 +1228,8 @@
   ;; keep it for good, and a collection could wait for a thread that waits
   ;; for the fence. That rules out with-mutex: it releases in a dynamic-wind
   ;; exit thunk, after the winder is gone, at a point where an engine can be
-  ;; suspended (the review of #43). tests/test-async-fence.sps probes every
-  ;; such point from another thread.
+  ;; suspended. tests/test-async-fence.sps probes every such point from
+  ;; another thread.
   ;; - BODY must not raise or block: a raise would leave the fence held and
   ;;   interrupts disabled. The bodies check what could fault, the state and
   ;;   the pointer, and answer a status; their callers raise after.
@@ -1222,6 +1238,7 @@
       ((_ async body1 body2 ...)
        (with-step-lock (async-fence async) body1 body2 ...))))
 
+  ;; real-close-handle! : uv-handle (or procedure #f) -> unspecified
   ;; Starting close is idempotent and asynchronous. A repeated call cannot
   ;; replace the original on-close callback.
   (define (real-close-handle! handle on-close)
@@ -1313,8 +1330,10 @@
 
   (define installed-dispatch-names '(timer close))
 
+  ;; contain-dispatcher-raise! : symbol uptr (or registry-entry #f) object
+  ;;                             -> unspecified
   ;; This is the outermost Scheme error boundary reachable from libuv, and
-  ;; the only one a callback crosses (#45). ENTRY is what the seam found
+  ;; the only one a callback crosses. ENTRY is what the seam found
   ;; registered under PTR before dispatch: the seam of a completing request
   ;; or a closing handle has already taken it out of the registry, and the
   ;; dispatcher frees the block before it calls user code, so the address
