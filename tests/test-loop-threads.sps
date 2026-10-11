@@ -1,23 +1,23 @@
 #!r6rs
-;;; SRFI-64 suite for loops that run on different threads at once (#70).
+;;; SRFI-64 suite for loops that run on different threads at once.
 ;;;
-;;; docs/api.md gives each loop to one thread, and ADR-0019 names a thread
-;;; per core as its driver: several threads, each running a loop of its own.
-;;; Until #70 every such thread wrote the binding's process-wide state with
-;;; no lock:
-;;; - the handle registry, one table for every loop. Two threads making and
-;;;   closing timers on loops of their own corrupted it in 4 of 4 runs: a
-;;;   constructor raised pointer-already-registered or invalid memory
-;;;   reference, or a teardown found an entry that was not one;
+;;; docs/api.md gives each loop to one thread, and lets several threads each
+;;; run a loop of their own at once, a thread per core for instance. Every
+;;; such thread writes the binding's process-wide state, and each piece of
+;;; it goes wrong when two threads write it unguarded:
+;;; - the handle registry, one table for every loop. With no lock, two
+;;;   threads making and closing timers on loops of their own corrupted it
+;;;   in 4 of 4 runs: a constructor raised pointer-already-registered or
+;;;   invalid memory reference, or a teardown found an entry that was not
+;;;   one;
 ;;; - the cell that handle-in-loop-queue? collects uv_walk's pointers in.
-;;;   One thread's walk reset it while another's was being read, so a
-;;;   handle in a loop's queue was reported as out of it. uv-spawn! asks
-;;;   that to decide how to clean up a failed spawn (ADR-0015), but there
-;;;   the window is too narrow to race: two threads spawning at once passed
-;;;   under every mutation (.plans/registry-lock-mutation-log.md). So the
-;;;   walk race asks handle-in-loop-queue? directly;
-;;; - the orphan event list, which lost events;
-;;; - the debug shim's allocation counters, which lost updates.
+;;;   Shared, one thread's walk resets it while another's is being read, so
+;;;   a handle in a loop's queue is reported as out of it. uv-spawn! asks
+;;;   that to decide how to clean up a failed spawn, but there the window
+;;;   is too narrow to race: two threads spawning at once passed under
+;;;   every mutation. So the walk race asks handle-in-loop-queue? directly;
+;;; - the orphan event list, which loses events;
+;;; - the debug shim's allocation counters, which lose updates.
 ;;;
 ;;; Each race below runs the same work on two threads at once, each on a
 ;;; loop of its own, and asks for what one thread alone would see. On a
@@ -36,7 +36,7 @@
 ;;; for what every schedule gives. Timing decides only how soon a broken
 ;;; build loses.
 ;;;
-;;; The registry and the orphan list now hold one lock, which every loop's
+;;; The registry and the orphan list hold one lock, which every loop's
 ;;; thread takes, so no thread may ever keep it. It is taken and released
 ;;; only with interrupts disabled (with-step-lock), so no engine is
 ;;; suspended while its thread holds it: an engine dropped there, as a
@@ -320,9 +320,9 @@
 ;; WORK ran. WORK asks (go-on? ROUNDS I) before its round I, and does that
 ;; round only if the answer is true. Past ROUNDS a thread goes on until
 ;; each has seen the other move or the other has finished, bounded by the
-;; other thread's progress, never by a count of its own (#74). A thread
-;; whose WORK raised answers (raised message). Each thread first waits for
-;; the other to start, and both threads are joined before race-pair answers.
+;; other thread's progress, never by a count of its own. A thread whose
+;; WORK raised answers (raised message). Each thread first waits for the
+;; other to start, and both threads are joined before race-pair answers.
 (define (race-pair work)
   (let ((progress (vector 0 0))
         (started (vector #f #f))

@@ -1,26 +1,27 @@
 #!r6rs
 ;;; SRFI-64 suite for a raise out of call-with-uv-loop's body reaching guards
-;;; outside it (#118).
+;;; outside it.
 ;;;
 ;;; R6RS guard unwinds to itself before it tests its clauses. When none
 ;;; matches, it re-raises in the dynamic environment of the original raise,
 ;;; and so re-enters the body's dynamic-wind. call-with-uv-loop refuses every
-;;; return into a body it has left, since the loop is torn down by then. Its
-;;; refusal raised &uv-handle-closed, which replaced the body's condition: a
-;;; guard that did not match handed its caller &uv-handle-closed, and a guard
-;;; with a uv-error? clause took a user's error for the binding's.
+;;; return into a body it has left, since the loop is torn down by then. A
+;;; refusal that raised &uv-handle-closed there would replace the body's
+;;; condition: a guard that did not match would hand its caller
+;;; &uv-handle-closed, and a guard with a uv-error? clause would take a
+;;; user's error for the binding's.
 ;;;
-;;; The first re-entry into a body that was left while its raise was being
-;;; handled now raises that raise again. It is still a refusal, so nothing resumes
-;;; the body, but the condition that reaches the guards outside is the
-;;; body's own.
+;;; So the first re-entry into a body that was left while its raise was
+;;; being handled raises that raise again. It is still a refusal, so nothing
+;;; resumes the body, but the condition that reaches the guards outside is
+;;; the body's own.
 (import (rnrs)
         (srfi :64)
         (libuv)
         (only (uv-evidence) live-count describe)
         (only (chezscheme) make-engine engine-block))
 
-;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
+;; SRFI-64's default runner does not set a process exit code.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -188,7 +189,7 @@
 ;; A handler outside that answers a raise by re-entering the body, to retry
 ;; it, is refused. Were every re-entry refused with the raise, it would see
 ;; the same raise for good and retry for good; the cap of 5 makes that a
-;; failure here instead of a hang (#120's review).
+;; failure here instead of a hang.
 (test-equal "a handler that retries the body by re-entering it is refused once with the raise, then as closed"
   '((outer-got handle-closed) retries 1 body-runs 1)
   (let ((retries 0) (body-runs 0) (restart #f))
@@ -252,7 +253,7 @@
       (list outcome (reverse seen)))))
 
 ;; A handler that returns from the body's raise: R6RS raises the
-;; &non-continuable from the handler that was returned to. That is now
+;; &non-continuable from the handler that was returned to. That handler is
 ;; call-with-uv-loop's own, so the handler outside it is called once more,
 ;; with the &non-continuable.
 (test-equal "a handler that returns from the body's raise is called again with the &non-continuable"

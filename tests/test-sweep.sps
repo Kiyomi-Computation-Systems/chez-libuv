@@ -1,7 +1,7 @@
 #!r6rs
-;;; SRFI-64 suite for (uv-sweep), the engine-sweep driver the suites share
-;;; (#81): run-capped, capped and sweep-fuels, and what the step suites read
-;;; from their sweeps (#103).
+;;; SRFI-64 suite for (uv-sweep), the engine-sweep driver the suites share:
+;;; run-capped, capped and sweep-fuels, and what the step suites read from
+;;; their sweeps.
 ;;;
 ;;; Pure: the library imports no native code, and make check-purity runs
 ;;; this suite with the shim poisoned (PURE_TESTS), so the pure suites can
@@ -16,8 +16,7 @@
         (only (chezscheme) directory-list with-output-to-string get-thread-id
               disable-interrupts enable-interrupts))
 
-;; SRFI-64 sets no exit status; the runner's fail count drives it
-;; (AGENTS.md).
+;; SRFI-64 sets no exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -198,7 +197,7 @@
                (lambda (verdict)
                  (if (equal? verdict '(verdict 2)) (raise 'stop-raised) #f))))
 
-;; --- what a sweep's runs say (#103) --------------------------------------------
+;; --- what a sweep's runs say -------------------------------------------------
 ;; Two sweeps whose first, second and last verdicts all differ, so a helper
 ;; that read another run, or the expired? column, answers something else.
 ;; beta has a list verdict at two fuels in a row, and a verdict again after
@@ -297,18 +296,17 @@
 ;; --- the engine census -------------------------------------------------------
 ;; A change sweep that resumes its engine itself can resume it without a cap,
 ;; and a cap shows only on a call that never ends, which a correct build has
-;; none of: test-dns's sweep, test-process's two spawn sweeps and
-;; test-native's truncation scan all resumed without one until #81, with
-;; every row green. So every engine the tests make is the driver's, or one
-;; of the sweeps below, each bounded on its own: most stop an engine once
-;; and then resume it once with a fixed budget, or drop it (test-loop's
-;; refused-take-drop-sweep drops every run that expires, up to fuel 5000);
-;; test-loop-claim's exit-split-run resumes one tick at a time up to its
-;; own cap; test-owner-refusal's handback-run stops it twice, resuming it
-;; with one tick and then a fixed budget; and test-loop-guard's
-;; blocked-raise-run resumes it with a fixed budget at most 10 times. A new engine fails this row by
-;; name, as (file definition): port it to the driver, or list it here once
-;; it has a bound of its own.
+;; none of: a sweep with no cap passes every row on a correct build, and
+;; hangs the suite on a broken one. So every engine the tests make is the
+;; driver's, or one of the sweeps below, each bounded on its own: most stop
+;; an engine once and then resume it once with a fixed budget, or drop it
+;; (test-loop's refused-take-drop-sweep drops every run that expires, up to
+;; fuel 5000); test-loop-claim's exit-split-run resumes one tick at a time
+;; up to its own cap; test-owner-refusal's handback-run stops it twice,
+;; resuming it with one tick and then a fixed budget; and test-loop-guard's
+;; blocked-raise-run resumes it with a fixed budget at most 10 times. A new
+;; engine fails this row by name, as (file definition): port it to the
+;; driver, or list it here once it has a bound of its own.
 (define engine-sites-allowed
   '(("tests/stranded-exit-child.sps" first-slice)
     ("tests/test-async-fence.sps" send-then-close)
@@ -376,16 +374,16 @@
   engine-sites-allowed
   (engine-sites))
 
-;; describe was copied into seven suites and libraries before #81, the step
-;; suites' sweep helpers into eight suites before #103, and the source
-;; lister and reader into three suites before #89; each now lives in one
-;; library. A new copy of any name these libraries export fails this
-;; row by name, as (name file ...): a definition, procedure or variable, or
-;; a binding in a let, let*, letrec or letrec*, or a named let's name,
-;; anywhere in a source directly under tests/. test-constructors bound its
-;; own `me` in a let* until #103. What the census cannot see: a lambda's
-;; parameters, a copy under another name, and one written out inline, as
-;; test-process wrote `(+ (get-thread-id) 1)` for other-thread.
+;; describe, the step suites' sweep helpers, and the source lister and
+;; reader each live in one library: copies kept in each suite drift apart,
+;; and a fix to one copy misses the rest. A new copy of any name these
+;; libraries export fails the census row below by name, as (name file ...):
+;; a definition, procedure or variable, or a binding in a let, let*, letrec
+;; or letrec*, or a named let's name, anywhere in a source directly under
+;; tests/. A suite's own `me` bound in a let* counts. What the census
+;; cannot see: a lambda's parameters, a copy under another name, and one
+;; written out inline, such as `(+ (get-thread-id) 1)` for other-thread.
+
 ;; binds? : datum symbol -> boolean
 ;; Whether X defines or let-binds NAME anywhere outside quoted data.
 (define (binds? x name)

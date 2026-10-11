@@ -1,17 +1,20 @@
 #!r6rs
 ;;; tests/signal-child.sps -- the spawned-child half of test-signal.sps's
-;;; end-to-end graceful-shutdown scenario (v0.4 design spec §9.3; spike
-;;; finding SQ-S2-F1). NOT a suite: the name stays outside the test-*.sps
-;;; wildcard on purpose.
+;;; end-to-end graceful-shutdown scenario. NOT a suite: the name stays
+;;; outside the test-*.sps wildcard on purpose.
 ;;;
 ;;; Protocol, one line each on stdout (the parent's from-child pipe):
 ;;;   READY      after the oneshot sigterm watcher is armed
 ;;;   GOT1       from INSIDE the sigterm callback -- proves DELIVERY
 ;;;   DISARMED   from a LATER dispatch (a repeating timer's next tick) --
 ;;;              proves DISARM: the vendor auto-stop runs only after the
-;;;              signal callback returns (EV-9), so any later dispatch is
-;;;              after it by construction. The parent gates kill #2 here.
-;;; Then kill #2 lands on SIG_DFL (EV-3) and this process dies (0 sigterm).
+;;;              signal callback returns, so any later dispatch is after
+;;;              it by construction. The parent gates its second kill here.
+;;; GOT1 proves delivery only: libuv stops a oneshot watcher after its
+;;; callback returns, so while the callback runs the watcher still reads
+;;; active. DISARMED comes from a dispatch after that stop.
+;;; Then the second kill lands on SIG_DFL (libuv leaves SIG_DFL when the last
+;;; watcher on a signum stops) and this process dies (0 sigterm).
 ;;; Surviving to the iteration cap is the named failure: exit 43.
 (import (rnrs)
         (libuv)
@@ -41,7 +44,7 @@
 
 (say! "READY")
 
-;; Iteration-capped stepping, never wall-clock: kill #2 ends this process
+;; Iteration-capped stepping, never wall-clock: the second kill ends this process
 ;; long before 4000 ticks of the 5 ms timer.
 (let step ((i 0))
   (when (< i 4000)

@@ -1,5 +1,5 @@
 #!r6rs
-;;; uv-spawn!'s list reads against another thread (#66 items 2 and 3), for
+;;; uv-spawn!'s list reads against another thread, for
 ;;; tests/test-process.sps, and its lists malformed from the start, which
 ;;; tests/spawn-level-3-child.sps also runs at --optimize-level 3.
 ;;;
@@ -12,27 +12,29 @@
 ;;; reasons: read whole, for something the list holds after the flipped
 ;;; pair; read cut, for the list itself, or the value the cut stands for.
 ;;;
-;;; A read that took the list's length after list? raised length's own
-;;; condition when the flip landed between the two. A read that stopped at
-;;; the cut, or walked as many pairs as it counted without requiring the end,
-;;; read a list without its last element, so the call went on, and was
+;;; A read that takes the list's length after list? raises length's own
+;;; condition when the flip lands between the two. A read that stops at the
+;;; cut, or walks as many pairs as it counted without requiring the end,
+;;; reads a list without its last element, so the call goes on, and is
 ;;; refused because its pipe is on another loop. A pipe spec's pair read
-;;; twice gave Chez's own cddr or cadr condition. A key or a kind read twice
-;;; reads a value as some other key's, but the entry-key and spec-kind races
-;;; catch that only now and then: the two reads are a few instructions
-;;; apart, and the flipper's store rarely lands between them unless this
-;;; thread is descheduled there (.plans/spawn-list-reads-mutation-log.md has
-;;; the rates). In the args-circular race the cut makes the list circular:
-;;; a read can then go around the cycle more than once, but every walk to
-;;; the list's end passes its last string, so the same two reasons hold.
+;;; twice gives Chez's own cddr or cadr condition. A key or a kind read
+;;; twice reads a value as some other key's, but the entry-key and
+;;; spec-kind races catch that only sometimes: the two reads are a few
+;;; instructions apart, and the flipper's store rarely lands between them
+;;; unless this thread is descheduled there. With the read doubled, run
+;;; alone 30 times at a load near 3, each race caught it in 1 or 2 runs;
+;;; inside the full suite at a load of 4 to 10, in at least 1 run of 2.
+;;; In the args-circular race the cut makes the list circular: a read can
+;;; then go around the cycle more than once, but every walk to the list's
+;;; end passes its last string, so the same two reasons hold.
 ;;;
 ;;; Each call names a file that does not exist, so a read that loses the
 ;;; pipe on another loop, the one thing between a wrong read and a spawn,
 ;;; reaches uv_spawn and is refused there with ENOENT, leaving no child; with
-;;; a real program, every such call left one, and nothing reaped them. A
-;;; race stops at the first outcome that reached uv_spawn, since each failed
-;;; spawn leaves a closing handle that the next one's cleanup walks past; it
-;;; counts every other wrong outcome and goes on.
+;;; a real program, every such call would leave one, and nothing would reap
+;;; them. A race stops at the first outcome that reached uv_spawn, since
+;;; each failed spawn leaves a closing handle that the next one's cleanup
+;;; walks past; it counts every other wrong outcome and goes on.
 ;;;
 ;;; A flipper that never ran, or stopped, would leave every race passing.
 ;;; So before the first call and after the last, each race waits to see its
@@ -243,8 +245,7 @@
   ;; read that took a malformed list for a shorter proper one is refused
   ;; for that; one that took it for () reaches uv_spawn and is refused
   ;; ENOENT. At --optimize-level 3 a list counted with Chez's length, which
-  ;; checks nothing there, is walked forever when it is circular, as #66
-  ;; found checked-flags walking a flag list.
+  ;; checks nothing there, is walked forever when it is circular.
   (define (malformed-refusals)
     (with-race-loops
      (lambda (loop pipe)

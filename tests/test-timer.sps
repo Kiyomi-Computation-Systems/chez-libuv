@@ -1,18 +1,17 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv timer) and (libuv handle) -- the first C-to-Scheme
-;;; callback path in this binding. Design spec S5 (the handle lifecycle state
-;;; machine and the close protocol), S8 (callback boundary discipline and the
-;;; store-and-reraise error policy), S10 (the debug counters), S11 ("timers
-;;; never depend on wall-clock timing ... every timer callback calls
-;;; (collect)"), ADR-0007 (explicit close) and ADR-0008 (eight static locked
-;;; trampolines dispatching through the registry).
+;;; SRFI-64 suite for (libuv timer) and (libuv handle) -- the plainest
+;;; C-to-Scheme callback path in this binding. It covers the handle
+;;; lifecycle state machine and the close protocol, the callback boundary
+;;; discipline and the store-and-reraise error policy, the debug counters,
+;;; explicit close (the binding uses no guardians), and the static locked
+;;; trampolines that dispatch through the registry.
 ;;;
-;;; EVERY on-timeout callback in this file calls (collect). That is design
-;;; spec S11's GC-pressure axis, productionized from spike FINDINGS Q1 (which
-;;; forced a full collection on each of 10,000 re-entries with libuv's C
-;;; frames live below the Scheme callback): the re-entrant callback path is
-;;; exercised under a moving heap on every single run of this suite rather
-;;; than in one special-case test.
+;;; EVERY on-timeout callback in this file calls (collect), so the
+;;; re-entrant callback path, with libuv's C frames live below the Scheme
+;;; callback, is exercised under a moving heap on every single run of this
+;;; suite rather than in one special-case test. (A standalone probe forced a
+;;; full collection on each of 10,000 such re-entries, and every one
+;;; returned.)
 ;;;
 ;;; NOTHING HERE ASSERTS ELAPSED TIME. Determinism comes from invocation
 ;;; counts, from 'once-stepping (which blocks until the next timer is due),
@@ -49,7 +48,8 @@
         (uv-evidence)
         (only (chezscheme) collect make-engine))
 
-;; SRFI-64's default runner sets no process exit status (AGENTS.md).
+;; SRFI-64's default runner sets no process exit status, so the suite ends
+;; with its own (exit ...).
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -70,9 +70,9 @@
 (define registry-count-at-start (registry-count))
 
 ;; A condition type of this suite's own, deliberately OUTSIDE the &uv-error
-;; hierarchy. The store-and-reraise policy's load-bearing claim (design spec
-;; S8) is that the re-raised compound still satisfies a guard written against
-;; the ORIGINAL condition's type -- and that claim is only discriminating if
+;; hierarchy. The store-and-reraise policy's load-bearing claim is that the
+;; re-raised compound still satisfies a guard written against the ORIGINAL
+;; condition's type -- and that claim is only discriminating if
 ;; the original type is one this binding could not have produced by itself.
 (define-condition-type &timer-probe &error
   make-timer-probe timer-probe?
@@ -84,7 +84,10 @@
 ;; Every counter assertion in this suite needs the DEV shim (the Makefile's
 ;; CFLAGS_DEV, -DCHEZ_LIBUV_DEBUG_COUNTERS); against a production shim the
 ;; live queries answer a constant 0 and the "moved" rows would fail pointing
-;; at cross-wiring that is not there. Name that precondition first.
+;; at cross-wiring that is not there. The two seeds below establish the
+;; baseline, and pass there too; the first row to fail against a production
+;; shim is "seed: creating a timer moves the live timer counter", which
+;; names the counter that did not move.
 (test-equal "seed: no timer is live before this suite creates one"
   0 (live-count 'timer))
 
@@ -109,9 +112,10 @@
 (test-equal "a timer is not a uv-tcp"
   'not-a-tcp (if (uv-tcp? t0) 'a-tcp 'not-a-tcp))
 
-;; uv-tcp? would otherwise be indistinguishable from (lambda (x) #f) until
-;; Stage 4: a handle record carrying kind 'tcp is the stand-in that makes the
-;; predicate's answer depend on the kind field rather than on a constant.
+;; This suite makes no tcp handle, so uv-tcp? would otherwise be
+;; indistinguishable here from (lambda (x) #f): a handle record carrying
+;; kind 'tcp is the stand-in that makes the predicate's answer depend on the
+;; kind field rather than on a constant.
 (test-equal "uv-tcp? answers #t for a handle record of kind 'tcp"
   'a-tcp
   (if (uv-tcp? (%make-uv-handle-record 1 'tcp l)) 'a-tcp 'not-a-tcp))
@@ -136,7 +140,7 @@
   'same (if (eq? l (uv-handle-loop t0)) 'same 'different))
 
 ;; positive? is the discriminating part: 0 is what the freeing site leaves
-;; behind (design spec S10).
+;; behind.
 (test-equal "make-uv-timer stores a non-null handle pointer"
   'positive
   (if (and (integer? (handle-ptr t0)) (exact? (handle-ptr t0))
@@ -165,7 +169,7 @@
     'no-raise))
 
 ;; --- a non-handle is a CALLER bug, distinct from a closed handle ---------
-;; Two different conditions on purpose (design spec S9): passing a symbol is
+;; Two different conditions on purpose: passing a symbol is
 ;; &uv-invalid-argument naming who, while touching a closed handle is
 ;; &uv-handle-closed, which is the one callers guard for.
 (define (non-handle-refusal thunk)
@@ -192,10 +196,10 @@
 
 ;; --- another kind of handle is a caller bug too ---------------------------
 ;; libuv's timer calls take any handle's address as a uv_timer_t's and read
-;; and write its fields. Before the timer verbs checked the kind, given a
-;; TCP handle uv-timer-set-repeat! wrote into its struct and uv-timer-stop!
-;; faulted. A signal handle that has never started is the gentlest other
-;; kind to ask with.
+;; and write its fields. Without the kind check, given a TCP handle,
+;; uv-timer-set-repeat! writes into its struct and uv-timer-stop! faults. A
+;; signal handle that has never started is the gentlest other kind to ask
+;; with.
 (define other-kind (make-uv-signal l))
 
 (for-each
@@ -228,7 +232,7 @@
   'open (uv-handle-state t0))
 
 ;; --- uv-timer-start! validates BEFORE it reaches libuv -------------------
-;; Design spec S5: the argument checks happen before any native call. The
+;; The argument checks happen before any native call. The
 ;; row after the matrix is what makes that ordering observable -- a
 ;; validation done after uv_timer_start would leave the timer armed and the
 ;; loop alive.
@@ -278,8 +282,9 @@
 (test-equal "the refused set-repeat left the interval alone"
   25 (uv-timer-repeat t0))
 
-;; libuv's own EINVAL, surfaced as a SYMBOL (ADR-0006): uv_timer_again on a
-;; timer that was never started has no callback to re-arm.
+;; libuv's own EINVAL, surfaced as a SYMBOL, as the binding surfaces every
+;; libuv error code: uv_timer_again on a timer that was never started has no
+;; callback to re-arm.
 (test-equal "uv-timer-again! on a never-started timer surfaces libuv's EINVAL as a symbol"
   'EINVAL
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
@@ -299,9 +304,9 @@
 ;; sources rather than this binding restating itself. Without this row,
 ;; nothing would notice a uv-close! that updated the Scheme state and never
 ;; called uv_close. uv_is_closing returns a C boolean, not an errno, so it is
-;; read for its value: 0 before the close was started, nonzero after (spike
-;; FINDINGS Q1 measured exactly this ordering, with close_cb not yet fired at
-;; that point).
+;; read for its value: 0 before the close was started, nonzero after
+;; (measured: nonzero as soon as uv_close returns, with close_cb not yet
+;; fired at that point).
 (test-equal "libuv agrees the handle is closing, and did not before"
   '(not-closing closing)
   (list (if (zero? t0-closing-before) 'not-closing 'closing)
@@ -394,7 +399,7 @@
  t1
  (lambda (timer)
    (set! fires (+ fires 1))
-   ;; design spec S11: GC pressure on the re-entry path, every fire.
+   ;; GC pressure on the re-entry path, every fire.
    (collect)
    (when (= fires 3)
      (uv-timer-stop! timer)
@@ -428,8 +433,8 @@
 
 ;; The positive half of the pair: the timer really is armed. Without this,
 ;; "0 fires" would also be what a uv-timer-start! that did nothing produces.
-;; This is also the loop-liveness transition tests/test-loop.sps could not
-;; reach in Stage 2 (no handle type existed to hold a loop alive).
+;; This is also the loop-liveness transition that tests/test-loop.sps's
+;; uv-loop-alive? rows leave to this suite: an empty loop cannot show it.
 (test-equal "an armed timer holds its loop alive"
   'alive (if (uv-loop-alive? l) 'alive 'not-alive))
 
@@ -448,7 +453,7 @@
 (uv-close! t2
            (lambda ()
              (set! t2-close-ran 'on-close-ran)
-             ;; Design spec S5: the free and the state transition happen
+             ;; The free and the state transition happen
              ;; BEFORE the user's on-close runs, so this is 'closed and the
              ;; touch below deterministically raises.
              (set! t2-state-inside (uv-handle-state t2))
@@ -489,7 +494,7 @@
 (test-equal "the loop is no longer alive once its only handle has closed"
   'not-alive (if (uv-loop-alive? l) 'alive 'not-alive))
 
-;; --- the callback error policy, end to end (design spec S8) --------------
+;; --- the callback error policy, end to end ------------------------------
 (define raise-fires 0)
 (define t3 (make-uv-timer l))
 
@@ -522,7 +527,7 @@
   (let ((cause (uv-callback-error-cause raised-by-run)))
     (if (timer-probe? cause) (timer-probe-mark cause) 'not-the-cause)))
 
-;; Spike FINDINGS Q2: the raise consumed its own iteration and nothing else.
+;; The raise ends the run within its own iteration: no later fire runs.
 (test-equal "the raise stopped the loop on the fire that raised"
   2 raise-fires)
 
@@ -531,7 +536,7 @@
   (if (loop-has-pending-error? l) 'still-pending 'no-pending))
 
 ;; The timer is still armed, so the loop is still usable: this is the
-;; "defined post-error state" store-and-reraise buys (design spec S8).
+;; "defined post-error state" store-and-reraise buys.
 (define after-raise (if (uv-run l 'default) 'work 'no-work))
 
 (test-equal "the loop runs normally again after the callback error"
@@ -552,8 +557,9 @@
 ;; A callback may raise a NON-condition -- R6RS `raise` takes any object.
 ;; The trampoline guard's clause is `#t` rather than a condition predicate
 ;; precisely so those are caught here as well; a predicate clause would let
-;; this one unwind into libuv's C frames, which spike FINDINGS Q2 measured
-;; as process death.
+;; this one unwind into libuv's C frames: with no handler outside uv-run a
+;; probe measured that as process death (exit 255), and with one the bare
+;; symbol would arrive there in place of a &uv-callback-error.
 (define bare-loop (make-uv-loop))
 (define bare-timer (make-uv-timer bare-loop))
 
@@ -576,8 +582,8 @@
 (uv-loop-teardown! bare-loop)
 
 ;; --- uv-stop! from inside a callback -------------------------------------
-;; Design spec S11 lists this as a test-loop row; it needs a callback, so it
-;; lands here. The timer stays ARMED across the stop, which is what makes
+;; A loop verb, tested here rather than in tests/test-loop.sps because it
+;; needs a callback. The timer stays ARMED across the stop, which is what makes
 ;; the 'work answer discriminating: an unstopped loop would keep firing and
 ;; a stopped-and-disarmed loop would answer 'no-work.
 (define stop-fires 0)
@@ -603,7 +609,7 @@
 (test-equal "the stopped loop drains normally afterwards"
   'satisfied (run-until l (lambda () (eq? 'closed (uv-handle-state t4))) 64))
 
-;; --- operations that are illegal from inside a callback (design spec S8) -
+;; --- operations that are illegal from inside a callback -----------------
 (define illegal-attempts '())
 (define t5 (make-uv-timer l))
 
@@ -729,10 +735,9 @@
 (uv-loop-teardown! deferred-loop)
 
 ;; --- an on-close callback that raises, during teardown -------------------
-;; The open question tests/../loop.sls recorded for Task 7: a callback error
-;; raised while uv-loop-teardown! is draining. The policy chosen is
-;; "complete the teardown, THEN re-raise", so the caller gets both the error
-;; and a closed loop rather than an error and a leak.
+;; A callback error raised while uv-loop-teardown! is draining. The policy
+;; is "complete the teardown, THEN re-raise", so the caller gets both the
+;; error and a closed loop rather than an error and a leak.
 (define teardown-loop (make-uv-loop))
 (define teardown-timer (make-uv-timer teardown-loop))
 
@@ -757,19 +762,18 @@
   0 (live-count 'timer))
 
 ;; The close dispatcher calls on-close last, so a raise there skips none of
-;; its own steps (#45): the seam contains the raise only after the dispatcher
+;; its own steps: the seam contains the raise only after the dispatcher
 ;; has returned control to it, with nothing left to run.
 (test-equal "...and marked it closed before its on-close raised"
   'closed (uv-handle-state teardown-timer))
 
 ;; --- the dispatcher's state check, reached directly ----------------------
 ;; libuv stops a timer as part of uv_close, so a timeout for a 'closing
-;; handle cannot be produced through libuv -- which would leave the state
-;; check in timer-dispatch untested by every row above (it was: the mutation
-;; that deletes it survived the whole suite until this row existed). The
-;; dispatcher is called here exactly as the trampoline calls it, with the
-;; handle's own pointer, so what is exercised is the shipped code path and
-;; not a copy of it.
+;; handle cannot be produced through libuv -- which leaves the state check
+;; in timer-dispatch untested by every row above: with the check deleted,
+;; none of them fails, and this one does. The dispatcher is called here
+;; exactly as the trampoline calls it, with the handle's own pointer, so
+;; what is exercised is the library's own code path and not a copy of it.
 ;;
 ;; The 'open call is the seed: without it, "the callback did not run" would
 ;; also be what a dispatcher that never delivers anything produces.
@@ -801,9 +805,9 @@
 ;; --- the orphan fallback (a callback for a pointer nobody knows) ---------
 ;; libuv hands a trampoline nothing but a pointer. If the registry has no
 ;; entry for it there is no loop to record an error against, so the
-;; dispatcher must not raise (that would be a raise inside a C frame, which
-;; spike FINDINGS Q2 measured as process death) and must not crash. It
-;; records instead.
+;; dispatcher records the callback as an orphan, and must not crash. A
+;; raise would reach the seam's guard, which records an orphan the same way
+;; (contain-dispatcher-raise!).
 (define orphans-before (length (orphan-callback-events)))
 
 (test-equal "a timer callback for an unregistered pointer does not raise"
@@ -822,34 +826,32 @@
   '((timer . 424242) (close . 424243))
   (list-tail (orphan-callback-events) orphans-before))
 
-;; --- the dispatch seam, and the two stubs v0.2 brings back ---------------
-;; The ten slots in (libuv private native) are installed exactly once, by
-;; (libuv private handles), at library initialisation. The callback types no
-;; stage had implemented yet were installed as raising stubs that the
-;; installed closure reaches THROUGH a mutable table -- so a later stage
+;; --- the dispatch seam, and the stubs a suite can still reach ------------
+;; The slots in (libuv private native) are installed exactly once, by
+;; (libuv private handles), at library initialisation. A callback type whose
+;; library has not installed its dispatcher holds a raising stub, which the
+;; installed closure reaches THROUGH a mutable table -- so a library
 ;; replaces one by name, with no second install-callback-dispatchers! call.
 ;;
-;; v0.1's Stage 4 spent four of its six stubs ('connection, 'write-done,
-;; 'shutdown, 'connect) and Stage 5 the last two ('alloc, 'read); v0.2
-;; Stage 2 widened the list to ten, and the two DNS names ('getaddrinfo,
-;; 'getnameinfo) hold the raising stub until (libuv dns) installs the real
-;; dispatchers through the seam. So the ORIGINAL formulation of these rows
-;; -- fire a stub and watch the seam contain its raise -- is available
-;; again, and it is once more the one pre-guard raise reachable through
-;; shipped code: v0.1's replacement route (a req record whose handle field
-;; is not a handle, making complete-taken-request!'s record-accessor read raise
-;; before it reached user code) no longer raises at all, because ADR-0011's
-;; complete-taken-request! resolves the owning loop from the REGISTRY ENTRY and
-;; never touches the handle field -- that record now completes normally,
-;; the entry being the authority on ownership. This suite keeps no row on
-;; that shape; the handle-less completion itself is pinned in
-;; tests/test-loop.sps's ADR-0011 section.
+;; The two DNS names ('getaddrinfo, 'getnameinfo) hold the raising stub
+;; until (libuv dns) installs the real dispatchers through the seam, and
+;; this suite does not import it. A stub's raise, which the seam must
+;; contain, is the one pre-guard raise reachable through the library's
+;; code, and these rows fire one. A request record whose handle field is
+;; not a handle does not raise: complete-taken-request! resolves the owning
+;; loop from the REGISTRY ENTRY and never touches the handle field, so that
+;; record completes normally, the entry being the authority on ownership.
+;; This suite keeps no row on that shape; the handle-less completion itself
+;; is pinned in tests/test-loop.sps ("complete-taken-request! completes a
+;; handle-less request without raising").
 ;;
-;; THE SEAM CLOSURE IS GUARDED, and these rows are what says so. Since #45
-;; its guard is the only containment a callback crosses: it covers the
-;; user's callback, and anything raised before a dispatcher gets that far
-;; -- a stub, or a bug in a dispatcher's own registry lookup. Unguarded,
-;; spike FINDINGS Q2 applies: exit 255, no teardown, no foreign-free.
+;; THE SEAM CLOSURE IS GUARDED, and these rows are what says so. Its guard
+;; is the only containment a callback crosses: it covers the user's
+;; callback, and anything raised before a dispatcher gets that far -- a
+;; stub, or a bug in a dispatcher's own registry lookup. Unguarded, a raise
+;; there would cross libuv's C frames: with no handler outside uv-run, exit
+;; 255, no teardown, no foreign-free; with one, it would arrive there past
+;; an unfinished iteration.
 (define seam-loop (make-uv-loop))
 (define seam-block (alloc-zeroed 64))
 (define seam-orphans-before (length (orphan-callback-events)))
@@ -895,11 +897,12 @@
 
 (uv-loop-teardown! seam-loop)
 
-;; --- the seam's install-once rule, with every name spoken for ------------
-;; Every name is installed, so every install-dispatch-procedure! call from
-;; here on is refused. What each row below pins down is WHICH refusal, and
-;; that a refused call changes nothing.
-(test-equal "replacing a dispatcher a later stage installed is refused, naming who and why"
+;; --- the seam's install-once rule ----------------------------------------
+;; (libuv private handles) installs the timer, close, stream and connect
+;; dispatchers itself, so a call that names one is refused. The rows below
+;; try 'read and 'timer, and pin down WHICH refusal, and that a refused
+;; call changes nothing.
+(test-equal "replacing the installed read dispatcher is refused, naming who and why"
   '(uv-install-dispatch-procedure! dispatch-procedure-already-installed)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -917,7 +920,7 @@
     ((dispatcher-ref 'read) 606060 0 0)
     (list-tail (orphan-callback-events) before)))
 
-(test-equal "replacing this stage's own timer dispatcher is refused, naming who and why"
+(test-equal "replacing the installed timer dispatcher is refused, naming who and why"
   '(uv-install-dispatch-procedure! dispatch-procedure-already-installed)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
@@ -948,7 +951,8 @@
 ;; uv-close! checks that a handle is open, marks it closing, and calls
 ;; libuv's uv_close. A green-thread scheduler on the loop thread can suspend
 ;; a close anywhere in that and run another close of the same handle
-;; meanwhile, so all three must be one step. Measured before the fix:
+;; meanwhile, so all three must be one step. Measured with them as
+;; separate steps:
 ;; - split between the check and the mark, two closes both began and both
 ;;   called uv_close, and the loop then walked a corrupted closing list
 ;;   ("invalid memory reference" on macOS, a hang on Linux);
@@ -1017,7 +1021,8 @@
 ;; 'second-began row) and its fuel outlasted the whole verb, so every point
 ;; in between was visited. A split step would add suspension points inside
 ;; it, and the rows above would see them; the one-step close has none after
-;; its step (fuel map in the async-send-fence mutation log).
+;; its step: an engine timer that expires inside it is taken only once the
+;; verb has returned.
 (define (close-sweep-reach sweep)
   (list (if (memq 'second-began sweep) 'second-began 'never-caught-before-the-step)
         (let ((last-row (list-ref sweep (- (length sweep) 1))))

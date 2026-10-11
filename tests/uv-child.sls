@@ -2,7 +2,7 @@
 ;;; Running a child Chez program under a deadline, and reading the one datum
 ;;; it prints. tests/uv-level-3.sls runs its children at --optimize-level 3
 ;;; through it (test-addrinfo, test-process), and tests/test-loop.sps runs
-;;; tests/stranded-exit-child.sps, whose teardown libuv cannot finish (#117).
+;;; tests/stranded-exit-child.sps, whose teardown libuv cannot finish.
 ;;;
 ;;; A child runs in a process of its own when what it does cannot be undone
 ;;; or contained in the suite's: a hang no guard or engine can stop, or a
@@ -27,7 +27,7 @@
 
   ;; waitpid, or #f where libc did not load. open-process-ports gives the
   ;; child's pid and nothing that waits on it, so the runner waits through
-  ;; libc (#110). The load comes first: foreign-procedure resolves its entry
+  ;; libc. The load comes first: foreign-procedure resolves its entry
   ;; when it is evaluated.
   (define waitpid
     (guard (e (#t #f))
@@ -42,7 +42,7 @@
   ;; errno-location : (or (-> uptr) #f)
   ;; The address of the calling thread's errno: glibc's __errno_location,
   ;; macOS's __error, or #f where neither resolves. A wait that fails says
-  ;; why with it (#128).
+  ;; why with it.
   (define errno-location
     (and waitpid
          (guard (e (#t #f))
@@ -58,8 +58,9 @@
     (if (= n 10) 'ECHILD n))
 
   ;; How long a child may run, by the monotonic clock. A healthy child takes
-  ;; under a second; a poll count of 10 ms sleeps, as #69's runner kept, came
-  ;; to about 81 s for 6,000 polls on macOS, whose sleeps overshoot.
+  ;; under a second. The deadline is a clock reading, not a count of polls:
+  ;; 6,000 polls of 10 ms sleeps came to about 81 s on macOS, whose sleeps
+  ;; overshoot.
   (define child-deadline-seconds 60)
 
   ;; child-run : string (list-of string) string (list-of symbol) [seconds]
@@ -82,25 +83,24 @@
   ;; could not be read, (wait-raised text) for a raise while waiting, or
   ;; (wait-unavailable) where libc did not load. Only (exit 0) lets a
   ;; datum through. Every child that ends is waited on, so none is left a
-  ;; zombie (#110).
+  ;; zombie.
   ;;
   ;; No collection runs while a child does. Chez records each child
   ;; open-process-ports starts, and every collection reaps those that have
   ;; ended, keeping no status (c/gc.c); one between the child's end and the
-  ;; runner's wait left the wait ECHILD (#128). Collections are deferred
-  ;; through collect-request-handler, for every thread, from the spawn to
-  ;; the last wait, and the handler put back once no run is left. An
-  ;; explicit collect meanwhile, on any thread, can still take the status,
-  ;; and an engine dropped inside a run leaves collections off for good:
-  ;; child-run is not for engines. The
-  ;; deadline is child-deadline-seconds unless given. The command execs
-  ;; Chez, so the pid is Chez's own: the kill reaches the child, and the
-  ;; status is its own.
+  ;; runner's wait leaves the wait ECHILD. Collections are deferred through
+  ;; collect-request-handler, for every thread, from the spawn to the last
+  ;; wait, and the handler put back once no run is left. An explicit
+  ;; collect meanwhile, on any thread, can still take the status, and an
+  ;; engine dropped inside a run leaves collections off for good: child-run
+  ;; is not for engines. The deadline is child-deadline-seconds unless
+  ;; given. The command execs Chez, so the pid is Chez's own: the kill
+  ;; reaches the child, and the status is its own.
   ;;
   ;; Both pipes are drained on every pass, until the child closes both or
-  ;; the deadline passes (#88). A child blocked writing to a full stderr
-  ;; pipe never finishes its stdout, and a read that waits for stdout's end
-  ;; has no deadline: either way the suite lost the output that said why.
+  ;; the deadline passes. A child blocked writing to a full stderr pipe
+  ;; never finishes its stdout, and a read that waits for stdout's end has
+  ;; no deadline: either way the suite loses the output that says why.
   (define child-run
     (case-lambda
       ((chez options program names)

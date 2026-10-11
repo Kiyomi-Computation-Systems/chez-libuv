@@ -1,7 +1,7 @@
 #!r6rs
-;;; What a cross-thread race needs to show that its other thread raced:
-;;; #67's liveness watch, shared by tests/test-native.sps,
-;;; tests/test-stream.sps and tests/spawn-list-races.sls.
+;;; What a cross-thread race needs to show that its other thread raced: a
+;;; liveness watch, shared by tests/test-native.sps, tests/test-stream.sps
+;;; and tests/spawn-list-races.sls.
 ;;;
 ;;; A race whose flipper never ran, or stopped, passes every row it has. So
 ;;; before the race's first call and after its last, the race waits up to

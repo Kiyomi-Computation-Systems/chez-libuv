@@ -1,18 +1,19 @@
 #!r6rs
-;;; SRFI-64 suite for the claim a loop's callers make on it (#78).
+;;; SRFI-64 suite for the claim a loop's callers make on it.
 ;;;
 ;;; uv-run marks its loop running, and every verb that would run, close or
-;;; tear the loop down refuses a loop so marked ('loop-running). Until #78
-;;; that mark was a plain field, checked and then set as two steps, and so
-;;; were uv-loop-close!'s and uv-loop-teardown!'s checks of it. Two threads
-;;; could both pass the check and both run uv_run on one uv_loop_t: two of
-;;; the loop's callbacks ran at once on two threads, `invalid memory
-;;; reference` was raised out of uv-run and left the loop marked running for
-;;; good, or both threads spun in libuv's timer heap for good. A close or a
-;;; teardown that passed its check while another thread entered uv_run freed
-;;; the loop, or closed its handles, under that thread.
+;;; tear the loop down refuses a loop so marked ('loop-running). Were that
+;;; mark a plain field, checked and then set as two steps, and were
+;;; uv-loop-close!'s and uv-loop-teardown!'s checks of it the same, two
+;;; threads could both pass the check and both run uv_run on one
+;;; uv_loop_t. Then two of the loop's callbacks would run at once on two
+;;; threads: `invalid memory reference` raised out of uv-run, leaving the
+;;; loop marked running for good, or both threads spinning in libuv's timer
+;;; heap for good. A close or a teardown that passed its check while
+;;; another thread entered uv_run would free the loop, or close its
+;;; handles, under that thread.
 ;;;
-;;; A run, a close and each step of a teardown now claim the loop before
+;;; So a run, a close and each step of a teardown claim the loop before
 ;;; they call libuv on it: the mark, which names the claiming thread, is
 ;;; taken with a compare-and-set in one interrupt-free step, and whoever
 ;;; takes it is the only one inside until it is given back. The rows below
@@ -35,8 +36,8 @@
 ;;; precondition rows: each thread saw the other's progress move, and was
 ;;; refused at least once where refusal is the point. A thread past its own
 ;;; rounds goes on until those hold, or the other has finished, bounded by
-;;; race-time-cap and never by a count of its own (#74). Every wait on
-;;; another thread gives up at that cap too, so a broken build that hangs two
+;;; race-time-cap and never by a count of its own. Every wait on another
+;;; thread gives up at that cap too, so a broken build that hangs two
 ;;; threads in uv_run fails its rows by name instead of hanging the suite.
 ;;; Valgrind runs one thread at a time, so under it the races are skipped
 ;;; (CHEZ_LIBUV_UNDER_VALGRIND).
@@ -197,8 +198,7 @@
                     'owner-moved)))
     (list other owner (tear-down loop))))
 
-;; uv-run refuses a loop that is running before it looks at the mode, as it
-;; did before the claim.
+;; uv-run refuses a loop that is running before it looks at the mode.
 (test-equal "a uv-run with an unknown mode, on a loop this thread is running, is refused 'loop-running"
   '(uv-run loop-running)
   (let* ((loop (make-uv-loop))
@@ -292,10 +292,10 @@
                      (list 'held-by (loop-holder loop)))))
       (list released held (take-back-and-tear-down loop)))))
 
-;; A teardown takes the loop over at each run of its drain, as its drain's
-;; uv-run always did. So a teardown on another thread whose close callback
-;; escapes leaves the loop claimed by that thread, and owned by it, like any
-;; run left from a callback.
+;; A teardown takes the loop over at each run of its drain, as a uv-run
+;; does. So a teardown on another thread whose close callback escapes
+;; leaves the loop claimed by that thread, and owned by it, like any run
+;; left from a callback.
 (define escaped-teardown-loop (make-uv-loop))
 
 (test-equal "a teardown on another thread whose close callback escapes leaves the loop claimed by that thread, and owned by it"
@@ -329,11 +329,11 @@
 ;; --- call-with-uv-loop's exit and another thread's claim ---------------------
 
 ;; The exit tears its loop down. A claim this thread left there, by leaving
-;; the body from inside one of the loop's callbacks, it takes over (#45),
-;; and any other call's claim it refuses. Before #78's review the exit took
-;; "marked, and owned by this thread" for its own claim. A close on another
-;; thread claims without taking the loop over, so its claim looked like the
-;; exit's own: the exit cleared it and tore the loop down under the close.
+;; the body from inside one of the loop's callbacks, it takes over, and any
+;; other call's claim it refuses. An exit that took "marked, and owned by
+;; this thread" for its own claim would be wrong: a close on another thread
+;; claims without taking the loop over, so its claim looks like the exit's
+;; own, and that exit clears it and tears the loop down under the close.
 ;; Here another thread holds a claim taken as a close takes it, and keeps it
 ;; until the exit is over.
 (define (exit-with-another-threads-claim)
@@ -379,16 +379,16 @@
   '((uv-loop-teardown! loop-running) held-by-that-thread owner-kept released torn-down)
   (exit-with-another-threads-claim))
 
-;; --- the exit's re-claim, split by an engine (#96) ---------------------------
+;; --- the exit's re-claim, split by an engine ---------------------------------
 
 ;; A teardown refused because another call took the claim between its
 ;; steps leaves the loop to that call: the exit must not claim it again. An
-;; exit that re-claims after any refusal (N3) leaves the loop claimed by
-;; this thread once that call is done, with no run in it, refused by every
-;; verb for good. The exit race below catches that only when another
-;; thread's run ends in the instant between the refusal and the re-claim:
-;; 5 of 5 races on macOS and 1 of 10 on an arm64 Linux mirror (#91's
-;; log), though 10 of 10 on x86_64 Linux (2026-10-09).
+;; exit that re-claims after any refusal leaves the loop claimed by this
+;; thread once that call is done, with no run in it, refused by every verb
+;; for good. The exit race below catches that only when another thread's
+;; run ends in the instant between the refusal and the re-claim: 5 of 5
+;; races on macOS and 1 of 10 on an arm64 Linux mirror, though 10 of 10 on
+;; x86_64 Linux.
 ;;
 ;; Here the interleaving is forced on one thread, in an engine. A body
 ;; leaves call-with-uv-loop from inside a timer callback, so its exit tears
@@ -408,11 +408,12 @@
 ;; On a correct build no expiry comes between the drain's refusal and the
 ;; exit's return: the clears before the refusal let the teardown finish,
 ;; and the next run ends with the forgery still held. A re-claim brings
-;; expiries of its own ahead of its claim, so N3's runs clear the forgery
-;; between the refusal and the re-claim, and the re-claim succeeds.
-;; Measured on Linux, 2026-10-09: the first expiry inside the exit at
-;; tick 47 of the body; four clears before the drain's claim, and none
-;; after it on a correct build, one under N3.
+;; expiries of its own ahead of its claim, so with an exit that re-claims
+;; after any refusal, the runs clear the forgery between the refusal and
+;; the re-claim, and the re-claim succeeds. Measured on Linux: the first
+;; expiry inside the exit at tick 47 of the body; four clears before the
+;; drain's claim, and none after it on a correct build, one with that
+;; re-claim.
 
 ;; The most runs the sweep makes, and the most resumes a run may take
 ;; before it is given up: the engine's bound (the engine census in
@@ -442,7 +443,7 @@
 ;; Only a claim still the forgery is cleared, and only a run whose final
 ;; holder is the forged thread counts as forgery-held: an exit that took
 ;; or cleared the other call's claim would otherwise pass as one that left
-;; it alone (#96's review).
+;; it alone.
 (define (exit-split-run fuel clear-at)
   (let ((the-loop #f) (the-timer #f) (escaping #f) (early #f) (expiries 0)
         (forged #f) (since-forged 0) (cleared #f) (gone-at-clear #f)
@@ -567,35 +568,35 @@
             (caddr exit-splits))))
 
 ;; The exit takes its own claim straight into the teardown, with no moment
-;; unclaimed in between. Before #78's review it cleared the claim and then
-;; let the teardown claim again: another thread's uv-run could take the loop
-;; in between, the teardown was refused, and the exit wrote its own mark
-;; over the other thread's claim, leaving the loop marked with no run in it,
-;; refused by every verb for good. Here a body leaves from inside a timer
-;; callback, again and again, while another thread runs every loop it sees
-;; unclaimed. That thread may still get in between the teardown's steps,
-;; and keeps the loop then: the row asks only that no loop is left claimed
-;; once that thread has stopped.
+;; unclaimed in between. An exit that cleared the claim and then let the
+;; teardown claim again would leave a gap: another thread's uv-run could
+;; take the loop in between, the teardown would be refused, and the exit
+;; would write its own mark over the other thread's claim, leaving the loop
+;; marked with no run in it, refused by every verb for good. Here a body
+;; leaves from inside a timer callback, again and again, while another
+;; thread runs every loop it sees unclaimed. That thread may still get in
+;; between the teardown's steps, and keeps the loop then: the row asks only
+;; that no loop is left claimed once that thread has stopped.
 ;;
 ;; The race says nothing unless that thread got in at least once, which
 ;; the precondition holds. It gets in when the body's thread is slow
 ;; between two of the teardown's steps, mostly when a collection lands
 ;; there, and that is rare: with a fixed 2,000 bodies on one thread it never
-;; got in, in 6 of 8 runs on Ubuntu 24.04 and in CI's first run on 26.04
-;; (#91). So the bodies go on until the other thread has got in
-;; exit-race-hits times, bounded by race-time-cap, never by a count of this
-;; thread's own (#74). A machine that cannot get to that many by the cap
-;; still passes the precondition with one.
+;; got in, in 6 of 8 runs on Ubuntu 24.04 and in a CI run on 26.04. So the
+;; bodies go on until the other thread has got in exit-race-hits times,
+;; bounded by race-time-cap, never by a count of this thread's own. A
+;; machine that cannot get to that many by the cap still passes the
+;; precondition with one.
 ;;
 ;; One run would prove the race happened, but a loop is left claimed only
 ;; when the other thread's run ends in the instant between a refused
 ;; teardown and the exit's next move. An exit that re-claims after any
-;; refusal (N3 in .plans/loop-claim-mutation-log.md) strands a loop exactly
-;; there. With 100 runs the main row caught it in 5 of 5 races on macOS
-;; and 1 of 10 on an arm64 Linux mirror, where 2,000 bodies on one thread
-;; caught it in none. The 100 runs took 1 to 5 s. The engine split above
-;; now catches N3 in every run (#96); the race stays for what a forged
-;; claim cannot be, a real other thread's run inside the loop.
+;; refusal strands a loop exactly there. With 100 runs the main row caught
+;; it in 5 of 5 races on macOS and 1 of 10 on an arm64 Linux mirror, where
+;; 2,000 bodies on one thread caught it in none. The 100 runs took 1 to
+;; 5 s. The engine split above catches that re-claim in every run; the race
+;; is kept for what a forged claim cannot be, a real other thread's run
+;; inside the loop.
 ;;
 ;; Each body leaves its callback by a continuation, and that strands the
 ;; C frames of the uv_run it left on its thread's stack for as long as the
@@ -685,11 +686,11 @@
 ;; claiming thread comes between them. A uv-run an engine suspends before
 ;; its claim, while the engine's own thread closes or tears the loop down,
 ;; must find the loop closed when it resumes, never run the freed one; one
-;; suspended inside its claim keeps the loop from the close. Until #78 a run
-;; suspended between its check of the mark and setting it ran the loop the
-;; close had freed: `invalid memory reference`. Each sweep runs a uv-run
-;; 'nowait in an engine with fuel 1, 2, ..., and at its first expiry calls
-;; VERB on the loop, then resumes the run.
+;; suspended inside its claim keeps the loop from the close. Were the check
+;; of the mark and its setting two steps, a run suspended between them
+;; would run the loop the close had freed: `invalid memory reference`. Each
+;; sweep runs a uv-run 'nowait in an engine with fuel 1, 2, ..., and at its
+;; first expiry calls VERB on the loop, then resumes the run.
 
 ;; The most fuel a sweep tries before it gives up on a run that finishes
 ;; with no expiry.
@@ -790,8 +791,8 @@
 ;; Split inside the claim, VERB is refused, and the resumed run fires them
 ;; and defers two. Split after the claim is given back, VERB finds nothing
 ;; to fire, and its own reset is what the resumed run's caller reads. A run
-;; that reset its errors before the claim, and was split between the reset
-;; and the claim, kept VERB's two.
+;; that resets its errors before the claim, split between the reset and the
+;; claim, keeps VERB's two.
 (define (loop-with-raising-timers)
   (let ((loop (make-uv-loop)))
     (let arm ((i 0))
@@ -861,11 +862,11 @@
 ;; interrupt-free step, and a teardown is steps that hold the claim only
 ;; while they call libuv, so a dropped close never leaves its loop claimed,
 ;; and a dropped teardown does only inside a run of its drain, as a dropped
-;; uv-run does: a claim that covered the whole teardown left its loop
-;; claimed for good at almost every expiry (#78's review). Each sweep runs
-;; VERB on a fresh loop in an engine with fuel 1, 2, ..., drops it at its
-;; first expiry, notes whether the loop was left claimed, and then calls
-;; VERB again, or tears the loop down after a run, on the same thread, which
+;; uv-run does: a claim that covered the whole teardown would leave its
+;; loop claimed for good at almost every expiry. Each sweep runs VERB on a
+;; fresh loop in an engine with fuel 1, 2, ..., drops it at its first
+;; expiry, notes whether the loop was left claimed, and then calls VERB
+;; again, or tears the loop down after a run, on the same thread, which
 ;; must finish the job.
 
 ;; drop-sweep : (-> uv-loop) (uv-loop -> object) (uv-loop -> object) boolean

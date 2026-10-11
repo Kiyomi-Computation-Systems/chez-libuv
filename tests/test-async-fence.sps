@@ -1,5 +1,5 @@
 #!r6rs
-;;; SRFI-64 suite for the async send fence (#33). uv-async-send! may run on
+;;; SRFI-64 suite for the async send fence. uv-async-send! may run on
 ;;; any thread, while uv-close! runs on the loop thread, and the close frees
 ;;; the handle's native block at the end of that uv-run iteration. A send
 ;;; that has checked the handle is open but not yet made its native call can
@@ -13,7 +13,7 @@
 ;;; every point where a send or a close can be suspended. Chez mutexes are
 ;;; recursive, so only a thread that does not hold the fence can see it held.
 ;;;
-;;; On the default gate and the memory gate (ADR-0010, amended 2026-09-28).
+;;; It runs on the default gate and the memory gate.
 ;;; The rows fork threads, but no verdict on a correct build depends on
 ;;; timing: each row waits for an event. Where a row also has a time bound,
 ;;; the bound only caps how long a broken build gets to show itself.
@@ -280,9 +280,10 @@
 ;; in between was visited. Without this, a sweep that never got inside the
 ;; send would pass the rows above. In the fenced shape nothing in the verb
 ;; can be suspended after its step: an engine timer that expires inside it
-;; is taken only once the verb has returned (fuel map in the mutation log).
-;; The with-mutex shape could be suspended just after its native call, and
-;; still held the fence there: that is what the row above caught.
+;; is taken only once the verb has returned. A send fenced by with-mutex,
+;; even one wrapped around with-interrupts-disabled, can be suspended just
+;; after its native call, in with-mutex's exit, still holding the fence:
+;; the row above catches that.
 (test-equal "the send sweep caught the send before it decided and ran it to the end"
   '(refused finished)
   (list (if (exists (lambda (row) (eq? (row-verdict row) 'refused)) send-sweep)
@@ -296,8 +297,9 @@
 ;; can be suspended, another thread tries the fence. Scheme's closing state
 ;; and libuv's are checked against each other in test-timer.sps's close
 ;; sweep, for this kind and a timer. As with the send, nothing in the fenced
-;; close can be suspended after its step; the with-mutex shape could be, and
-;; held the fence there.
+;; close can be suspended after its step; a close fenced by with-mutex,
+;; even one wrapped around with-interrupts-disabled, can be, and holds the
+;; fence there.
 
 (define close-sweep-max-fuel 80)
 
@@ -359,7 +361,7 @@
            (lambda ()
              (spawn! b 'closer
                      (lambda ()
-                       (uv-run loop 'nowait)    ; this thread now owns the loop
+                       (uv-run loop 'nowait)    ; this thread takes the loop
                        (post! b 'closing #t)
                        (uv-close! a)
                        (post! b 'close-returned #t)
@@ -417,7 +419,7 @@
   'free
   (let* ((loop (make-uv-loop))
          (a (make-uv-async loop (lambda (h) #f))))
-    (uv-close! a)                       ; closing: every send is now refused
+    (uv-close! a)                       ; closing: every later send is refused
     (let ((seen (call/cc
                  (lambda (k)
                    (with-exception-handler
@@ -456,7 +458,8 @@
 ;; the fence's steps must not fault if one ever does: a fault there would be
 ;; raised with interrupts disabled and the fence held. Each step checks the
 ;; pointer and answers a status instead, and the refusal is the one the
-;; checked accessor raised before #33. The private setter forces the state.
+;; checked accessor, handle-pointer, raises. The private setter forces the
+;; state.
 ;; This row comes last, because a fault here would leave interrupts disabled
 ;; for any row after it.
 

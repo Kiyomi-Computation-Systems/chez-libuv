@@ -1,16 +1,18 @@
 #!r6rs
-;;; SRFI-64 suite for (libuv dns) -- the full DNS surface (design spec v0.2
-;;; S4.1-S4.5, S5.4, S5.5, S6, S9): the getaddrinfo half (Stage 4), and
-;;; Stage 5's getnameinfo, uv-cancel!, cancel-race, and teardown rows.
+;;; SRFI-64 suite for (libuv dns) -- the full DNS surface: getaddrinfo,
+;;; getnameinfo, uv-cancel!, the cancel race, and teardown with lookups in
+;;; flight.
 ;;;
-;;; BRANCH DISCIPLINE for the cancel rows (FINDINGS Q3): where the race is
-;;; real (a same-turn cancel, a teardown sweep racing a worker pickup) the
-;;; row is TOLERANT -- the outcome is asserted boolean and each branch is
-;;; asserted with its PAIRED consequence, never the boolean alone. Where
-;;; the design forces the branch (a queued tail behind a blocker at pool 1)
-;;; the row is FORCED and must not be weakened to tolerant.
+;;; BRANCH DISCIPLINE for the cancel rows: a cancel lands on exactly one of
+;;; two branches, cancelled or already running, each with exactly one
+;;; callback. Where the race is real (a same-turn cancel, a teardown sweep
+;;; racing a worker pickup) the row is TOLERANT -- the outcome is asserted
+;;; boolean and each branch is asserted with its PAIRED consequence, never
+;;; the boolean alone. Where the setup forces the branch (a queued tail
+;;; behind a blocker at pool 1) the row is FORCED and must not be weakened
+;;; to tolerant.
 ;;;
-;;; HERMETIC BY POLICY (ADR-0013): every lookup below is numeric --
+;;; HERMETIC BY POLICY: every lookup below is numeric --
 ;;; AI_NUMERICHOST literals, numeric services -- so the resolver's
 ;;; configuration (/etc/hosts, nsswitch, mDNSResponder) is never consulted
 ;;; and nothing here can reach a network. "localhost" and named services
@@ -18,13 +20,14 @@
 ;;; helper builds every hints alist, and a pure-arithmetic row asserts its
 ;;; computed ai_flags integer carries the shim's AI_NUMERICHOST bit -- the
 ;;; resolve-a-.invalid-name watchdog variant is a trap (NXDOMAIN maps to
-;;; the same EAI_NONAME on any networked machine; measured, ADR-0013).
+;;; the same EAI_NONAME on any networked machine; measured).
 ;;;
-;;; EVERY DNS WAIT GOES THROUGH run-until/ticking (FINDINGS Q1: a pending
-;;; getaddrinfo parks a bare 'once in the poll; FINDINGS item 11: the two
-;;; legal NOWAIT outcomes after a submit were BOTH observed on CI, so no
-;;; row may assert which branch a post-submit step takes). (collect) runs
-;;; in every callback; sentinels are values no failure path produces.
+;;; EVERY DNS WAIT GOES THROUGH run-until/ticking: a pending getaddrinfo
+;;; parks a bare 'once in the poll until the pool posts, and the two legal
+;;; NOWAIT outcomes after a submit (delivered already, still pending) were
+;;; BOTH observed on CI, so no row may assert which branch a post-submit
+;;; step takes. (collect) runs in every callback; sentinels are values no
+;;; failure path produces.
 ;;;
 ;;; NOT pure: (libuv dns) reaches (libuv private native). Never add this to
 ;;; the Makefile's PURE_TESTS.
@@ -39,7 +42,7 @@
         (libuv private handles)
         (libuv private conditions)
         ;; alloc-zeroed/free!/copy-in!/c-int-set!/fill-sockaddr! build the
-        ;; SYNTHETIC chains (S5.4: hand-built nodes, freed with free!,
+        ;; SYNTHETIC chains (hand-built nodes, freed with free!,
         ;; never uv_freeaddrinfo -- that call is legal only on
         ;; getaddrinfo-owned chains). dispatcher-ref reaches the installed
         ;; getaddrinfo dispatcher directly, which is the only way the
@@ -55,8 +58,9 @@
               count-connect-req-new! count-connect-req-free!
               count-getaddrinfo-req-new! count-getaddrinfo-req-free!
               count-getnameinfo-req-new! count-getnameinfo-req-free!)
-        ;; Shim-snapshotted values (ADR-0005), for the ADR-0013 watchdog
-        ;; and the synthetic-chain field writes.
+        ;; Shim-snapshotted values (read from the C headers, never
+        ;; transcribed), for the numeric-flags watchdog and the
+        ;; synthetic-chain field writes.
         (only (libuv private constants)
               ai-numerichost ai-numericserv ipproto-tcp
               af-inet af-inet6 af-unspec sock-stream sock-dgram
@@ -76,12 +80,14 @@
 ;; libuv reads UV_THREADPOOL_SIZE exactly once, at the first
 ;; uv__work_submit (vendor/libuv/src/threadpool.c:194-217); Chez's putenv
 ;; writes the same process environment libuv reads, measured through
-;; libuv's own uv_os_getenv (FINDINGS Q1 observation (c)). Stage 5's
-;; cancel rows depend on the pinned pool (FINDINGS Q3); pinning from this
-;; suite's first line keeps every row in the same measured regime.
+;; libuv's own uv_os_getenv. The cancel rows depend on the pinned pool (at
+;; pool 1 a queued lookup's cancel was measured to win 1000 of 1000
+;; trials); pinning from this suite's first line keeps every row in the
+;; same measured regime.
 (putenv "UV_THREADPOOL_SIZE" "1")
 
-;; SRFI-64's default runner does not set a process exit code (AGENTS.md).
+;; SRFI-64's default runner does not set a process exit code, so the suite
+;; ends with its own (exit ...).
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -96,7 +102,8 @@
         (write (test-result-ref r 'actual-value))
         (newline)))))
 
-;; #f is the worst possible expected value (AGENTS.md), so every err
+;; #f is the worst possible expected value -- a missing key, a defaulting
+;; accessor and a swallowed raise all produce it -- so every err
 ;; observation maps to a symbol: 'no-error for success, the errno symbol
 ;; for an &uv-errno-error, and a tagged list for anything else.
 ;; 'callback-never-fired is the seed every observer starts at, and no
@@ -108,7 +115,7 @@
 
 (define cap 64)
 
-;; --- THE hints helper (ADR-0013's value-level watchdog target) -----------
+;; --- THE hints helper (the value-level watchdog's target) ----------------
 ;; Every hints alist a lookup in this suite passes is built HERE, and the
 ;; helper ALWAYS includes 'numeric-host -- plus 'numeric-serv when the row
 ;; passes a service. Rows append their own family/socktype/protocol pairs.
@@ -152,26 +159,26 @@
 (define l (make-uv-loop))
 (define registry-with-loop (registry-count))
 
-;; --- the ADR-0013 value-level watchdog -----------------------------------
+;; --- the value-level watchdog on the numeric flags -----------------------
 ;; Pure arithmetic over the helper's own output and the shim's snapshot;
 ;; fails instantly and offline if the helper ever stops carrying the
 ;; numeric flags. (The constants snapshot exists because make-uv-loop just
 ;; ran ensure-native-loaded!.)
-(test-equal "ADR-0013 watchdog: helper flags carry the AI_NUMERICHOST bit"
+(test-equal "numeric-flags watchdog: helper flags carry the AI_NUMERICHOST bit"
   'numeric-host-bit-set
   (let ((n (flags->int (cdr (assq 'flags (suite-hints #t))))))
     (if (= (ai-numerichost) (bitwise-and n (ai-numerichost)))
         'numeric-host-bit-set
         (list 'numeric-host-bit-missing n))))
 
-(test-equal "ADR-0013 watchdog: with a service the helper also carries AI_NUMERICSERV"
+(test-equal "numeric-flags watchdog: with a service the helper also carries AI_NUMERICSERV"
   'numeric-serv-bit-set
   (let ((n (flags->int (cdr (assq 'flags (suite-hints #t))))))
     (if (= (ai-numericserv) (bitwise-and n (ai-numericserv)))
         'numeric-serv-bit-set
         (list 'numeric-serv-bit-missing n))))
 
-(test-equal "ADR-0013 watchdog: the no-service spelling still carries AI_NUMERICHOST"
+(test-equal "numeric-flags watchdog: the no-service spelling still carries AI_NUMERICHOST"
   'numeric-host-bit-set
   (let ((n (flags->int (cdr (assq 'flags (suite-hints #f))))))
     (if (= (ai-numerichost) (bitwise-and n (ai-numerichost)))
@@ -180,9 +187,8 @@
 
 ;; --- prologue: one throwaway drained lookup pins the pool ----------------
 ;; The pool is process-global and sized at the FIRST submit, so this
-;; lookup is what latches UV_THREADPOOL_SIZE=1 before any dependent row
-;; (design spec v0.2 S9; FINDINGS Q3, consequence 6). Asserted rather than
-;; fire-and-forgotten: a comment-that-is-a-check.
+;; lookup is what latches UV_THREADPOOL_SIZE=1 before any dependent row.
+;; Asserted rather than fire-and-forgotten: a comment-that-is-a-check.
 (define pin-err 'callback-never-fired)
 
 (test-equal "prologue: the pool-pinning lookup starts"
@@ -202,9 +208,9 @@
 
 ;; --- row a: numeric v4, fully pinned hints -------------------------------
 ;; family/socktype/protocol pinned so every symbol->int write in the hints
-;; tail is exercised; the answer is spike-measured identical on both libcs
-;; (FINDINGS Q4 f1): one inet/stream/tcp entry, the literal rendered back,
-;; the numeric service decoded, no canonname.
+;; tail is exercised; the answer is measured identical on both libcs: one
+;; inet/stream/tcp entry, the literal rendered back, the numeric service
+;; decoded, no canonname.
 (define a-err 'callback-never-fired)
 (define a-results 'callback-never-fired)
 
@@ -248,7 +254,7 @@
   'absent (if (uv-addrinfo-canonname (car a-results)) 'present 'absent))
 
 ;; --- row a2: absent service crosses as NULL ------------------------------
-;; service #f -> NULL (FINDINGS Q1(b) measured #f->NULL marshalling); with
+;; service #f -> NULL (measured: #f crosses as NULL, not ""); with
 ;; no service there is nothing to put in sin_port, so the port is 0 --
 ;; pure formatting, no /etc/services.
 (define a2-err 'callback-never-fired)
@@ -273,7 +279,7 @@
   '(0) (map uv-addrinfo-port a2-results))
 
 ;; --- row b: numeric v6 ---------------------------------------------------
-;; The v6 row is the PORTABILITY TRAP's live check (design spec S5.2 / S9):
+;; The v6 row is the PORTABILITY TRAP's live check:
 ;; the walk reads sin6_port at the shim's own offset and renders through
 ;; uv_ip_name, on a family whose struct layout the two libcs disagree
 ;; about. Family pinned inet6 exercises the AF_INET6 hint write.
@@ -337,7 +343,7 @@
 ;; --- row c: unpinned socktype => a real multi-entry chain ----------------
 ;; SET-CONTAINMENT, NEVER ORDER OR COUNT EQUALITY: Darwin answers 2 entries
 ;; dgram-first with no raw; glibc answers 3 stream-first including raw --
-;; both shapes measured twice per OS (FINDINGS Q4 f4, consequence 12). A
+;; both shapes measured twice per OS. A
 ;; row asserting order or exact count passes on one CI OS and fails on the
 ;; other by construction.
 (define c-err 'callback-never-fired)
@@ -385,7 +391,7 @@
 ;; --- row d: AF_UNSPEC + a v4 literal => exactly one family ---------------
 ;; The unspec symbol is written EXPLICITLY (exercising the AF_UNSPEC hint
 ;; write, distinct from row c's omitted-family zero); the literal pins the
-;; family the resolver answers (FINDINGS Q4 f1/f4: all-inet on both libcs).
+;; family the resolver answers (measured: all-inet on both libcs).
 (define d-err 'callback-never-fired)
 (define d-results 'callback-never-fired)
 
@@ -412,10 +418,10 @@
       (list 'families (map uv-addrinfo-family d-results))))
 
 ;; --- row e: non-numeric name under numeric-host => EAI_NONAME ------------
-;; The deterministic OFFLINE error path ADR-0013 substitutes for banned
+;; The deterministic OFFLINE error path that stands in for banned
 ;; resolver lookups: AI_NUMERICHOST makes a non-numeric name fail in pure
 ;; formatting, asynchronously, with empty results -- '() and never #f
-;; (err is the sole discriminant, S4.4).
+;; (err is the sole discriminant).
 (define e-err 'callback-never-fired)
 (define e-results 'callback-never-fired)
 
@@ -438,7 +444,7 @@
 (test-equal "numeric-host + non-numeric name: results are '(), never #f"
   '() e-results)
 
-;; --- row f: every run delivers fresh records (ADR-0009) ------------------
+;; --- row f: every run delivers fresh records (copied at the boundary) ----
 (define f1-results 'callback-never-fired)
 (define f2-results 'callback-never-fired)
 
@@ -473,7 +479,7 @@
       'fresh))
 
 ;; --- row g: in flight, and freed BEFORE on-complete ----------------------
-;; The lifetime contract of S4.4: the block is deregistered, freed,
+;; The lifetime contract: the block is deregistered, freed,
 ;; counted, and ptr-zeroed all before on-complete runs. Observed from
 ;; INSIDE the callback, which is the only vantage point that can tell
 ;; "freed before" from "freed after".
@@ -502,7 +508,7 @@
 ;; Between the submit and the first uv-run nothing can deliver (callbacks
 ;; run only inside uv-run, on the loop thread), so these two mid-flight
 ;; assertions are race-free -- unlike anything about a post-submit NOWAIT
-;; branch, which FINDINGS item 11 bans outright.
+;; branch, which the header bans outright.
 (test-equal "in flight: the live counter reads 1 after submit, before stepping"
   1 (live-count 'getaddrinfo-req))
 
@@ -515,7 +521,7 @@
 ;; THE BOUNDARY-WRITE WATCHDOG, closing the loop the helper watchdog above
 ;; cannot see: dropping a c-int-set! in the start call's hints writing
 ;; would otherwise leave this suite green on any networked machine (the
-;; same NXDOMAIN trap ADR-0013 documents for the flags bit). The
+;; same NXDOMAIN trap the header describes for the flags bit). The
 ;; co-allocated hints tail of the IN-FLIGHT block is read back at the same
 ;; shim offsets the start call wrote through. Deterministic, offline, and
 ;; race-free: libuv memcpys node/service/hints into its own req-owned
@@ -547,7 +553,7 @@
 (test-equal "freed before on-complete: the registry entry is popped inside the callback"
   (+ g-registry-before-submit 1) g-registry-in-callback)
 
-;; --- uv-dns-request? (S4.5's kind-based domain predicate) ----------------
+;; --- uv-dns-request? (the kind-based domain predicate) -------------------
 (test-equal "uv-dns-request? accepts a getaddrinfo request record"
   'dns-request (if (uv-dns-request? g-req) 'dns-request 'not-dns))
 
@@ -560,16 +566,16 @@
   'not-dns (if (uv-dns-request? probe-timer) 'dns-request 'not-dns))
 
 ;; The discriminating case for the KIND check: a request record that is
-;; not a DNS request. Constructed bare (no registration, no native call)
-;; -- the S3 synthetic-completion precedent; the predicate reads only the
-;; kind field, so the placeholder ptr is never dereferenced.
+;; not a DNS request. Constructed bare (no registration, no native call);
+;; the predicate reads only the kind field, so the placeholder ptr is never
+;; dereferenced.
 (test-equal "uv-dns-request? refuses a non-DNS request record, by kind"
   'not-dns
   (if (uv-dns-request? (%make-uv-req-record 1 'write #f #f))
       'dns-request 'not-dns))
 
 ;; --- row h: resubmit from inside the callback, chain of three ------------
-;; The FINDINGS Q1 engine shape in miniature: each completion submits the
+;; Re-entrant submission in miniature: each completion submits the
 ;; next lookup from inside on-complete, and the completions arrive in
 ;; submission order.
 (define h-order '())
@@ -605,7 +611,7 @@
 
 ;; --- row i: the post-registration sync failure, and its undo -------------
 ;; An empty hostname reaches libuv (NO Scheme-side empty-string validation,
-;; deliberately -- S5.5: adding one would make this guard untestable) and
+;; deliberately -- adding one would make this guard untestable) and
 ;; fails DETERMINISTICALLY in uv__idna_toascii with UV_EINVAL, after our
 ;; register/count, before any possible callback. submit-request!'s undo must
 ;; reverse exactly that much. This row also drives the THREE-
@@ -621,7 +627,7 @@
     'no-raise))
 
 ;; The explicit #f and '() hint spellings canonicalize to the same NULL
-;; pointer (S4.2), proven on the same deterministic sync-failure path.
+;; pointer, proven on the same deterministic sync-failure path.
 (test-equal "empty node via #f hints: same sync EINVAL through the 4-arity"
   'EINVAL
   (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
@@ -652,8 +658,8 @@
 ;; --- row j: a raising on-complete surfaces as &uv-callback-error ---------
 ;; The raise is caught by the seam's guard and recorded against the loop the
 ;; seam found through registry-loop-of before the dispatcher deregistered
-;; the request (no handle-loop route exists for a handle-less request --
-;; ADR-0011), then re-raised by uv-run.
+;; the request (no handle-loop route exists for a handle-less request),
+;; then re-raised by uv-run.
 (test-equal "a raising on-complete: the lookup starts"
   'started
   (guard (e (#t (list 'raised (describe e))))
@@ -730,7 +736,7 @@
    (lambda () (uv-getaddrinfo! l #f #f (suite-hints #t)
                                (lambda (err results) #f)))))
 
-;; Guards the MEASURED prefix-resolution hazard (FINDINGS Q1(b)):
+;; Guards the MEASURED prefix-resolution hazard:
 ;; "127.0.0.1\x0;.evil" would otherwise resolve silently as 127.0.0.1.
 (test-equal "boundary: an embedded NUL in node is refused"
   '(uv-getaddrinfo! node-contains-nul)
@@ -771,17 +777,17 @@
 ;;   'untouched the last run, which no expiry reached.
 ;; Anything else is the evidence, a list.
 ;;
-;; The first sweep is the leak's. Before the fix, a family turned bogus after
-;; the block existed was refused exactly as one turned bogus before it, but
-;; with the block allocated and unregistered, and nothing freed it. The
-;; request counters count from registration on and never saw that block; the
-;; debug shim's block counter does (live-counts' 'block), so a refused run
-;; must leave it where it found it, and Valgrind reports the block definitely
-;; lost when `make test-memory` runs this suite. The other three fail here by
-;; name on a call that reads its arguments again, as the call did before the
-;; fix: a hints change made with valid values lands in the request's hints,
-;; and a NUL written into the node or the service reaches libuv as a shorter
-;; name.
+;; The first sweep is the leak's. A call that checks the hints again after
+;; allocating its block refuses a family turned bogus after the block exists
+;; exactly as one turned bogus before it, but with the block allocated and
+;; unregistered, and nothing frees it. The request counters count from
+;; registration on and never see that block; the debug shim's block counter
+;; does (live-counts' 'block), so a refused run must leave it where it found
+;; it, and Valgrind reports the block definitely lost when `make
+;; test-memory` runs this suite. The other three fail here by name on a call
+;; that reads its arguments again after checking them: a hints change made
+;; with valid values lands in the request's hints, and a NUL written into
+;; the node or the service reaches libuv as a shorter name.
 (define sweep-max-fuel 400)
 
 (define sweep-hints-tail
@@ -841,8 +847,8 @@
 ;; expiry. BEFORE runs in the engine just ahead of the lookup; the sweeps'
 ;; does nothing. A call still running after the driver's cap is given up
 ;; there (tests/uv-sweep.sls), so a lookup whose walk came to loop fails
-;; its run by name instead of hanging the suite: until #81 this driver
-;; resumed without a cap. The verb is called here by name, inside the
+;; its run by name instead of hanging the suite, as a driver that resumed
+;; without a cap would. The verb is called here by name, inside the
 ;; guard, where seed-gates' rule 4 reads it.
 (define (lookup-verdict variant fuel before)
   (let* ((node (string-copy "127.0.0.1"))
@@ -959,8 +965,8 @@
 
 ;; A lookup still running at the driver's cap is given up. The run spins
 ;; for three times the cap's ticks before it calls uv-getaddrinfo!, so a
-;; driver that resumed without a cap, as this one did until #81, lets it
-;; finish, and the run answers the lookup's own verdict instead of the
+;; driver that resumed without a cap would let it finish, and the run
+;; would answer the lookup's own verdict instead of the
 ;; give-up. With no cap at all, a lookup that never ended would hang the
 ;; suite where this row fails.
 (define (spin-past-cap)
@@ -982,15 +988,16 @@
 ;; --- row k: synthetic chains through addrinfo-chain->list ----------------
 ;; Hand-built struct addrinfo nodes: alloc-zeroed memory, fields written at
 ;; the SHIM's offsets, freed below with free! -- NEVER uv_freeaddrinfo,
-;; which is legal only on getaddrinfo-owned chains (S8 delta). This is the
+;; which is legal only on getaddrinfo-owned chains. This is the
 ;; only honest way to drive the skip policy and the NULL-field arms: no
 ;; hermetic lookup can make the resolver hand back a non-INET entry or a
 ;; NULL ai_addr.
 
 ;; Pointer width derived from the shim's own layout rather than
 ;; transcribed: ai_addr and ai_canonname are ADJACENT pointer fields on
-;; both supported libcs -- in opposite orders (the S5.2 portability trap),
-;; which is exactly why the absolute difference of their offsets is
+;; both supported libcs -- in opposite orders (an ftype that guessed
+;; either order would be wrong on the other libc), which is exactly why
+;; the absolute difference of their offsets is
 ;; sizeof(void*) either way.
 (define pointer-width
   (abs (- (offsetof-addrinfo-ai-addr) (offsetof-addrinfo-ai-canonname))))
@@ -1055,9 +1062,9 @@
                          (uv-addrinfo-port r)))
        (addrinfo-chain->list (link-nodes! (list k-skip-node k-inet-node)))))
 
-;; k2: an unmapped protocol passes through as the raw exact int (S4.3:
-;; lossless, discriminable with symbol?; deliberately NOT the ADR-0006
-;; sentinel-symbol shape). 6151 maps to no IPPROTO this binding knows.
+;; k2: an unmapped protocol passes through as the raw exact int (lossless,
+;; discriminable with symbol?; deliberately NOT a sentinel symbol, the shape
+;; error codes take). 6151 maps to no IPPROTO this binding knows.
 (test-equal "synthetic: an unmapped protocol int passes through losslessly"
   '(6151)
   (map uv-addrinfo-protocol
@@ -1070,7 +1077,7 @@
   (map uv-addrinfo-canonname
        (addrinfo-chain->list (link-nodes! (list k-skip-node k-inet-node)))))
 
-;; k4: all entries skipped is a legal '() -- the documented S4.3 corollary
+;; k4: all entries skipped is a legal '() -- the documented corollary
 ;; (a success whose entries were all skipped, indistinguishable from an
 ;; empty success).
 (define k-lone-skip (make-synthetic-node (af-unspec) (sock-dgram) 0 0 0))
@@ -1079,7 +1086,7 @@
   '() (addrinfo-chain->list (link-nodes! (list k-lone-skip))))
 
 ;; k5: NULL ai_addr on an INET entry. The zero-refusing
-;; sockaddr->address-string answers #f WITHOUT calling native (S5.1) --
+;; sockaddr->address-string answers #f WITHOUT calling native --
 ;; the entry is delivered, address #f, port 0, canonname #f. An unmapped
 ;; socktype int (424242) rides along, pinning the raw-int passthrough on
 ;; the socktype side.
@@ -1097,8 +1104,8 @@
        (addrinfo-chain->list (link-nodes! (list k-null-addr-node)))))
 
 ;; k6: the empty chain (a NULL head) is '(), which is what makes the
-;; dispatcher's uniform conversion correct on every failure status (S5.4:
-;; res is NULL on every failure/cancel).
+;; dispatcher's uniform conversion correct on every failure status (res
+;; is NULL on every failure/cancel).
 (test-equal "synthetic: a NULL chain head answers '()"
   '() (addrinfo-chain->list 0))
 
@@ -1107,7 +1114,7 @@
                         (list k-skip-node k-inet-node k-lone-skip
                               k-null-addr-node k-sockaddr k-canon)))
 
-;; --- the dispatcher's step-1 arms, driven directly (S5.4) ----------------
+;; --- the dispatcher's step-1 arms, driven directly ----------------------
 ;; No public API can make libuv deliver a completion for an unregistered
 ;; pointer or a wrong-kind entry, so the installed dispatcher is invoked
 ;; from Scheme through its own seam -- the same technique
@@ -1153,19 +1160,18 @@
       'entry-disturbed))
 
 ;; ========================================================================
-;; STAGE 5: uv-getnameinfo!, uv-cancel!, cancel/teardown rows (S4.5, S5.4,
-;; S5.5, S6, S9)
+;; uv-getnameinfo!, uv-cancel!, cancel/teardown rows
 ;; ========================================================================
 
 ;; --- seed: the second counter class starts at zero -----------------------
 (test-equal "seed: no getnameinfo request is live before this suite starts one"
   0 (live-count 'getnameinfo-req))
 
-;; --- row m: numeric reverse v4 (S9; FINDINGS Q4 f6) ----------------------
+;; --- row m: numeric reverse v4 ------------------------------------------
 ;; NI_NUMERICHOST|NI_NUMERICSERV makes the reverse pure formatting: the
 ;; hostname IS the literal rendered back and the service IS the port
-;; printed in decimal -- both STRINGS (getnameinfo(3)'s output vocabulary,
-;; S4.4), no resolver, no /etc/services (ADR-0013).
+;; printed in decimal -- both STRINGS (getnameinfo(3)'s output
+;; vocabulary), no resolver, no /etc/services.
 (define m-err 'callback-never-fired)
 (define m-host 'callback-never-fired)
 (define m-serv 'callback-never-fired)
@@ -1220,7 +1226,7 @@
   "8080" m2-serv)
 
 ;; --- row n: getnameinfo request lifecycle, mirroring row g ---------------
-;; The S4.4 lifetime contract for the second request kind: deregistered,
+;; The lifetime contract for the second request kind: deregistered,
 ;; freed, counted, ptr-zeroed all BEFORE on-complete runs -- observed from
 ;; inside the callback, the only vantage point that can tell "freed
 ;; before" from "freed after". The two strings the callback received were
@@ -1255,8 +1261,8 @@
 (test-equal "getnameinfo in flight: the start call answered an opaque request record"
   'a-req (if (uv-req? n-req) 'a-req 'not-a-req))
 
-;; The second kind in uv-dns-request?'s kind list becomes watchable now
-;; that a getnameinfo request exists (Stage 4's deferred-coverage note).
+;; The second kind in uv-dns-request?'s kind list, watched on a real
+;; getnameinfo request.
 (test-equal "uv-dns-request? accepts a getnameinfo request record"
   'dns-request (if (uv-dns-request? n-req) 'dns-request 'not-dns))
 
@@ -1273,15 +1279,18 @@
 (test-equal "getnameinfo freed before on-complete: the registry entry is popped inside the callback"
   (+ n-registry-before-submit 1) n-registry-in-callback)
 
-;; --- cancel after completion: the zeroed-ptr guard (S4.5) ----------------
+;; --- cancel after completion: the zeroed-ptr guard ----------------------
 ;; n-req's block was freed and its stored ptr zeroed at the freeing site;
 ;; uv-cancel! must answer #f WITHOUT calling native -- uv_cancel reads
 ;; req->type through whatever pointer it is handed
 ;; (vendor/libuv/src/threadpool.c:399-441), and this one is stale. Both
-;; observable halves are asserted: the #f, and that nothing raised. (That
-;; the native call really is skipped is the valgrind-backstopped mutation
-;; in .plans/dns-stage-5-mutation-log.md -- no Scheme assertion can see a
-;; call that faults.)
+;; observable halves are asserted: the #f, and that nothing raised. With
+;; the zero check removed, uv_cancel reads req->type through the NULL
+;; pointer; Chez raises that fault as "invalid memory reference", which
+;; this row's guard catches, so the row fails by name and the suite runs
+;; on. The zeroing at the freeing site is what makes a stale pointer NULL
+;; here: a call through a stale address that was reused would not fault,
+;; and only the memory gate would see it.
 (test-equal "cancel after completion: answers #f, and nothing raises"
   'cancelled-too-late
   (guard (e (#t (list 'raised e)))
@@ -1290,11 +1299,12 @@
       ((#t) 'cancel-claimed-success)
       (else 'not-a-boolean))))
 
-;; --- uv-cancel! domain rows (S4.5) ---------------------------------------
-;; DNS requests ONLY. A v0.1-kind request record is REFUSED, not answered
-;; #f: libuv would answer UV_EINVAL for the non-threadpool kinds, and
-;; refusing in Scheme names the mistake as static, not racy. The record is
-;; constructed bare (ptr never dereferenced) -- the Stage 4 precedent.
+;; --- uv-cancel! domain rows ---------------------------------------------
+;; DNS requests ONLY. A request record of a stream or connect kind is
+;; REFUSED, not answered #f: libuv would answer UV_EINVAL for the
+;; non-threadpool kinds, and refusing in Scheme names the mistake as
+;; static, not racy. The record is constructed bare (ptr never
+;; dereferenced), as in the uv-dns-request? row above.
 (define (cancel-rejection thunk)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e)
@@ -1307,16 +1317,16 @@
   '(uv-cancel! not-a-cancellable-request)
   (cancel-rejection (lambda () (uv-cancel! "127.0.0.1"))))
 
-(test-equal "uv-cancel! refuses a v0.1-kind request record, by kind"
+(test-equal "uv-cancel! refuses a write request record, by kind"
   '(uv-cancel! not-a-cancellable-request)
   (cancel-rejection
    (lambda () (uv-cancel! (%make-uv-req-record 1 'write #f #f)))))
 
-;; --- the tolerant tail-cancel (S4.5, S9; FINDINGS Q3) --------------------
-;; Q3's measured regime exactly: pool pinned to 1 (prologue), four numeric
+;; --- the tolerant tail-cancel -------------------------------------------
+;; The measured regime exactly: pool pinned to 1 (prologue), four numeric
 ;; blockers occupying the single worker's queue, a tail behind them,
 ;; uv-cancel! on the tail in the SAME turn -- no loop step between submit
-;; and cancel. Q3 recorded the cancelled branch at 1000/1000 twice here,
+;; and cancel. The cancelled branch was measured at 1000/1000 twice here,
 ;; but the race is real, so the outcome is asserted BOOLEAN and each
 ;; branch carries its PAIRED consequence -- never the boolean alone.
 (define tc-blocker-fires (make-vector 4 0))
@@ -1403,22 +1413,20 @@
   (list (live-count 'getaddrinfo-req) (live-count 'getnameinfo-req)
         (registry-count)))
 
-;; --- double-cancel before the drain (S4.5) -------------------------------
+;; --- double-cancel before the drain -------------------------------------
 ;; The target is a getnameinfo request, covering the second kind's cancel
 ;; path and its 'EAI_CANCELED delivery (host and service #f through the
-;; NULL->#f rule, S4.4). Both cancels land in the same turn, before any
-;; drain: the vendor unlinks and re-inserts the same queue node, rc 0
-;; twice (vendor/libuv/src/threadpool.c:399-441; design spec S7's
-;; verified-facts row) -- #t twice, documented not defended, and the
-;; callback still fires EXACTLY once.
+;; NULL->#f rule). Both cancels land in the same turn, before any drain:
+;; the vendor unlinks and re-inserts the same queue node, rc 0 twice
+;; (vendor/libuv/src/threadpool.c:399-441) -- #t twice, documented not
+;; defended, and the callback still fires EXACTLY once.
 ;;
 ;; BOUNDED RETRY, NOT A TOLERANT ROW. The first cancel's #t is a race with
-;; a measured heavy favorite (FINDINGS Q3: 1000/1000 at pool 1), but a GC
-;; or scheduler pause landing between the tail submit and the cancel lets
+;; a measured heavy favorite (1000/1000 at pool 1), but a GC or scheduler
+;; pause landing between the tail submit and the cancel lets
 ;; the single worker drain the whole queue -- MEASURED under the ASan arm:
 ;; a forced (collect) inside that window lost the race 52/100, and even
-;; with the collect moved ahead of the submits ~1% of 500 trials lost
-;; (.plans/dns-stage-5-mutation-log.md records the probe histograms). So
+;; with the collect moved ahead of the submits ~1% of 500 trials lost. So
 ;; each attempt resets the allocation clock FIRST, and the scenario
 ;; retries -- bounded by attempts, never wall-clock -- until the first
 ;; cancel wins; the vendor property under test (second cancel also #t,
@@ -1572,9 +1580,9 @@
            (cdr (assq 'tail-serv final))))))
 
 ;; --- boundary: uv-getnameinfo! validation, before the first allocation ---
-;; The TCP input vocabulary on the way in (S4.5, ADR-0012), each refusal
-;; before anything is allocated, registered, or counted -- asserted by the
-;; balance row after the block.
+;; The TCP address vocabulary on the way in, each refusal before anything
+;; is allocated, registered, or counted -- asserted by the balance row
+;; after the block.
 (define (getnameinfo-rejection thunk)
   (guard (e ((uv-invalid-argument? e)
              (list (uv-invalid-argument-who e)
@@ -1619,7 +1627,7 @@
    (lambda () (uv-getnameinfo! l "127.0.0.1" 8080 '(numeric-host)
                                'not-a-procedure))))
 
-;; The PRE-REGISTRATION guard (S5.5; S9's relabeled garbage-address row):
+;; The PRE-REGISTRATION guard:
 ;; "not-an-ip" passes validate-address (it IS a string, with no NUL) and fails
 ;; inside fill-sockaddr! AFTER the block is allocated, BEFORE anything is
 ;; registered or counted -- the guard's undo is exactly one free. Driven
@@ -1635,7 +1643,7 @@
   (list 0 (+ registry-with-loop 1))   ; loop + probe-timer
   (list (live-count 'getnameinfo-req) (registry-count)))
 
-;; --- the getnameinfo dispatcher's step-1 arms, driven directly (S5.4) ----
+;; --- the getnameinfo dispatcher's step-1 arms, driven directly ----------
 ;; Same seam technique as the getaddrinfo arms above. The ORPHAN arm is
 ;; driven with NULL hostname/service: for a pointer this binding has
 ;; forgotten there is nothing to copy and nothing to free -- the strings
@@ -1673,8 +1681,8 @@
 
 ;; A request of the OTHER DNS kind is a request too, so only the kind
 ;; comparison tells the seam to leave it. Each DNS seam takes its pointer's
-;; entry in the step that finds it, and puts back one its dispatcher refuses
-;; (#87): this is the case where a seam that asked only uv-req? would keep
+;; entry in the step that finds it, and puts back one its dispatcher
+;; refuses: this is the case where a seam that asked only uv-req? would keep
 ;; the entry its dispatcher raised over.
 (define (other-kind-dns-run slot-name registered-kind req-kind call)
   (set! other-kind-completed 'not-completed)
@@ -1781,17 +1789,17 @@
                     (filter (lambda (cell) (eq? (car cell) (car s))) matrix))))
        matrix-seams))
 
-;; --- pool-pinned queued-tail teardown (S6; ADR-0011; Stage 3's M3 caveat)
+;; --- pool-pinned queued-tail teardown -----------------------------------
 ;; A second loop per attempt: four numeric blockers head the single
-;; worker's queue (Q3's exactly-measured same-turn regime -- 1000/1000
-;; cancelled, twice), a getnameinfo tail behind them, then
+;; worker's queue (the measured same-turn regime -- 1000/1000 cancelled,
+;; twice), a getnameinfo tail behind them, then
 ;; uv-loop-teardown! in the SAME turn -- the cancel sweep must reach the
 ;; still-queued tail, which then drains as 'EAI_CANCELED before teardown
-;; returns (S6's contract: every in-flight on-complete runs before
+;; returns (teardown's contract: every in-flight on-complete runs before
 ;; teardown returns).
 ;;
 ;; THE CANCELLED-TAIL ROW IS THE NAMED CATCHER for a kind-narrowed
-;; cancel-requests-for-loop! (the Stage 3 caveat): a sweep that misses
+;; cancel-requests-for-loop!: a sweep that misses
 ;; getnameinfo-req never cancels the tail on ANY attempt -- the drain
 ;; waits the real result out instead -- so the observed-within-bound row
 ;; below fails by name, deterministically.
@@ -1801,14 +1809,12 @@
 ;; behind the blockers, and a GC/scheduler pause inside the
 ;; submit-to-sweep window lets it drain everything (measured: a forced
 ;; (collect) in the window lost 52/100; collect-first still lost ~1% of
-;; 500 ASan trials, and the very first 1-blocker suite shape lost a real
-;; test-memory run -- .plans/dns-stage-5-mutation-log.md). Each attempt
-;; collects FIRST, and the branch-independent invariants -- teardown
-;; returned with the loop closed, all five callbacks fired exactly once
-;; BEFORE it returned, every blocker in a legal branch, counters and
+;; 500 ASan trials, and a 1-blocker shape lost a real test-memory run).
+;; Each attempt collects FIRST, and the branch-independent invariants --
+;; teardown returned with the loop closed, all five callbacks fired exactly
+;; once BEFORE it returned, every blocker in a legal branch, counters and
 ;; registry balanced -- are asserted over EVERY attempt, losing draws
-;; included. Only the branch draw itself retries; wall-clock never
-;; decides.
+;; included. Only the branch draw itself retries; wall-clock never decides.
 (define td-registry-before (registry-count))
 (define td-max-attempts 16)
 
@@ -1941,10 +1947,10 @@
            (cdr (assq 'tail-host final))
            (cdr (assq 'tail-serv final))))))
 
-;; --- uv-loop-close! with an in-flight request => 'EBUSY (S6; ADR-0011) ---
+;; --- uv-loop-close! with an in-flight request => 'EBUSY -----------------
 ;; libuv's own guard is the check (vendor/libuv/src/uv-common.c:885): an
 ;; active request keeps the loop alive, so uv_loop_close answers EBUSY --
-;; surfacing as the SYMBOL through &uv-errno-error (ADR-0006) -- with the
+;; surfacing as the SYMBOL through &uv-errno-error -- with the
 ;; loop untouched and usable. Deterministic without a step: whatever the
 ;; worker has done meanwhile, the req stays active until its completion
 ;; callback runs inside uv-run, which has not happened yet.

@@ -1,8 +1,8 @@
 #!r6rs
 ;;; SRFI-64 suite for (libuv private c-string): read-utf8 and nul-free?, the
-;;; copy and the NUL scan that uv-spawn! and c-string-bytes share (#64 item
-;;; 4); c-string?; and what c-string-bytes costs. tests/test-addrinfo.sps's
-;;; node sweeps and race hold the copy against a string that changes, and
+;;; copy and the NUL scan that uv-spawn! and c-string-bytes share;
+;;; c-string?; and what c-string-bytes costs. tests/test-addrinfo.sps's node
+;;; sweeps and race hold the copy against a string that changes, and
 ;;; tests/test-address.sps and tests/test-native.sps hold the address verbs'
 ;;; use of these.
 ;;;
@@ -11,7 +11,8 @@
 ;;; procedures fails rows here by name even when it stops native.sls
 ;;; working: a c-string? that refuses well-formed names makes every constant
 ;;; unavailable at the first ensure-native-loaded!, before most of the native
-;;; suites' rows run (#72's lookup-constant checks each name with it).
+;;; suites' rows run (native.sls's lookup-constant checks each name with
+;;; it).
 (import (rnrs)
         (srfi :64)
         (libuv private c-string)
@@ -22,8 +23,7 @@
         (uv-meter)
         (uv-describe))
 
-;; SRFI-64 sets no exit status; the runner's fail count drives it
-;; (AGENTS.md).
+;; SRFI-64 sets no exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
@@ -50,7 +50,7 @@
         (read-utf8 (string->utf8 "x"))))
 
 ;; undo-disables! : -> exact-nonnegative-integer
-;; How many interrupt disables were outstanding, each now undone:
+;; How many interrupt disables were outstanding, undoing each:
 ;; enable-interrupts answers the disable count it leaves.
 (define (undo-disables!)
   (let undo ((n 0))
@@ -110,7 +110,7 @@
 ;; Its callers refuse a non-string themselves, each for its own reason, so
 ;; one reaching c-string-bytes is the binding's own fault: refused under
 ;; c-string-bytes's name, never its caller's, and never read through as a
-;; bytevector, as #f was at --optimize-level 3.
+;; bytevector, which is what an unchecked #f gets at --optimize-level 3.
 (test-equal "c-string-bytes refuses anything but a string under its own name, not its caller's"
   '((refused c-string-bytes not-a-string)
     (refused c-string-bytes not-a-string)
@@ -124,15 +124,15 @@
            'not-refused))
        (list 'x #f (u8-list->bytevector '(120)))))
 
-;; c-string-bytes took its copy inside with-interrupts-disabled, a
-;; dynamic-wind, and paid 64 B a call for it: 176 B for "127.0.0.1". Its
-;; copy now takes a bare interrupt pair (read-utf8), so it allocates what
-;; the same three objects cost made directly: the copy, the copy's UTF-8
-;; and the answer. uv-spawn! reads each of its strings with read-utf8 too,
-;; inside its own interrupt-free step, where a dynamic-wind nested there
-;; would cost the same 64 B a string; main's read-string took no fence of
-;; its own. tests/uv-meter.sls has the meter; the second element shows it
-;; sees an allocation.
+;; c-string-bytes takes its copy with a bare interrupt pair (read-utf8), so
+;; it allocates what the same three objects cost made directly: the copy,
+;; the copy's UTF-8 and the answer. Inside with-interrupts-disabled, a
+;; dynamic-wind, the copy would cost 64 B more a call: 176 B for
+;; "127.0.0.1" where the pair costs 112 B. uv-spawn! reads each of its
+;; strings with read-utf8 too, inside its own interrupt-free step, where a
+;; dynamic-wind nested there would cost the same 64 B a string.
+;; tests/uv-meter.sls has the meter; the second element shows it sees an
+;; allocation.
 
 (test-equal "c-string-bytes allocates its copy, the copy's UTF-8 and its answer, and nothing more"
   '(0 meter-live)

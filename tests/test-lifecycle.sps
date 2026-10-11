@@ -1,24 +1,23 @@
 #!r6rs
-;;; SRFI-64 suite for allocation balance across whole lifecycles -- design
-;;; spec S10 (GC invariants and the debug counters that enforce them) and
-;;; S11 ("counters asserted mid-test nonzero, then balanced: after an
-;;; ordinary close, after a callback raises, after 100 iterations plus
-;;; (collect)").
+;;; SRFI-64 suite for allocation balance across whole lifecycles. The debug
+;;; counters count the binding's native allocations, class by class. Each
+;;; row asserts them nonzero mid-test, then balanced: after an ordinary close,
+;;; after a callback raises, and after 100 iterations plus (collect).
 ;;;
-;;; Stage 2 filled in the LOOP rows; Stage 3 added the TIMER rows (rows 6-8
-;;; below: a timer's counters across an ordinary close, across a callback
-;;; that raises, and across 100 make/start/fire/close iterations with a full
-;;; collection on each). Stage 4 added the TCP and REQUEST rows (rows 9-11: a
-;;; tcp handle across an ordinary close, the connect and write request blocks
-;;; across a close that races an in-flight write, and 100
-;;; connect/accept/close iterations with a full collection on each). The read
-;;; buffer's own row arrives with Stage 5.
+;;; Rows 1-5 are the LOOP rows. Rows 6-8 are the TIMER rows: a timer's
+;;; counters across an ordinary close, across a callback that raises, and
+;;; across 100 make/start/fire/close iterations with a full collection on
+;;; each. Rows 9-11 are the TCP and REQUEST rows: a tcp handle across an
+;;; ordinary close, the connect and write request blocks across a close that
+;;; races an in-flight write, and 100 connect/accept/close iterations with a
+;;; full collection on each. The signal rows come last.
 ;;;
 ;;; Every assertion here needs the DEV shim (CFLAGS_DEV,
 ;;; -DCHEZ_LIBUV_DEBUG_COUNTERS); against a production shim the live queries
-;;; are constant 0. The first assertion names that precondition, so it is
-;;; what fails, by name, rather than a balance check that looks like
-;;; cross-wiring.
+;;; are constant 0. The baseline rows pass there too, so the first row to
+;;; fail is row 1's first seed, "seed: make-uv-loop moves the live loop
+;;; counter off zero": it names that precondition, by name, rather than a
+;;; balance check that looks like cross-wiring.
 ;;;
 ;;; NOT pure: (libuv loop) reaches (libuv private native). Never add this to
 ;;; the Makefile's PURE_TESTS.
@@ -112,12 +111,12 @@
 (test-equal "uv-loop-teardown! leaves the registry at its baseline"
   registry-count-at-start (registry-count))
 
-;; --- row 4: the registry is the GC root (ADR-0007, design spec S5) ------
-;; "An open handle and its stored closures stay reachable through this table
-;; for as long as it is open, even if the caller drops every other reference
-;; to it -- closing is therefore never GC-timed." That is a claim about what
-;; survives a collection, and it is the one loop-lifecycle property in this
-;; stage that needs no handle type to test.
+;; --- row 4: the registry is the GC root ---------------------------------
+;; The binding uses no guardians. An open handle and its stored closures
+;; stay reachable through the registry for as long as it is open, even if
+;; the caller drops every other reference to it -- closing is therefore
+;; never GC-timed. That is a claim about what survives a collection, and it
+;; is the one loop-lifecycle property that needs no handle type to test.
 ;;
 ;; The loop record is created inside a `let` whose binding dies with it, so
 ;; after the collection below the ONLY strong reference left in the program
@@ -163,9 +162,9 @@
   registry-count-at-start (registry-count))
 
 ;; --- row 5: 100 iterations, with a full collection on each --------------
-;; (collect) on every iteration is the GC-pressure axis design spec S11 asks
-;; for: the registry is the only GC root for an open loop (ADR-0007), so a
-;; collection between make and close must not disturb it.
+;; (collect) on every iteration puts the registry under GC pressure: it is
+;; the only GC root for an open loop, so a collection between make and close
+;; must not disturb it.
 (define peak-live 0)
 (define peak-registry 0)
 
@@ -193,9 +192,9 @@
   registry-count-at-start (registry-count))
 
 ;; --- row 6: a timer's whole lifecycle, closed normally ------------------
-;; Stage 3's handle rows. The counters are asserted to MOVE first and to
-;; balance second, per design spec S10 -- a counter stuck at zero throughout
-;; would otherwise satisfy every "balanced" assertion in this file.
+;; The first handle rows. The counters are asserted to MOVE first and to
+;; balance second -- a counter stuck at zero throughout would otherwise
+;; satisfy every "balanced" assertion in this file.
 (define timer-loop (make-uv-loop))
 (define timer-live-inside 0)
 (define timer-registry-inside 0)
@@ -225,11 +224,12 @@
   registry-count-at-start (registry-count))
 
 ;; --- row 7: the counters after a callback RAISES ------------------------
-;; ADR-0008: "test-lifecycle asserts the counters return to baseline after a
-;; callback raises -- the check that would fail if a trampoline were ever
-;; left unguarded". An unguarded raise terminates the process outright
-;; (spike FINDINGS Q2, exit 255), so this row is also the in-suite witness
-;; that the guard exists at all.
+;; The counters return to baseline after a callback raises: the check that
+;; fails if a trampoline is ever left unguarded. A raise left unguarded
+;; crosses libuv's C frames: with no handler outside uv-run the process
+;; dies (exit 255, no teardown), and with one the raise arrives there past
+;; an unfinished iteration. So this row is also the in-suite witness that
+;; the guard exists at all.
 (define raise-loop (make-uv-loop))
 (define raise-timer (make-uv-timer raise-loop))
 (define raise-live-inside 0)
@@ -257,11 +257,12 @@
 ;; MEASURED, not assumed. uv_run runs timers BEFORE entering its while loop
 ;; in UV_RUN_DEFAULT mode (vendor/libuv/src/unix/core.c), and
 ;; uv__run_closing_handles runs INSIDE that loop -- so the uv_stop this
-;; error policy performs (design spec S8) means the close this callback
-;; started is still pending when uv-run returns. The handle is 'closing, its
-;; pointer is still live, and the counter has not moved yet. That is the
-;; state a caller actually gets after a callback raise, so it is the state
-;; asserted here rather than the one that would be convenient.
+;; error policy performs (a raising callback's error is recorded and the
+;; loop stopped, and uv-run raises it on return) means the close this
+;; callback started is still pending when uv-run returns. The handle is
+;; 'closing, its pointer is still live, and the counter has not moved yet.
+;; That is the state a caller actually gets after a callback raise, so it is
+;; the state asserted here rather than the one that would be convenient.
 (test-equal "the close the raising callback started is still pending when uv-run returns"
   'closing (uv-handle-state raise-timer))
 
@@ -290,7 +291,7 @@
 ;; not visible in the fixture's return value (there isn't one -- the wait
 ;; raised), only in the next assertion that asks the loop what is still live.
 ;; Every suite that waits through a raising callback would otherwise measure a
-;; loop the fixture is still holding open, and the capstone
+;; loop the fixture is still holding open, and the echo suite
 ;; (tests/test-echo.sps) waits that way on every error path it has.
 (define ticking-loop (make-uv-loop))
 (define ticking-timer (make-uv-timer ticking-loop))
@@ -364,10 +365,10 @@
   registry-count-at-start (registry-count))
 
 ;; --- row 9: a tcp handle's whole lifecycle, closed normally -------------
-;; Stage 4's handle rows. Same shape as row 6, on the second handle type: the
-;; counters are asserted to MOVE first and to balance second, so a 'tcp arm
-;; missing from the freeing site's counter switch (design spec S10) fails
-;; here rather than passing as "balanced at zero throughout".
+;; Same shape as row 6, on the second handle type: the counters are
+;; asserted to MOVE first and to balance second, so a 'tcp arm missing from
+;; the freeing site's counter switch fails here rather than passing as
+;; "balanced at zero throughout".
 (define tcp-loop (make-uv-loop))
 (define tcp-live-inside 0)
 (define tcp-registry-inside 0)
@@ -397,13 +398,13 @@
   registry-count-at-start (registry-count))
 
 ;; --- row 10: the request blocks, including a close that races a write ---
-;; A connect request and a write request are separate allocation classes
-;; (design spec S10), each freed in exactly one place -- its own completion
-;; dispatcher -- and each asserted to MOVE before it is asserted to balance.
-;; The write is deliberately still in flight when uv-close! is called, which
-;; is the 'ECANCELED path design spec S5 says request dispatchers must
-;; tolerate on a 'closing handle. Whichever ordering the platform produces,
-;; the block is freed exactly once.
+;; A connect request and a write request are separate allocation classes,
+;; each freed in exactly one place -- its own completion dispatcher -- and
+;; each asserted to MOVE before it is asserted to balance. The write is
+;; deliberately still in flight when uv-close! is called, which is the
+;; 'ECANCELED path: a request dispatcher must tolerate a completion on a
+;; 'closing handle. Whichever ordering the platform produces, the block is
+;; freed exactly once.
 (define wl (make-uv-loop))
 (define w-connect-err 'connect-cb-never-fired)
 (define w-write-err 'write-cb-never-fired)
@@ -464,10 +465,9 @@
   0 (live-count 'tcp))
 
 ;; --- row 11: 100 connect/accept/close iterations, collecting on each ----
-;; The GC-pressure axis of design spec S11, applied to the TCP path: the
-;; registry is the only GC root for an open handle or an in-flight request
-;; (ADR-0007), so a collection between connect and close must not disturb
-;; either.
+;; Row 5's GC pressure, applied to the TCP path: the registry is the only
+;; GC root for an open handle or an in-flight request, so a collection
+;; between connect and close must not disturb either.
 (define tcp-peak-live 0)
 (define connect-req-peak 0)
 (define accepts 0)
@@ -536,7 +536,7 @@
 (test-equal "100 connect/accept/collect/close iterations leave the registry at its baseline"
   registry-count-at-start (registry-count))
 
-;; --- v0.4 signal rows (design spec §9.3; ADR-0007) ----------------------
+;; --- signal rows -------------------------------------------------------
 (define sig-base (live-count 'signal))
 
 ;; Row: ordinary close balances.
@@ -548,7 +548,7 @@
   (uv-loop-teardown! l))
 (test-equal "signal counter balanced after an ordinary close" sig-base (live-count 'signal))
 
-;; Row: a raising callback still balances (the guard invariant, ADR-0008).
+;; Row: a raising callback still balances (the trampoline guard, as in row 7).
 (let ((l (make-uv-loop)))
   (let ((s (make-uv-signal l)))
     (uv-signal-start! s 'sigusr1 (lambda (x) (collect) (raise 'lifecycle-boom)))

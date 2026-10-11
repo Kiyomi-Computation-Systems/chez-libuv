@@ -1,13 +1,9 @@
 #!r6rs
-;;; Shared test plumbing for the suites that drive a real event loop --
-;;; design spec S11 ("tests/uv-testing.sls provides run-until ... failure is
-;;; iteration exhaustion, never wall-clock elapsed time", "plus loopback
-;;; connection plumbing shared across suites").
-;;;
-;;; Stage 3 needed exactly one procedure. Stage 4 adds the loopback plumbing
-;;; S11 also mentions, now that there is a suite to exercise it. Stage 5 adds
-;;; the two pieces a read test needs and a write test did not: a payload that
-;;; is the same on every run, and somewhere to put the spans that arrive.
+;;; Shared test plumbing for the suites that drive a real event loop: a loop
+;;; stepper whose failure is iteration exhaustion, never wall-clock elapsed
+;;; time; the loopback connection plumbing every TCP suite shares; and the
+;;; two pieces a read test needs: a payload that is the same on every run,
+;;; and somewhere to put the spans that arrive.
 ;;;
 ;;; NOT pure: (libuv loop) reaches (libuv private native). No suite importing
 ;;; this library may appear in the Makefile's PURE_TESTS.
@@ -29,16 +25,16 @@
   ;; timeout.
   ;;
   ;; WHY SYMBOLS. `#t`/`#f` would be indistinguishable from what SRFI-64
-  ;; produces when the expression under test raises (AGENTS.md's named trap:
+  ;; produces when the expression under test raises (its
   ;; %test-evaluate-with-catch turns any exception into #f), so a drain that
   ;; blew up would read as "predicate never held" -- the same answer an
   ;; honestly-exhausted drain gives. Two distinct symbols make the three
   ;; outcomes -- satisfied, exhausted, raised -- three distinct values.
   ;;
-  ;; WHY AN ITERATION CAP, NOT A DEADLINE. Design spec S11: a wall-clock
-  ;; bound turns a slow machine into a flaky suite. The cap counts loop
-  ;; steps, which is a property of the program under test rather than of the
-  ;; hardware running it.
+  ;; WHY AN ITERATION CAP, NOT A DEADLINE. A wall-clock bound turns a slow
+  ;; machine into a flaky suite. The cap counts loop steps, which is a
+  ;; property of the program under test rather than of the hardware running
+  ;; it.
   ;;
   ;; `pred` is tested BEFORE the first step, so a condition that already
   ;; holds costs no iterations -- and so a caller cannot accidentally assert
@@ -66,17 +62,17 @@
   ;; means a predicate that never holds -- on a loop whose only remaining
   ;; handles are waiting on a socket that will never be readable -- leaves
   ;; the FIRST step blocked in the kernel, where run-until's iteration cap
-  ;; never gets to count. The suite then hangs instead of failing, and design
-  ;; spec S11's "failure is iteration exhaustion, never wall-clock elapsed
-  ;; time" quietly stops being true.
+  ;; never gets to count. The suite then hangs instead of failing, and
+  ;; "failure is iteration exhaustion, never wall-clock elapsed time"
+  ;; quietly stops being true.
   ;;
   ;; A timer that fires every millisecond gives 'once something to return
   ;; for, so the cap does the deciding again and a broken delivery path
   ;; produces 'iterations-exhausted -- a NAMED assertion failure -- rather
-  ;; than a stuck process. This was measured, not theorised: four Stage 5
-  ;; mutations (an EOF routed to on-error, a span framed wrongly, an alloc_cb
-  ;; that answers a corrupt buffer) all hung the suite before this existed
-  ;; and all fail by name with it (.plans/stage-5-mutation-log.md).
+  ;; than a stuck process. This is measured, not theorised: mutations to the
+  ;; read path (an EOF routed to on-error, a span framed wrongly, an alloc_cb
+  ;; that answers a corrupt buffer) hang a suite that waits with plain
+  ;; run-until, and fail by name with this one.
   ;;
   ;; EVERY WAIT WHOSE PREDICATE DEPENDS ON A CALLBACK BEING DELIVERED SHOULD
   ;; USE THIS ONE. Plain run-until is right where something else already
@@ -89,8 +85,8 @@
   ;;
   ;; IT IS DISARMED ON THE UNWIND PATH TOO, and that is the whole reason the
   ;; guard below exists. `run-until` raises whenever a callback under test
-  ;; raised: uv-run's store-and-reraise policy (design spec S8) turns that
-  ;; into an &uv-callback-error out of the very `uv-run` this fixture is
+  ;; raised: uv-run stores a callback's raise on the loop and re-raises it,
+  ;; as an &uv-callback-error, out of the very `uv-run` this fixture is
   ;; driving. Without the guard the ticker stays ARMED on the loop, and every
   ;; later assertion in the suite is measuring a loop this fixture is still
   ;; holding open -- a live timer in the counters, a non-empty live-handle
@@ -102,9 +98,9 @@
   (define (run-until/ticking loop pred max-iters)
     (let ((ticker (make-uv-timer loop)))
       ;; The tick callback deliberately does nothing -- not even (collect).
-      ;; This timer is a fixture whose only job is to wake the loop; design
-      ;; spec S11's GC-pressure rule is carried by the callbacks UNDER TEST,
-      ;; every one of which collects, and a full collection every millisecond
+      ;; This timer is a fixture whose only job is to wake the loop; GC
+      ;; pressure on the callback path is the job of the callbacks UNDER
+      ;; TEST, which collect, and a full collection every millisecond
       ;; for the length of a megabyte transfer would buy no coverage at a
       ;; cost measured in seconds.
       (uv-timer-start! ticker (lambda (t) #f) 1 1)
@@ -136,13 +132,14 @@
     (when (uv-loop-open? loop)
       (run-until loop (lambda () (eq? (uv-handle-state ticker) 'closed)) 8)))
 
-  ;; --- loopback plumbing (ADR-0010, design spec S11) ---------------------
-  ;; "Every TCP test binds 127.0.0.1:0, reads the real ephemeral port back
+  ;; --- loopback plumbing -------------------------------------------------
+  ;; Every TCP test binds 127.0.0.1:0, reads the real ephemeral port back
   ;; via uv_tcp_getsockname, and connects to it from the same loop and
-  ;; process." Both halves of that live here so no suite spells the address
+  ;; process. Both halves of that live here so no suite spells the address
   ;; literal out for itself -- a suite that bound something other than
-  ;; loopback would be an external-network test, which ADR-0010 rejects by
-  ;; design.
+  ;; loopback would be an external-network test, which no suite makes: the
+  ;; TCP suites test the real kernel stack looped back on itself, in one
+  ;; process a single Valgrind run can see.
   (define loopback-address "127.0.0.1")
 
   ;; (bind-loopback! tcp) -> the REAL ephemeral port the kernel chose, read
@@ -165,7 +162,7 @@
   (define (connect-loopback! tcp port on-connect)
     (uv-tcp-connect! tcp loopback-address port on-connect))
 
-  ;; --- deterministic payloads (design spec S11) ---------------------------
+  ;; --- deterministic payloads --------------------------------------------
   ;; A linear congruential generator with a CALLER-SUPPLIED seed and no other
   ;; input. Deliberately not `random` and deliberately not the clock: a suite
   ;; that compares a megabyte byte-for-byte has to be able to say which byte
@@ -216,10 +213,10 @@
   ;; loop iteration.
   ;;
   ;; IT KEEPS THE CALLER'S BYTEVECTOR RATHER THAN COPYING IT, on purpose.
-  ;; ADR-0009 says every on-data delivery is a FRESH copy; a collector that
-  ;; copied immediately would be just as green against a binding that handed
-  ;; the same scratch bytevector out on every read, because the corruption
-  ;; would happen after the copy. Holding the references means the
+  ;; Every on-data delivery is a FRESH copy of the read buffer; a collector
+  ;; that copied immediately would be just as green against a binding that
+  ;; handed the same scratch bytevector out on every read, because the
+  ;; corruption would happen after the copy. Holding the references means the
   ;; byte-for-byte comparison at the end of a chunked transfer is also the
   ;; assertion that each delivery was its own object.
   (define-record-type (byte-collector make-byte-collector byte-collector?)

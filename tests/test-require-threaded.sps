@@ -1,6 +1,6 @@
 #!r6rs
-;;; SRFI-64 suite for #41: chez-libuv needs a threaded Chez, and must refuse
-;;; any other by name.
+;;; SRFI-64 suite: chez-libuv needs a threaded Chez, and must refuse any
+;;; other by name.
 ;;;
 ;;; Chez builds make-mutex, with-mutex and the rest of its thread system only
 ;;; into threaded builds, so on a --nothreads Chez a library importing them
@@ -8,7 +8,7 @@
 ;;; (libuv private require-threaded) raises a readable message instead, while
 ;;; it is being expanded -- which only helps if it is expanded first: Chez
 ;;; processes a library's imports in order, and a (chezscheme) import listed
-;;; ahead of the refusal still fails with the old message (measured on a
+;;; ahead of the refusal still fails with the bare message (measured on a
 ;;; --nothreads 10.4.1). So every library in src/ that imports from
 ;;; (chezscheme) must import (libuv private require-threaded) before it. This
 ;;; suite reads each library's import form and holds that order.
@@ -132,7 +132,7 @@
 ;; Editors leave dotfiles with the same suffix beside the sources. Emacs's
 ;; lock file for an unsaved native.sls is a dangling symlink named
 ;; .#native.sls, and macOS writes ._native.sls resource forks on some
-;; volumes. Reading one crashed the whole suite.
+;; volumes. Reading one as a source would crash the whole suite.
 (test-equal "the scan reads .sls sources and skips the dotfiles beside them"
   '(read skipped skipped skipped skipped)
   (map (lambda (name) (if (sls-file? name) 'read 'skipped))

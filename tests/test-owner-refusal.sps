@@ -1,21 +1,21 @@
 #!r6rs
-;;; SRFI-64 suite for what &uv-wrong-thread names (#102): a verb refused
-;;; because another thread owns its loop names the owner its check
-;;; compared against, as `expected`, and this thread, as `actual`.
+;;; SRFI-64 suite for what &uv-wrong-thread names: a verb refused because
+;;; another thread owns its loop names the owner its check compared
+;;; against, as `expected`, and this thread, as `actual`.
 ;;;
 ;;; Every verb that checks its loop's owner checks it in its step, and
-;;; raises once the step is over (ADR-0019's decision 3 amendments). The
-;;; step used to answer a bare 'wrong-thread, and the refusal read the
-;;; loop's owner again to build the condition, after the step, with
-;;; interrupts enabled. A loop handed on in between, by another thread's
-;;; uv-run or by a scheduler on this one, was named instead of the owner
-;;; the step saw. Handed back to this thread, the condition said `expected`
-;;; = `actual`: refused for being on the wrong thread, it named the right
-;;; one. An engine alone did that to fifteen verbs: uv-accept!, the seven
-;;; scratch verbs, uv-tcp-connect!, both signal starts, uv-write!,
-;;; uv-write*! and uv-shutdown!.
+;;; raises once the step is over. A step that answered a bare 'wrong-thread
+;;; would leave the refusal to read the loop's owner again to build the
+;;; condition, after the step, with interrupts enabled. A loop handed on in
+;;; between, by another thread's uv-run or by a scheduler on this one, would
+;;; be named instead of the owner the step saw. Handed back to this thread,
+;;; the condition would say `expected` = `actual`: refused for being on the
+;;; wrong thread, it would name the right one. Built that way, an engine
+;;; alone does that to fifteen verbs: uv-accept!, the eight scratch verbs,
+;;; uv-tcp-connect!, both signal starts, uv-write!, uv-write*! and
+;;; uv-shutdown!.
 ;;;
-;;; Now an owner check answers an owner-mismatch holding the owner it
+;;; So an owner check answers an owner-mismatch holding the owner it
 ;;; compared against and the caller, and the refusal is built from that
 ;;; alone. The first rows hold the checks to what they answer; the
 ;;; builder's rows are with step-refusal's, in tests/test-loop.sps, and
@@ -64,7 +64,7 @@
         (uv-sweep)
         ;; make-engine drives the sweeps; collect starts each run with no
         ;; collection due, which would otherwise be taken where a step ends
-        ;; and spend fuel there (#68).
+        ;; and spend fuel there.
         (only (chezscheme) make-engine collect))
 
 (define runner (test-runner-simple))

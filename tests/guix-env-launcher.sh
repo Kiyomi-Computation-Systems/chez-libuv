@@ -1,6 +1,6 @@
 #!/bin/sh
-# Host-side tests for the container's scripts (ADR-0020). Nothing here runs
-# Guix:
+# Host-side tests for the Guix development container's scripts. Nothing
+# here runs Guix:
 #
 #   - scripts/guix-env: every case sets GUIX_ENV_DRY_RUN=1, under which the
 #     launcher prints `cd <dir>` and then the guix command it would exec,

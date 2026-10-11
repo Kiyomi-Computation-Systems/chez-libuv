@@ -1,7 +1,7 @@
 #!r6rs
 ;;; SRFI-64 suite for the process verbs an engine splits or drops:
-;;; uv-process-kill! and uv-process-pid (issues #71 and #86; ADR-0019's
-;;; decision 3 amendments). uv-spawn!'s own sweeps are in test-process.sps.
+;;; uv-process-kill! and uv-process-pid. uv-spawn!'s own sweeps are in
+;;; test-process.sps.
 ;;;
 ;;; NOT pure: it spawns children. Never add this to the Makefile's
 ;;; PURE_TESTS.
@@ -47,17 +47,17 @@
 ;; --- a verb split by an engine ------------------------------------------------
 ;; A green-thread scheduler on the loop thread runs each task in an engine,
 ;; and a task's fuel can run out anywhere inside uv-process-kill! or
-;; uv-process-pid. Each checked that its process was open, read the
-;; handle's pointer, and called libuv, in separate steps. Another task could
-;; close the process in between and run the loop, which freed the
-;; uv_process_t, and the verb resumed with the stale pointer. When a new
-;; process's handle had been given the freed address meanwhile, a resumed
-;; kill signalled the NEW process and returned normally, and a resumed pid
-;; answered the new process's pid (#71). Now each verb checks, reads and
-;; calls in one interrupt-free step (one-step). The step checked only that
-;; the process was open, so a verb resumed after its loop was handed to
-;; another thread made its call anyway, on a loop that thread now owned
-;; (#86).
+;; uv-process-pid. A verb that checks that its process is open, reads the
+;; handle's pointer, and calls libuv, in separate steps, lets another task
+;; close the process in between and run the loop, which frees the
+;; uv_process_t, and the verb resumes with the stale pointer. When a new
+;; process's handle has been given the freed address meanwhile, a resumed
+;; kill signals the NEW process and returns normally, and a resumed pid
+;; answers the new process's pid. So each verb checks, reads and calls in
+;; one interrupt-free step (one-step). The step checks the loop's owner as
+;; well as that the process is open (owned-handle-ptr): a step that checked
+;; only the process would let a verb resumed after its loop was handed to
+;; another thread make its call anyway, on a loop that thread owns.
 ;;
 ;; Each sweep runs a verb in an engine at rising fuel. Fuel 1 expires before
 ;; the verb's own open check, and the sweep stops at the first run no expiry
@@ -74,7 +74,7 @@
 ;; no engine expires after the step here, and a verb that returns after the
 ;; close without having returned before it made its call on the freed
 ;; handle. A collection that came due inside a step would be taken where
-;; the step ends and spend fuel there (#68), so each run starts with a
+;; the step ends and spend fuel there, so each run starts with a
 ;; (collect): a run allocates far too little to bring the next one due.
 ;;
 ;; The reuse sweep puts child B's handle at A's freed address before
@@ -231,7 +231,8 @@
       (list a-fate b-fate))))
 
 ;; A kill made on a process that has exited and been reaped answers libuv's
-;; errno under the verb's own name, as it did before the step.
+;; errno under the verb's own name: the step answers the call's status,
+;; and step-refusal raises it as libuv's errno naming the verb.
 (test-equal "uv-process-kill! on a child already reaped raises ESRCH as uv-process-kill!"
   '(uv-process-kill! ESRCH)
   (let ((a (spawn-child!)))

@@ -1,20 +1,20 @@
 # Valgrind suppressions for the memory gate (make test-memory), each a cost
-# of Chez Scheme itself, not of this binding. ADR-0003's amendment of
-# 2026-10-09 records why each is here; check-memory-gate proves each still
-# matches, and that none hides a leak the binding could make.
+# of Chez Scheme itself, not of this binding. Each says below why it is
+# here; check-memory-gate proves each still matches, and that none hides a
+# leak the binding could make.
 #
-# A callback left without returning (#94). S_call_help, Chez's entry from C
+# A callback left without returning. S_call_help, Chez's entry from C
 # into Scheme, mallocs a jmp_buf for each call (312 B on aarch64 glibc,
 # 200 B on x86-64) and frees it only when that call returns. A
 # continuation that escapes a libuv callback never returns through it, and
 # nor does an engine dropped while inside one, so the block is never freed,
 # even when its thread ends. Nor is the block of a callback abandoned by a
 # return into an older one: Chez drops it from its chain unfreed
-# (.plans/escape-costs-mutation-log.md). A child forked before exec
-# reports the block its parent held at the fork.
+# (S_call_help, schlib.c). A child forked before exec reports the block
+# its parent held at the fork.
 # Valgrind calls the block "still reachable" or "definitely lost" by how
-# collections happened to run: test-loop-claim's escaped teardown flipped
-# from one to the other on a change to an unrelated library. A block the
+# collections happen to run: a change to an unrelated library can flip
+# test-loop-claim's escaped teardown from one to the other. A block the
 # binding allocates comes from its shim's calloc, and one from foreign-alloc
 # from s_malloc, never from malloc called directly by S_call_help, so
 # neither matches. Every kind is matched, so that check-memory-gate's

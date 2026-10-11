@@ -1,19 +1,20 @@
 #!r6rs
 ;;; SRFI-64 suite for the request verbs split or dropped by an engine:
-;;; uv-tcp-connect!, uv-getaddrinfo! and uv-getnameinfo! (#85; ADR-0019's
-;;; decision 3 amendments).
+;;; uv-tcp-connect!, uv-getaddrinfo! and uv-getnameinfo!, and, in its own
+;;; section at the end, uv-cancel!.
 ;;;
 ;;; A green-thread scheduler on the loop thread runs each task in an engine,
 ;;; and a task's fuel can run out anywhere inside one of these verbs. Each
-;;; verb checks its handle or loop, reads its pointer, allocates its
-;;; request, fills it, registers and counts it, and calls libuv. Until #85
-;;; each did so with interrupts enabled between the steps, so:
-;;; - Split: another task closed the handle, tore the loop down or handed
-;;;   the loop to another thread, and the verb resumed past its checks. It
-;;;   called libuv with a freed handle or loop, or raced the new owner's
-;;;   uv_run on the loop's request count (#79).
+;;; of the first three checks its handle or loop, reads its pointer,
+;;; allocates its request, fills it, registers and counts it, and calls
+;;; libuv, all in one interrupt-free step (one-step). With interrupts
+;;; enabled between those steps:
+;;; - Split: another task closes the handle, tears the loop down or hands
+;;;   the loop to another thread, and the verb resumes past its checks. It
+;;;   calls libuv with a freed handle or loop, or races the new owner's
+;;;   uv_run on the loop's request count.
 ;;; - Dropped, as a timeout drops a task: whatever the verb had allocated
-;;;   and not yet handed to libuv was lost: a block, or a request
+;;;   and not yet handed to libuv is lost: a block, or a request
 ;;;   registered and counted that libuv never saw.
 ;;;
 ;;; Each sweep runs a verb in an engine at rising fuel (uv-sweep's
@@ -288,7 +289,8 @@
 (define lookups '(uv-getaddrinfo! uv-getnameinfo!))
 
 ;; The sweeps that can only fail by name run first, the ones a wrong run
-;; could fault in last (AGENTS.md: emit a sweep's row as soon as it ends).
+;; could fault in last, after the others' rows are out: a fault ends the
+;; process and takes every row not yet emitted with it.
 (define reuse-sweeps
   (map (lambda (verb) (cons verb (split-sweep verb 'reuse)))
        (cons 'uv-tcp-connect! lookups)))
@@ -411,9 +413,8 @@
 ;; and libuv answers EINVAL. glibc's calloc takes no block from the
 ;; thread's cache, where a free of a small block goes first, so seven
 ;; same-size blocks freed beforehand fill that cache, and the request's
-;; block goes where calloc looks (AGENTS.md's C and the FFI notes, #75).
-;; Memory tools never hand a freed block back, so there the witness lands
-;; in no run.
+;; block goes where calloc looks. Memory tools never hand a freed block
+;; back, so there the witness lands in no run.
 ;;
 ;; Split by a handoff: resumed, the cancel must be refused with
 ;; &uv-wrong-thread. This oracle has one premise: an expiry never lands
@@ -528,9 +529,9 @@
 
 ;; The witness: a zeroed block took the freed request's address in every
 ;; run the engine expired in. A run where none did could not have shown a
-;; stale cancel, so asking for one landing let every other run prove
-;; nothing. The reach row above holds that the sweep's runs expired at all:
-;; only an expired run answers 'answered-done.
+;; stale cancel, so a row that asked for only one landing would let every
+;; other run prove nothing. The reach row above holds that the sweep's runs
+;; expired at all: only an expired run answers 'answered-done.
 (test-equal "the completion sweep's zeroed block took the freed request's address in every expired run"
   '()
   (if under-memory-tool? '() (reverse missed-landings)))

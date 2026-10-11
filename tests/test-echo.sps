@@ -1,7 +1,6 @@
 #!r6rs
-;;; THE CAPSTONE (design spec S11, S12 stage 6): an echo SERVER and eight
-;;; concurrent in-process clients, on one loop, built from the PUBLIC API and
-;;; nothing else.
+;;; THE CAPSTONE: an echo SERVER and eight concurrent in-process clients, on
+;;; one loop, built from the PUBLIC API and nothing else.
 ;;;
 ;;; WHAT THIS SUITE IS FOR, and why it is not just another TCP test. Every
 ;;; other suite reaches into whichever library owns the thing it is checking
@@ -12,14 +11,14 @@
 ;;; `(import (libuv))`, and its import list is therefore part of the test. If
 ;;; the echo server below cannot be written without reaching past the facade,
 ;;; the facade is incomplete, and the failure shows up here as an unbound
-;;; identifier at expand time rather than as an opinion in a review.
+;;; identifier at expand time rather than as a matter of opinion.
 ;;;
 ;;; THE ONE NAME THAT IS NOT FROM THE FACADE, and why it is not a hole in
 ;;; that claim: `live-counts` is (libuv private native)'s debug-counter query,
 ;;; renamed on the way in so it cannot stand in for a facade export that went
 ;;; missing. This is tests/test-facade.sps's `libuv-packed-version` precedent,
 ;;; for the same reason -- the counters are a DEV-BUILD-ONLY observability
-;;; facility (design spec S10; a prod shim's queries answer a constant 0, see
+;;; facility (a prod shim's queries answer a constant 0, see
 ;;; tests/check-prod.sps), so making them public would put a procedure in the
 ;;; API that silently lies in release builds. No name the echo server itself
 ;;; uses comes from anywhere but (libuv).
@@ -30,9 +29,9 @@
 ;;; this loop", and it is asserted at the same two points -- the seventeen-
 ;;; handle peak and the empty end.
 ;;;
-;;; THE SHAPE OF THE EXCHANGE (design spec S12):
-;;;   * one server, bound to 127.0.0.1:0 (ADR-0010: never a fixed port, never
-;;;     an external peer, never a subprocess), accepting into per-connection
+;;; THE SHAPE OF THE EXCHANGE:
+;;;   * one server, bound to 127.0.0.1:0 (never a fixed port, never an
+;;;     external peer, never a subprocess), accepting into per-connection
 ;;;     closures; each peer echoes the EXACT span it was handed and shuts down
 ;;;     and closes when it sees EOF;
 ;;;   * eight clients on the SAME loop, each writing a DISTINCT 32 KiB
@@ -41,8 +40,8 @@
 ;;;   * one designated pair applies BACKPRESSURE in the middle of all that:
 ;;;     client 0 stops its own read from inside a delivery, and the restart is
 ;;;     issued from inside a DIFFERENT client's delivery -- uv-read-start!
-;;;     called from within a callback, which is the one shape Stage 5 left
-;;;     untested;
+;;;     called from within a callback, against a handle other than the one
+;;;     being delivered to;
 ;;;   * teardown: seventeen handles closed, the loop drained, every counter
 ;;;     back to zero.
 ;;;
@@ -57,32 +56,35 @@
 (import (rnrs)
         (srfi :64)
         (libuv)
-        ;; Test plumbing only -- the loopback address dance (ADR-0010), the
-        ;; seeded payload generator, the span collector, and the iteration-
-        ;; capped drain. Every libuv name it uses is a public one; it supplies
-        ;; nothing the echo server itself calls.
+        ;; Test plumbing only -- the loopback address dance (bind port 0, read
+        ;; back the port the kernel chose), the seeded payload generator, the
+        ;; span collector, and the iteration-capped drain. Every libuv name
+        ;; it uses is a public one; it supplies nothing the echo server
+        ;; itself calls.
         (uv-testing)
         ;; See the header: renamed so it cannot substitute for a facade export.
         (rename (only (libuv private native) live-counts)
                 (live-counts debug-live-counts))
-        ;; design spec S11's GC-pressure rule: every callback collects.
+        ;; GC pressure: every callback collects, so anything the binding
+        ;; failed to keep reachable across a callback is reclaimed while the
+        ;; exchange still needs it.
         (only (chezscheme) collect))
 
-;; SRFI-64's default runner sets no process exit status (AGENTS.md).
+;; SRFI-64 sets no process exit status, so the suite's last line exits by
+;; this runner's fail count.
 (define runner (test-runner-simple))
 (test-runner-current runner)
 
 (define (live-count kind) (cdr (assq kind (debug-live-counts))))
 
-;; A callback's `err` argument is #f on success, and #f is the value AGENTS.md
-;; names as the worst possible expected value: it is what a missing key, a
-;; defaulting accessor and an SRFI-64-swallowed exception all produce. Every
-;; assertion below compares a SYMBOL, and this is the one place the mapping
-;; happens.
+;; A callback's `err` argument is #f on success, and #f is the worst possible
+;; expected value: it is what a missing key, a defaulting accessor and an
+;; SRFI-64-swallowed exception all produce. Every assertion below compares
+;; a SYMBOL, and this is the one place the mapping happens.
 (define (err->symbol err)
   (cond ((not err) 'no-error)
-        ;; The portable SYMBOL from uv_err_name_r (ADR-0006), not the raw
-        ;; platform int uv-errno-error-code carries.
+        ;; The portable SYMBOL from uv_err_name_r, not the raw platform int
+        ;; uv-errno-error-code carries.
         ((uv-errno-error? err) (uv-errno-error-errno err))
         (else (list 'unexpected-err-object err))))
 
@@ -95,9 +97,9 @@
 ;; three sizes share no factor with the buffer size or with each other.
 (define chunk-spans '((0 . 13000) (13000 . 26000) (26000 . 32768)))
 
-;; Iteration caps, not timeouts (design spec S11). Generous enough that a slow
-;; machine never reaches them, small enough that a genuinely stuck exchange is
-;; a NAMED failure -- 'iterations-exhausted -- rather than a hung suite.
+;; Iteration caps, not timeouts. Generous enough that a slow machine never
+;; reaches them, small enough that a genuinely stuck exchange is a NAMED
+;; failure -- 'iterations-exhausted -- rather than a hung suite.
 (define cap 4096)
 (define drain-cap 512)
 
@@ -106,7 +108,7 @@
 ;; require: on-data is handed (bv start end) and no handle, so a server that
 ;; serves more than one connection has to close over the connection it is
 ;; serving. That is not a limitation being worked around here -- it is the
-;; design being exercised (see (libuv tcp)'s note on uv-listen!).
+;; design being exercised.
 (define-record-type (client %make-client client?)
   (fields index tcp payload collector
           (mutable connected client-connected set-client-connected!)
@@ -234,9 +236,8 @@
                        (collect)
                        (when err (set-peer-shutdown-error! p (err->symbol err)))
                        (uv-close! tcp))))
-     ;; on-error: a read error does NOT close the handle by itself (design
-     ;; spec S6) -- that decision is the caller's, and this caller makes it
-     ;; here.
+     ;; on-error: a read error does NOT close the handle by itself -- that
+     ;; decision is the caller's, and this caller makes it here.
      (lambda (err)
        (collect)
        (set-peer-read-error! p (err->symbol err))
@@ -259,7 +260,8 @@
 (define (start-client-read! c)
   ;; The buffer-size argument is OMITTED, deliberately: an omitted size asks
   ;; for nothing, which is what makes the restart below legal against the
-  ;; buffer this first call fixed (design spec S6).
+  ;; buffer this first call fixed (ensure-read-buffer! in
+  ;; src/libuv/stream.sls refuses only a size that differs from it).
   (uv-read-start! (client-tcp c)
                   (client-on-data c) (client-on-eof c) (client-on-error c)))
 
@@ -282,8 +284,7 @@
 ;; whose payload is deliberately not written until the stop has been observed
 ;; -- issues the RESTART from inside ITS first delivery, so uv-read-start! is
 ;; exercised from within a callback against a handle that is not the one being
-;; delivered to. Stage 5 tested the stop from inside a callback and the restart
-;; only from the suite's own top level; this closes that gap.
+;; delivered to.
 (define stopper-index 0)
 (define restarter-index 1)
 (define bp-stopped-at 'never-stopped)   ; client 0's byte count when it stopped
@@ -398,7 +399,7 @@
   17 (length (uv-loop-live-handles loop)))
 
 ;; Sixteen, not seventeen: the listener never reads, so it never allocated the
-;; per-handle read buffer of design spec S6.
+;; per-handle read buffer that a handle's first uv-read-start! allocates.
 (test-equal "sixteen read buffers are live at the peak -- one per reading handle"
   16 (live-count 'read-buffer))
 
@@ -554,15 +555,14 @@
               payload-size
               sizes))))
 
-;; A loop that ran dry (design spec S5). Read with 'nowait so it cannot block.
+;; A loop that ran dry. Read with 'nowait so it cannot block.
 ;;
 ;; NOT `#f (uv-run loop 'nowait)`, even though #f is exactly what uv-run
 ;; answers here: uv-run can RAISE -- it is the procedure that re-raises
 ;; whatever a callback raised this run, and it refuses a closed loop with
 ;; &uv-handle-closed -- and SRFI-64 turns any raise in a test's actual
-;; expression into #f (AGENTS.md's named trap). The row would then pass on the
-;; one outcome it most needs to report. 'no-work is producible only by uv-run
-;; returning.
+;; expression into #f. The row would then pass on the one outcome it most
+;; needs to report. 'no-work is producible only by uv-run returning.
 (test-equal "the loop has nothing left to run"
   'no-work (if (uv-run loop 'nowait) 'work 'no-work))
 

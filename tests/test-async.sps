@@ -1,17 +1,17 @@
 #!r6rs
-;;; SRFI-64 suite for the #20 threading model: enforced per-loop thread
+;;; SRFI-64 suite for the threading model: enforced per-loop thread
 ;;; affinity (this file's first section) and uv_async cross-thread wakeup
-;;; (added in the async section below). It is a DETERMINISTIC suite on the
+;;; (the async section below). It is a DETERMINISTIC suite on the
 ;;; default `make test` gate — it forks no OS threads. The affinity check is
 ;;; exercised by pointing a loop's owner field at a foreign thread id and
 ;;; confirming the verb refuses; uv_async_send is exercised same-thread, since
 ;;; libuv permits a loop-thread send too. The genuinely multi-threaded proofs
 ;;; (a real worker raising, owner transfer to a real thread, a worker pool
 ;;; posting via uv-async-send!) live in tests/test-threading-stress.sps, off
-;;; the default gate (ADR-0010 companion), because they fork threads and are
-;;; timing-dependent. The send fence's rows fork threads but depend on no
-;;; timing, and run on the default gate in tests/test-async-fence.sps
-;;; (ADR-0010, amended 2026-09-28).
+;;; the default gate (it runs under `make test-threading`), because they fork
+;;; threads and are timing-dependent. The send fence's rows fork threads but
+;;; depend on no timing, and run on the default gate in
+;;; tests/test-async-fence.sps.
 (import (rnrs)
         (srfi :64)
         (libuv)
@@ -27,7 +27,7 @@
 ;; loop owned by another thread without actually forking one.
 (define foreign-owner 999999)
 
-;; --- enforced per-loop thread affinity (design §6) ----------------------
+;; --- enforced per-loop thread affinity --------------------------------
 
 ;; Positive control: on the owning thread a verb runs normally. Without this,
 ;; a check that raised unconditionally would still pass the refusal tests.
@@ -70,9 +70,9 @@
       outcome)))
 
 ;; uv-run transfers ownership to the calling thread. Simulate a loop owned
-;; elsewhere, run it (no handles, so the poll returns at once), and confirm the
-;; caller now owns it — the create-on-A/run-on-B handoff, minus the second
-;; thread (which test-threading-stress.sps supplies).
+;; elsewhere, run it (no handles, so the poll returns at once), and confirm
+;; the caller owns it afterwards — the create-on-A/run-on-B handoff, minus
+;; the second thread (which test-threading-stress.sps supplies).
 (test-equal "uv-run transfers loop ownership to the calling thread"
   #t
   (let ((loop (make-uv-loop)))
@@ -82,7 +82,7 @@
       (uv-loop-teardown! loop)
       owned)))
 
-;; --- uv_async construction, send, and the callback (design §6.1) --------
+;; --- uv_async construction, send, and the callback ---------------------
 ;; uv_async_send is thread-safe and may be called from the loop thread too, so
 ;; the send->wake path is exercised deterministically here without a fork. The
 ;; cross-thread proofs are in tests/test-threading-stress.sps.
@@ -128,8 +128,9 @@
     (list (if fired 'fired 'not-fired)
           (if got-same 'same-handle 'other-handle))))
 
-;; Coalescing: N sends before an iteration may collapse to one callback. The
-;; design forbids assuming one-callback-per-send, so tolerate 1..N.
+;; Coalescing: N sends before an iteration may collapse to one callback.
+;; libuv coalesces uv_async_send calls and promises only that the callback
+;; runs at least once after a send, so tolerate 1..N.
 (test-equal "N sends before an iteration yield between 1 and N callbacks"
   'coalesced-ok
   (let* ((loop (make-uv-loop))

@@ -1,6 +1,6 @@
 #!r6rs
-;;; Reference helpers for the bulk-move rows (issue #35) in test-native.sps
-;;; and test-stream.sps.
+;;; Reference helpers for the bulk-move rows in test-native.sps and
+;;; test-stream.sps.
 ;;;
 ;;; A bulk row times one of this binding's moves against libc's own
 ;;; memcpy or memset over the same bytes, a moment apart in the same process,
@@ -8,20 +8,20 @@
 ;;; Scheme loop: a Scheme loop's speed depends on how Chez compiled it (about
 ;;; 30 ns a byte in safe code, about 1 ns at --optimize-level 3), while libc
 ;;; runs the same code in every build and under Memcheck, which replaces it
-;;; for both sides alike. Measured (see .plans/bulk-copy-mutation-log.md):
-;;; the helpers and the write verbs run at 0.95-1.10x libc on macOS and
-;;; 0.97-1.05x in the Linux image, at optimize levels 0 and 3 and under
-;;; Memcheck. A byte-at-a-time Scheme loop runs at 140x or more at the default
-;;; level, 570x or more under Memcheck, and still 4.7x at optimize-level 3 in
-;;; the Linux image, where glibc's memcpy is slowest. That last figure is why
-;;; bulk-bar is 3, not higher.
+;;; for both sides alike. Measured: the helpers and the write verbs run at
+;;; 0.95-1.10x libc on macOS and 0.97-1.05x in the Linux image, at optimize
+;;; levels 0 and 3 and under Memcheck. A byte-at-a-time Scheme loop runs at
+;;; 140x or more at the default level, 570x or more under Memcheck, and
+;;; still 4.7x at optimize-level 3 in the Linux image, where glibc's memcpy
+;;; is slowest. That last figure is why bulk-bar is 3, not higher.
 ;;;
 ;;; libc's memcpy and memset are bound directly here. They resolve only once
 ;;; a library that links libc is loaded, which is why this library reads
 ;;; shim-file first: referencing it runs (libuv private native)'s body, which
 ;;; loads libuv and the shim, and never runs ensure-native-loaded!, whose
-;;; first run test-native.sps observes. The library itself keeps its copies
-;;; in the shim (ADR-0002, amended for #35); a test may lean on the
+;;; first run test-native.sps observes. The library itself makes its bulk
+;;; moves through the shim's own wrappers (chez_uv_copy_in, chez_uv_copy_out,
+;;; chez_uv_zero) and binds no libc symbol; a test may lean on the
 ;;; transitive symbol.
 ;;;
 ;;; NOT pure: importing this loads libuv and the shim.
@@ -86,8 +86,8 @@
 
   ;; timed-ns : thunk -> exact-nonnegative-integer
   ;; One run, started from a fresh collection so a 4 MiB allocation cannot
-  ;; trigger one mid-run. Over 20 copy-out verdicts that took the worst ratio
-  ;; from 1.59x to 1.22x (bulk-copy mutation log).
+  ;; trigger one mid-run. Over 20 copy-out verdicts, the fresh collection
+  ;; takes the worst ratio from 1.59x to 1.22x.
   (define (timed-ns thunk)
     (collect)
     (let* ((t0 (current-time 'time-monotonic))

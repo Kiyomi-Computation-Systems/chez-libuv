@@ -23,8 +23,8 @@
   ;; print-actual-on-failure! : test-runner -> unspecified
   ;; The simple runner prints only a failing row's title. A row that returns
   ;; its evidence when it fails needs that printed too: without it, a
-  ;; one-off failure leaves nothing to diagnose (test-threading-stress's
-  ;; careless pool, 2026-10-06).
+  ;; one-off failure, such as one under load in test-threading-stress's
+  ;; careless pool, leaves nothing to diagnose.
   (define (print-actual-on-failure! runner)
     (let ((simple-end (test-runner-on-test-end runner)))
       (test-runner-on-test-end! runner
@@ -44,13 +44,12 @@
   ;; hands back asks less under one. The memory gates say so in the
   ;; environment (CHEZ_LIBUV_UNDER_VALGRIND on Linux, ASAN_OPTIONS on
   ;; macOS), but a plain run can inherit ASAN_OPTIONS from a shell, and
-  ;; would then ask less for nothing: test-process's squatter row, asking
-  ;; it, failed a correct build that way. So the allocator is asked as
-  ;; well: both tools report a block's size as requested, where a plain
-  ;; allocator rounds it up. A 288 B block from the shim read 288 under ASan
-  ;; and Valgrind, 320 on macOS and 296 on glibc 2.36 and 2.39 (#75's
-  ;; measurements, tests/test-process-steps.sps). getenv answers "" for a
-  ;; variable set empty.
+  ;; would then ask less for nothing: tests/test-process.sps's squatted-spawn
+  ;; row, asking the environment alone, would fail a correct build that way. So
+  ;; the allocator is asked as well: both tools report a block's size as
+  ;; requested, where a plain allocator rounds it up. A 288 B block from the
+  ;; shim measures 288 under ASan and Valgrind, 320 on macOS and 296 on
+  ;; glibc 2.36 and 2.39. getenv answers "" for a variable set empty.
   (define (env-set? name)
     (let ((v (getenv name))) (and v (not (string=? v "")))))
 
