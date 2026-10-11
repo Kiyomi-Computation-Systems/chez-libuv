@@ -407,6 +407,145 @@ long chez_uv_live_block(void) { return 0; }
 
 #endif /* CHEZ_LIBUV_DEBUG_COUNTERS */
 
+#ifdef CHEZ_LIBUV_DEBUG_COUNTERS
+
+/* A pool hold, in dev builds only, for tests/test-dns.sps: a threadpool
+ * item that keeps the worker running it until the caller releases it, or
+ * until its bound passes. With the pool pinned to one worker, and that
+ * worker inside a hold, a lookup queued after it cannot start until the
+ * release, and stays cancellable. Without a hold, two of the suite's rows
+ * would bet on that state, and a bet can lose: the teardown row has lost
+ * all 16 of its draws on CI.
+ *
+ * The caller allocates the block, zeroed, at chez_uv_debug_pool_hold_size
+ * bytes, and frees it only once the hold has finished: until then the
+ * worker or the loop can still touch it. So the shim keeps no state of its
+ * own (rule 6 of tests/test-source-rules.sps). These are the shim's only
+ * exports that call into libuv, and the binding never calls them. They
+ * are compiled only under -DCHEZ_LIBUV_DEBUG_COUNTERS, with no release
+ * stub, and tests/check-prod.sps fails a release shim that exports any
+ * of them. */
+struct chez_uv_pool_hold {
+  uv_work_t req; /* first, so a callback's uv_work_t * is the block */
+  uv_mutex_t mutex;
+  uv_cond_t cond;
+  uint64_t bound_ns;
+  int released;
+  int state;
+  int finished;
+};
+
+enum {
+  CHEZ_UV_HOLD_QUEUED = 1,
+  CHEZ_UV_HOLD_WAITING = 2,
+  CHEZ_UV_HOLD_RELEASED = 3,
+  CHEZ_UV_HOLD_TIMED_OUT = 4
+};
+
+static void pool_hold_work(uv_work_t *req) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)req;
+  uint64_t deadline;
+  uv_mutex_lock(&h->mutex);
+  h->state = CHEZ_UV_HOLD_WAITING;
+  uv_cond_broadcast(&h->cond);
+  deadline = uv_hrtime() + h->bound_ns;
+  while (!h->released) {
+    uint64_t now = uv_hrtime();
+    if (now >= deadline ||
+        uv_cond_timedwait(&h->cond, &h->mutex, deadline - now) == UV_ETIMEDOUT) {
+      break;
+    }
+  }
+  h->state = h->released ? CHEZ_UV_HOLD_RELEASED : CHEZ_UV_HOLD_TIMED_OUT;
+  uv_mutex_unlock(&h->mutex);
+}
+
+static void pool_hold_after(uv_work_t *req, int status) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)req;
+  (void)status;
+  uv_mutex_lock(&h->mutex);
+  h->finished = 1;
+  uv_mutex_unlock(&h->mutex);
+}
+
+size_t chez_uv_debug_pool_hold_size(void) {
+  return sizeof(struct chez_uv_pool_hold);
+}
+
+int chez_uv_debug_pool_hold(uv_loop_t *loop, void *block, uint64_t bound_ns) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  int rc = uv_mutex_init(&h->mutex);
+  if (rc != 0) {
+    return rc;
+  }
+  rc = uv_cond_init(&h->cond);
+  if (rc != 0) {
+    uv_mutex_destroy(&h->mutex);
+    return rc;
+  }
+  h->bound_ns = bound_ns;
+  h->released = 0;
+  h->state = CHEZ_UV_HOLD_QUEUED;
+  h->finished = 0;
+  rc = uv_queue_work(loop, &h->req, pool_hold_work, pool_hold_after);
+  if (rc != 0) {
+    uv_cond_destroy(&h->cond);
+    uv_mutex_destroy(&h->mutex);
+  }
+  return rc;
+}
+
+void chez_uv_debug_pool_release(void *block) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  uv_mutex_lock(&h->mutex);
+  h->released = 1;
+  uv_cond_broadcast(&h->cond);
+  uv_mutex_unlock(&h->mutex);
+}
+
+int chez_uv_debug_pool_hold_started(void *block, uint64_t bound_ns) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  uint64_t deadline = uv_hrtime() + bound_ns;
+  int state;
+  uv_mutex_lock(&h->mutex);
+  while (h->state == CHEZ_UV_HOLD_QUEUED) {
+    uint64_t now = uv_hrtime();
+    if (now >= deadline ||
+        uv_cond_timedwait(&h->cond, &h->mutex, deadline - now) == UV_ETIMEDOUT) {
+      break;
+    }
+  }
+  state = h->state;
+  uv_mutex_unlock(&h->mutex);
+  return state;
+}
+
+int chez_uv_debug_pool_hold_state(void *block) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  int state;
+  uv_mutex_lock(&h->mutex);
+  state = h->state;
+  uv_mutex_unlock(&h->mutex);
+  return state;
+}
+
+int chez_uv_debug_pool_hold_finished(void *block) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  int finished;
+  uv_mutex_lock(&h->mutex);
+  finished = h->finished;
+  uv_mutex_unlock(&h->mutex);
+  return finished;
+}
+
+void chez_uv_debug_pool_hold_dispose(void *block) {
+  struct chez_uv_pool_hold *h = (struct chez_uv_pool_hold *)block;
+  uv_cond_destroy(&h->cond);
+  uv_mutex_destroy(&h->mutex);
+}
+
+#endif /* CHEZ_LIBUV_DEBUG_COUNTERS */
+
 /* calloc, not malloc and a separate memset: the zeroing is in the one call,
  * and a fresh mapping comes back zero without being written. */
 void *chez_uv_alloc(size_t n) {

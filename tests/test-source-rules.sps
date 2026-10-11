@@ -161,6 +161,18 @@
 ;;;    uv-loop-run, the foreign call, and claim-loop-for-run! to run-step!,
 ;;;    named once each.
 ;;;
+;;; 12. A release shim exports nothing the tests call into libuv through.
+;;;    The pool hold that test-dns queues on
+;;;    the threadpool is compiled only in a dev shim, and
+;;;    tests/check-prod.sps fails a release shim that exports any entry on
+;;;    its list. A list kept by hand misses an entry added later, and an
+;;;    entry moved out of the #ifdef ships unchecked. So this suite holds
+;;;    every function src/libuv-shim.c defines under the chez_uv_debug_
+;;;    prefix to an #ifdef CHEZ_LIBUV_DEBUG_COUNTERS branch, not its #else,
+;;;    and check-prod's list to exactly those names. What the scan cannot
+;;;    see: a dev-only entry named without the prefix, or a definition not
+;;;    written as the shim writes them, from column 0 to its opening brace.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -920,6 +932,60 @@
            (each (cdr lines) (+ n 1) (cons n acc)))
           (else (each (cdr lines) (+ n 1) acc)))))
 
+;; starts-with? : string string -> boolean
+(define (starts-with? s prefix)
+  (and (>= (string-length s) (string-length prefix))
+       (string=? (substring s 0 (string-length prefix)) prefix)))
+
+;; trim-right : string -> string
+(define (trim-right s)
+  (let skip ((i (string-length s)))
+    (if (and (> i 0) (char-whitespace? (string-ref s (- i 1))))
+        (skip (- i 1))
+        (substring s 0 i))))
+
+;; dev-only-definitions : (list-of string) -> (list-of (string . boolean))
+;; Each function the C LINES define under the chez_uv_debug_ prefix, and
+;; whether the definition sits in an #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
+;; branch, not its #else (rule 12). A definition starts in column 0 and
+;; ends its line with the opening brace, as the shim writes them: a
+;; declaration ends with a semicolon, and a call is indented.
+(define (dev-only-definitions lines)
+  (let each ((lines lines) (branches '()) (acc '()))
+    (if (null? lines)
+        (reverse acc)
+        (let* ((line (car lines))
+               (t (trim-right (trim-left line)))
+               (at (string-index-of line "chez_uv_debug_" 0)))
+          (cond ((starts-with? t "#if")
+                 (each (cdr lines)
+                       (cons (if (string=? t "#ifdef CHEZ_LIBUV_DEBUG_COUNTERS") 'debug 'other)
+                             branches)
+                       acc))
+                ((or (starts-with? t "#else") (starts-with? t "#elif"))
+                 (each (cdr lines)
+                       (if (and (pair? branches) (eq? (car branches) 'debug))
+                           (cons 'debug-else (cdr branches))
+                           branches)
+                       acc))
+                ((starts-with? t "#endif")
+                 (each (cdr lines) (if (pair? branches) (cdr branches) branches) acc))
+                ((and at
+                      (> (string-length line) 0)
+                      (not (char-whitespace? (string-ref line 0)))
+                      (> (string-length t) 0)
+                      (char=? (string-ref t (- (string-length t) 1)) #\{))
+                 (let ((end (let scan ((j at))
+                              (if (and (< j (string-length line))
+                                       (c-word-char? (string-ref line j)))
+                                  (scan (+ j 1))
+                                  j))))
+                   (each (cdr lines) branches
+                         (cons (cons (substring line at end)
+                                     (if (memq 'debug branches) #t #f))
+                               acc))))
+                (else (each (cdr lines) branches acc)))))))
+
 ;; Every static variable the shim defines: the debug counters, each updated
 ;; only through count_add and read only through count_read, which are
 ;; atomic. Pinned, so that the row cannot pass by reading nothing.
@@ -1193,6 +1259,28 @@
                 (define (lazy) (install-dispatch-procedure! 'c cons)))))
     (library-init-offenses (list (cons "seeded.sls" lib))
                            '(("seeded.sls" (table library-init))))))
+
+;; Each line's place in the expected answer is written out, so a reading
+;; that dropped the #else, the nesting or the column test fails here.
+(test-equal "rule 12 reads a chez_uv_debug_ definition, not a declaration or a call, with the #ifdef branch it sits in"
+  '(("chez_uv_debug_a" . #t) ("chez_uv_debug_b" . #f) ("chez_uv_debug_e" . #f)
+    ("chez_uv_debug_f" . #t))
+  (dev-only-definitions
+   '("#ifdef CHEZ_LIBUV_DEBUG_COUNTERS"
+     "int chez_uv_debug_a(void) {"
+     "#else"
+     "int chez_uv_debug_b(void) {"
+     "#endif"
+     "int chez_uv_debug_c(void *p);"
+     "  chez_uv_debug_d(p);"
+     "#if defined(__linux__)"
+     "void chez_uv_debug_e(void) {"
+     "#endif"
+     "#ifdef CHEZ_LIBUV_DEBUG_COUNTERS"
+     "#if defined(__linux__)"
+     "void chez_uv_debug_f(void) {"
+     "#endif"
+     "#endif")))
 
 (test-equal "rule 6 reads a static variable in C, and not a static constant or a function"
   '(count table_size)
@@ -1692,6 +1780,28 @@
 
 (test-equal "the shim's counters are changed only through count_add and read only through count_read, which are atomic"
   '() (bare-counter-uses shim-counters shim-lines))
+
+;; The names tests/check-prod.sps refuses in a release shim.
+(define check-prod-entries
+  (guard (e (#t (list 'unreadable "tests/check-prod.sps")))
+    (let ((defs (filter (lambda (f) (and (pair? f) (eq? (car f) 'define)
+                                         (pair? (cdr f))
+                                         (eq? (cadr f) 'dev-only-entries)))
+                        (read-forms "tests/check-prod.sps"))))
+      (if (null? defs)
+          (list 'no-dev-only-entries-definition)
+          (cadr (caddr (car defs)))))))
+
+(define shim-dev-only (dev-only-definitions shim-lines))
+
+;; Each side is non-empty on its own: check-prod's list names seven entries,
+;; so a scan that found nothing would leave all seven not defined.
+(test-equal "rule 12: every chez_uv_debug_ function the shim defines is compiled only in a dev shim, and check-prod looks for each of them and no other"
+  '(outside-dev () unchecked () not-defined ())
+  (let ((names (map car shim-dev-only)))
+    (list 'outside-dev (map car (filter (lambda (d) (not (cdr d))) shim-dev-only))
+          'unchecked (filter (lambda (n) (not (member n check-prod-entries))) names)
+          'not-defined (filter (lambda (n) (not (member n names))) check-prod-entries))))
 
 (test-end "source-rules")
 

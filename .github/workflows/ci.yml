@@ -202,19 +202,28 @@ jobs:
       # runs in CI is a comment: this is the step that proves `make prod`
       # really produces a counters-free shim (tests/check-prod.sps fails
       # unless every counter reads zero while a loop and a bound tcp handle
-      # are demonstrably alive) and that the following `make build` relinks
-      # the dev artifact back, rather than leaving a release build in place
-      # for dev callers. pkg-config is present on this runner, so `prod`
-      # links against the system libuv and rebuilds nothing vendored.
+      # are demonstrably alive, and unless the shim exports none of the
+      # dev-only pool hold's entries) and that the following `make build`
+      # relinks the dev artifact back, rather than leaving a release build in
+      # place for dev callers. The dev shim must be refused for both, so
+      # neither check can hide the other. pkg-config is present on this
+      # runner, so `prod` links against the system libuv and rebuilds
+      # nothing vendored.
       - name: Release build guard (make prod -> check-prod)
         run: |
           make prod
           make build
-          if make check-prod; then
+          if make check-prod > check-prod-dev.log 2>&1; then
+            cat check-prod-dev.log
             echo "::error::check-prod passed against a dev shim"
             exit 1
           fi
-          echo "check-prod correctly refused the dev shim"
+          cat check-prod-dev.log
+          grep -q 'FAIL: the counters moved' check-prod-dev.log \
+            || { echo "::error::check-prod did not see the dev shim's counters"; exit 1; }
+          grep -q 'FAIL: the shim exports the dev-only pool hold' check-prod-dev.log \
+            || { echo "::error::check-prod did not see the dev shim's pool hold"; exit 1; }
+          echo "check-prod correctly refused the dev shim, for its counters and its pool hold"
 
   floor:
     name: linux (system libuv at the floor)

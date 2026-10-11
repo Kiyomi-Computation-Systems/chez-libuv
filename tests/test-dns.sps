@@ -74,7 +74,7 @@
         (only (uv-evidence) live-count describe)
         ;; The engine-sweep driver drives the changed-arguments sweeps.
         (uv-sweep)
-        (only (chezscheme) collect putenv))
+        (only (chezscheme) collect putenv foreign-procedure foreign-entry?))
 
 ;; PIN THE THREADPOOL TO ONE WORKER, before any native/threadpool touch.
 ;; libuv reads UV_THREADPOOL_SIZE exactly once, at the first
@@ -1413,6 +1413,184 @@
   (list (live-count 'getaddrinfo-req) (live-count 'getnameinfo-req)
         (registry-count)))
 
+;; --- the pool hold -------------------------------------------------------
+;; Two rows below need a lookup still QUEUED when a cancel looks at it: the
+;; double-cancel's and the teardown sweep's. Without a hold that is a bet.
+;; A numeric lookup takes the worker microseconds, so a row would retry
+;; until a draw found its request still queued, and a draw loses about 1%
+;; of the time. Retried up to 16 times, the teardown row has still lost
+;; every draw on CI, a failure that looked exactly like the defect that
+;; row exists to catch.
+;;
+;; A hold makes the queued state certain. A hold is a dev-shim work item
+;; (src/libuv-shim.c) that keeps the worker running it until the row
+;; releases it. A row queues one and waits until the pool's only worker
+;; (pinned above) is inside it, before it queues any lookup: from then on
+;; no lookup can start until the release. The double-cancel row releases
+;; it once both its cancels have answered. The teardown row cannot, since
+;; its sweep and drain are one call, so its lookups' callbacks release it:
+;; a cancelled lookup's callback runs while the worker is still held, and
+;; no uncancelled one can run before the release.
+;;
+;; The hold's bound is a backstop, not a verdict. A wait on another thread
+;; needs a bound of its own, or a broken build hangs where it should fail a
+;; row. A build whose sweep cancels nothing
+;; runs no callback to release the teardown row's hold, so its rows fail by
+;; name, the hold 'timed-out, instead of hanging the suite.
+
+;; The hold's entries, resolved only when the shim has them. A dev shim has
+;; all seven, and a release shim none (tests/check-prod.sps). Against a
+;; shim without one, the row just below fails by name, and so does every
+;; row that holds the pool, instead of the suite stopping here with no
+;; summary: a raise between rows would destroy the evidence.
+(define pool-hold-missing '())
+
+(define-syntax hold-entry
+  (syntax-rules ()
+    ((_ name (arg ...) result)
+     (if (foreign-entry? name)
+         (foreign-procedure name (arg ...) result)
+         (begin
+           (set! pool-hold-missing (cons name pool-hold-missing))
+           (lambda args (error 'pool-hold "the shim has no entry" name)))))))
+
+(define pool-hold-size
+  (hold-entry "chez_uv_debug_pool_hold_size" () size_t))
+(define pool-hold-queue
+  (hold-entry "chez_uv_debug_pool_hold" (uptr uptr unsigned-64) int))
+(define pool-hold-started
+  (hold-entry "chez_uv_debug_pool_hold_started" (uptr unsigned-64) int))
+(define pool-hold-release
+  (hold-entry "chez_uv_debug_pool_release" (uptr) void))
+(define pool-hold-state
+  (hold-entry "chez_uv_debug_pool_hold_state" (uptr) int))
+(define pool-hold-finished
+  (hold-entry "chez_uv_debug_pool_hold_finished" (uptr) int))
+(define pool-hold-dispose
+  (hold-entry "chez_uv_debug_pool_hold_dispose" (uptr) void))
+
+(test-equal "pool hold: the shim exports every entry of the hold"
+  '()
+  (reverse pool-hold-missing))
+
+(define pool-hold-bound-ns (* 10 1000 1000 1000))
+
+;; hold-state : integer -> symbol
+;; The shim's CHEZ_UV_HOLD_* numbers. The seeded rows below hold this
+;; reading to what the shim means by each.
+(define (hold-state n)
+  (case n
+    ((1) 'queued)
+    ((2) 'waiting)
+    ((3) 'released)
+    ((4) 'timed-out)
+    (else (list 'state n))))
+
+;; A hold: its block, until it is freed, and #f from then on, so that a
+;; release after the free is ignored rather than handed freed memory.
+(define-record-type pool-hold (fields (mutable block)))
+
+;; pool-hold! : uv-loop exact-nonnegative-integer -> (values pool-hold symbol)
+;; A hold queued on LOOP, from LOOP's thread, with a bound of BOUND-NS, and
+;; its state once a worker took it: 'waiting, or whatever it was when the
+;; wait for a worker gave up. Raises, before queueing anything, when the
+;; shim lacks an entry or libuv refuses the hold.
+(define (pool-hold! loop bound-ns)
+  (unless (null? pool-hold-missing)
+    (error 'pool-hold! "the shim has no pool hold" pool-hold-missing))
+  (let* ((block (alloc-zeroed (pool-hold-size)))
+         (rc (pool-hold-queue (loop-ptr loop) block bound-ns)))
+    (unless (zero? rc)
+      (free! block)
+      (error 'pool-hold! "libuv refused the hold" rc))
+    (values (make-pool-hold block)
+            (hold-state (pool-hold-started block pool-hold-bound-ns)))))
+
+;; release-hold! : pool-hold -> (or 'released 'ignored)
+(define (release-hold! hold)
+  (let ((block (pool-hold-block hold)))
+    (cond (block (pool-hold-release block) 'released)
+          (else 'ignored))))
+
+;; hold-finished? : pool-hold -> boolean
+;; Whether the hold's after-work callback has run on its loop: from then on
+;; nothing in libuv touches the block. A freed hold had.
+(define (hold-finished? hold)
+  (let ((block (pool-hold-block hold)))
+    (or (not block) (= 1 (pool-hold-finished block)))))
+
+;; hold-outcome : pool-hold -> (or (list symbol symbol) 'freed)
+;; How the hold ended, and whether it has finished.
+(define (hold-outcome hold)
+  (let ((block (pool-hold-block hold)))
+    (if block
+        (list (hold-state (pool-hold-state block))
+              (if (= 1 (pool-hold-finished block)) 'finished 'unfinished))
+        'freed)))
+
+;; free-hold! : pool-hold -> (or 'freed 'kept)
+;; Frees a finished hold and forgets its block. One the worker or the loop
+;; may still touch is kept: a leak on a failing run, never a use after
+;; free.
+(define (free-hold! hold)
+  (let ((block (pool-hold-block hold)))
+    (cond ((not block) 'freed)
+          ((= 1 (pool-hold-finished block))
+           (pool-hold-dispose block)
+           (free! block)
+           (pool-hold-block-set! hold #f)
+           'freed)
+          (else 'kept))))
+
+;; settle-hold! : uv-loop pool-hold -> unspecified
+;; Releases HOLD, when nothing has, and steps LOOP until the hold has
+;; finished and no lookup is live, so that a row leaves nothing queued for
+;; a later one. Its cap outlasts the hold's bound, so even a hold that
+;; ignores its release ends before a later row runs. Total, since it also
+;; runs in a guard's handler, where a raise would end the suite.
+(define settle-cap (+ 2048 (div pool-hold-bound-ns (* 1000 1000))))
+
+(define (settle-hold! loop hold)
+  (guard (e (#t #f))
+    (release-hold! hold)
+    (run-until/ticking loop
+                       (lambda () (and (hold-finished? hold)
+                                       (zero? (live-count 'getaddrinfo-req))
+                                       (zero? (live-count 'getnameinfo-req))))
+                       settle-cap)))
+
+;; The hold on seeded cases, before the rows below rely on it. Its states
+;; cross as numbers, which hold-state must read as the shim means them: a
+;; hold left unreleased past its bound has to read 'timed-out, and one
+;; released while its worker waits 'released. And a free must keep a hold
+;; its worker is still in, and a release after the free must not reach C.
+(define (seed-timed-out-hold)
+  (guard (e (#t (list 'raised (describe e))))
+    (let-values (((hold started) (pool-hold! l (* 1000 1000))))
+      (run-until/ticking l (lambda () (hold-finished? hold)) settle-cap)
+      (let ((outcome (hold-outcome hold)))
+        (free-hold! hold)
+        outcome))))
+
+(test-equal "pool hold: a hold left unreleased past its bound reads timed-out, and finishes"
+  '(timed-out finished)
+  (seed-timed-out-hold))
+
+(define (seed-hold-lifecycle)
+  (guard (e (#t (list 'raised (describe e))))
+    (let-values (((hold started) (pool-hold! l pool-hold-bound-ns)))
+      (let* ((early-free (free-hold! hold))
+             (released (release-hold! hold)))
+        (run-until/ticking l (lambda () (hold-finished? hold)) settle-cap)
+        (let* ((outcome (hold-outcome hold))
+               (freed (free-hold! hold))
+               (late-release (release-hold! hold)))
+          (list started early-free released outcome freed late-release))))))
+
+(test-equal "pool hold: a free keeps a hold its worker waits in, a release ends it as released, and a release after its free is ignored"
+  '(waiting kept released (released finished) freed ignored)
+  (seed-hold-lifecycle))
+
 ;; --- double-cancel before the drain -------------------------------------
 ;; The target is a getnameinfo request, covering the second kind's cancel
 ;; path and its 'EAI_CANCELED delivery (host and service #f through the
@@ -1421,163 +1599,104 @@
 ;; (vendor/libuv/src/threadpool.c:399-441) -- #t twice, documented not
 ;; defended, and the callback still fires EXACTLY once.
 ;;
-;; BOUNDED RETRY, NOT A TOLERANT ROW. The first cancel's #t is a race with
-;; a measured heavy favorite (1000/1000 at pool 1), but a GC or scheduler
-;; pause landing between the tail submit and the cancel lets
-;; the single worker drain the whole queue -- MEASURED under the ASan arm:
-;; a forced (collect) inside that window lost the race 52/100, and even
-;; with the collect moved ahead of the submits ~1% of 500 trials lost. So
-;; each attempt resets the allocation clock FIRST, and the scenario
-;; retries -- bounded by attempts, never wall-clock -- until the first
-;; cancel wins; the vendor property under test (second cancel also #t,
-;; exactly one delivery, 'EAI_CANCELED) is then asserted on that attempt,
-;; and the exactly-once/balance invariants are asserted on EVERY attempt,
-;; the losing draws included.
-(define dc-max-attempts 16)
-
+;; Four numeric lookups and the request wait behind a pool hold (above),
+;; so both cancels find the request queued, behind the lookups. The hold is
+;; released only once both have answered. The lookups then run for real,
+;; after the cancelled delivery, each callback collecting. Without the
+;; hold, the lookups alone would keep the request queued only by a race.
 (define (double-cancel-attempt!)
-  (collect)   ; no organic collection pause inside the submit-to-cancel window
-  (let ((blocker-fires 0)
-        (tail-fires 0)
-        (tail-err 'callback-never-fired)
-        (tail-host 'callback-never-fired)
-        (tail-serv 'callback-never-fired))
-    (let submit ((i 0))
-      (when (< i 4)
-        (uv-getaddrinfo! l "127.0.0.1" "80"
-                         (suite-hints #t '(family . inet) '(socktype . stream))
-                         (lambda (err results)
-                           (collect)
-                           (set! blocker-fires (+ blocker-fires 1))))
-        (submit (+ i 1))))
-    (let* ((req (uv-getnameinfo!
-                 l "127.0.0.1" 8080 '(numeric-host numeric-serv)
-                 (lambda (err host service)
-                   (collect)
-                   (set! tail-fires (+ tail-fires 1))
-                   (set! tail-err (err->symbol err))
-                   (set! tail-host (if host (list 'host host) 'host-absent))
-                   (set! tail-serv (if service
-                                       (list 'service service)
-                                       'service-absent)))))
-           ;; SAME TURN: no loop step since the submits.
-           (first (uv-cancel! req))
-           (second (if (eq? first #t)
-                       (uv-cancel! req)
-                       'not-attempted)))
-      (run-until/ticking l
-                         (lambda () (and (>= tail-fires 1)
-                                         (>= blocker-fires 4)))
-                         cap)
-      (list (cons 'first first)
-            (cons 'second second)
-            (cons 'blocker-fires blocker-fires)
-            (cons 'tail-fires tail-fires)
-            (cons 'tail-err tail-err)
-            (cons 'tail-host tail-host)
-            (cons 'tail-serv tail-serv)
-            (cons 'balance (list (live-count 'getaddrinfo-req)
-                                 (live-count 'getnameinfo-req)
-                                 (registry-count)))))))
+  (let-values (((hold started) (pool-hold! l pool-hold-bound-ns)))
+    (let ((lookup-fires (make-vector 4 0))
+          (lookup-errs (make-vector 4 'callback-never-fired))
+          (tail-fires 0)
+          (tail-err 'callback-never-fired)
+          (tail-host 'callback-never-fired)
+          (tail-serv 'callback-never-fired))
+      ;; A raise after the hold is queued releases it, and lets anything
+      ;; already queued drain, before it goes on to be recorded below.
+      (guard (e (#t (settle-hold! l hold)
+                    (free-hold! hold)
+                    (raise e)))
+        (let submit ((i 0))
+          (when (< i 4)
+            (let ((idx i))
+              (uv-getaddrinfo! l "127.0.0.1" "80"
+                               (suite-hints #t '(family . inet) '(socktype . stream))
+                               (lambda (err results)
+                                 (collect)
+                                 (vector-set! lookup-fires idx
+                                              (+ 1 (vector-ref lookup-fires idx)))
+                                 (vector-set! lookup-errs idx (err->symbol err)))))
+            (submit (+ i 1))))
+        (let* ((req (uv-getnameinfo!
+                     l "127.0.0.1" 8080 '(numeric-host numeric-serv)
+                     (lambda (err host service)
+                       (collect)
+                       (set! tail-fires (+ tail-fires 1))
+                       (set! tail-err (err->symbol err))
+                       (set! tail-host (if host (list 'host host) 'host-absent))
+                       (set! tail-serv (if service
+                                           (list 'service service)
+                                           'service-absent)))))
+               ;; SAME TURN: no loop step since the submit.
+               (first (uv-cancel! req))
+               (second (if (eq? first #t)
+                           (uv-cancel! req)
+                           'not-attempted)))
+          (settle-hold! l hold)
+          (let* ((outcome (hold-outcome hold))
+                 (freed (free-hold! hold)))
+            (list (cons 'hold (append (list started) outcome (list freed)))
+                  (cons 'first first)
+                  (cons 'second second)
+                  (cons 'delivery (list tail-fires tail-err tail-host tail-serv))
+                  (cons 'lookups (list (vector->list lookup-fires)
+                                       (vector->list lookup-errs)))
+                  (cons 'balance (list (live-count 'getaddrinfo-req)
+                                       (live-count 'getnameinfo-req)
+                                       (registry-count))))))))))
 
-(define dc-attempts '())   ; most recent first
+;; An attempt that raised is kept as ((raised description)), and each row
+;; below then shows that instead of its own value.
+(define dc-obs
+  (guard (e (#t (list (list 'raised (describe e)))))
+    (double-cancel-attempt!)))
 
-;; drain-dns-requests! : uv-loop -> unspecified
-;; Steps LOOP until no lookup is live, for an attempt that raised after
-;; submitting some: left in flight, they would show in a later section's
-;; counts and blame code that is not at fault. Total, since it runs in a
-;; guard's handler, where a raise would end the suite.
-(define (drain-dns-requests! loop)
-  (guard (e (#t #f))
-    (run-until/ticking loop
-                       (lambda () (and (zero? (live-count 'getaddrinfo-req))
-                                       (zero? (live-count 'getnameinfo-req))))
-                       cap)))
+(define (dc-read key)
+  (cond ((assq 'raised dc-obs) => (lambda (r) r))
+        (else (cdr (assq key dc-obs)))))
 
-;; An attempt that raises is kept as ((raised description)) and ends the
-;; retries; the rows below report it as raised.
-(let attempt ((n 1))
-  (let ((obs (guard (e (#t (drain-dns-requests! l)
-                           (list (list 'raised (describe e)))))
-               (double-cancel-attempt!))))
-    (set! dc-attempts (cons obs dc-attempts))
-    (when (and (< n dc-max-attempts)
-               (not (assq 'raised obs))
-               (not (eq? #t (cdr (assq 'first obs)))))
-      (attempt (+ n 1)))))
+(test-equal "double-cancel: the attempt did not raise"
+  'no-raise
+  (if (assq 'raised dc-obs) dc-obs 'no-raise))
 
-(test-equal "double-cancel: no attempt raised"
-  '() (filter (lambda (obs) (assq 'raised obs)) dc-attempts))
+(test-equal "double-cancel: the worker was inside the hold before the request was queued, stayed until the release, and the hold was freed"
+  '(waiting released finished freed)
+  (dc-read 'hold))
 
-;; The wording branches on the OUTCOME: an exhausted retry bound must not
-;; print "won" -- the catcher row below fails in that case, and the
-;; informational line has to agree with it rather than contradict it.
-(display (let ((final (car dc-attempts)))
-           (cond ((assq 'raised final)
-                  (string-append "  [informational] double-cancel: attempt "
-                                 (number->string (length dc-attempts)) " raised"))
-                 ((eq? #t (cdr (assq 'first final)))
-                  (string-append "  [informational] double-cancel: first cancel won on attempt "
-                                 (number->string (length dc-attempts))
-                                 " of max " (number->string dc-max-attempts)))
-                 (else
-                  (string-append "  [informational] double-cancel: first cancel never won in "
-                                 (number->string (length dc-attempts))
-                                 " attempts (max " (number->string dc-max-attempts) ")")))))
-(newline)
-
-;; The losing attempts' tail-err is pinned to the two LEGAL outcomes: the
-;; real reverse delivered ('no-error -- the cancel lost) or 'EAI_CANCELED
-;; (the cancel won on that draw too). Anything else -- a third errno, an
-;; escaped raise turned sentinel -- is an invariant violation even on a
-;; draw the retry loop would otherwise discard.
-(test-equal "double-cancel: every attempt fired every callback exactly once, in a legal branch, and balanced"
-  'invariants-held
-  (let check ((atts dc-attempts))
-    (cond ((null? atts) 'invariants-held)
-          ((assq 'raised (car atts)) (list 'raised-attempt (car atts)))
-          ((let ((a (car atts)))
-             (and (= 4 (cdr (assq 'blocker-fires a)))
-                  (= 1 (cdr (assq 'tail-fires a)))
-                  (memq (cdr (assq 'tail-err a)) '(no-error EAI_CANCELED))
-                  (equal? (list 0 0 (+ registry-with-loop 1)) ; loop + probe-timer
-                          (cdr (assq 'balance a)))))
-           (check (cdr atts)))
-          (else (list 'invariant-violated (car atts))))))
-
-;; The rows below read the final attempt; one that raised has nothing to
-;; read, and says so.
-(define (dc-final-or-raised read)
-  (let ((final (car dc-attempts)))
-    (if (assq 'raised final)
-        (list 'raised-on-attempt (length dc-attempts))
-        (read final))))
-
-(test-equal "double-cancel: a same-turn first cancel won within the attempt bound"
-  'first-cancel-won
-  (dc-final-or-raised
-   (lambda (final)
-     (if (eq? #t (cdr (assq 'first final)))
-         'first-cancel-won
-         (list 'never-won-in (length dc-attempts) 'attempts)))))
+(test-equal "double-cancel: a same-turn first cancel of a queued request answers #t"
+  #t
+  (dc-read 'first))
 
 (test-equal "double-cancel: the second cancel on the same queued node also answers #t"
   'second-cancel-true
-  (dc-final-or-raised
-   (lambda (final)
-     (case (cdr (assq 'second final))
-       ((#t) 'second-cancel-true)
-       ((#f) 'second-cancel-false)
-       (else (list 'second-was (cdr (assq 'second final))))))))
+  (let ((second (dc-read 'second)))
+    (case second
+      ((#t) 'second-cancel-true)
+      ((#f) 'second-cancel-false)
+      (else (list 'second-was second)))))
 
 (test-equal "double-cancel: the callback fired exactly once, cancelled, host and service #f"
   '(1 EAI_CANCELED host-absent service-absent)
-  (dc-final-or-raised
-   (lambda (final)
-     (list (cdr (assq 'tail-fires final))
-           (cdr (assq 'tail-err final))
-           (cdr (assq 'tail-host final))
-           (cdr (assq 'tail-serv final))))))
+  (dc-read 'delivery))
+
+(test-equal "double-cancel: the four lookups queued ahead of it ran for real once the hold was released, once each"
+  '((1 1 1 1) (no-error no-error no-error no-error))
+  (dc-read 'lookups))
+
+(test-equal "double-cancel: no lookup or registry entry outlived the drain"
+  (list 0 0 (+ registry-with-loop 1))   ; loop + probe-timer
+  (dc-read 'balance))
 
 ;; --- boundary: uv-getnameinfo! validation, before the first allocation ---
 ;; The TCP address vocabulary on the way in, each refusal before anything
@@ -1790,49 +1909,45 @@
        matrix-seams))
 
 ;; --- pool-pinned queued-tail teardown -----------------------------------
-;; A second loop per attempt: four numeric blockers head the single
-;; worker's queue (the measured same-turn regime -- 1000/1000 cancelled,
-;; twice), a getnameinfo tail behind them, then
-;; uv-loop-teardown! in the SAME turn -- the cancel sweep must reach the
-;; still-queued tail, which then drains as 'EAI_CANCELED before teardown
-;; returns (teardown's contract: every in-flight on-complete runs before
-;; teardown returns).
+;; A second loop: a pool hold (above), four numeric lookups and a
+;; getnameinfo tail queued behind it, then uv-loop-teardown! in the SAME
+;; turn. The cancel sweep, in the teardown's first step, finds all five
+;; still queued and cancels them, and each drains as 'EAI_CANCELED before
+;; teardown returns (teardown's contract: every in-flight on-complete runs
+;; before teardown returns). The first of their callbacks releases the
+;; hold, which the drain also waits for.
 ;;
-;; THE CANCELLED-TAIL ROW IS THE NAMED CATCHER for a kind-narrowed
-;; cancel-requests-for-loop!: a sweep that misses
-;; getnameinfo-req never cancels the tail on ANY attempt -- the drain
-;; waits the real result out instead -- so the observed-within-bound row
-;; below fails by name, deterministically.
+;; THE CANCELLED-TAIL ROW IS THE NAMED CATCHER for a kind-narrowed sweep:
+;; a sweep that misses getnameinfo-req never cancels the tail, which then
+;; runs for real once a cancelled lookup's callback releases the hold, and
+;; the row fails by name. A sweep that misses getaddrinfo-req fails the
+;; blockers' row the same way.
 ;;
-;; BOUNDED RETRY, same physics as the double-cancel row above: "pool=1
-;; guarantees the tail is queued" holds only while the worker is still
-;; behind the blockers, and a GC/scheduler pause inside the
-;; submit-to-sweep window lets it drain everything (measured: a forced
-;; (collect) in the window lost 52/100; collect-first still lost ~1% of
-;; 500 ASan trials, and a 1-blocker shape lost a real test-memory run).
-;; Each attempt collects FIRST, and the branch-independent invariants --
-;; teardown returned with the loop closed, all five callbacks fired exactly
-;; once BEFORE it returned, every blocker in a legal branch, counters and
-;; registry balanced -- are asserted over EVERY attempt, losing draws
-;; included. Only the branch draw itself retries; wall-clock never decides.
+;; Behind the four lookups and no hold, the tail would stay queued only by
+;; a race that loses about 1% of draws, and 16 retries have all lost on CI.
 (define td-registry-before (registry-count))
-(define td-max-attempts 16)
 
 (define (teardown-attempt!)
-  (collect)   ; no organic collection pause inside the submit-to-sweep window
   (let ((l2 (make-uv-loop))
+        (hold #f)
+        (started 'never-queued)
         (blocker-fires (make-vector 4 0))
         (blocker-errs (make-vector 4 'callback-never-fired))
         (tail-fires 0)
         (tail-err 'callback-never-fired)
         (tail-host 'callback-never-fired)
         (tail-serv 'callback-never-fired))
-    ;; A submit that raises leaves l2 open with what was already submitted,
-    ;; which would show in the epilogue's counts. It is torn down before the
-    ;; raise goes on to the retry below, which records it.
-    (guard (e (#t (guard (x (#t #f))
+    ;; A raise while queueing leaves l2 open with what was already queued.
+    ;; The hold is released and l2 torn down before the raise goes on to be
+    ;; recorded below.
+    (guard (e (#t (when hold (release-hold! hold))
+                  (guard (x (#t #f))
                     (when (uv-loop-open? l2) (uv-loop-teardown! l2)))
+                  (when hold (free-hold! hold))
                   (raise e)))
+      (let-values (((h s) (pool-hold! l2 pool-hold-bound-ns)))
+        (set! hold h)
+        (set! started s))
       (let submit ((i 0))
         (when (< i 4)
           (let ((idx i))
@@ -1840,6 +1955,7 @@
                              (suite-hints #t '(family . inet)
                                           '(socktype . stream))
                              (lambda (err results)
+                               (release-hold! hold)
                                (collect)
                                (vector-set! blocker-fires idx
                                             (+ 1 (vector-ref blocker-fires idx)))
@@ -1848,6 +1964,7 @@
           (submit (+ i 1))))
       (uv-getnameinfo! l2 "127.0.0.1" 8080 '(numeric-host numeric-serv)
                        (lambda (err host service)
+                         (release-hold! hold)
                          (collect)
                          (set! tail-fires (+ tail-fires 1))
                          (set! tail-err (err->symbol err))
@@ -1856,96 +1973,61 @@
                                              (list 'service service)
                                              'service-absent)))))
     ;; Teardown IMMEDIATELY: no loop step between the submits and the sweep.
-    (uv-loop-teardown! l2)
-    (list (cons 'loop-state (if (uv-loop-open? l2) 'still-open 'closed))
-          (cons 'fires (list (vector-ref blocker-fires 0)
-                             (vector-ref blocker-fires 1)
-                             (vector-ref blocker-fires 2)
-                             (vector-ref blocker-fires 3)
-                             tail-fires))
-          (cons 'blocker-errs (vector->list blocker-errs))
-          (cons 'tail-err tail-err)
-          (cons 'tail-host tail-host)
-          (cons 'tail-serv tail-serv)
-          (cons 'balance (list (live-count 'getaddrinfo-req)
-                               (live-count 'getnameinfo-req)
-                               (registry-count))))))
+    ;; A teardown that raises frees the hold too, when it has finished,
+    ;; before the raise goes on to be recorded below.
+    (guard (e (#t (free-hold! hold) (raise e)))
+      (uv-loop-teardown! l2))
+    (let* ((outcome (hold-outcome hold))
+           (freed (free-hold! hold)))
+      (list (cons 'hold (append (list started) outcome (list freed)))
+            (cons 'end-state
+                  (list (if (uv-loop-open? l2) 'still-open 'closed)
+                        (list (vector-ref blocker-fires 0)
+                              (vector-ref blocker-fires 1)
+                              (vector-ref blocker-fires 2)
+                              (vector-ref blocker-fires 3)
+                              tail-fires)
+                        (list (live-count 'getaddrinfo-req)
+                              (live-count 'getnameinfo-req)
+                              (registry-count))))
+            (cons 'blocker-errs (vector->list blocker-errs))
+            (cons 'tail-err tail-err)
+            (cons 'tail-delivery (list tail-err tail-host tail-serv))))))
 
-(define td-attempts '())   ; most recent first
+;; An attempt that raised is kept as ((raised description)), as above.
+(define td-obs
+  (guard (e (#t (list (list 'raised (describe e)))))
+    (teardown-attempt!)))
 
-;; An attempt that raises is kept as ((raised description)) and ends the
-;; retries, as above.
-(let attempt ((n 1))
-  (let ((obs (guard (e (#t (list (list 'raised (describe e)))))
-               (teardown-attempt!))))
-    (set! td-attempts (cons obs td-attempts))
-    (when (and (< n td-max-attempts)
-               (not (assq 'raised obs))
-               (not (eq? 'EAI_CANCELED (cdr (assq 'tail-err obs)))))
-      (attempt (+ n 1)))))
+(define (td-read key)
+  (cond ((assq 'raised td-obs) => (lambda (r) r))
+        (else (cdr (assq key td-obs)))))
 
-(test-equal "queued-tail teardown: no attempt raised"
-  '() (filter (lambda (obs) (assq 'raised obs)) td-attempts))
+(test-equal "queued-tail teardown: the attempt did not raise"
+  'no-raise
+  (if (assq 'raised td-obs) td-obs 'no-raise))
 
-;; Branched on the outcome for the same reason as the double-cancel line:
-;; exhaustion must not print "won" while the catcher row fails.
-(display (let ((final (car td-attempts)))
-           (cond ((assq 'raised final)
-                  (string-append "  [informational] queued-tail teardown: attempt "
-                                 (number->string (length td-attempts)) " raised"))
-                 ((eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
-                  (string-append "  [informational] queued-tail teardown: cancel won on attempt "
-                                 (number->string (length td-attempts))
-                                 " of max " (number->string td-max-attempts)))
-                 (else
-                  (string-append "  [informational] queued-tail teardown: cancel never won in "
-                                 (number->string (length td-attempts))
-                                 " attempts (max " (number->string td-max-attempts) ")")))))
-(newline)
+;; Only a lookup's callback releases the hold on this path, so 'released
+;; here means one ran while the worker was held.
+(test-equal "queued-tail teardown: the worker was inside the hold before the lookups were queued, stayed until a lookup's callback released it, and the hold was freed"
+  '(waiting released finished freed)
+  (td-read 'hold))
 
-;; The tail's err is held to the same two-legal-outcomes set as the
-;; blockers', losing draws included: the drain either cancelled it
-;; ('EAI_CANCELED) or waited its real result out ('no-error). A third
-;; value on ANY attempt fails here even when the branch draw would retry.
-(test-equal "queued-tail teardown: every attempt closed the loop, fired all five exactly once in legal branches, and balanced"
-  'invariants-held
-  (let check ((atts td-attempts))
-    (cond ((null? atts) 'invariants-held)
-          ((assq 'raised (car atts)) (list 'raised-attempt (car atts)))
-          ((let ((a (car atts)))
-             (and (eq? 'closed (cdr (assq 'loop-state a)))
-                  (equal? '(1 1 1 1 1) (cdr (assq 'fires a)))
-                  (for-all (lambda (e) (memq e '(no-error EAI_CANCELED)))
-                           (cdr (assq 'blocker-errs a)))
-                  (memq (cdr (assq 'tail-err a)) '(no-error EAI_CANCELED))
-                  (equal? (list 0 0 td-registry-before)
-                          (cdr (assq 'balance a)))))
-           (check (cdr atts)))
-          (else (list 'invariant-violated (car atts))))))
+(test-equal "queued-tail teardown: teardown closed the loop, fired all five callbacks exactly once, and balanced"
+  (list 'closed '(1 1 1 1 1) (list 0 0 td-registry-before))
+  (td-read 'end-state))
 
-;; As for the double-cancel rows: a final attempt that raised says so.
-(define (td-final-or-raised read)
-  (let ((final (car td-attempts)))
-    (if (assq 'raised final)
-        (list 'raised-on-attempt (length td-attempts))
-        (read final))))
+(test-equal "queued-tail teardown: the sweep cancelled every queued getaddrinfo request"
+  '(EAI_CANCELED EAI_CANCELED EAI_CANCELED EAI_CANCELED)
+  (td-read 'blocker-errs))
 
-(test-equal "queued-tail teardown: the sweep cancelled the queued tail within the attempt bound"
-  'cancel-won-observed
-  (td-final-or-raised
-   (lambda (final)
-     (if (eq? 'EAI_CANCELED (cdr (assq 'tail-err final)))
-         'cancel-won-observed
-         (list 'never-cancelled-in (length td-attempts) 'attempts
-               'final-tail-err (cdr (assq 'tail-err final)))))))
+(test-equal "queued-tail teardown: the sweep cancelled the queued tail"
+  'EAI_CANCELED
+  (td-read 'tail-err))
 
 (test-equal "queued-tail teardown: the cancelled tail delivered EAI_CANCELED with host and service #f"
   '(EAI_CANCELED host-absent service-absent)
-  (td-final-or-raised
-   (lambda (final)
-     (list (cdr (assq 'tail-err final))
-           (cdr (assq 'tail-host final))
-           (cdr (assq 'tail-serv final))))))
+  (td-read 'tail-delivery))
 
 ;; --- uv-loop-close! with an in-flight request => 'EBUSY -----------------
 ;; libuv's own guard is the check (vendor/libuv/src/uv-common.c:885): an

@@ -92,18 +92,21 @@ initialisation — config in the environment is 12-factor. It is
 
 `make build` links a *dev* shim: `-O0 -g`, with
 `-DCHEZ_LIBUV_DEBUG_COUNTERS` defined, which is what makes the allocation
-counters the test suites assert on report real numbers. A release build
-turns both off:
+counters the test suites assert on report real numbers. It also compiles in
+a test hook that the release shim leaves out: a *pool hold*, a threadpool
+item that `tests/test-dns.sps` queues to keep the pool's worker busy until
+the suite releases it. A release build turns all of these off:
 
 ```sh
 make prod
 ```
 
-cleans, relinks at `-O2` with the counters compiled out, and then runs
-`make check-prod` — a *behavioural* check that the surviving artifact
-really is the release one: `tests/check-prod.sps` allocates a loop and a
-bound TCP handle and fails unless every counter reads zero while they are
-demonstrably alive.
+cleans, relinks at `-O2` with the counters and the hold compiled out, and
+then runs `make check-prod` — a *behavioural* check that the surviving
+artifact really is the release one: `tests/check-prod.sps` allocates a loop
+and a bound TCP handle and fails unless every counter reads zero while they
+are demonstrably alive, and unless the shim exports none of the hold's
+entry points.
 
 The Makefile's `relink-guard` deletes the shim whenever the requested
 flavor (or acquisition path) stops matching what the artifact was linked
