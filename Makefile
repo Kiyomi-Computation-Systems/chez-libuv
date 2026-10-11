@@ -1079,7 +1079,7 @@ prod: ## Rebuild the shim with optimizations and verify the release artifact
 # by running it rather than trusting the recipe: a shim carrying
 # -DCHEZ_LIBUV_DEBUG_COUNTERS reports live allocation counts while a loop and
 # a bound tcp handle are alive, a prod shim's queries are a constant 0
-# (src/libuv-shim.c). tests/check-prod.sps establishes that the scope really
+# (src/libuv-shim.c), and only a dev shim exports the pool hold (#127). tests/check-prod.sps establishes that the scope really
 # was live using two witnesses that do not go through the counters, so
 # all-zero cannot also mean "the probe allocated nothing".
 #
@@ -1090,7 +1090,7 @@ prod: ## Rebuild the shim with optimizations and verify the release artifact
 #
 # `env -u` so an exported CHEZ_LIBUV_SHIM cannot point the probe at a
 # different shim from the one config.sls names.
-check-prod: ## Verify the built shim is a release (counters-free) build
+check-prod: ## Verify the built shim is a release build: no counters, no pool hold
 	@test -f $(SHIM) || { echo "check-prod: $(SHIM) is missing; run 'make prod' (or 'make build FLAVOR=prod') first" >&2; exit 1; }
 	@test -f $(CONFIG_SLS) || { echo "check-prod: $(CONFIG_SLS) is missing; run 'make prod' first" >&2; exit 1; }
 	env -u CHEZ_LIBUV_SHIM CHEZSCHEMELIBDIRS=$(CHEZ_LIBDIRS) \

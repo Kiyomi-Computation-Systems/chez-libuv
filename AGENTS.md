@@ -395,6 +395,15 @@ None is obvious from reading the code.
   in none, in either row. They now run until it has tried, parking it
   between intervals so each interval starts with it awake
   (`.plans/bulk-copy-liveness-mutation-log.md`).
+* **A bounded retry assumes its draws are independent, and on CI they
+  were not.** test-dns's queued-tail teardown and double-cancel rows needed
+  a lookup still queued when a cancel looked, and retried up to 16 times
+  at about 1% loss a draw. One CI run lost all 16 on a correct build
+  (#127). Locally, 3,000 draws on macOS and Linux never lost twice in a
+  row, whatever order the sweep cancelled in. A row that needs a race won
+  makes the state certain instead: test-dns now waits until the pool's
+  only worker is inside a dev-shim hold before it queues anything behind
+  it (`.plans/dns-pool-hold-mutation-log.md`).
 * **Chez resolves its boot files by argv[0], not by the executable's path.**
   A Chez child spawned with `file` = the real binary but argv[0] hardcoded to
   another name (e.g. `"chez"` against an install whose binary is `scheme`)

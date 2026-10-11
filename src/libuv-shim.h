@@ -1,7 +1,8 @@
 /* Thin ABI shim for compiler-derived constants, layouts, errnos, optional
  * allocation counters, bulk byte moves, libuv's alloc callback for reads,
  * and where the calling thread's stack is. It does not wrap uv_*
- * operations. */
+ * operations for the binding; in dev builds only, a pool hold queues work
+ * for the tests. */
 #ifndef CHEZ_LIBUV_SHIM_H
 #define CHEZ_LIBUV_SHIM_H
 
@@ -123,5 +124,25 @@ long chez_uv_live_async(void);
 /* Counted by chez_uv_alloc and chez_uv_free themselves, not by a pair of
  * count entries. */
 long chez_uv_live_block(void);
+
+#ifdef CHEZ_LIBUV_DEBUG_COUNTERS
+/* A pool hold, for tests only and in dev builds only (#127): a threadpool
+ * item that keeps its worker until released, or until BOUND_NS passes.
+ * The caller's zeroed block of chez_uv_debug_pool_hold_size bytes holds
+ * it. chez_uv_debug_pool_hold queues it on LOOP, from LOOP's thread, and
+ * answers libuv's status; chez_uv_debug_pool_hold_started waits, up to its
+ * own bound, for a worker to take it. The state is 1 queued, 2 waiting, 3
+ * released or 4 timed out. Once finished is 1, the hold's after-work
+ * callback has run and nothing in libuv touches the block: dispose of it,
+ * then free it. */
+struct uv_loop_s;
+size_t chez_uv_debug_pool_hold_size(void);
+int chez_uv_debug_pool_hold(struct uv_loop_s *loop, void *block, uint64_t bound_ns);
+int chez_uv_debug_pool_hold_started(void *block, uint64_t bound_ns);
+void chez_uv_debug_pool_release(void *block);
+int chez_uv_debug_pool_hold_state(void *block);
+int chez_uv_debug_pool_hold_finished(void *block);
+void chez_uv_debug_pool_hold_dispose(void *block);
+#endif
 
 #endif /* CHEZ_LIBUV_SHIM_H */
