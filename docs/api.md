@@ -872,7 +872,8 @@ discriminant is a symbol).
 | `&uv-wrong-thread` | `who` `expected` `actual` | A verb ran off its loop's owning thread; `expected` is the id of the thread the verb's check found owning the loop, `actual` the caller's. The two always differ, even if the loop has changed hands again since the check ([ADR-0019](../.plans/decisions/0019-threading-model-collect-safe-and-per-loop-affinity.md)) |
 | `&uv-stack-exhausted` | `who` `headroom` `floor` | A run was refused because its thread had `headroom` bytes of C stack left, under the `floor` it needs: 131,072 for `uv-run`, 65,536 for a teardown's drain. Escapes from callbacks spend that stack, and the thread gets it back only by ending |
 
-v0.3, v0.4, v0.5 and v0.7 added no new condition types, and v0.6 added one — every
+v0.3, v0.4, v0.5, v0.7 and v0.8 added no new condition types; v0.6 added
+one, and v0.9 `&uv-stack-exhausted`, which only a run raises — every
 `(libuv process)`/`(libuv pipe)`/`(libuv stream)`/`(libuv signal)`/`(libuv
 handle)`/`(libuv async)` failure raises one of the three above
 (`&uv-errno-error`, `&uv-handle-closed`, `&uv-invalid-argument`), or

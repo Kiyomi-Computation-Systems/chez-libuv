@@ -3,6 +3,147 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.0 — 2026-10-11
+
+This release refuses a run before its thread's C stack runs out. A
+continuation that escapes a libuv callback, or an engine dropped inside
+one, leaves that run's C frames on the thread's stack for as long as the
+thread lives. Enough of them crashed the thread, or on macOS could hang
+it, and nothing warned first. Every run the binding makes now measures
+the stack first, and short of its floor raises a new condition,
+`&uv-stack-exhausted`, which is why this is a minor release. The shim
+gains two exports, so run `make build` after upgrading. A raise out of
+`call-with-uv-loop`'s body now reaches the guards outside it as itself,
+and `&uv-wrong-thread` names the owner its check found.
+
+### Added
+
+- **A run is refused before its thread's C stack runs out** (#94, #126).
+  Before every `uv_run` it makes, the binding reads how much C stack its
+  thread has left. `uv-run` raises `&uv-stack-exhausted` (`who`,
+  `headroom`, `floor`) with less than 128 KiB left. The drain of
+  `uv-loop-teardown!`, and so of every `call-with-uv-loop` exit, raises
+  it under the name `uv-loop-teardown!` with less than 64 KiB. A refused
+  run changes nothing, and the gap between the two floors leaves it room
+  to tear its loops down: `call-with-uv-loop` still tears down around a
+  `uv-run` that raised it. Where a thread's stack cannot be read, nothing
+  is refused.
+  - Before, nothing warned. A macOS `fork-thread` thread held 14 escapes
+    from callbacks libuv calls while it polls for I/O, or 1,429 from
+    timer callbacks, and the next escape faulted. The fault reached
+    Scheme as "invalid memory reference", and a program that caught it
+    and went on could hang at the next collection (#95). On Linux the
+    process died with `SIGSEGV`.
+  - Under the check, a macOS `fork-thread` thread's run is refused after
+    12 escapes from I/O callbacks, or 1,152 from timer callbacks.
+  - A thread refused this way gets its stack back only by ending.
+    `docs/api.md`'s loop section says what to do instead.
+
+### Fixed
+
+- **A raise out of `call-with-uv-loop`'s body reaches the guards outside
+  it as itself** (#118, #120). R6RS `guard` unwinds to itself before it
+  tests its clauses, and when none matches, it re-raises from where the
+  body raised, which re-enters the body. `call-with-uv-loop` refuses
+  every return into a body it has left, and that refusal raised
+  `&uv-handle-closed` in place of the body's condition. So a guard whose
+  clauses did not match handed its caller `&uv-handle-closed`, and a
+  `uv-error?` guard further out took a user's error for the binding's.
+  Against 0.8.0, a body that raised `'boom`, or an `&error`, through such
+  a guard arrived as `&uv-handle-closed`; each now arrives as itself.
+  The first return into a body left while one of its raises was being
+  handled is refused with that raise, and every other with
+  `&uv-handle-closed`. `docs/api.md` lists what this costs: a guard whose
+  clauses do not match tests them twice, and a handler between that
+  guard and the body sees the condition twice.
+- **`&uv-wrong-thread` names the owner its check found** (#102, #113). A
+  verb checks its loop's owner inside its step and raises once the step
+  is over, and the refusal read the owner again to build the condition.
+  A loop handed to another thread and back in between made the condition
+  name the caller as both `expected` and `actual`. An engine alone did
+  that to fifteen verbs: `uv-accept!`, `uv-tcp-bind!`,
+  `uv-tcp-getsockname-port`, `uv-tcp-sockname-address`,
+  `uv-tcp-peer-address`, the four buffer-size verbs, `uv-tcp-connect!`,
+  both signal starts, `uv-write!`, `uv-write*!` and `uv-shutdown!`.
+  `expected` is now the owner the check compared against, and the two
+  always differ.
+
+### Changed
+
+- **Costs.** Measured on macOS arm64, bytes on the Scheme heap per call,
+  the fewest of 64, the same on two runs of each build:
+
+  | Call | 0.8.0 | 0.9.0 |
+  |---|---|---|
+  | `call-with-uv-loop`, the body returns | 752 | 1,008 |
+  | `call-with-uv-loop`, the body raises to a guard outside | 1,344 | 1,760 |
+  | `uv-update-time!`, refused on another thread | 640 | 672 |
+  | `uv-timer-start!`, refused on another thread | 656 | 688 |
+
+  The first two are #120's handler around the body, and the others #113's
+  record of the owner the check compared. The stack check allocates
+  nothing. Unchanged: an empty `uv-run` at 16 B; a 0 ms timer started and
+  run to its callback, 400 B; a timer made, closed and run to its close
+  callback, 928 B; `uv-loop-alive?`, `uv-now`, `uv-update-time!` and a
+  timer's start and stop, nothing.
+- **Time** (#87, #116, #126). A close and a request completion take the
+  registry lock once, where they took it twice, and every run now reads
+  its thread's stack first. Measured on macOS arm64 with #116's
+  benchmark, release shims, one thread: ns per operation, the median of
+  10 rounds alternating the builds, each round the best of 30
+  repetitions, with the range. Other work kept the load average at
+  45–95, so the figures run high:
+
+  | Operation | 0.8.0 | 0.9.0 |
+  |---|---|---|
+  | a close | 497 (440–598) | 416 (396–526) |
+  | a request completion | 228 (224–264) | 195 (190–227) |
+  | an empty `uv-run` | 106 (105–108) | 122 (121–128) |
+
+  Making a timer and firing one are unchanged within their ranges. The
+  run's 16 ns are #126's check: run the same way at #126 and its parent,
+  an empty run took 117–122 ns against 106–107. On a quiet machine #116
+  measured a close at 382 → 352 ns and a completion at 210 → 178 ns
+  against its own base.
+
+### Notes
+
+- `docs/api.md` now says what an escape costs, and when an engine
+  suspended inside a callback can be resumed (#94, #115, #124):
+  - An escape from a callback libuv calls while it polls for I/O also
+    leaves the poll's frame, which holds libuv's array of events: 34,352
+    bytes of stack on macOS arm64 and 22,272 on Linux arm64, against
+    about 400 for a timer callback's.
+  - An engine suspended inside a callback can be resumed only on its own
+    thread, and only while its callback still nests. 0.8.0's docs
+    promised that resuming always finishes the run. Resumed out of that
+    order, a run raises Chez's "attempt to return to stale foreign
+    context" and leaves its loop marked running for good.
+- The macOS hang at a full stack is Chez's (#95, #121). After a fault
+  inside a `__collect_safe` call, as `uv_run` is, Chez leaves the thread
+  deactivated, and a collection requested before the next such call
+  returns deadlocks. Never treat "invalid memory reference" as
+  recoverable.
+- ADR-0002 is amended for the shim's seventh kind of export, where the
+  calling thread's stack is (#126). ADR-0019 is amended for #102 and #87.
+- New checks hold these changes: the suites `test-stack-headroom`,
+  `test-loop-guard` and `test-owner-refusal`, and rules 9, 10 and 11 of
+  `tests/test-source-rules.sps`. A new pure suite,
+  `test-unread-assignments`, fails any variable a test assigns and never
+  reads (#89, #123).
+- The test runners: the level-3 child is reaped, with its exit status
+  reported (#110, #114); the stranded-exit child runs under the shared
+  runner (#117, #122); and the runner holds off Chez's collections while
+  it waits on a child, since a collection reaps the children
+  `open-process-ports` starts and takes their status (#128, #129). The
+  step suites share one copy of their sweep helpers (#103, #119), and
+  `test-loop-claim` catches the exit's re-claim after a refusal every run
+  (#96, #112).
+- Known: `test-dns`'s queued-tail teardown row can fail a correct build
+  when its cancel loses every attempt (#127), and the test suites assume
+  a POSIX host (#125).
+- The evidence is in `.plans/*-mutation-log.md`, one log per change.
+
 ## 0.8.0 — 2026-10-09
 
 This release finishes the work 0.7.4 began on calls an engine stops part
