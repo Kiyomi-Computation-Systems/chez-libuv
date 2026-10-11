@@ -1,6 +1,6 @@
 # ADR-0002: Bind libuv directly via FFI; keep the C shim to constants only
 
-- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline. Amended 2026-10-05 (issue #45): a sixth kind, libuv's alloc callback for reads — see the dated note inline. Amended 2026-10-09 (issue #94): a seventh kind, where the calling thread's stack is — see the dated note inline.
+- **Status:** Accepted (2026-08-18) — evidence: spike/FINDINGS.md Q1/Q2. Amended 2026-09-27 (issue #35): a fifth kind of export, bulk byte moves — see the dated note inline. Amended 2026-10-05 (issue #45): a sixth kind, libuv's alloc callback for reads — see the dated note inline. Amended 2026-10-09 (issue #94): a seventh kind, where the calling thread's stack is — see the dated note inline. Amended 2026-10-11 (issue #127): an eighth kind, in dev builds only, a test hook that queues threadpool work — see the dated note inline.
 - **Date:** 2026-08-18
 - **Scope:** chez-libuv v0.1
 - **Related:** [design spec](../2026-08-18-chez-libuv-v0.1-design.md), [ADR-0001](0001-hybrid-native-dependency-acquisition.md)
@@ -206,6 +206,35 @@ binding's behalf.
 > the rest. Also rejected: an `initial-exec` thread-local in the shim,
 > which glibc places in static TLS without a malloc, but only while its
 > surplus for dlopened libraries lasts.
+>
+> **Amended 2026-10-11 (issue #127).** An eighth kind of export, in dev
+> builds only: a *pool hold*. `chez_uv_debug_pool_hold` queues a
+> threadpool item with `uv_queue_work` that keeps the worker running it
+> until `chez_uv_debug_pool_release`, or until a bound passes. Five more
+> entries size it, wait for a worker to take it, and report and dispose of
+> its state. `tests/test-dns.sps` queues one on a pool pinned to one
+> worker, and waits for the worker to take it before it queues a lookup.
+> So the lookup is certainly still queued when its row cancels it. Two
+> rows had bet on that with retries, and one CI run lost all 16 of the
+> teardown row's draws.
+>
+> It is the first export that calls into libuv, which this ADR's decision
+> rules out for the binding. The binding never calls it. It is compiled
+> only under `-DCHEZ_LIBUV_DEBUG_COUNTERS`, with no release stub, so a
+> binding that resolved it would fail to import against a release shim,
+> and `make prod` imports the binding against one in `tests/check-prod.sps`.
+> That program also fails a release shim that exports any of the hold's
+> entries, and rule 12 of `tests/test-source-rules.sps` holds its list to
+> every function the shim defines under the `chez_uv_debug_` prefix, each
+> inside the `#ifdef`. The caller allocates the hold's block, so the shim keeps no
+> state for it (rule 6 of `tests/test-source-rules.sps`). Its bound turns
+> a broken build into named failures rather than a hung suite
+> (`.plans/dns-pool-hold-mutation-log.md`).
+>
+> Rejected: a separate test-only C library, which would need a link rule
+> of its own on every platform and acquisition path for one test hook;
+> and running a Scheme callback on libuv's worker thread, which Chez would
+> have to adopt as a Scheme thread.
 
 On Linux this requires libuv's own shared object to be `load-shared-object`'d
 by absolute path *before* the shim is loaded, because Linux's per-object
@@ -231,7 +260,8 @@ layers above this binding depend on.
   Amended 2026-10-05 for #45: six. The sixth is the one function libuv
   calls, and it calls nothing back. Amended 2026-10-09 for #94: seven. The
   seventh is two functions that read the calling thread's stack pointer
-  and stack bottom.)
+  and stack bottom. Amended 2026-10-11 for #127: eight, the eighth in dev
+  builds only, a pool hold for the tests.)
 - The Linux load-order requirement becomes a hard invariant, enforced in
   `native.sls` and covered by `test-shim-loading`; getting it wrong fails at
   import time, not at first call.

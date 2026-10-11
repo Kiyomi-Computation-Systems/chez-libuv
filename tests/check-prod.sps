@@ -39,7 +39,8 @@
         ;; this program exists precisely to observe that a release build does
         ;; NOT report them, so it is the one caller that reads them from
         ;; outside the test suites.
-        (only (libuv private native) live-counts))
+        (only (libuv private native) live-counts)
+        (only (chezscheme) foreign-entry?))
 
 (define (say . parts)
   (for-each (lambda (p) (if (string? p) (display p) (write p))) parts)
@@ -48,6 +49,18 @@
 (define (fail . parts)
   (apply say "check-prod: FAIL: " parts)
   (exit 1))
+
+;; The pool hold is a test hook that calls libuv, which ADR-0002 allows in a
+;; dev shim only (#127; src/libuv-shim.c). A dev shim answers all seven of
+;; these, so a prod shim must answer none. Read after the import above,
+;; which loads the shim.
+(define dev-only-entries
+  '("chez_uv_debug_pool_hold_size" "chez_uv_debug_pool_hold"
+    "chez_uv_debug_pool_hold_started" "chez_uv_debug_pool_release"
+    "chez_uv_debug_pool_hold_state" "chez_uv_debug_pool_hold_finished"
+    "chez_uv_debug_pool_hold_dispose"))
+
+(define dev-entries-present (filter foreign-entry? dev-only-entries))
 
 ;; 'unset is what a probe whose body never ran leaves behind; no successful
 ;; path can produce it.
@@ -73,15 +86,28 @@
   ((not (and (integer? live) (positive? live)))
    (fail "the probe never had a live scope -- the loop held no live handle: " live))
   ((not (pair? during))
-   (fail "the probe body never ran; nothing was observed: " during))
-  ((for-all (lambda (p) (zero? (cdr p))) during)
-   (say "check-prod: PASS: every counter read 0 while a bound tcp handle "
-        "(port " port ") was live on the loop; the shim is a prod "
-        "(counters-free) build")
-   (exit 0))
-  (else
-   (say "check-prod: FAIL: the counters moved while the probe's scope was live: "
-        during)
-   (say "The shim was linked with dev flags (-DCHEZ_LIBUV_DEBUG_COUNTERS).")
+   (fail "the probe body never ran; nothing was observed: " during)))
+
+;; Both checks report, so that a dev shim is refused for each of its dev
+;; features, and one cannot hide the other (ci.yml's release guard reads
+;; both lines).
+(define counters-moved (not (for-all (lambda (p) (zero? (cdr p))) during)))
+
+(when counters-moved
+  (say "check-prod: FAIL: the counters moved while the probe's scope was live: "
+       during)
+  (say "The shim was linked with dev flags (-DCHEZ_LIBUV_DEBUG_COUNTERS)."))
+
+(when (pair? dev-entries-present)
+  (say "check-prod: FAIL: the shim exports the dev-only pool hold: "
+       dev-entries-present))
+
+(cond
+  ((or counters-moved (pair? dev-entries-present))
    (say "Run `make prod` -- or `make build FLAVOR=prod` -- and try again.")
-   (exit 1)))
+   (exit 1))
+  (else
+   (say "check-prod: PASS: every counter read 0 while a bound tcp handle "
+        "(port " port ") was live on the loop, and no dev-only entry is "
+        "exported; the shim is a prod build")
+   (exit 0)))
