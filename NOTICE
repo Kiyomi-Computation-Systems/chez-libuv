@@ -44,9 +44,10 @@ chez-srfi
 ---------
 https://github.com/arcfide/chez-srfi
 Location: vendor/chez-srfi (git submodule, pinned; also named in Akku.lock)
-Used: by the test suites, for SRFI 64 and the SRFIs it imports. The
-library itself, (libuv), imports nothing from it. Akku.manifest lists it as
-a dependency, so an Akku install fetches it.
+Used: by the test suites only, for SRFI 64 and the SRFIs it imports. The
+library itself, (libuv), imports nothing from it, and Akku.manifest lists
+it as a development dependency, which a project that depends on
+chez-libuv does not install.
 
   Copyright (c) 2008-2010 Derick Eddington, MIT-style license, for the
   files he wrote (vendor/chez-srfi/LICENSE). Files written by others keep

@@ -16,7 +16,28 @@ plans='[.]plans|spike/|ADR[- ]?[0-9]'
 issue='(^|[^[:alnum:]&$])#[0-9]+([^[:alnum:]]|$)|(^|[^[:alnum:]])([Ii]ssues?|PR)[ #]*[0-9]|/(issues|pull)/[0-9]'
 date='(^|[^0-9])20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]([^0-9]|$)'
 release='(^|[^[:alnum:].])(v0[.][0-9]|0[.][1-9][0-9]*[.][0-9])'
-pattern="$plans|$issue|$date|$release"
+
+# This project's own releases, read from CHANGELOG.md's "## X.Y.Z"
+# headings, so the check knows them past 0.x without taking a dependency's
+# version (libuv 1.48.0) for one. The 0.x rule above also catches a 0.x
+# release named before it ships.
+releases=
+if [ -f CHANGELOG.md ]; then
+  releases=$(sed -n 's/^## \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+               CHANGELOG.md)
+fi
+if [ -z "$releases" ]; then
+  echo "check-history-refs: no '## X.Y.Z' release headings in CHANGELOG.md" >&2
+  exit 2
+fi
+own=
+for r in $releases; do
+  rest=${r#*.}
+  escaped=$(printf '%s' "$r" | sed 's/[.]/[.]/g')
+  own="${own:+$own|}$escaped|v${r%%.*}[.]${rest%%.*}"
+done
+own="(^|[^[:alnum:].])($own)([^[:alnum:]]|\$)"
+pattern="$plans|$issue|$date|$release|$own"
 
 planted='see the plans directory: .plans/x.md
 see spike/flow/FINDINGS.md
@@ -42,6 +63,16 @@ Chez Scheme 10.4.1, libuv 1.48.0
 192.0.2.1
 printf("%" PRIu64, n); a tissue 3 thick
 Copyright (c) 2026'
+
+# The releases read from CHANGELOG.md must name its latest one, by itself.
+latest=$(printf '%s\n' "$releases" | head -n 1)
+found=$(printf 'in %s\nsince v%s\n' "$latest" "${latest%.*}" \
+          | grep -cE "$own" || true)
+if [ "$found" != 2 ]; then
+  echo "check-history-refs: the release pattern read from CHANGELOG.md does" >&2
+  echo "not match its latest release, $latest, as X.Y.Z and as vX.Y." >&2
+  exit 2
+fi
 
 missed=$(printf '%s\n' "$planted" | grep -vE "$pattern" || true)
 caught=$(printf '%s\n' "$lookalikes" | grep -E "$pattern" || true)

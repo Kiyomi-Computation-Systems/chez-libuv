@@ -240,11 +240,12 @@ require-toolchain: ## Fail early, naming the Guix container, when the compiler, 
 
 # Scheme dependencies. chez-srfi is vendored as a submodule pinned to the SAME
 # commit Akku.lock names (7879b52). Keep them equal: bumping the Akku dependency
-# without re-pinning the submodule means consumers and CI test different code,
-# and nothing here would notice. Akku itself is
+# without re-pinning the submodule means an Akku install and CI test different
+# code, and nothing here would notice. Akku itself is
 # deliberately NOT on this path: it has no prebuilt binary, and its downloader
 # fails on some hosts with CURLE_URL_MALFORMED. Akku.manifest/Akku.lock remain
-# the consumer-facing declaration.
+# the declaration Akku reads; chez-srfi is a development dependency there, so
+# a project that depends on chez-libuv does not install it.
 #
 # chez-srfi ships Akku's percent-encoded filenames (%3a64.sls). Chez resolves
 # (srfi :64) only from the decoded spelling, so link both into a build tree and
@@ -289,7 +290,7 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 	case "$$rec" in \
 	  "$$lock"*) echo "pins agree: chez-srfi $$lock" ;; \
 	  *) echo "PIN DRIFT: submodule $$rec but Akku.lock names $$lock." >&2; \
-	     echo "Consumers install what Akku.lock names; CI tests the submodule." >&2; \
+	     echo "An Akku install gets what Akku.lock names; CI tests the submodule." >&2; \
 	     exit 1 ;; \
 	esac
 	@if [ ! -f $(VENDOR_DIR)/include/uv/version.h ]; then \
