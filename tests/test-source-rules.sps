@@ -51,7 +51,10 @@
 ;;;    place (passes first to a procedure whose name ends in !), or makes,
 ;;;    while its body runs, with a table, a box, a vector, a parameter, a
 ;;;    lock or a guardian, or as a closure over a variable it assigns. It
-;;;    lists each static variable in the C shim too. A new one fails here
+;;;    lists each static variable in the C shim too, and the shim keeps no
+;;;    thread-local storage: glibc mallocs a dlopened library's on each
+;;;    thread's first use, and the memory gate counted that block as
+;;;    suppressed (#94). A new one fails here
 ;;;    until it is listed. Each word for how threads share a variable is
 ;;;    checked against the source, by where the variable is written or by
 ;;;    what makes it. The registry and the orphan list are used only inside
@@ -149,6 +152,15 @@
 ;;;    - a new registry entry to registry-add!, the only definition that
 ;;;      makes one, and every write of the table to registry-add! and the
 ;;;      put-back in registry-take-accepted!.
+;;;
+;;; 11. Every uv_run starts in run-step!, where the C stack's headroom is
+;;;    checked first (#94). An escape from a callback leaves its uv_run's
+;;;    frames on the thread's stack for good, and a run made that deep
+;;;    crashes the thread, or on macOS hangs it (#95). run-step! claims
+;;;    the loop through claim-loop-for-run!, which refuses a run below its
+;;;    floor, so a uv_run made anywhere else would go unchecked. So this
+;;;    suite holds uv-loop-run, the foreign call, and claim-loop-for-run!
+;;;    to run-step!, named once each.
 ;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
@@ -699,7 +711,8 @@
      (dispatch-table library-init) (installed-dispatch-names library-init))
     ("src/libuv/private/native.sls"
      (dispatchers library-init) (dispatchers-installed library-init)
-     (init-mutex lock) (initialized? init-lock) (init-count init-lock))))
+     (init-mutex lock) (initialized? init-lock) (init-count init-lock)
+     (stack-bottom-cell thread-local))))
 
 ;; The procedures that may write a library-init variable, each called only
 ;; while a library's body runs.
@@ -897,6 +910,16 @@
                                         (else (scan (+ i 1) (list number name))))))))
                           names)))
             acc))))))
+
+;; thread-local-lines : (list-of string) -> (list-of integer)
+;; The number of each line of C in LINES that names thread-local storage.
+(define (thread-local-lines lines)
+  (let each ((lines lines) (n 1) (acc '()))
+    (cond ((null? lines) (reverse acc))
+          ((exists (lambda (word) (string-index-of (car lines) word 0))
+                   '("__thread" "_Thread_local" "thread_local"))
+           (each (cdr lines) (+ n 1) (cons n acc)))
+          (else (each (cdr lines) (+ n 1) acc)))))
 
 ;; Every static variable the shim defines: the debug counters, each updated
 ;; only through count_add and read only through count_read, which are
@@ -1180,6 +1203,14 @@
                     "  static int table_size;"
                     "int global;")))
 
+(test-equal "rule 6 finds each line of C that names thread-local storage, in any spelling"
+  '(1 3 4)
+  (thread-local-lines '("static __thread uintptr_t a;"
+                        "static uintptr_t b;"
+                        "_Thread_local int c;"
+                        "thread_local long d;"
+                        "uintptr_t chez_uv_stack_bottom(void);")))
+
 (test-equal "rule 6 finds a counter used outside count_add and count_read"
   '((3 live_a) (4 live_b))
   (bare-counter-uses '(live_a live_b)
@@ -1461,6 +1492,14 @@
      ("src/libuv/private/handles.sls" registry-take-accepted! 1)))
   (list (namers-in-src '%make-registry-entry) (registry-writes)))
 
+(test-equal "rule 11: uv-loop-run, the foreign call to uv_run, is named only by run-step!, once"
+  '(("src/libuv/loop.sls" run-step! 1))
+  (namers-in-src 'uv-loop-run))
+
+(test-equal "rule 11: claim-loop-for-run!, which checks the C stack's headroom, is named only by run-step!, once"
+  '(("src/libuv/loop.sls" run-step! 1))
+  (namers-in-src 'claim-loop-for-run!))
+
 (test-equal "rule 10 counts each (hashtable-set! registry ...) in a form, and no other table's"
   '(2 0)
   (list (registry-set-count '(define (f p e) (when p (hashtable-set! registry p e)) (hashtable-set! registry 1 e)))
@@ -1648,6 +1687,9 @@
   (let ((found (static-objects shim-lines)))
     (list 'unlisted (filter (lambda (n) (not (memq n shim-counters))) found)
           'gone (filter (lambda (n) (not (memq n found))) shim-counters))))
+
+(test-equal "the C shim keeps no thread-local storage, which glibc would malloc on each thread's first use"
+  '() (thread-local-lines shim-lines))
 
 (test-equal "the shim's counters are changed only through count_add and read only through count_read, which are atomic"
   '() (bare-counter-uses shim-counters shim-lines))

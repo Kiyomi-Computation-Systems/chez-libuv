@@ -1,10 +1,12 @@
 /* Thin ABI shim for compiler-derived constants, layouts, errnos, optional
- * allocation counters, bulk byte moves, and libuv's alloc callback for reads.
- * It does not wrap uv_* operations. */
+ * allocation counters, bulk byte moves, libuv's alloc callback for reads,
+ * and where the calling thread's stack is. It does not wrap uv_*
+ * operations. */
 #ifndef CHEZ_LIBUV_SHIM_H
 #define CHEZ_LIBUV_SHIM_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* A struct tag introduced only in a prototype has prototype scope. */
 struct uv_handle_s;
@@ -41,6 +43,16 @@ void chez_uv_zero(void *dst, size_t len);
  * callback as UV_ENOBUFS. It calls nothing, in libuv or in Scheme. */
 void chez_uv_alloc_cb(struct uv_handle_s *handle, size_t suggested_size,
                       struct uv_buf_t *buf);
+
+/* The calling thread's C stack (ADR-0002 as amended for issue #94): where
+ * this call's frame is, and the stack's lowest address, 0 where the system
+ * gives no way to read it. Every uv_run the binding makes first measures
+ * the distance between the two, and is refused below a floor, because each
+ * continuation that escapes a callback leaves its uv_run's frames on the
+ * stack for the thread's life. Scheme keeps each thread's bottom, so the
+ * shim keeps no state. Neither calls anything in libuv or in Scheme. */
+uintptr_t chez_uv_stack_pointer(void);
+uintptr_t chez_uv_stack_bottom(void);
 
 /* The binding's own foreign blocks: handles, requests, read buffers and
  * scratch. chez_uv_alloc answers n zeroed bytes, or NULL when the allocator

@@ -1,8 +1,9 @@
 # Refusing a run before the C stack runs out (#94): design note
 
 - **Status:** Accepted, 2026-10-09: option D, with every recommendation
-  under "Decisions" below. Nothing in `src/` has changed yet. The check
-  comes in its own pull request. The docs correction ships with this note.
+  under "Decisions" below. Implemented the same day
+  (`.plans/stack-headroom-mutation-log.md`), as proposed except where
+  "As built" says otherwise.
 - **Scope:** the part of #94 still open after #115: "whether the binding can
   do more than document it". The upstream question (can Chez reclaim the
   frames?) is drafted separately and not filed.
@@ -227,6 +228,48 @@ The user took every recommendation:
    the call, and the way to recover (end the thread) is unlike any other
    refusal's.
 4. **The docs correction ships now**, with this note, ahead of the check.
+
+## As built (2026-10-09)
+
+- The shim export, the floors and `&uv-stack-exhausted` are as proposed.
+  The floors live in `(libuv private handles)` as `run-stack-floor` and
+  `teardown-stack-floor`. The check is `claim-loop-for-run!`, which reads
+  the headroom first in the claim's step, ahead of every other refusal,
+  and `run-step!` is its only caller. Rule 11 of
+  `tests/test-source-rules.sps` holds that, and that `run-step!` is the
+  only caller of the foreign call to `uv_run`.
+- The shim exports the stack pointer and the stack's bottom, and keeps
+  nothing. `native.sls`'s `stack-headroom` keeps each thread's bottom in a
+  thread parameter, keyed by thread id. The first version kept it in a
+  `__thread` variable in the shim, as item 1 proposed. glibc mallocs that
+  on each thread's first use, and CI's x86-64 Valgrind hid the block with
+  its default suppressions, which `check-memory-gate` counts.
+- Where the stack's bottom cannot be read, the headroom is 2^40, so
+  nothing is refused.
+- As built, the check costs about 7 ns a run on both systems, against the
+  prototype's 4 ns: the thread parameter, the thread id and the shim call.
+  A checked empty `'nowait` run took 112 ns on macOS and 180 ns on Linux
+  arm64.
+- The tests run in a child, `tests/stack-headroom-child.sps`, on a
+  `fork-thread`. Its `floors` mode reaches a depth by nesting libc `qsort`
+  comparator callbacks, which all return, so the floors are tested without
+  any escape. Its `escapes` mode escapes async callbacks until refused.
+  Measured there, under the check:
+
+  | | macOS arm64 | Linux arm64 | Linux x86-64 |
+  |---|---|---|---|
+  | one timer escape | 352 B | 384 B | 480 B |
+  | one async escape | 34,352 B | 22,272 B | 17,264 B |
+  | I/O escapes held by a `fork-thread` thread | 12 | 370 | 479 |
+  | headroom at the refusal | 123,792 B | 119,296 B | 114,048 B |
+  | loops left open | 0 | 0 | 0 |
+
+  x86-64 is Ubuntu 26.04 emulated on arm64, with apt's Chez 10.0.0:
+  emulation changes no frame size.
+
+  Timer escapes held by a macOS `fork-thread` thread: 1,152.
+- Valgrind's main thread reads 8,386,832 B of headroom, so the memory
+  gate's runs are not refused.
 
 ## Reproducing
 

@@ -32,6 +32,7 @@
 
           ;; runtime sizes and loop entry points
           uv-loop-size uv-handle-size uv-req-size
+          stack-headroom
 
           uv-loop-init uv-loop-run uv-loop-stop
           uv-loop-alive uv-loop-now uv-loop-update-time uv-loop-close
@@ -108,7 +109,7 @@
                 foreign-callable foreign-callable-entry-point lock-object
                 define-ftype ftype-sizeof ftype-set! ftype-ref ftype-&ref
                 make-ftype-pointer ftype-pointer-address
-                file-regular? make-mutex with-mutex getenv
+                file-regular? make-mutex with-mutex getenv make-thread-parameter
                 get-thread-id)
           (libuv private config)
           (libuv private conditions)
@@ -208,6 +209,38 @@
   ;; the stream's own read buffer, is fixed per handle and needs no Scheme.
   ;; uv-read-start-native hands libuv this address.
   (define alloc-cb-entry (shim-entry "chez_uv_alloc_cb"))
+
+  ;; stack-headroom : -> exact-integer
+  ;; How many bytes of C stack this thread has left below the call (#94;
+  ;; ADR-0002 as amended for it): run-step! refuses a uv_run below a floor.
+  ;; Plain calls, and nothing here raises, so a step can make it. Where the
+  ;; stack's bottom cannot be read, the answer is headroom-unknown, more
+  ;; than any floor, so nothing is refused.
+  (define raw-stack-pointer (shim-procedure "chez_uv_stack_pointer" () uptr))
+  (define raw-stack-bottom (shim-procedure "chez_uv_stack_bottom" () uptr))
+
+  (define headroom-unknown (expt 2 40))
+
+  ;; This thread's stack bottom, as (thread-id . bottom), or #f until the
+  ;; thread first asks. Reading it costs 22 us on Linux's main thread, so it
+  ;; is read once per thread. A thread parameter: a new thread starts with
+  ;; its creator's cell, whose id is not its own, and reads its own bottom.
+  ;; Kept in the shim as a C thread-local instead, it was a block glibc
+  ;; mallocs on each thread's first use, which the memory gate counted.
+  (define stack-bottom-cell (make-thread-parameter #f))
+
+  (define (stack-headroom)
+    (let* ((me (current-thread-id))
+           (cell (stack-bottom-cell))
+           (bottom (if (and cell (eqv? (car cell) me))
+                       (cdr cell)
+                       (let ((read (raw-stack-bottom)))
+                         (stack-bottom-cell (cons me read))
+                         read)))
+           (here (raw-stack-pointer)))
+      (if (and (positive? bottom) (> here bottom))
+          (- here bottom)
+          headroom-unknown)))
 
   ;; The binding's blocks come from the shim: zeroed, 0 when the allocator
   ;; refuses, and counted alive by the debug shim (live-counts' 'block).

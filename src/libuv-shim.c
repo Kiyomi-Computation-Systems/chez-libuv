@@ -1,11 +1,19 @@
+/* pthread_getattr_np, for chez_uv_stack_bottom, is a GNU extension. It
+ * must be asked for before the first system header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "libuv-shim.h"
 
 #include <uv.h>
 
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -418,4 +426,42 @@ void chez_uv_free(void *p) {
   }
 #endif
   free(p);
+}
+
+#if !defined(__GNUC__) && !defined(__clang__)
+#error "chez_uv_stack_pointer needs __builtin_frame_address"
+#endif
+
+/* The address of this call's own frame: within a few hundred bytes of the
+ * Scheme caller's C stack pointer. */
+uintptr_t chez_uv_stack_pointer(void) {
+  return (uintptr_t)__builtin_frame_address(0);
+}
+
+/* The lowest address of the calling thread's stack, or 0 where the system
+ * gives no way to read it. On Linux the main thread's costs about 22 us,
+ * since glibc reads /proc/self/maps for it, so Scheme keeps it per thread
+ * (native.sls's stack-headroom). The shim keeps nothing itself: a
+ * thread-local here is a block glibc mallocs on each thread's first use,
+ * which the memory gate counted (rule 6 of tests/test-source-rules.sps). */
+uintptr_t chez_uv_stack_bottom(void) {
+#if defined(__APPLE__)
+  pthread_t self = pthread_self();
+  return (uintptr_t)pthread_get_stackaddr_np(self) -
+         (uintptr_t)pthread_get_stacksize_np(self);
+#elif defined(__linux__)
+  pthread_attr_t attr;
+  void *addr = NULL;
+  size_t size = 0;
+  uintptr_t low = 0;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    if (pthread_attr_getstack(&attr, &addr, &size) == 0) {
+      low = (uintptr_t)addr;
+    }
+    pthread_attr_destroy(&attr);
+  }
+  return low;
+#else
+  return 0;
+#endif
 }
