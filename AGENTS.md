@@ -398,6 +398,35 @@ None is obvious from reading the code.
   binary's real name (tests/test-signal.sps passes the resolved path as both
   `file` and argv[0]); the A/B proof is in the v0.4 SDD ledger's diagnostic
   narrative.
+* **Chez's collector reaps the children `open-process-ports` starts, and
+  drops their status.** `s_process` records each child's pid. Each
+  collection then calls `waitpid(pid, WNOHANG)` on the recorded children
+  in the generations it collects, and keeps no status (`c/gc.c`, the
+  `child_process` list). A collection between a child's end and the
+  suite's own `waitpid` leaves that wait `ECHILD`. That happened once on
+  CI: test-level-3's 1 MiB stderr row allocated while it drained, and its
+  status came back `(wait-failed)` (#128).
+  - The list moves up the generations with the child. A plain `(collect)`
+    can miss a child that a collection promoted while it still ran:
+    test-level-3's precondition, which shows the collector doing it,
+    missed one time in three until it collected every generation.
+  - `child-run` (`tests/uv-child.sls`) defers collections from the spawn
+    to the last wait, through `collect-request-handler`, and puts the
+    handler back when the last run on any thread ends. An explicit
+    `collect` on any thread meanwhile can still take the status, and an
+    engine dropped inside a run leaves collections off.
+  - A row that counts zombies has the same hole: a collection clears
+    them first. test-level-3 turns collections off for the whole suite.
+  - test-level-3's outlived row, a child that ends while its pipes stay
+    open for a second, with collections forced every 256 B, fails 10 runs
+    in 10 without the deferral (`.plans/child-reap-mutation-log.md`).
+  
+  Only `open-process-ports` and `process` put a pid on that list, not
+  libuv's `uv-spawn!`. A pid stays on it after its own waiter has reaped
+  it, until a collection of its generation. A child that reuses the pid
+  in that window, `uv-spawn!`'s included, can lose its status to the
+  collector too. That takes the pid numbers wrapping around, and nothing
+  holds it.
 
 ### The build (make)
 

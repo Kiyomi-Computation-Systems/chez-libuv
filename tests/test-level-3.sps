@@ -14,7 +14,9 @@
         (uv-child)
         (only (chezscheme) getenv current-time time-difference time-second
               cpu-time open-process-ports sleep make-time foreign-procedure
-              load-shared-object machine-type))
+              load-shared-object machine-type collect collect-trip-bytes
+              collect-maximum-generation collect-request-handler void
+              foreign-ref with-interrupts-disabled fork-thread parameterize))
 
 ;; SRFI-64 sets no exit status; the runner's fail count drives it
 ;; (AGENTS.md).
@@ -84,6 +86,12 @@
     (load-shared-object "libc.so.6")))
 (define waitpid (foreign-procedure "waitpid" (int u8* int) int))
 
+;; errno-location : -> uptr, the address of this thread's errno: glibc's
+;; __errno_location, else macOS's __error.
+(define errno-location
+  (guard (e (#t (foreign-procedure "__error" () uptr)))
+    (foreign-procedure "__errno_location" () uptr)))
+
 ;; wait-any : -> integer
 ;; Reaps one finished child of this process without waiting: its pid, 0
 ;; while every child is still running, or -1 when there is none.
@@ -129,6 +137,14 @@
       thunk
       (lambda () (signal-action sigchld before)))))
 
+;; collecting : (-> object) -> object
+;; THUNK's value, called with collections on and one requested every 256
+;; bytes allocated: what the runner has to defer for its own runs.
+(define (collecting thunk)
+  (parameterize ((collect-request-handler (lambda () (collect)))
+                 (collect-trip-bytes 256))
+    (thunk)))
+
 ;; spawn-true : -> pid
 ;; Runs `true` and reads its stdout to the end, leaving it unreaped.
 (define (spawn-true)
@@ -139,6 +155,14 @@
     (close-port from-child)
     (close-port errors)
     pid))
+
+;; No collection runs in this suite unless a row asks for one. Chez's
+;; collector reaps the ended children of open-process-ports and keeps no
+;; status (#128), so a collection could reap the zombie probe's child
+;; before the probe does, and clear a zombie a broken runner left before
+;; the last row looks. The rows that need collections make them through
+;; collecting or collect, and run before every other run.
+(collect-request-handler void)
 
 ;; Before any level-3 run, so the only child is the probe's own. Without
 ;; it, the last row's -1 could come from a probe that sees no zombies.
@@ -151,6 +175,74 @@
     (test-equal "level-3 runner rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
       'skipped 'skipped)
     (begin
+      ;; #128: Chez records every child open-process-ports starts, and each
+      ;; collection reaps the ones that have ended and keeps no status
+      ;; (c/gc.c, the child_process list). One between a child's end and
+      ;; the runner's wait took the status, and test-level-3's flood row
+      ;; failed once on CI with (wait-failed). The precondition shows the
+      ;; collector does it: the runner's own wait is not what it measures.
+      ;; It collects every generation: the list of children moves up the
+      ;; generations with them, and a collection while the child still ran
+      ;; left it where a bare (collect) did not look, 1 run in 3. The wait
+      ;; must refuse with ECHILD, the child gone, and not for any reason.
+      (test-equal "precondition: a collection reaps an ended child of open-process-ports itself"
+        'reaped-by-the-collector
+        (let ((pid (spawn-true)))
+          (sleep (make-time 'time-duration 200000000 0))
+          (collect (collect-maximum-generation))
+          (let-values (((r errno)
+                        (with-interrupts-disabled
+                         (let ((r (waitpid pid (make-bytevector 4 0) 1)))
+                           (values r (foreign-ref 'int (errno-location) 0))))))
+            (if (and (= r -1) (= errno 10))
+                'reaped-by-the-collector
+                (list 'waitpid-answered r 'errno errno 'for pid)))))
+
+      ;; The outlived child ends at once and leaves its pipes open for a
+      ;; second, so the runner polls with it ended; a collection requested
+      ;; every 256 bytes then comes at almost every poll.
+      (test-equal "a child that ends while the runner still polls answers its datum: no collection takes its status"
+        '((outlived . #t))
+        (collecting (lambda () (child-run chez '() stand-in '(outlived) 20))))
+
+            ;; The deferral is the runner's alone: the suite's own handler, a
+      ;; procedure no default could be eq? to, is back once it returns.
+      (test-equal "child-run puts back the collect-request-handler it found"
+        'put-back
+        (let ((mine (lambda () (collect))))
+          (parameterize ((collect-request-handler mine))
+            (child-run chez '() stand-in '(level) 20)
+            (if (eq? (collect-request-handler) mine)
+                'put-back
+                (list 'left (collect-request-handler))))))
+
+      ;; Two runs on two threads, the first to begin the first to end: the
+      ;; second begins 300 ms into the first and outlives it by as much. A
+      ;; runner that put back what each run found as it ended would turn
+      ;; collections on under the second, and leave them off after both.
+      ;; The wait for the first is bounded, so a hung thread fails the row.
+      (test-equal "two runs overlapping on two threads each keep their status, and the handler found is back after both"
+        '(((outlived . #t)) ((outlived . #t)) put-back)
+        (let ((mine (lambda () (collect)))
+              (first-report #f))
+          (parameterize ((collect-request-handler mine)
+                         (collect-trip-bytes 256))
+            (fork-thread
+             (lambda ()
+               (set! first-report
+                     (list (child-run chez '() stand-in '(outlived) 20)))))
+            (sleep (make-time 'time-duration 300000000 0))
+            (let ((second (child-run chez '() stand-in '(outlived) 20)))
+              (let poll ((tries 1000))
+                (when (and (not first-report) (> tries 0))
+                  (sleep (make-time 'time-duration 10000000 0))
+                  (poll (- tries 1))))
+              (list (if first-report (car first-report) 'first-run-never-ended)
+                    second
+                    (if (eq? (collect-request-handler) mine)
+                        'put-back
+                        (list 'left (collect-request-handler))))))))
+
       ;; child-run hands its options to Chez ahead of --program (#117). Two
       ;; levels other than 3, so a runner that drops its options and one
       ;; that runs level 3 whatever it is given each fail a row.
@@ -244,13 +336,15 @@
            (let* ((pid (spawn-true)) (r (wait-within pid)))
              (if (= r -1) 'reaped-by-the-system (list 'waitpid-answered r 'for pid))))))
 
-      (test-equal "a child the system reaps first answers wait-failed, not killed-at-cap"
-        '(unreadable "" "" (wait-failed))
+      (test-equal "a child the system reaps first answers wait-failed with ECHILD, not killed-at-cap"
+        '(unreadable "" "" (wait-failed ECHILD))
         (with-sigchld-ignored
          (lambda () (level-3-run chez stand-in '(quiet-exit) 20))))))
 
 ;; Last, after every run: a child the runner never waited on stays a zombie
-;; until this process exits (#110).
+;; until this process exits (#110). Collections are off from the
+;; collecting rows on, so no collection reaps one first: the row holds
+;; every run after them.
 (test-equal "no child is left unreaped: every run's child was waited on"
   'none-left
   (let collect ((zombies '()))

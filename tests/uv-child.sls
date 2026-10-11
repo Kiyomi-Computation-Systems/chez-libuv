@@ -20,7 +20,10 @@
           (uv-describe)
           (only (chezscheme) open-process-ports
                 input-port-ready? sleep make-time system current-time
-                add-duration time>=? foreign-procedure load-shared-object))
+                add-duration time>=? foreign-procedure load-shared-object
+                foreign-ref collect-request-handler void
+                with-interrupts-disabled make-mutex mutex-acquire
+                mutex-release))
 
   ;; waitpid, or #f where libc did not load. open-process-ports gives the
   ;; child's pid and nothing that waits on it, so the runner waits through
@@ -35,6 +38,24 @@
 
   ;; WNOHANG, 1 on Linux and on macOS.
   (define wnohang 1)
+
+  ;; errno-location : (or (-> uptr) #f)
+  ;; The address of the calling thread's errno: glibc's __errno_location,
+  ;; macOS's __error, or #f where neither resolves. A wait that fails says
+  ;; why with it (#128).
+  (define errno-location
+    (and waitpid
+         (guard (e (#t #f))
+           (let try ((names '("__errno_location" "__error")))
+             (guard (e ((pair? (cdr names)) (try (cdr names))))
+               (foreign-procedure (car names) () uptr))))))
+
+  ;; errno-name : integer -> object
+  ;; ECHILD, 10 on Linux and on macOS, by its name: the refusal a WNOHANG
+  ;; wait for a pid it has already given up answers. Any other errno stays
+  ;; a number.
+  (define (errno-name n)
+    (if (= n 10) 'ECHILD n))
 
   ;; How long a child may run, by the monotonic clock. A healthy child takes
   ;; under a second; a poll count of 10 ms sleeps, as #69's runner kept, came
@@ -55,11 +76,23 @@
   ;;   (run-failed text status) for a raise while it ran, after which the
   ;;     child is killed too.
   ;; A status is (exit code), (signal number), (not-reaped) for a child
-  ;; that had not ended a second after its kill, (wait-failed) for a
-  ;; waitpid that refused, as it does for a child the system reaped itself
-  ;; (SIGCHLD ignored), or (wait-unavailable) where libc did not load. Only
-  ;; (exit 0) lets a datum through. Every
-  ;; child that ends is waited on, so none is left a zombie (#110). The
+  ;; that had not ended a second after its kill, (wait-failed errno) for a
+  ;; waitpid that refused, with errno's name (ECHILD, as for a child the
+  ;; system reaped itself with SIGCHLD ignored) or number, or #f where it
+  ;; could not be read, (wait-raised text) for a raise while waiting, or
+  ;; (wait-unavailable) where libc did not load. Only (exit 0) lets a
+  ;; datum through. Every child that ends is waited on, so none is left a
+  ;; zombie (#110).
+  ;;
+  ;; No collection runs while a child does. Chez records each child
+  ;; open-process-ports starts, and every collection reaps those that have
+  ;; ended, keeping no status (c/gc.c); one between the child's end and the
+  ;; runner's wait left the wait ECHILD (#128). Collections are deferred
+  ;; through collect-request-handler, for every thread, from the spawn to
+  ;; the last wait, and the handler put back once no run is left. An
+  ;; explicit collect meanwhile, on any thread, can still take the status,
+  ;; and an engine dropped inside a run leaves collections off for good:
+  ;; child-run is not for engines. The
   ;; deadline is child-deadline-seconds unless given. The command execs
   ;; Chez, so the pid is Chez's own: the kill reaches the child, and the
   ;; status is its own.
@@ -73,27 +106,61 @@
       ((chez options program names)
        (child-run chez options program names child-deadline-seconds))
       ((chez options program names deadline-seconds)
-       (let ((spawned
-              (guard (e (#t (list 'spawn-failed (describe e))))
-                (let-values (((to-child from-child errors pid)
-                              (open-process-ports
-                               (apply string-append
-                                      "exec " chez
-                                      (append
-                                       (map (lambda (option) (string-append " " option))
-                                            options)
-                                       (list " --program " program)
-                                       (map (lambda (name)
-                                              (string-append " " (symbol->string name)))
-                                            names)))
-                               (buffer-mode block) #f)))
-                  (close-port to-child)
-                  (list from-child errors pid)))))
-         (if (eq? (car spawned) 'spawn-failed)
-             spawned
-             (apply (lambda (from-child errors pid)
-                      (watch from-child errors pid deadline-seconds))
-                    spawned))))))
+       (without-collections
+        (lambda ()
+         (let ((spawned
+                (guard (e (#t (list 'spawn-failed (describe e))))
+                  (let-values (((to-child from-child errors pid)
+                                (open-process-ports
+                                 (apply string-append
+                                        "exec " chez
+                                        (append
+                                         (map (lambda (option) (string-append " " option))
+                                              options)
+                                         (list " --program " program)
+                                         (map (lambda (name)
+                                                (string-append " " (symbol->string name)))
+                                              names)))
+                                 (buffer-mode block) #f)))
+                    (close-port to-child)
+                    (list from-child errors pid)))))
+           (if (eq? (car spawned) 'spawn-failed)
+               spawned
+               (apply (lambda (from-child errors pid)
+                        (watch from-child errors pid deadline-seconds))
+                      spawned))))))))
+
+  ;; The runs under way on every thread, and the collect-request-handler
+  ;; the first of them found. Runs on two threads need not end in the order
+  ;; they began, so the handler goes back when the last run ends, not when
+  ;; each does. deferral-lock is taken and released with interrupts
+  ;; disabled, so no engine or collection stops a thread holding it.
+  (define deferral-lock (make-mutex))
+  (define runs-deferring 0)
+  (define handler-found #f)
+
+  ;; without-collections : (-> object) -> object
+  ;; THUNK's value, called with every collection request dropped until no
+  ;; run is left.
+  (define (without-collections thunk)
+    (dynamic-wind
+      (lambda ()
+        (with-interrupts-disabled
+         (mutex-acquire deferral-lock)
+         (when (= runs-deferring 0)
+           (set! handler-found (collect-request-handler))
+           (collect-request-handler void))
+         (set! runs-deferring (+ runs-deferring 1))
+         (mutex-release deferral-lock)))
+      thunk
+      (lambda ()
+        (with-interrupts-disabled
+         (mutex-acquire deferral-lock)
+         (set! runs-deferring (- runs-deferring 1))
+         (when (= runs-deferring 0)
+           (collect-request-handler handler-found)
+           (set! handler-found #f))
+         (mutex-release deferral-lock)))))
 
   ;; How long the pipes are drained after the kill, for what the child wrote
   ;; since the last pass and what the pipes still hold, and then how long
@@ -160,15 +227,26 @@
   ;; PID's status if it has ended, reaping it, or #f if it is still
   ;; running. Raises nothing: it also runs from watch's handler.
   (define (try-reap pid)
-    (guard (e (#t '(wait-failed)))
+    (guard (e (#t (list 'wait-raised (describe e))))
       (if (not waitpid)
           '(wait-unavailable)
-          (let* ((cell (make-bytevector 4 0))
-                 (r (waitpid pid cell wnohang)))
-            (cond
-              ((= r pid) (decode-status (bytevector-s32-native-ref cell 0)))
-              ((= r 0) #f)
-              (else '(wait-failed)))))))
+          (let ((cell (make-bytevector 4 0)))
+            (let-values (((r errno) (wait-once pid cell)))
+              (cond
+                ((= r pid) (decode-status (bytevector-s32-native-ref cell 0)))
+                ((= r 0) #f)
+                (else (list 'wait-failed (and errno (errno-name errno))))))))))
+
+  ;; wait-once : pid bytevector -> (values integer (or integer #f))
+  ;; waitpid's answer for PID with WNOHANG, its status in CELL, and errno
+  ;; read straight after it, or #f where errno cannot be read. Interrupts
+  ;; are disabled between the two, so no timer, engine or keyboard handler
+  ;; runs there and makes a call that sets errno.
+  (define (wait-once pid cell)
+    (with-interrupts-disabled
+     (let* ((r (waitpid pid cell wnohang))
+            (errno (and errno-location (foreign-ref 'int (errno-location) 0))))
+       (values r errno))))
 
   ;; decode-status : integer -> status
   ;; A wait status as (exit code) or (signal number), by the encoding Linux
