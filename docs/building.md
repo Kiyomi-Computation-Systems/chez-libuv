@@ -109,7 +109,7 @@ The Makefile's `relink-guard` deletes the shim whenever the requested
 flavor (or acquisition path) stops matching what the artifact was linked
 as, so `make test` after `make prod` self-heals back to a dev shim rather
 than running the counter suites against an `-O2` artifact. The full
-archaeology — including why the guard *deletes* instead of trusting stamp
+reasoning — including why the guard *deletes* instead of trusting stamp
 mtimes (Apple make 3.81 compares at one-second granularity) — is in the
 Makefile's own comments, which are kept deliberately thorough.
 
@@ -147,8 +147,7 @@ make test-memory
 runs the suites again under Valgrind on Linux, or an AddressSanitizer
 preload on macOS. **Only the Linux run can support a leak claim** —
 LeakSanitizer does not exist on macOS/ARM64, so the macOS leg says nothing
-at all about leaks
-([ADR-0003](../.plans/decisions/0003-linux-valgrind-is-the-sole-memory-gate.md)).
+at all about leaks.
 It sees less than you might expect about everything else, too. Chez's
 generated code is not instrumented, so ASan checks only what passes
 through libc and the allocator: an overrun inside `memcpy` or `memset`
@@ -179,16 +178,15 @@ pass on that block, but it must never fail on it without printing the
 block's loss record. CI and `make test-memory-docker` run it before the
 memory gate. Run it yourself after touching either `test-memory` recipe,
 and on macOS after touching the shim's copies: only the macOS arm can lose
-sight of them, which happens if they stop going through libc. Both arms
-once passed while checking nothing: Valgrind was handed `timeout(1)`
-instead of Chez, and the ASan preload was lost on its way through `sh -c`.
+sight of them, which happens if they stop going through libc. Either arm
+can pass while checking nothing: Valgrind handed `timeout(1)` checks
+`timeout`, not Chez, and an ASan preload passed through `sh -c` is lost on
+the way.
 
 If you develop on macOS, that leaves a real hole: the leak gate you most
-need is the one leg you cannot run. v0.5 measured what it costs — four
-independent ways to leak foreign memory in the OS-buffer wrappers, and
-every one of them left the suite fully green. On macOS there is no local
-signal for that entire class of defect, and CI is the first thing to see
-it.
+need is the one leg you cannot run. A leak passes every macOS run unless
+a suite's own assertions happen to catch it, so on macOS there is no local
+signal for that class of defect, and CI is the first thing to see it.
 
 ```sh
 make test-memory-docker
@@ -229,14 +227,13 @@ child that exits under Valgrind without reaching `exec`, and
 spawn failures. Each such child reports that row's spawn-options block as
 lost: the parent holds the block while `uv_spawn` forks and frees it as
 soon as `uv_spawn` returns, but the child exits inside `uv_spawn`. On
-arm64 the block shows up as definitely lost; in v0.5, CI's x86_64 runner
-showed it at zero. None of these is a leak in this binding. Plant a block
+arm64 the block shows up as definitely lost; CI's x86_64 runner has shown
+it at zero. None of these is a leak in this binding. Plant a block
 that the parent holds for the whole suite, and every such child reports it
 as well, while the parent stays at zero. None of them gates, either.
 libuv discards the exit status of a child whose `exec` failed, and the
 suite's own process is the one whose status the loop checks. **Read the
-exit status, not the scrollback**; the evidence is in
-`.plans/memory-gate-mutation-log.md`.
+exit status, not the scrollback.**
 
 Both `make test` and `make test-memory` cap each suite individually. A
 suite that hangs — rather than failing an assertion — is reported as
@@ -246,9 +243,7 @@ HUNG: tests/test-tcp.sps exceeded 300s and was killed (not a failing assertion)
 ```
 
 and, under `make test`, **the run continues to the remaining suites**.
-`make test-memory` stops at its first failing suite, hung or not. Before
-this, a single hang took the whole run with it and produced no failing-row
-output at all, so a hang and a failure were indistinguishable in the log.
+`make test-memory` stops at its first failing suite, hung or not.
 Under `make test-memory` the cap wraps Valgrind itself, so a hung suite is
 killed together with the Valgrind process running it. Override with
 `SUITE_TIMEOUT=` (default 300s) or `MEMORY_SUITE_TIMEOUT=` (default 900s,
@@ -257,8 +252,8 @@ because Valgrind is far slower).
 The cap needs GNU coreutils' `timeout(1)`, which **stock macOS does not
 ship**; Homebrew installs it as `timeout`, or as `gtimeout` when coreutils
 is installed with prefixed names. Without either, the target prints a note
-and runs exactly as before — you get the same suite results, just no HUNG
-diagnosis.
+and runs the suites uncapped — you get the same suite results, just no
+HUNG diagnosis.
 
 ```sh
 make check-nothreads-docker
@@ -289,10 +284,10 @@ runs the root-gated setuid/setgid suite alone (see
 `make build deps` unprivileged first — the target deliberately refuses to
 build anything as root.
 
-Every assertion in those suites has been watched to fail. Each stage's
-mutation log (`.plans/*-mutation-log.md`) records the mutation that breaks
-each decision, the assertion that caught it *by name*, and — where nothing
-could catch one — why, rather than leaving the gap silent.
+Every assertion in those suites has been watched to fail: a mutation that
+breaks the decision it guards makes it fail *by name*, and where nothing
+could catch a mutation, the gap is recorded rather than left silent.
+[CONTRIBUTING.md](../CONTRIBUTING.md) describes the discipline.
 
 ## On a Guix host
 
@@ -343,8 +338,7 @@ make check-guix
 tests the launcher on the host, then checks the container from inside:
 the pinned tools, Chez and libuv at their floors, the isolation, the
 loopback-only network, and finally `make test`.
-[ADR-0020](../.plans/decisions/0020-pinned-guix-container.md) records the
-choices. `sudo make test-root` and the Docker targets cannot run in the
+`sudo make test-root` and the Docker targets cannot run in the
 container. Neither needs to on this host:
 `scripts/guix-env make HAVE_PKG=no test-memory` there is CI's Valgrind
 leg itself.

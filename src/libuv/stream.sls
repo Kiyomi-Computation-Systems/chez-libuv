@@ -9,8 +9,8 @@
 ;;; libuv holds what it was given (test-stream.sps's engine sweeps). Nothing
 ;;; in a step raises: it answers a status, and the verb raises after the
 ;;; step (step-refusal). When libuv refuses a start, the step takes its
-;;; request back itself; a guard around the native call allocated ~300 B on
-;;; every write (#45).
+;;; request back itself rather than through a guard around the native call,
+;;; which would allocate ~300 B on every write.
 (library (libuv stream)
   (export uv-write! uv-write*! uv-shutdown! uv-read-start! uv-read-stop!
           uv-stream-write-queue-size)
@@ -21,6 +21,7 @@
           (only (libuv private lists) read-proper-list let-fixed-list)
           (libuv private handles))
 
+  ;; require-open-stream : object symbol -> uv-stream
   ;; Passing a non-stream handle to libuv stream functions is undefined.
   (define (require-open-stream stream who)
     (unless (uv-stream-record? stream)
@@ -56,7 +57,7 @@
   ;; The [start, end) payload is copied into request-owned foreign memory.
   ;; The span is checked again in the step: the bytevector can be truncated
   ;; while the verb is suspended, and the step allocates nothing for a span
-  ;; that no longer fits.
+  ;; that runs past the bytevector's end.
   (define uv-write!
     (case-lambda
       ((stream bv on-complete)
@@ -105,7 +106,7 @@
   ;; pairs: (bv . len) for a span from 0, else (bv start . len). Every spec
   ;; stays live while the walk reads the rest of the list, so a spec is one
   ;; pair where it can be: as a list of three, a million segments cost a
-  ;; write a dozen collections (#64's review).
+  ;; write a dozen collections.
   (define (make-spec bv start len)
     (if (zero? start) (cons bv len) (cons bv (cons start len))))
   (define (spec-bv spec) (car spec))
@@ -117,8 +118,9 @@
   ;; is range-checked exactly as uv-write! checks its own. Anything else is a
   ;; malformed segment, named before the caller's list is copied anywhere.
   ;; A span is read once with let-fixed-list, each pair checked as it is
-  ;; read: asking list? and length first left a gap an engine's handler could
-  ;; change the span in, and length then raised a condition of its own (#64).
+  ;; read: asking list? and length first would leave a gap in which an
+  ;; engine's handler could change the span, and length would then raise a
+  ;; condition of its own.
   (define (parse-write-segment seg)
     (if (bytevector? seg)
         (make-spec seg 0 (bytevector-length seg))
@@ -145,9 +147,10 @@
 
   ;; place-spans! : (listof spec) uptr uptr -> unspecified
   ;; Inside the write's step: copies each span in and fills its uv_buf_t in
-  ;; the array at BUFS. Packs non-empty spans consecutively from the payload region's start, and
-  ;; points every empty span's base at that same start (always valid, the
-  ;; region is >= 1 byte) so no base lands one-past-the-end of the block.
+  ;; the array at BUFS. Packs non-empty spans consecutively from the payload
+  ;; region's start, and points every empty span's base at that same start
+  ;; (always valid, the region is >= 1 byte) so no base lands
+  ;; one-past-the-end of the block.
   (define (place-spans! specs bufs payload-base)
     (let place ((specs specs) (buf bufs) (running 0))
       (when (pair? specs)
@@ -160,13 +163,13 @@
 
   ;; uv-write*! : uv-stream (listof segment) procedure -> uv-request
   ;;   segment = bytevector | (bytevector start end)
-  ;; The scatter-gather write ADR-0009 reserved this name for. Each segment's
-  ;; [start, end) span is copied into request-owned foreign memory; one block
-  ;; holds the N copied spans and an N-entry uv_buf_t[], and uv_write is issued
-  ;; with nbufs = N. Completion and the free-before-on-complete discipline are
-  ;; uv-write!'s, unchanged: the block is freed as a unit by the shared
-  ;; write-done dispatcher. libuv rejects nbufs < 1, so an empty segment list
-  ;; is refused here rather than forwarded as a platform EINVAL.
+  ;; The scatter-gather counterpart of uv-write!. Each segment's [start, end)
+  ;; span is copied into request-owned foreign memory; one block holds the N
+  ;; copied spans and an N-entry uv_buf_t[], and uv_write is issued with
+  ;; nbufs = N. Completion and the free-before-on-complete discipline are
+  ;; uv-write!'s: the block is freed as a unit by the shared write-done
+  ;; dispatcher. libuv rejects nbufs < 1, so an empty segment list is
+  ;; refused here rather than forwarded as a platform EINVAL.
   (define (uv-write*! stream segments on-complete)
     (require-open-stream stream 'uv-write*!)
     (require-callback on-complete 'uv-write*! 'on-complete-not-a-procedure)
@@ -176,9 +179,10 @@
     ;; read-proper-list reads the list once, each pair checked: a list an
     ;; engine's handler or another thread changes during the read is refused,
     ;; or written as it was or as the change left it, and never read through
-    ;; a non-pair or walked forever. Chez's map, which this replaced, read
-    ;; through a non-pair put in its way (#64), and the walk that followed it
-    ;; refused a list changed into another proper list (#81).
+    ;; a non-pair or walked forever. Chez's map would read through a
+    ;; non-pair put in its way. A single count and walk, with no second
+    ;; count when the walk contradicts the first, would refuse a list
+    ;; changed in between into another proper list.
     (let* ((specs (or (read-proper-list segments parse-write-segment)
                       (refuse-segments 'segments-not-a-list)))
            (n (if (null? specs)
@@ -251,6 +255,8 @@
       ((stream on-data on-eof on-error buffer-size)
        (start-reading! stream on-data on-eof on-error buffer-size))))
 
+  ;; start-reading! : uv-stream procedure procedure procedure
+  ;;                  (or exact-positive-integer #f) -> unspecified
   ;; The callbacks are stored only once libuv accepts the start, and in the
   ;; same step, so no read can be delivered between the two.
   (define (start-reading! stream on-data on-eof on-error buffer-size)

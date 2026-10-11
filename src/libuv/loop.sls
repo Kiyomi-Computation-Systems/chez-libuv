@@ -18,6 +18,10 @@
     (let ((made (try-construct-loop uv-loop-init values)))
       (if (uv-loop? made) made (raise (step-refusal made 'make-uv-loop #f)))))
 
+  ;; uv-loop? : object -> boolean
+  ;; The loop record's predicate, defined with the record in (libuv private
+  ;; handles) and exported from here.
+
   ;; uv-loop-open? : uv-loop -> boolean
   (define (uv-loop-open? loop)
     (require-loop loop 'uv-loop-open?)
@@ -63,7 +67,7 @@
   ;; between the claim's step and the release's, around the native call: an
   ;; engine dropped anywhere else leaves the loop unclaimed. Every uv_run
   ;; the binding makes starts here, so this is where the C stack's headroom
-  ;; is checked against FLOOR (claim-loop-for-run!; #94): uv-run's is
+  ;; is checked against FLOOR (claim-loop-for-run!): uv-run's is
   ;; run-stack-floor and a drain's teardown-stack-floor.
   (define (run-step! loop mode-int floor)
     (let ((ptr (claim-loop-for-run! loop floor)))
@@ -85,7 +89,7 @@
   ;; runs out of fuel in a callback suspends the frame, and a continuation
   ;; that escapes a callback abandons it, both in the middle of an iteration
   ;; only a return into the frame can finish. So the claim is given back
-  ;; when uv_run returns and not on the way out of the call (#45), and every
+  ;; when uv_run returns and not on the way out of the call, and every
   ;; verb that would run, close or tear the loop down meanwhile is refused
   ;; it. No raise needs unwinding here: the seams contain every raise, and
   ;; uv_run returns.
@@ -93,8 +97,8 @@
   ;; The claim also hands the loop to the calling thread: a loop created on
   ;; one thread and run on another (the worker-pool handoff) becomes owned by
   ;; whichever thread runs it. A call on another thread cannot take the
-  ;; claim while this one holds it (#78), so at most one thread runs the loop
-  ;; at a time and the transfer is unambiguous (design §6.2).
+  ;; claim while this one holds it, so at most one thread runs the loop at
+  ;; a time and the transfer is unambiguous.
   ;;
   ;; The first check of the mark only keeps the order of uv-run's refusals,
   ;; 'loop-running before an unknown mode; the claim is what refuses.
@@ -116,12 +120,12 @@
   ;; pointer, taken in the same interrupt-free step from PTR-OF:
   ;; open-loop-ptr, or owned-loop-ptr for a query that also checks this
   ;; thread owns the loop. Once the step is over it raises WHO's refusal
-  ;; for a check that failed. The query's open check was made on entry and
-  ;; its pointer read after it, with interrupts enabled between, so an
-  ;; engine could suspend the query there while a teardown freed the loop:
-  ;; resumed, it called libuv on the freed block, or on a new loop the
-  ;; allocator gave its address (tests/test-handle-steps.sps). NATIVE must
-  ;; answer something refused? does not take for a refusal.
+  ;; for a check that failed. With the open check made on entry and the
+  ;; pointer read after it, interrupts enabled between, an engine could
+  ;; suspend the query there while a teardown freed the loop: resumed, it
+  ;; would call libuv on the freed block, or on a new loop the allocator
+  ;; gave its address (tests/test-handle-steps.sps). NATIVE must answer
+  ;; something refused? does not take for a refusal.
   (define-syntax loop-call
     (syntax-rules ()
       ((_ loop who ptr-of native)
@@ -153,12 +157,12 @@
   ;; uv-update-time! : uv-loop -> unspecified
   ;; Refresh the cached time from libuv's clock. Timers are armed from that
   ;; cache, so a callback that held the loop calls this before arming a
-  ;; deadline, or the deadline starts from before the callback ran (#28).
+  ;; deadline, or the deadline starts from before the callback ran.
   ;; Legal while the loop runs, and it runs nothing. Unlike uv-now it is
   ;; affinity-checked, in the step that writes: it writes the cache the loop
   ;; thread rewrites every iteration, so from another thread it is a
-  ;; write-write race that can move the clock backwards (ADR-0019). A closed
-  ;; loop is refused before the owner is asked, as make-uv-async's order.
+  ;; write-write race that can move the clock backwards. A closed loop is
+  ;; refused before the owner is asked, as make-uv-async's order.
   (define (uv-update-time! loop)
     (require-loop loop 'uv-update-time!)
     (loop-call loop 'uv-update-time! owned-loop-ptr uv-loop-update-time))
@@ -193,10 +197,10 @@
   ;; errno, EBUSY while a handle is open; the claim's refusal; or
   ;; 'pointer-not-registered for a loop missing from the registry, which only
   ;; a defect in the binding makes. Its caller raises.
-  ;; - Claimed, no run on any thread can enter the loop it frees (#78).
-  ;; - One step, so no engine is suspended or dropped inside a close. Holding
-  ;;   the claim across trap checks, a dropped close left the loop claimed
-  ;;   for good, open or closed (#78's review).
+  ;; - Claimed, no run on any thread can enter the loop it frees.
+  ;; - One step, so no engine is suspended or dropped inside a close. Held
+  ;;   across trap checks, the claim would let a dropped close leave the
+  ;;   loop claimed for good, open or closed.
   ;; - Nothing in it raises: a raise would leave interrupts disabled.
   (define (close-step! loop)
     (one-step
@@ -240,16 +244,16 @@
   ;; So no other call is inside the loop while a step calls libuv, and an
   ;; engine dropped between steps leaves the loop unclaimed and its teardown
   ;; retryable. Only a drop inside a drain step's uv_run leaves it claimed,
-  ;; as a run's does (#45). Held across the whole teardown, the claim made a
-  ;; dropped teardown strand its loop at almost every point (#78's review).
+  ;; as a run's does. Held across the whole teardown, the claim would let a
+  ;; dropped teardown strand its loop at almost every point.
   ;; Between steps another call can get in: then a teardown that finds the
   ;; loop closed has nothing left to do, and one that finds it claimed is
   ;; refused 'loop-running, its handles already closing.
   ;; The callback failure retained is the first; libuv's refusal to close,
   ;; and the drain bound, take precedence over it. Nothing here raises: a
-  ;; guard around the teardown, to give a claim back on a raise, cost about
-  ;; 400 B a teardown, and gave the claim back over a fault raised out of
-  ;; uv_run.
+  ;; guard around the teardown, to give a claim back on a raise, would cost
+  ;; about 400 B a teardown, and would give the claim back over a fault
+  ;; raised out of uv_run.
   (define (teardown! loop held?)
     (let ((started (start-teardown! loop held?)))
       (cond ((eq? started 'loop-not-open) #f)
@@ -306,8 +310,9 @@
 
   ;; close-after-drain : uv-loop (or condition #f) -> (or condition #f)
   ;; The teardown's close-step!, and what the teardown raises after it:
-  ;; libuv's refusal under uv-loop-close!'s name, as before #78, ahead of
-  ;; STORED, the first callback failure the drain retained.
+  ;; libuv's refusal, under uv-loop-close!'s name as uv-loop-close! itself
+  ;; raises it, ahead of STORED, the first callback failure the drain
+  ;; retained; and any other refusal under uv-loop-teardown!'s.
   (define (close-after-drain loop stored)
     (let ((closed (close-step! loop)))
       (cond ((memq closed '(closed loop-not-open)) stored)
@@ -333,16 +338,16 @@
   ;; loop down however the body left.
   ;; - The loop is made inside the body, and handed over inside its own
   ;;   step, so wherever an engine expires from then on, the after thunk
-  ;;   finds the loop. Made before the dynamic-wind, a loop was lost to an
-  ;;   engine dropped in between (tests/test-constructors.sps).
+  ;;   finds the loop. Made before the dynamic-wind, a loop would be lost to
+  ;;   an engine dropped in between (tests/test-constructors.sps).
   ;; - A body left from inside one of the loop's callbacks, by a continuation
-  ;;   or an engine's suspension, leaves the loop claimed by this thread
-  ;;   (#45). The teardown takes that claim over as it stands, which is safe
+  ;;   or an engine's suspension, leaves the loop claimed by this thread.
+  ;;   The teardown takes that claim over as it stands, which is safe
   ;;   because nothing can resume the run the teardown ends. The mark names
   ;;   the claim's thread, so a claim another thread holds, a run's or a
-  ;;   close's, is never taken for this thread's own (#78's review). The
-  ;;   claim passes straight to the teardown's first step, so every handle's
-  ;;   close has begun before another call can get in.
+  ;;   close's, is never taken for this thread's own. The claim passes
+  ;;   straight to the teardown's first step, so every handle's close has
+  ;;   begun before another call can get in.
   ;; - That teardown can fail: escaping one close callback strands the rest
   ;;   of libuv's batch of closes, and the loop cannot be closed. The failure
   ;;   is contained rather than raised in the middle of the escape or the
@@ -353,20 +358,21 @@
   ;; - A loop claimed by another thread is live under that thread's call:
   ;;   the teardown refuses it, as from any exit.
   ;; - A guard unwinds to itself before it tests its clauses, and when none
-  ;;   matches it re-raises from where the body raised: a re-entry (#118).
+  ;;   matches it re-raises from where the body raised: a re-entry.
   ;;   So the first re-entry after the body was left while raising raises
   ;;   that raise again, and every other re-entry &uv-handle-closed: the
   ;;   guards outside get the body's own condition, and nothing resumes the
   ;;   body. Only the first: a handler outside that answers the raise by
   ;;   re-entering the body, to retry it, would otherwise get the same raise
-  ;;   for good (#120's review).
+  ;;   for good.
   ;;   RAISING is that raise in a list, so that a body that raises #f is told
   ;;   from one that raised nothing. The handler that records it hands the
   ;;   raise on in place, with raise-continuable, so handlers outside run in
   ;;   the body's dynamic environment, and one that returns from a
-  ;;   raise-continuable resumes the body as before. One that returns from
-  ;;   a raise sees one call more: R6RS raises the &non-continuable from
-  ;;   the handler that was returned to, which is now this one.
+  ;;   raise-continuable resumes the body, as it would without this
+  ;;   handler. One that returns from a raise sees one call more: R6RS
+  ;;   raises the &non-continuable from the handler that was returned to,
+  ;;   and that handler is this one.
   ;;   A return ends the raise, and so does the body's: RAISING goes back to
   ;;   #f, not to a raise it interrupted. A raise can interrupt another only
   ;;   when a handler gave the other up by jumping back into the body.

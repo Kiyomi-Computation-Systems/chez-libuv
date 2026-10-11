@@ -156,11 +156,11 @@ static const struct chez_uv_constant_entry chez_uv_constant_table[] = {
 
   /* Version-gated bind flag. UV_TCP_REUSEPORT (TCP SO_REUSEPORT with load
    * balancing) is an enum constant, so it is invisible to #ifdef; it is guarded
-   * by libuv's version instead, which arrived in 1.49.0 (UV_VERSION_HEX
-   * 0x013100). Below that the name is simply absent from this table and
-   * chez_uv_constant returns 0 for it, which surfaces in Scheme as
-   * &uv-constant-unavailable at the point of use (ADR-0005) -- a named refusal,
-   * never a silent bind with the flag dropped. */
+   * by libuv's version instead: the flag arrived in libuv 1.49.0
+   * (UV_VERSION_HEX 0x013100). Below that the name is simply absent from this
+   * table and chez_uv_constant returns 0 for it, which surfaces in Scheme as
+   * &uv-constant-unavailable at the point of use -- a named refusal, never a
+   * silent bind with the flag dropped. */
 #if UV_VERSION_HEX >= 0x013100
   { "UV_TCP_REUSEPORT", UV_TCP_REUSEPORT },
 #endif
@@ -263,9 +263,9 @@ void chez_uv_alloc_cb(uv_handle_t *handle, size_t suggested_size,
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
 /* Each loop's thread updates these counters, and a program can run a loop
- * on each of several threads (#70). So every update is one atomic add:
- * with plain += and -=, two loop threads lost updates, and the counts no
- * longer balanced (tests/test-loop-threads.sps's balance row). Relaxed
+ * on each of several threads. So every update is one atomic add: with
+ * plain += and -=, two loop threads would lose updates, and the counts
+ * would not balance (tests/test-loop-threads.sps's balance row). Relaxed
  * order is enough, as a count orders nothing else. GCC and Clang have these
  * builtins under -std=c99. */
 #if !defined(__GNUC__) && !defined(__clang__)
@@ -442,8 +442,9 @@ uintptr_t chez_uv_stack_pointer(void) {
  * gives no way to read it. On Linux the main thread's costs about 22 us,
  * since glibc reads /proc/self/maps for it, so Scheme keeps it per thread
  * (native.sls's stack-headroom). The shim keeps nothing itself: a
- * thread-local here is a block glibc mallocs on each thread's first use,
- * which the memory gate counted (rule 6 of tests/test-source-rules.sps). */
+ * thread-local here would be a block glibc mallocs on each thread's first
+ * use, which the memory gate would count (rule 6 of
+ * tests/test-source-rules.sps). */
 uintptr_t chez_uv_stack_bottom(void) {
 #if defined(__APPLE__)
   pthread_t self = pthread_self();

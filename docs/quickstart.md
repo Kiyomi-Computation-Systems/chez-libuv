@@ -25,7 +25,7 @@ CHEZSCHEMELIBDIRS=src chez --program echo.sps
 (import (rnrs) (libuv))
 
 ;; A span is [start, end), like every other R6RS range. on-data is handed a
-;; FRESH bytevector per delivery (ADR-0009), so this copy is only about
+;; FRESH bytevector per delivery, so this copy is only about
 ;; taking the sub-range.
 (define (span->bytevector bv start end)
   (let ((out (make-bytevector (- end start))))
@@ -72,7 +72,7 @@ CHEZSCHEMELIBDIRS=src chez --program echo.sps
 
 ;; Callbacks run here and nowhere else. uv-run answers #f when the loop has
 ;; run dry; uv-loop-teardown! closes whatever is left, drains it, and closes
-;; the loop (there are no guardians -- ADR-0007).
+;; the loop (there are no guardians).
 (uv-run loop 'default)
 (uv-loop-teardown! loop)
 
@@ -81,13 +81,12 @@ CHEZSCHEMELIBDIRS=src chez --program echo.sps
 
 ## The three rules
 
-That program depends on three rules, stated in full in the design spec
-(§5–§9 of [the v0.1 design](../.plans/2026-08-18-chez-libuv-v0.1-design.md)):
+That program depends on three rules:
 
 - **A close is asynchronous.** `uv-close!` *starts* the close; the handle is
   `closing` until the loop runs its close callback, which is the only place
   a handle's memory is ever released. Nothing is freed by the garbage
-  collector ([ADR-0007](../.plans/decisions/0007-no-guardians-explicit-close.md)).
+  collector.
 - **EOF is not an error.** It is its own callback, taking no arguments, and
   it is never wrapped in a condition. A read *error* is delivered to
   `on-error` as a condition *object* — never raised across the callback
@@ -107,5 +106,3 @@ That program depends on three rules, stated in full in the design spec
 - [API reference](api.md) — every export of every module, one line each
 - [Building & testing](building.md) — acquisition paths, `CHEZ_LIBUV_SHIM`,
   release builds, the test gates
-- [Design specs & ADRs](../.plans/) — why it is built this way, with the
-  evidence

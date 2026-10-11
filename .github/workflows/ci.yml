@@ -1,25 +1,23 @@
 name: CI
 
-# Two jobs, both Linux, deliberately. Linux is the gate for every memory claim
-# (ADR-0003): LeakSanitizer does not exist on macOS/ARM64, so a green macOS
-# run was never evidence of no leaks -- only Valgrind on Linux can support
-# that claim.
+# Two jobs, both Linux, deliberately. Linux is the gate for every memory
+# claim: LeakSanitizer does not exist on macOS/ARM64, so a green macOS run is
+# no evidence of no leaks -- only Valgrind on Linux can support that claim.
 #
-# The macOS job that used to run beside this one was removed because it billed
-# at 10x the Linux minute rate for a leg that largely duplicated Linux's
-# coverage while lacking the one check that matters most. macOS is the primary development
-# platform, so it is covered by running `make test` and `make test-memory`
-# (ASan, no leak detection) on the laptop before pushing -- see
-# docs/building.md. Two things that only the macOS leg used to catch now
-# depend on that local run actually happening: `relink-guard` under make 3.81's
-# one-second mtime granularity (macOS ships 3.81; this runner has make 4.x),
-# and homebrew's chezscheme drifting below $CHEZ_FLOOR_VERSION.
+# There is no macOS job: it would bill at 10x the Linux minute rate for a leg
+# that largely duplicates Linux's coverage while lacking the one check that
+# matters most. macOS is covered by running `make test` and `make test-memory`
+# (ASan, no leak detection) locally before pushing -- see docs/building.md.
+# Two things only a macOS run catches depend on that local run actually
+# happening: `relink-guard` under make 3.81's one-second mtime granularity
+# (macOS ships 3.81; this runner has make 4.x), and homebrew's chezscheme
+# drifting below $CHEZ_FLOOR_VERSION.
 #
-# Both acquisition paths are exercised on every run (ADR-0001): pkg-config
-# and the pinned vendored submodule. Nothing here treats the vendored path as
-# an afterthought -- it is Windows's eventual primary path (ADR-0004) too.
+# Both acquisition paths are exercised on every run: pkg-config and the
+# pinned vendored submodule. Nothing here treats the vendored path as an
+# afterthought -- it is the only path on a host without pkg-config.
 # The second job runs the pkg-config path against the libuv floor itself,
-# Ubuntu 24.04's 1.48 (#90).
+# Ubuntu 24.04's 1.48.
 
 on:
   push:
@@ -42,11 +40,11 @@ env:
 jobs:
   linux:
     name: linux (vendored + valgrind)
-    # A named image, not ubuntu-latest: the label moves on GitHub's schedule
-    # (to Ubuntu 26.04 from 2026-10-19), and with it the compiler, glibc,
-    # Valgrind and the apt libuv the pkg-config leg links. Moving is a commit
-    # here, run once in a mirror of this job first. On 26.04: gcc 15.2,
-    # cmake 4.2, Valgrind 3.26, libuv 1.51.0 (measured 2026-10-08).
+    # A named image, not ubuntu-latest: the label moves on GitHub's schedule,
+    # and with it the compiler, glibc, Valgrind and the apt libuv the
+    # pkg-config leg links. Moving is a commit here, run once in a mirror of
+    # this job first. On 26.04: gcc 15.2, cmake 4.2, Valgrind 3.26, libuv
+    # 1.51.0.
     runs-on: ubuntu-26.04
     # Observed wall clock: ~4min on a Chez-cache hit, ~14min on a cache miss
     # (Chez Scheme built from source -- see .github/actions/pinned-chez). 30min
@@ -90,10 +88,13 @@ jobs:
       # The chez-srfi submodule and Akku.lock must name the same commit, and
       # the vendored libuv submodule must fall inside the version range this
       # binding validates at init -- and README.org must state the floor
-      # that range is built from. They drifted once already, silently
-      # (AGENTS.md's "prefer a check to a comment").
+      # that range is built from. Each can drift silently, so this is a
+      # check rather than a comment.
       - name: Check dependency pins agree
         run: make check-pins
+
+      - name: Check source and docs cite no plans or history
+        run: make check-history
 
       - name: Scheme dependencies
         run: make deps
@@ -116,37 +117,35 @@ jobs:
       # twice instead of the vendored one. The stamp alone is not enough --
       # it compares mtimes, and make 3.81 does that at one-second granularity
       # (see the guard's comment in the Makefile); this runner's make 4.x
-      # would have got away with it.
+      # would get away with it.
       - name: Check purity of native-free suites (vendored path)
         run: make HAVE_PKG=no check-purity
 
       - name: Test (vendored path)
         run: make HAVE_PKG=no test
 
-      # THE SPEC §9.4 / ADR-0016: the setuid/setgid positive tests are
-      # excluded from the default `make test` (see ROOT_TESTS in the
-      # Makefile) and run only here, under sudo. sudo drops the job's
-      # environment, so `env` hands make each variable the lane needs by
-      # name: PATH, which this job put the pinned Chez on, and CHEZ, its
-      # name (`scheme`), without which make runs `chez`. Not `sudo -E`:
-      # Ubuntu 26.04's sudo is sudo-rs, which ignores -E, and the lane
-      # failed `chez: not found` there (2026-10-08, reproduced with sudo-rs
-      # 0.2.13). `HAVE_PKG=no` matches the vendored-path build just above so
-      # test-root's artifact-precondition check accepts what that build
-      # produced -- the target deliberately does NOT rebuild (under sudo
-      # a `build` prerequisite would relink the shim as root; see the
+      # The setuid/setgid positive tests are excluded from the default
+      # `make test` (see ROOT_TESTS in the Makefile) and run only here, under
+      # sudo. sudo drops the job's environment, so `env` hands make each
+      # variable the lane needs by name: PATH, which this job put the pinned
+      # Chez on, and CHEZ, its name (`scheme`), without which make runs
+      # `chez`. Not `sudo -E`: Ubuntu 26.04's sudo is sudo-rs, which ignores
+      # -E, and the lane fails with `chez: not found` there (reproduced with
+      # sudo-rs 0.2.13). `HAVE_PKG=no` matches the vendored-path build just
+      # above so test-root's artifact-precondition check accepts what that
+      # build produced -- the target deliberately does NOT rebuild (under
+      # sudo a `build` prerequisite would relink the shim as root; see the
       # Makefile's test-root comment).
       - name: Root lane (setuid/setgid, sudo)
         run: sudo env "PATH=$PATH" "CHEZ=$CHEZ" make HAVE_PKG=no test-root
 
-      # The gate below proves nothing unless it can fail, and for a month it
-      # could not: from #14 (2026-08-30) Valgrind's client was timeout(1), Chez
-      # ran unchecked, and this job stayed green (ADR-0003's 2026-09-27
-      # amendment). check-memory-gate plants a one-byte heap overrun (by a
-      # Scheme store, by libc's memset, and by the C shim's own memcpy behind
-      # copy-in!) and a definite leak, runs the real test-memory recipe on
-      # each, and requires it to FAIL with Valgrind's own report of that
-      # defect. It also plants a possibly-lost block, and
+      # The gate below proves nothing unless it can fail: if Valgrind's
+      # client were timeout(1) rather than Chez, Chez would run unchecked and
+      # this job would stay green. check-memory-gate plants a one-byte heap
+      # overrun (by a Scheme store, by libc's memset, and by the C shim's own
+      # memcpy behind copy-in!) and a definite leak, runs the real
+      # test-memory recipe on each, and requires it to FAIL with Valgrind's
+      # own report of that defect. It also plants a possibly-lost block, and
       # requires the gate never to fail on it without printing its loss
       # record. It runs first because it is the precondition for reading the
       # next step's green as evidence.
@@ -160,13 +159,11 @@ jobs:
         run: make HAVE_PKG=no test-memory
 
       # `make test` reporting success on a failing suite would silently void
-      # every other check in this workflow, so verify the contract itself.
-      # conditions/native/loop are the suites Tasks 4-6 will add; none exist
-      # yet at Stage 1a, so this loop has nothing to assert on for
-      # suite-masking today and only exercises "make test fails on a failing
-      # suite" -- it checks for each file's EXISTENCE at run time, not at the
-      # time this workflow was written, so it starts covering suite-masking
-      # automatically as they land, with no further edit here.
+      # every other check in this workflow, so verify the contract itself:
+      # make test fails on a failing suite, and that failure does not mask
+      # the suites after it. The masking check looks for conditions, native
+      # and loop; it checks each file's EXISTENCE at run time, and skips one
+      # that is missing rather than failing on it.
       - name: Verify the test target fails on a failing suite
         run: |
           mkdir -p tests
@@ -223,11 +220,12 @@ jobs:
     name: linux (system libuv at the floor)
     # The libuv floor (the Makefile's UV_FLOOR_*, README.org) is Ubuntu
     # 24.04 LTS's libuv, 1.48.0, and this job runs the suite against exactly
-    # that (#90). The job above links 26.04's 1.51.0 and the vendored
-    # 1.52.1, so without this no run would test the floor README.org states:
-    # the floor was 1.44.0 until #90, and the suite fails two rows on
-    # Debian 12's 1.44.2. It runs beside that job, and does only the
-    # pkg-config build and `make test`.
+    # that. The job above links 26.04's 1.51.0 and the vendored 1.52.1, so
+    # without this no run would test the floor README.org states. Below it,
+    # Debian 12's 1.44.2 lacks an ordering two test-lifecycle rows assert,
+    # and a build linked against it refuses itself at load. It
+    # runs beside that job, and does only the pkg-config build and
+    # `make test`.
     runs-on: ubuntu-24.04
     # ~14min on a Chez-cache miss, as the job above; a few minutes on a hit.
     timeout-minutes: 30

@@ -6,9 +6,9 @@
 ;;; between any two instructions. Chez's own list procedures assume nothing
 ;;; changes. map measures a list and then walks it unchecked, and at
 ;;; --optimize-level 3 length walks it with no check at all, so a list made
-;;; circular is walked forever (#64, #66). These check each pair before
-;;; reading through it, and every walk is bounded. A list of any length is
-;;; counted first and walked no further than its count (read-proper-list,
+;;; circular is walked forever. These check each pair before reading
+;;; through it, and every walk is bounded. A list of any length is counted
+;;; first and walked no further than its count (read-proper-list,
 ;;; fold-flags), and its walk ends once the list stops changing. A list of
 ;;; a fixed length is walked no further than that length (let-fixed-list).
 ;;; Pure: no native code (tests/test-addrinfo.sps, under make check-purity).
@@ -29,9 +29,10 @@
   ;; another thread. The walk takes each cdr once, of a value it has just
   ;; found to be a pair, and only compares the mark with eq?, so no change
   ;; makes it read through a non-pair, and once the changes stop it ends.
-  ;; #61's count walked a tortoise behind its hare along the list's links:
-  ;; one change could cut the tortoise's way, and two could leave the two on
-  ;; separate cycles, where the count never ended (#64 and its review).
+  ;; A count that walks a tortoise behind its hare along the list's links
+  ;; (Floyd's check) has no such guarantee: one change can cut the
+  ;; tortoise's way, and two can leave the two on separate cycles, where the
+  ;; count never ends.
   ;;
   ;; A count can be stale all the same: by the time it returns, the list may
   ;; be improper, circular or of another length. So a caller walks at most
@@ -58,10 +59,10 @@
   ;; elements of the abandoned walk again. So a list changed once during the
   ;; read answers as it was before the change or after it, or #f when that
   ;; version is no proper list. Without the second read, one change between
-  ;; the count and the walk made a list that was proper before and after it
-  ;; answer #f (tests/test-native.sps's one-change race). Without the end, a
-  ;; tail spliced in during the read would be read only as far as the stale
-  ;; count, and the answer would end where the list did not (the
+  ;; the count and the walk would make a list that was proper before and
+  ;; after it answer #f (tests/test-native.sps's one-change race). Without
+  ;; the end, a tail spliced in during the read would be read only as far as
+  ;; the stale count, and the answer would end where the list did not (the
   ;; spliced-longer sweep there).
   ;;
   ;; A list changed more than once can answer a mix of its versions, or #f
@@ -80,9 +81,9 @@
   ;; A walk that answers #f has found X contradicting its count, and X is
   ;; counted and walked once more. read-proper-list and fold-flags both read
   ;; this way, so a list changed once during either read answers as it was
-  ;; before the change or after it (#81). A macro, so that fold-flags hands
-  ;; its walk BIT without a closure: it allocates nothing. Each ARG is
-  ;; evaluated once a walk, so it is a variable.
+  ;; before the change or after it. A macro, so that fold-flags hands its
+  ;; walk BIT without a closure: it allocates nothing. Each ARG is evaluated
+  ;; once a walk, so it is a variable.
   (define-syntax walk-counted
     (syntax-rules ()
       ((_ x-expr walk arg ...)
@@ -114,14 +115,14 @@
   ;; once more (walk-counted), so a list changed once during the walk is
   ;; folded as it was or as the change left it; a list that is improper or
   ;; circular as read is refused (WHO, REASON), and none is walked forever.
-  ;; Without the end, a tail spliced in during the walk was folded as far as
-  ;; the stale count, into flags the caller never held: (a b) made (a c d)
-  ;; folded a and c; without the second walk, a list proper before and
-  ;; after the splice was refused (tests/test-native.sps's fold-flags splice
-  ;; sweep). Asking list? first would leave a gap an engine's handler can
-  ;; change the list in, and fold-left walks a list made circular there
-  ;; forever (tests/test-address.sps's flags sweeps). Nothing here allocates
-  ;; (tests/test-native.sps).
+  ;; Without the end, a tail spliced in during the walk would be folded as
+  ;; far as the stale count, into flags the caller never held: (a b) made
+  ;; (a c d) would fold a and c; without the second walk, a list proper
+  ;; before and after the splice would be refused (tests/test-native.sps's
+  ;; fold-flags splice sweep). Asking list? first would leave a gap an
+  ;; engine's handler can change the list in, and fold-left walks a list
+  ;; made circular there forever (tests/test-address.sps's flags sweeps).
+  ;; Nothing here allocates (tests/test-native.sps).
   (define (fold-flags flags who reason bit)
     (or (walk-counted flags fold-counted bit)
         (raise (make-uv-invalid-argument who reason))))
@@ -144,10 +145,9 @@
   ;; the last NAME, so a list another thread changes during the read binds
   ;; each element as its pair stood when the walk reached it, or mismatches,
   ;; and is never read through a non-pair. Checking a shape first and reading
-  ;; its fields after, as cadr does, reads each pair twice: uv-spawn!'s pipe
-  ;; specs did, and a cut made in between raised Chez's own condition, or at
-  ;; --optimize-level 3 read through it (#66). Nothing is allocated
-  ;; (tests/test-native.sps).
+  ;; its fields after, as cadr does, reads each pair twice, and a cut made
+  ;; in between raises Chez's own condition, or at --optimize-level 3 is
+  ;; read through. Nothing is allocated (tests/test-native.sps).
   (define-syntax let-fixed-list
     (syntax-rules ()
       ((_ (name ...) list-expr mismatch body0 body ...)
@@ -155,7 +155,8 @@
          (walk-fixed (name ...) list-expr (on-mismatch)
                      (let () body0 body ...))))))
 
-  ;; walk-fixed: let-fixed-list's walk, one NAME a pair.
+  ;; (walk-fixed (name ...) p-expr fail done)
+  ;; let-fixed-list's walk, one NAME a pair.
   (define-syntax walk-fixed
     (syntax-rules ()
       ((_ () p-expr fail done)

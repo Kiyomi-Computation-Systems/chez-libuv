@@ -12,6 +12,11 @@
           (libuv private handles)
           (libuv private native))
 
+  ;; uv-handle? : object -> boolean
+  ;; uv-timer? : object -> boolean
+  ;; The handle and timer records' predicates, defined with the records in
+  ;; (libuv private handles) and exported from here.
+
   ;; uv-handle-open? : object -> boolean
   ;; uv-handle-closing? : object -> boolean
   ;; These predicates accept non-handles so cleanup paths can probe safely.
@@ -36,6 +41,7 @@
   ;; uv-pipe? : object -> boolean
   ;; uv-process? : object -> boolean
   ;; uv-signal? : object -> boolean
+  ;; uv-async? : object -> boolean
   (define (uv-tcp? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'tcp)))
 
@@ -51,6 +57,7 @@
   (define (uv-async? handle)
     (and (uv-handle? handle) (eq? (handle-kind handle) 'async)))
 
+  ;; require-socket-handle : object symbol -> uv-handle
   ;; Buffer-size operations support TCP and pipes on Unix, but only TCP on
   ;; Windows; libuv reports unsupported platform cases.
   (define (require-socket-handle handle who)
@@ -59,6 +66,7 @@
       (raise (make-uv-invalid-argument who 'not-a-socket-handle)))
     handle)
 
+  ;; require-buffer-size : object symbol -> exact-positive-integer
   ;; Keep the value inside positive C int range; foreign-set! would truncate.
   (define (require-buffer-size n who)
     (unless (and (integer? n) (exact? n) (positive? n) (< n 2147483648))
@@ -71,9 +79,8 @@
   ;; caller's int cell is zero, so N is 0 to get, and the size to set. One
   ;; interrupt-free step checks again that this thread owns the loop and
   ;; that the handle is open, and allocates the cell, writes N, calls libuv,
-  ;; reads the cell back and frees it (#86). So no engine can split the call
-  ;; from those checks, or drop it holding the cell
-  ;; (tests/test-handle-steps.sps).
+  ;; reads the cell back and frees it. So no engine can split the call from
+  ;; those checks, or drop it holding the cell (tests/test-handle-steps.sps).
   (define (buffer-size-step native handle n who)
     (let ((answer
            (one-step

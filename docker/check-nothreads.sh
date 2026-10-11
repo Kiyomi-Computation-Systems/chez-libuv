@@ -7,7 +7,7 @@
 # cannot hide files from that user. NOTHREADS_MARKER is the text the
 # refusal must print.
 #
-# chez-libuv needs a threaded Chez (#41). On a --nothreads Chez, importing
+# chez-libuv needs a threaded Chez. On a --nothreads Chez, importing
 # ANY public library must be stopped BY (libuv private require-threaded): a
 # non-zero exit, and the first exception printed carries the marker. The
 # marker anywhere in the output is not enough. A refusal that only printed

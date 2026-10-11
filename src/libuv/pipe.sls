@@ -20,5 +20,6 @@
                         (lambda (ptr) (%make-uv-pipe-record ptr loop handle-size))
                         count-pipe-new!)))
 
+  ;; init-pipe : uptr uptr -> exact-integer
   ;; No IPC: these pipes carry bytes, never handles.
   (define (init-pipe loop-ptr ptr) (uv-pipe-init loop-ptr ptr 0)))

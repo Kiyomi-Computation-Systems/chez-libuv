@@ -62,7 +62,7 @@
           require-callback
           signal-symbol->int term-signal->value
 
-          ;; thread identity (per-loop affinity, #20)
+          ;; thread identity (per-loop affinity)
           current-thread-id
 
           ;; callback dispatch
@@ -79,7 +79,7 @@
           uv-signal-start-oneshot-native uv-signal-stop
           uv-os-getpid-native
 
-          ;; async (#20)
+          ;; async
           uv-async-init-native uv-async-send
 
           ;; debug counters
@@ -99,7 +99,7 @@
           count-async-new!       count-async-free!)
   (import (rnrs)
           ;; Ahead of (chezscheme): make-mutex and with-mutex exist only in a
-          ;; threaded Chez (#41; tests/test-require-threaded.sps).
+          ;; threaded Chez (tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme)
                 load-shared-object foreign-procedure foreign-entry? foreign-entry
@@ -116,8 +116,6 @@
           (libuv private constants)
           (only (libuv private c-string) c-string-bytes c-string?))
 
-  ;; resolve-shim-path : string (or string #f) [procedure] -> string
-  ;; Accept an absolute regular file only; never search the working directory.
   (define (regular-file? path)
     (and (file-exists? path) (file-regular? path)))
 
@@ -126,6 +124,8 @@
          (> (string-length path) 0)
          (char=? (string-ref path 0) #\/)))
 
+  ;; resolve-shim-path : string (or string #f) [procedure] -> string
+  ;; Accept an absolute regular file only; never search the working directory.
   (define resolve-shim-path
     (case-lambda
       ((default-path override)
@@ -192,12 +192,15 @@
   (define raw-errno-name  (shim-procedure "chez_uv_errno_name" (int) uptr))
   (define raw-errno-value (shim-procedure "chez_uv_errno_value" (int) int))
 
-  ;; Bulk byte moves (issue #35). Plain, not __collect_safe
-  ;; (test-source-rules.sps): a u8* argument is the bytevector's own storage,
-  ;; and a plain call keeps this thread active, so no collection can move
-  ;; that storage before the call returns (test-threading-stress.sps pins
-  ;; this). The price is that other threads' collections wait for the whole
-  ;; move (ADR-0009's #35 note).
+  ;; Bulk byte moves. Plain, not __collect_safe (test-source-rules.sps): a
+  ;; u8* argument is the bytevector's own storage, and a plain call keeps
+  ;; this thread active, so no collection can move that storage before the
+  ;; call returns (test-threading-stress.sps pins this). The price is that
+  ;; other threads' collections wait for the whole move: under 0.7 ms for
+  ;; 4 MiB, 3-9 ms for 64 MiB (measured on macOS arm64). The moves stay
+  ;; whole. A loop of plain calls notices a pending collection only about
+  ;; once every 490 calls, so chunks would bound the wait only if near
+  ;; 64 KiB, and the wait matters only for single moves of tens of MiB.
   (define raw-copy-in
     (shim-procedure "chez_uv_copy_in" (uptr u8* size_t size_t) void))
   (define raw-copy-out
@@ -205,17 +208,20 @@
   (define raw-zero (shim-procedure "chez_uv_zero" (uptr size_t) void))
 
   ;; libuv's alloc callback for reads is the shim's own C function, not a
-  ;; trampoline (#45; ADR-0002 and ADR-0008, amended 2026-10-05): its answer,
-  ;; the stream's own read buffer, is fixed per handle and needs no Scheme.
-  ;; uv-read-start-native hands libuv this address.
+  ;; trampoline: its answer, the stream's own read buffer, is fixed per
+  ;; handle and needs no Scheme. A trampoline would cost a collect-safe
+  ;; reactivation of the loop thread and a dispatch on every read, 416 B a
+  ;; read (tests/test-callback-alloc.sps). uv-read-start-native hands libuv
+  ;; this address.
   (define alloc-cb-entry (shim-entry "chez_uv_alloc_cb"))
 
   ;; stack-headroom : -> exact-integer
-  ;; How many bytes of C stack this thread has left below the call (#94;
-  ;; ADR-0002 as amended for it): run-step! refuses a uv_run below a floor.
-  ;; Plain calls, and nothing here raises, so a step can make it. Where the
-  ;; stack's bottom cannot be read, the answer is headroom-unknown, more
-  ;; than any floor, so nothing is refused.
+  ;; How many bytes of C stack this thread has left below the call.
+  ;; run-step! refuses a uv_run below a floor, since each continuation that
+  ;; escapes a callback leaves its uv_run's C frames on the stack for the
+  ;; thread's life. Plain calls, and nothing here raises, so a step can make
+  ;; it. Where the stack's bottom cannot be read, the answer is
+  ;; headroom-unknown, more than any floor, so nothing is refused.
   (define raw-stack-pointer (shim-procedure "chez_uv_stack_pointer" () uptr))
   (define raw-stack-bottom (shim-procedure "chez_uv_stack_bottom" () uptr))
 
@@ -225,8 +231,8 @@
   ;; thread first asks. Reading it costs 22 us on Linux's main thread, so it
   ;; is read once per thread. A thread parameter: a new thread starts with
   ;; its creator's cell, whose id is not its own, and reads its own bottom.
-  ;; Kept in the shim as a C thread-local instead, it was a block glibc
-  ;; mallocs on each thread's first use, which the memory gate counted.
+  ;; A C thread-local in the shim would instead be a block glibc mallocs on
+  ;; each thread's first use, which the memory gate would count.
   (define stack-bottom-cell (make-thread-parameter #f))
 
   (define (stack-headroom)
@@ -345,7 +351,7 @@
 
   ;; uv_run's integer is an activity result, not an errno. uv_loop_close's is.
   (define uv-loop-init  (foreign-procedure "uv_loop_init"  (uptr) int))
-  ;; __collect_safe (#19): a thread blocked here is deactivated, so it does not
+  ;; __collect_safe: a thread blocked here is deactivated, so it does not
   ;; hold Chez's collect interlock and other Scheme threads can GC. This forces
   ;; every callable uv_run can invoke to be __collect_safe too (CSUG §4.3/4.8) —
   ;; every trampoline below carries the attribute but `walk`, which fires only
@@ -490,7 +496,10 @@
   (define (uv-buf-len addr)
     (ftype-ref uv-buf (len) (make-ftype-pointer uv-buf addr)))
 
-  ;; Measure field widths by observing writes, not by repeating type assumptions.
+  ;; uv-buf-ftype-layout : -> (listof exact-nonnegative-integer)
+  ;; The uv-buf ftype's size, base offset, base width, len offset and len
+  ;; width, in that order. Measure field widths by observing writes, not by
+  ;; repeating type assumptions.
   (define (uv-buf-ftype-layout)
     (let* ((size (ftype-sizeof uv-buf))
            (addr (foreign-alloc size))
@@ -534,10 +543,11 @@
   (define (uv-version-string) (c-string->string (raw-version-string)))
 
   ;; zero-out!, copy-in! and copy-out each move their span in one shim call,
-  ;; never a Scheme loop (#35; test-native.sps holds each within a small
-  ;; factor of libc). The checks stay here, before the call: the shim trusts
-  ;; its arguments. A foreign extent cannot be checked, so every caller passes
-  ;; a live block of at least len bytes.
+  ;; never a Scheme loop, which takes about 29 ns a byte, some 120 ms for
+  ;; each pass over 4 MiB (test-native.sps holds each within a small factor
+  ;; of libc). The checks stay here, before the call: the shim trusts its
+  ;; arguments. A foreign extent cannot be checked, so every caller passes a
+  ;; live block of at least len bytes.
 
   ;; zero-out! : uptr exact-nonnegative-integer -> unspecified
   (define (zero-out! addr len)
@@ -549,9 +559,14 @@
 
   ;; alloc-block, free-block! and copy-in-unchecked! are the forms a verb
   ;; uses inside an interrupt-free step, where nothing may raise (stream.sls).
-  ;; Each is total: it answers or ignores what it cannot use, so no argument
-  ;; can make it raise. alloc-zeroed and free! check their arguments and
-  ;; raise; everything else allocates and frees through them.
+  ;; alloc-block and free-block! are total: each answers or ignores what it
+  ;; cannot use, so no argument can make it raise. copy-in-unchecked!
+  ;; checks nothing: below --optimize-level 3 its foreign call raises for a
+  ;; non-bytevector or an argument outside its C type, at level 3 it checks
+  ;; nothing, and at no level does it check a span against the
+  ;; bytevector's end. Its caller passes only what it has checked.
+  ;; alloc-zeroed and free! check their arguments and raise;
+  ;; everything else allocates and frees through them.
 
   ;; alloc-block : object -> uptr
   ;; A zeroed block of N bytes, or 0 when N is not a positive fixnum or the
@@ -604,11 +619,11 @@
   ;; truncation scan). Another thread truncating it mid-copy is that
   ;; program's own race; nothing here can order it.
   ;;
-  ;; A span that no longer fits is answered, not raised: no check a caller
-  ;; makes beforehand can rule it out, since the bytevector can shrink after
-  ;; it, and a caller holding a block it has not yet handed on must free
-  ;; that block first (the write verbs, stream.sls). The other refusals are
-  ;; the caller's own mistakes and raise.
+  ;; A span that does not fit at the copy is answered, not raised: no check
+  ;; a caller makes beforehand can rule it out, since the bytevector can
+  ;; shrink after it, and a caller holding a block it has not yet handed on
+  ;; must free that block first (the write verbs, stream.sls). The other
+  ;; refusals are the caller's own mistakes and raise.
   (define (try-copy-in! dst bv start len)
     (unless (and (integer? dst) (exact? dst) (positive? dst))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
@@ -741,6 +756,7 @@
       (raise (make-uv-invalid-argument who 'address-not-a-string)))
     (c-string-bytes ip who 'address-contains-nul))
 
+  ;; valid-port? : object -> boolean
   ;; The port check the verbs make on entry and try-fill-sockaddr! makes in
   ;; their steps.
   (define (valid-port? port)
@@ -755,8 +771,10 @@
       (raise (make-uv-invalid-argument who reason))))
 
   ;; current-thread-id : -> exact-integer
-  ;; The identity per-loop affinity (#20) compares against. The binding needs
-  ;; a threaded Chez (#41), so this is always the real thread id.
+  ;; The identity per-loop affinity compares against: each loop's verbs run
+  ;; only on the thread that owns the loop. The binding needs a threaded
+  ;; Chez, which (libuv private require-threaded) enforces, so this is
+  ;; always the real thread id.
   (define (current-thread-id)
     (get-thread-id))
 
@@ -864,13 +882,17 @@
                 (hashtable-set! dispatchers name (uninstalled-dispatcher name)))
               dispatcher-names))
 
-  ;; Look up at fire time; capturing now would retain the seeded stub forever.
+  ;; dispatcher-ref : symbol -> procedure
+  ;; Looked up at fire time: a trampoline that captured its dispatcher when
+  ;; defined would keep the seeded stub forever.
   (define (dispatcher-ref name)
     (let ((proc (hashtable-ref dispatchers name #f)))
       (or proc
           (raise (make-uv-invalid-argument 'uv-dispatcher-ref
                                            'unknown-dispatcher)))))
 
+  ;; install-callback-dispatchers! : (listof (pair symbol procedure))
+  ;;                                -> unspecified
   ;; Validate the complete set before a once-only atomic installation.
   (define (install-callback-dispatchers! alist)
     (when dispatchers-installed
@@ -955,9 +977,10 @@
                         ((dispatcher-ref 'signal) handle signum))
                       (uptr int) void))
 
-  ;; uv_async_cb (uv_async_t*) -> void. Same arity as close/timer, distinct
-  ;; callback TYPE, so its own locked slot (ADR-0008's per-type rule). It fires
-  ;; from uv_run, so it is __collect_safe like the rest.
+  ;; uv_async_cb (uv_async_t*) -> void. Same arity as close/timer, but a
+  ;; distinct callback TYPE, and each type has its own locked slot: the
+  ;; locked set grows with libuv's callback types, never with handles or
+  ;; requests. It fires from uv_run, so it is __collect_safe like the rest.
   (define async-callable
     (foreign-callable __collect_safe (lambda (handle) ((dispatcher-ref 'async) handle))
                       (uptr) void))
@@ -978,8 +1001,9 @@
                     exit-callable walk-callable signal-callable
                     async-callable)))
 
-  ;; Entry-point addresses leave only through the wrappers below, except the
-  ;; shim's alloc-cb-entry, which tests/test-tcp.sps calls as libuv does.
+  ;; Entry-point addresses leave only through this library's wrappers,
+  ;; except the shim's alloc-cb-entry, which tests/test-tcp.sps calls as
+  ;; libuv does.
   (define close-cb-entry      (foreign-callable-entry-point close-callable))
   (define timer-cb-entry      (foreign-callable-entry-point timer-callable))
   (define connection-cb-entry (foreign-callable-entry-point connection-callable))
@@ -1019,6 +1043,7 @@
   (define (uv-shutdown-native req-ptr stream-ptr)
     (raw-shutdown req-ptr stream-ptr shutdown-cb-entry))
 
+  ;; uv-read-start-native : uptr -> exact-integer
   ;; libuv's alloc callback is the shim's and its read callback the
   ;; trampoline's, paired in this one wrapper.
   (define (uv-read-start-native stream-ptr)
@@ -1134,8 +1159,10 @@
 
   (define (native-init-count) init-count)
 
+  ;; validate-uv-buf-layout! : -> unspecified
   ;; Compare the Scheme ftype with independently compiled size, offsets, and
-  ;; field widths before any handle can exist.
+  ;; field widths before any handle can exist, raising &uv-shim-unavailable
+  ;; on a mismatch.
   (define (validate-uv-buf-layout!)
     (let* ((layout     (uv-buf-ftype-layout))
            (size       (list-ref layout 0))
@@ -1155,13 +1182,13 @@
   ;;
   ;; The lock is held only with interrupts disabled. with-mutex releases it
   ;; in a dynamic-wind exit, after the winder is gone, where an engine could
-  ;; expire: every constructor starts here, and a dropped one left the lock
-  ;; held for good, so another thread's next constructor would wait on it
-  ;; forever (tests/test-constructors.sps). Disabled, no engine expires and
-  ;; no collection stops the thread between the take and the release, so a
-  ;; thread that waits on the lock, waiting with interrupts disabled too,
-  ;; waits only for a holder that is running. A raise inside, from a refused
-  ;; library, unwinds both forms.
+  ;; expire: every constructor starts here, and a constructor dropped in
+  ;; that exit would leave the lock held for good, so another thread's next
+  ;; constructor would wait on it forever (tests/test-constructors.sps).
+  ;; Disabled, no engine expires and no collection stops the thread between
+  ;; the take and the release, so a thread that waits on the lock, waiting
+  ;; with interrupts disabled too, waits only for a holder that is running.
+  ;; A raise inside, from a refused library, unwinds both forms.
   (define (ensure-native-loaded!)
     (with-interrupts-disabled
      (with-mutex init-mutex

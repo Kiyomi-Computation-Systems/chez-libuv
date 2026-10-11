@@ -1,13 +1,11 @@
 # The Linux Valgrind memory gate, for developers on a non-Linux box.
 #
-# WHY THIS EXISTS. ADR-0003 makes Linux Valgrind the SOLE memory gate: macOS
-# has no LeakSanitizer on ARM64, so `make test-memory` there checks
-# addressability and says nothing whatever about leaks. That is not a
-# theoretical gap. v0.5 measured it: four independent ways to leak foreign
-# memory in the OS-buffer wrappers -- a mis-ordered validation and each of the
-# three `free!` sites -- and every one of them left the suite fully green at
-# 23 passes. On the primary development platform there is no local signal for
-# the entire defect class, and CI is the first thing that sees it.
+# WHY THIS EXISTS. Linux Valgrind is the SOLE memory gate: macOS has no
+# LeakSanitizer on ARM64, so `make test-memory` there checks addressability
+# and says nothing whatever about leaks. A leak there passes unless a
+# suite's own assertions happen to catch it, so on a macOS development box
+# there is no local signal for the entire defect class, and CI is the first
+# thing that sees it.
 #
 # This image mirrors ci.yml's linux job closely enough to be that signal.
 #
@@ -20,9 +18,9 @@ ARG CHEZ_VERSION
 RUN test -n "$CHEZ_VERSION" || (echo "build-arg CHEZ_VERSION is required" >&2; exit 1)
 
 # libuv1-dev is Debian 12's 1.44.2, below the floor, so the build passes it
-# over for the vendored libuv (ADR-0001, amended 2026-10-09), and
-# `make deps-info` here says so. It stays installed as the real case of that
-# fallback; removing it would also rebuild the Chez layer below for nothing.
+# over for the vendored libuv, and `make deps-info` here says so. It stays
+# installed as the real case of that fallback; removing it would also
+# rebuild the Chez layer below for nothing.
 # valgrind, cmake and build-essential match ci.yml's linux toolchain step.
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       valgrind cmake pkg-config build-essential libuv1-dev \

@@ -1,4 +1,4 @@
-;;; The Guix revision the development container is built from (ADR-0020).
+;;; The Guix revision the development container is built from.
 ;;; scripts/guix-env passes this to `guix time-machine`. Generated with
 ;;; `guix describe -f channels`, keeping only the guix channel. To bump it,
 ;;; change the commit and run `make check-guix`.

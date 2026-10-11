@@ -41,11 +41,12 @@
   ;; Present hints answer a copy that shares no pair with them. The alist is
   ;; read once, by read-proper-list, into fresh entries, each entry's key and
   ;; value read once; the checks then walk that copy, which nothing else
-  ;; reaches. Measured with Chez's list? first, as it was until #66, an alist
-  ;; changed twice at one engine expiry, a self-loop at each of its first two
-  ;; pairs, left list?'s two walkers on separate cycles, and the call never
-  ;; returned; one made circular after list? was refused as a duplicate key
-  ;; (tests/test-addrinfo.sps's spine sweeps).
+  ;; reaches. A check with Chez's list? first would not be safe. An alist
+  ;; changed twice at one engine expiry, a self-loop at each of its first
+  ;; two pairs, leaves list?'s two walkers on separate cycles, and the call
+  ;; never returns; one made circular after list? accepts it is refused as a
+  ;; duplicate key rather than as no alist (tests/test-addrinfo.sps's spine
+  ;; sweeps).
   (define (validate-hints hints who)
     (if (or (eq? hints #f) (null? hints))
         'absent
@@ -84,10 +85,10 @@
   ;; checked-flags : object symbol -> (list-of symbol)
   ;; A fresh list of the flags: read once by read-proper-list, which ends
   ;; and raises nothing whatever the list is or becomes, then checked on
-  ;; that copy, which nothing else reaches. A guarded length cost a guard a
-  ;; call, and at --optimize-level 3 Chez's length checks nothing, so a
-  ;; circular list hung the call where no engine could stop it (#66;
-  ;; tests/flags-level-3-child.sps).
+  ;; that copy, which nothing else reaches. A guarded length would cost a
+  ;; guard a call, and at --optimize-level 3 Chez's length checks nothing,
+  ;; so a circular list would hang the call where no engine could stop it
+  ;; (tests/flags-level-3-child.sps).
   (define (checked-flags value who)
     (let ((flags (read-proper-list value (lambda (flag) flag))))
       (unless flags (refuse who 'hint-flags-not-a-list))

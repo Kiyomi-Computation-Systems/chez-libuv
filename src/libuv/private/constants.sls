@@ -57,7 +57,9 @@
   (import (rnrs)
           (libuv private conditions))
 
-  ;; Values remain false until constants-init! commits a complete snapshot.
+  ;; snapshot, lookup and the errno tables stay #f, and errno-name-list
+  ;; '(), until constants-init! commits a complete snapshot, which it does
+  ;; at most once; init-count counts the commits.
   (define snapshot #f)
   (define lookup   #f)
   (define init-count 0)
@@ -185,11 +187,13 @@
     (require-initialized 'uv-errno-count)
     (length errno-name-list))
 
+  ;; errno-symbols : -> (listof symbol)
   ;; Return a fresh list so callers cannot mutate the stored enumeration.
   (define (errno-symbols)
     (require-initialized 'uv-errno-symbols)
     (map values errno-name-list))
 
+  ;; errno-value->symbol : exact-integer -> symbol
   ;; Unknown numeric errors retain a stable UV_UNKNOWN discriminant.
   (define (errno-value->symbol n)
     (require-initialized 'uv-errno-value->symbol)

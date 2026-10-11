@@ -10,7 +10,8 @@
 (library (libuv private c-string)
   (export c-string-bytes c-string? read-utf8 nul-free?)
   (import (rnrs)
-          ;; Ahead of (chezscheme) (#41; tests/test-require-threaded.sps).
+          ;; Ahead of (chezscheme), so a non-threaded Chez is refused by
+          ;; name (tests/test-require-threaded.sps).
           (libuv private require-threaded)
           (only (chezscheme) disable-interrupts enable-interrupts)
           (libuv private conditions))
@@ -32,12 +33,12 @@
   ;; through the address verbs, and test-process.sps's changing-data sweeps
   ;; and narrower race through uv-spawn!.
   ;;
-  ;; Interrupts go off and on as a bare pair, which allocates nothing: with
-  ;; with-interrupts-disabled, a dynamic-wind, a 9-byte address cost 64 B more
-  ;; a call, and each string uv-spawn! reads inside its own interrupt-free
-  ;; step 64 B more too. A raise between the two would leave interrupts off
-  ;; for good, so string-copy is handed only a string, which it copies
-  ;; without raising (tests/test-c-string.sps).
+  ;; Interrupts go off and on as a bare pair, which allocates nothing.
+  ;; with-interrupts-disabled, a dynamic-wind, would cost a 9-byte address
+  ;; 64 B more a call, and each string uv-spawn! reads inside its own
+  ;; interrupt-free step 64 B more too. A raise between the two would leave
+  ;; interrupts off for good, so string-copy is handed only a string, which
+  ;; it copies without raising (tests/test-c-string.sps).
   (define (read-utf8 s)
     (and (string? s)
          (begin
@@ -61,8 +62,9 @@
   ;; naming WHO with REASON when S holds a NUL of its own, which C would read
   ;; as the end of the string. Its callers refuse a non-string themselves,
   ;; each with its own reason; one that reaches here is the binding's own
-  ;; fault, refused under this procedure's name, where it was read through
-  ;; as a bytevector at --optimize-level 3 (tests/test-c-string.sps).
+  ;; fault, refused under this procedure's name. Unchecked, it would be
+  ;; read through as a bytevector at --optimize-level 3
+  ;; (tests/test-c-string.sps).
   (define (c-string-bytes s who reason)
     (let ((utf8 (read-utf8 s)))
       (unless utf8

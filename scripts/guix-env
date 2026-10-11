@@ -1,5 +1,5 @@
 #!/bin/sh
-# The pinned Guix development container (ADR-0020).
+# The pinned Guix development container.
 #
 #   scripts/guix-env                an interactive bash
 #   scripts/guix-env CMD [ARG...]   run CMD, e.g. `make test`

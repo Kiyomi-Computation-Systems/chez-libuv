@@ -1,5 +1,5 @@
 #!r6rs
-;;; uv_async: the one cross-thread wakeup (#20). An async handle is created and
+;;; uv_async: the one cross-thread wakeup. An async handle is created and
 ;;; closed on its loop's owning thread like every other handle, but uv-async-send!
 ;;; may be called from ANY thread — uv_async_send is libuv's sole thread-safe
 ;;; call. Sends coalesce: N sends may yield a single wake callback, so the wake
@@ -13,12 +13,14 @@
           (libuv private handles))
 
   ;; make-uv-async : uv-loop procedure -> uv-async
-  ;; Loop-thread-only: it initialises native state and mutates the registry.
-  ;; require-loop-thread runs before any allocation, so a wrong-thread create is
-  ;; a named refusal, not a corrupted registry, and the constructor's step
-  ;; checks the owner again, since an engine can suspend the constructor
-  ;; while the loop is handed to another thread. The send fence, a native
-  ;; mutex, is made before the step, because making one can raise.
+  ;; Loop-thread-only: uv_async_init links the handle into the loop's
+  ;; handle and async queues, which the loop's thread changes without a
+  ;; lock. require-loop-thread runs before any allocation, so a wrong-thread
+  ;; create is a named refusal, not a corrupted loop, and the constructor's
+  ;; step checks the owner again, since an engine can suspend the
+  ;; constructor while the loop is handed to another thread. The send
+  ;; fence, a native mutex, is made before the step, because making one can
+  ;; raise.
   (define (make-uv-async loop on-wake)
     (ensure-native-loaded!)
     (require-open-loop loop 'make-uv-async)
@@ -31,10 +33,10 @@
                         count-async-new!)))
 
   ;; uv-async-send! : uv-async -> unspecified
-  ;; The ONE verb exempt from the loop-thread affinity check (design §6.3):
-  ;; uv_async_send is thread-safe, so a worker thread wakes the loop with it. It
-  ;; does not touch the registry. The open check and the native send run inside
-  ;; the handle's send fence, which uv-close! takes too (#33), so a send either
+  ;; The ONE verb exempt from loop-thread affinity: uv_async_send is
+  ;; thread-safe, so a worker thread wakes the loop with it. It does not
+  ;; touch the registry. The open check and the native send run inside the
+  ;; handle's send fence, which uv-close! takes too, so a send either
   ;; completes before a close begins or is refused with &uv-handle-closed, never
   ;; made on a freed handle. Nothing may raise inside the fence, so the step
   ;; checks the pointer as handle-pointer would and answers a status, and the

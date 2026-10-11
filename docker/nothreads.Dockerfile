@@ -1,4 +1,4 @@
-# A NON-threaded Chez Scheme, for `make check-nothreads-docker` (#41).
+# A NON-threaded Chez Scheme, for `make check-nothreads-docker`.
 #
 # chez-libuv needs a threaded Chez: Chez builds make-mutex and the rest of its
 # thread system only into threaded builds, and the binding uses them. Chez 10
