@@ -103,10 +103,18 @@ The condition has three fields:
 
 `expected` and `actual` always differ.
 
-A few verbs are not checked: among them `uv-close!`, `uv-stop!`, and loop
-queries such as `uv-now` and `uv-loop-alive?`. They belong to the loop's
-thread all the same. (`uv-run` and `uv-loop-teardown!` are not checked
-either: called from another thread, they take the loop over.)
+The check covers every verb on an open handle except `uv-close!`, every
+verb that makes something on a loop (the handle constructors, `uv-accept!`,
+`uv-spawn!`, `uv-getaddrinfo!` and `uv-getnameinfo!`), `uv-cancel!` and
+`uv-update-time!`. The rest are not checked:
+
+- `uv-close!`;
+- the loop verbs `uv-stop!`, `uv-loop-close!`, `uv-now`, `uv-loop-alive?`,
+  `uv-loop-open?`, `uv-loop-live-handles` and `uv-loop-deferred-errors`.
+
+They belong to the loop's thread all the same. (`uv-run` and
+`uv-loop-teardown!` are not checked either: called from another thread,
+they take the loop over.)
 
 > ⚠️ **Call unchecked verbs only from the loop's thread.** Nothing stops
 > `uv-close!` or `uv-stop!` from running on another thread, and there

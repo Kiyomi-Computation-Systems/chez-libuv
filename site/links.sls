@@ -1,9 +1,12 @@
 #!r6rs
 ;; PURE. Imports no library that loads a shared object.
 (library (site links)
-  (export rewrite-links)
+  (export rewrite-links repo-blob)
   (import (rnrs))
 
+  ;; Where a ../ escape points: this repository's files on GitHub, at the
+  ;; ref the site is built for. tests/site-check.sps checks each such target
+  ;; exists in the checkout.
   (define repo-blob
     "https://github.com/Kiyomi-Computation-Systems/chez-libuv/blob/")
 

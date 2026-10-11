@@ -25,7 +25,16 @@ Branch `docs/site`, on main 13562df, 2026-10-11. Guix container
   4. no `<pre>` is reflowed;
   5. every relative link names a file the site writes. New here: chez-cmark-gfm
      has no such check, and without it a home page written under one name and
-     linked under another passes 1 to 4.
+     linked under another passes 1 to 4;
+  6. every link out to the repository (a `../` escape) names a file the
+     checkout has;
+  7. every heading's anchor is the same on GitHub as on the site.
+
+  Checks 3, 5 and 6 scan only markup: a code sample that shows `href="…"`
+  is text, not a link, and a fixed probe holds that.
+- CI runs `check-site-deps` and `check-site` in the vendored job, so a pull
+  request that breaks the docs fails before merge, not at the release's
+  Pages job.
 
 ## Mutants
 
@@ -82,14 +91,64 @@ the copy as the container's root, `make check-site`:
 
 S4 passed checks 1 to 4 before check 5 existed: that is why it was added.
 
+After the code review, the same way:
+
+| Mutant | Failure |
+|---|---|
+| none | all seven checks green |
+| R1 the link scan reads text too (the copied scan) | `the link scan reads text as links: (x.md y.md)` |
+| R2 building.md links `../CONTRIBUTNG.md` | `a link out to the repository names no file in it, in building.md: (…/blob/main/CONTRIBUTNG.md)` |
+| R3 README.md links `../../docs` | `… names no file in it, in README.md: (…/blob/main/../docs)` |
+| R4 a heading `Stop — then close` | `a heading's anchor differs on GitHub, in timers.md: … site stop-then-close, GitHub stop--then-close` |
+| R5 R4, with the comparison made against the site's own slug | nothing: shows the GitHub slug is what catches R4 |
+
+### The generator's own suites
+
+`tests/site-unit.sps` (53 assertions) and `tests/site-render-unit.sps` (16),
+ported from chez-cmark-gfm's site suites and adapted (README.md as
+index.html, the wordmark, the blob base, `./` links), run first in
+`check-site`. Each mutation, in a copy outside the repo, failed only the
+assertions named:
+
+| Mutation | Failing assertions |
+|---|---|
+| escape-attr's `&quot;` | "escape-attr turns a double quote into &quot;" (rerun here: 52 passes, that 1 failure) |
+| the slugger's `-N` suffix dropped | "duplicate headings get -1, -2 suffixes", and three that depend on it |
+| no warning-callout rewrap; or U+26A0 changed | "a warning-sign blockquote is rewrapped …", "a warning blockquote is rendered inside a callout div" |
+| README no longer mapped to index in links | four unit and two render assertions on README links |
+| page-file-name's README case | "README.md is written as index.html" |
+| the wordmark | "the wordmark names chez-libuv …" (both suites) |
+| the nav/footer README case | "a README.md nav entry links index.html", "the footer nav links the previous and next pages" |
+| strip-dot-slash removed | "a link to ./README.md …", "a ./page.md link has its ./ stripped" |
+| the blob base | "a ../ escape is pinned to the GitHub blob at the ref" |
+| the dangler test always true | "a bare .md link to a page absent from the registry is a dangler" |
+| text newlines re-indented | "indentation inside pre/code is content, preserved byte-for-byte" |
+| the rail takes h3 | "the rail does not link the h1 anchor", "the rail lists h2 sections, not h3 details" |
+| README.md left in the nav | three home-page assertions |
+
+Not mutated: the theme script's no-entities assertion.
+
+### check-pins
+
+Akku.lock now holds two projects, and chez-cmark-gfm sorts first. The old
+lookup took the first `akku.N.<hex>_repack` URL in the file: with
+chez-cmark-gfm relocked to a snapshot version (`…_0.0.0-akku.3.abc1234_repack`)
+it read `abc1234`. The lookup now reads only chez-srfi's project, and gives
+`7879b52` on both locks.
+
+### check-akku's copy
+
+A tracked file missing from the working tree (`tests/uv-race.sls` moved
+away for the run) now stops the check: `could not archive the tracked
+files`. Before, the copy was a pipeline, and only its last command's
+status counted.
+
 ### Uncovered
 
 - **S7, a link to README.md.** No page links to `README.md` today; the
   wordmark's `index.html` comes from the template. The first page that does
   is held by check 5: its link would name `README.html`, a file the site
   does not write. The site agent watched the mapping work on a stub tree.
-- **The `../` escape and `SITE_REF`.** `docs/README.md`'s `../docs` link
-  becomes a GitHub URL; nothing checks the URL's form beyond its scheme.
 - **`akku install`'s `.akku/lib`.** `make site-deps` uses it when present.
   No machine here has run `akku install`, so that branch has not run.
 - **The Pages workflow.** Not run: Actions has no minutes left this month.
@@ -99,9 +158,6 @@ S4 passed checks 1 to 4 before check 5 existed: that is why it was added.
   found wrong Raises lines and entries the check cannot see; they were fixed
   by hand. A check that compares each entry's kind and arity with its
   `define` would close most of it.
-- **GitHub's anchors.** The site's slugs drop underscores and collapse
-  hyphen runs where GitHub's do not. Every heading and anchor link agrees
-  today; nothing holds a new one to it.
 - **The examples in the pages.** Every writer ran every example and
   checked each shown output; a later run of a sample matched. Nothing holds
   them to the source from now on (chez-cmark-gfm's `examples/` gate would).

@@ -38,7 +38,7 @@ the conditions a call raises and the `&uv-invalid-argument` reasons you are
 most likely to meet. They are a guide, not a contract: the source names every
 reason, and [Errors](errors.md) explains how to catch them by type.
 
-The thread check does not cover `uv-close!`, `uv-stop!`, `uv-now` or `uv-loop-alive?`, which you still call only on the loop's thread. `uv-run` and `uv-loop-teardown!` are not refused from another thread either: they make that thread the loop's owner. `uv-async-send!` is the one verb you may call from any thread.
+The thread check does not cover `uv-close!`, or the loop verbs `uv-stop!`, `uv-loop-close!`, `uv-now`, `uv-loop-alive?`, `uv-loop-open?`, `uv-loop-live-handles` and `uv-loop-deferred-errors`: you still call them only on the loop's thread. `uv-run` and `uv-loop-teardown!` are not refused from another thread either: they make that thread the loop's owner. `uv-async-send!` is the one verb you may call from any thread.
 
 See [Errors](errors.md) for the condition family and
 [Threads](threads.md) for the thread rules.

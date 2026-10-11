@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            valgrind cmake pkg-config build-essential libuv1-dev
+            valgrind cmake pkg-config build-essential libuv1-dev cmark-gfm
 
       # The pinned Chez, built from source and cached per runner image (see
       # the action for why apt's will not do), asserted to meet the floor,
@@ -92,6 +92,17 @@ jobs:
       # check rather than a comment.
       - name: Check dependency pins agree
         run: make check-pins
+
+      # The docs: one reference entry per export, then the site rendered in
+      # memory (every page in the nav, every link and anchor resolving, and
+      # anchors GitHub agrees with). The release's Pages job runs the same
+      # gate; here a pull request that breaks the docs fails before merge.
+      # chez-cmark-gfm comes from the archive Akku.lock pins, and loads the
+      # cmark-gfm installed above. The download itself is tested offline.
+      - name: Docs reference and site
+        run: |
+          make check-site-deps
+          make check-site
 
       - name: Check source and docs cite no plans or history
         run: make check-history

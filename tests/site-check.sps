@@ -25,13 +25,19 @@
 ;;;   4. no <pre> reflow -- the serializer never reindents preformatted code.
 ;;;   5. every relative link names a written file -- a page under the name
 ;;;      (site io) writes it to, or the stylesheet.
+;;;   6. every link out to the repository (a ../ escape) names a file the
+;;;      checkout has.
+;;;   7. every heading's anchor is the same on GitHub as on the site.
 ;;;
 ;;; Each invariant `die`s with its own name on failure and a non-zero exit,
 ;;; per AGENTS.md ("Expect a value only success can produce"): a caller
 ;;; grepping this program's stderr for which invariant broke gets an answer,
 ;;; not a guess.
 (import (rnrs) (only (chezscheme) getenv directory-list)
-        (site io) (site render) (site pages) (site serializer))
+        (cmark gfm)
+        (site io) (site render) (site pages) (site serializer)
+        (only (site links) repo-blob) (only (site slug) slugify)
+        (site transform))
 
 (define (die . parts)
   (for-each (lambda (x) (display x (current-error-port))) parts)
@@ -116,14 +122,25 @@
 ;; -- it can never fire early on a quote that is part of the value itself.
 (define (attr-values html marker)
   (let ((hn (string-length html)) (mn (string-length marker)))
-    (let loop ((i 0) (acc '()))
+    (let loop ((i 0) (acc '()) (in-tag #f))
       (cond
         ((> (+ i mn) hn) (reverse acc))
-        ((string=? marker (substring html i (+ i mn)))
+        ((char=? (string-ref html i) #\<) (loop (+ i 1) acc #t))
+        ((char=? (string-ref html i) #\>) (loop (+ i 1) acc #f))
+        ((and in-tag (string=? marker (substring html i (+ i mn))))
          (let* ((start (+ i mn))
                 (end (or (string-search html "\"" start) hn)))
-           (loop (+ end 1) (cons (substring html start end) acc))))
-        (else (loop (+ i 1) acc))))))
+           (loop (+ end 1) (cons (substring html start end) acc) #t)))
+        (else (loop (+ i 1) acc in-tag))))))
+
+;; Only markup is scanned. escape-text turns every < and > in text into
+;; &lt; and &gt;, so a raw < opens a tag and a raw > closes it. Text is not
+;; scanned: a code sample showing href="x.md" is not a link. This probe holds
+;; that: a code sample with an href in it, then a real link.
+(let ((probe (sxml->html '(p (code "<a href=\"x.md\">") (a (^ (href "y.md")) "y")))))
+  (unless (equal? (attr-values probe "href=\"") '("y.md"))
+    (die "check-site: the link scan reads text as links: "
+         (attr-values probe "href=\""))))
 
 (define (relative-md-leak? v)
   (and (not (string-starts-with? "http" v))
@@ -170,6 +187,65 @@
              (car pg) ": " bad))))
   (site-result-pages result))
 
+;; --- (6) every link out to the repository names a file it has -------------
+;; A ../ escape becomes a GitHub URL under repo-blob at SITE_REF, which
+;; nothing on the site resolves. The file it names must exist in this
+;; checkout, or the published page links to a 404.
+(define blob-prefix (string-append repo-blob ref "/"))
+
+(define (missing-repo-files html)
+  (filter (lambda (v)
+            (and (string-starts-with? blob-prefix v)
+                 (let ((path (link-path (substring v (string-length blob-prefix)
+                                                   (string-length v)))))
+                   (or (string-starts-with? "../" path)
+                       (not (file-exists? path))))))
+          (attr-values html "href=\"")))
+
+(for-each
+  (lambda (pg)
+    (let ((bad (missing-repo-files (sxml->html (cdr pg)))))
+      (unless (null? bad)
+        (die "check-site: a link out to the repository names no file in it, in "
+             (car pg) ": " bad))))
+  (site-result-pages result))
+
+;; --- (7) every heading's anchor is GitHub's too ---------------------------
+;; docs/ is read on GitHub as well as on the site, so an anchor must be the
+;; same in both. GitHub keeps underscores and turns each space into a
+;; hyphen, where (site slug) drops underscores and collapses runs; the two
+;; agree on plain headings. A heading on which they differ is refused, so
+;; every page.md#anchor link works in both places.
+(define (github-slug text)
+  (list->string
+   (map (lambda (c) (if (char=? c #\space) #\- c))
+        (filter (lambda (c)
+                  (or (char-alphabetic? c) (char-numeric? c)
+                      (memv c '(#\space #\- #\_))))
+                (string->list (string-downcase (trim-spaces text)))))))
+
+(define (trim-spaces s)
+  (let* ((cs (string->list s))
+         (drop (lambda (cs) (let loop ((cs cs))
+                              (if (and (pair? cs) (char=? (car cs) #\space))
+                                  (loop (cdr cs))
+                                  cs)))))
+    (list->string (reverse (drop (reverse (drop cs)))))))
+
+(for-each
+  (lambda (in)
+    (let-values (((body toc) (transform-body (markdown->sxml (cdr in)
+                                                             (default-cmark-options)))))
+      (for-each
+        (lambda (entry)
+          (let ((text (cadr entry)))
+            (unless (string=? (slugify text) (github-slug text))
+              (die "check-site: a heading's anchor differs on GitHub, in "
+                   (car in) ": " text " -> site " (slugify text)
+                   ", GitHub " (github-slug text)))))
+        toc)))
+  (read-site-inputs))
+
 ;; --- (4) no <pre> reflow ----------------------------------------------------
 ;; A fixed probe, independent of the real corpus: a deeply-indented code
 ;; block must round-trip byte-for-byte, so `make check-site` alone catches
@@ -178,5 +254,5 @@
   (unless (string=? probe "<pre><code>a\n        b\n</code></pre>")
     (die "check-site: <pre> reflow FAILED: " probe)))
 
-(display "check-site: nav, anchors, no .md leak, every link written, no <pre> reflow -- all green\n")
+(display "check-site: nav, anchors, no .md leak, every link written, repository links exist, GitHub anchors, no <pre> reflow -- all green\n")
 (exit 0)

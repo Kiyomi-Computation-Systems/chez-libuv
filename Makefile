@@ -282,7 +282,9 @@ PINS_MAKE = $(MAKE)
 
 check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README floor, floor detection, manifest/CHANGELOG version, and vendor read-path facts agree
 	@rec=$$(git ls-files -s $(SRFI_SRC) | awk '{print $$2}'); \
-	lock=$$(sed -n 's/.*akku\.[0-9]*\.\([a-f0-9]*\)_repack.*/\1/p' Akku.lock | head -1); \
+	lock=$$(awk '/\(name "/ { split($$0, a, "\""); name = a[2] } \
+	             name == "chez-srfi" && /\(url "/' Akku.lock | \
+	        sed -n 's/.*akku\.[0-9]*\.\([a-f0-9]*\)_repack.*/\1/p' | head -1); \
 	if [ -z "$$rec" ] || [ -z "$$lock" ]; then \
 	  echo "check-pins: could not read both pins (submodule='$$rec' lock='$$lock')" >&2; \
 	  exit 1; \
@@ -396,20 +398,25 @@ site-deps: ## Get chez-cmark-gfm as Akku.lock pins it: an `akku install` tree, e
 	@if [ -f .akku/lib/cmark/gfm.sls ]; then \
 	  echo "site-deps: using .akku/lib (akku install)"; \
 	else \
-	  scripts/fetch-akku-lock chez-cmark-gfm; \
+	  AKKU_DEST=$(BUILD_DIR)/akku scripts/fetch-akku-lock chez-cmark-gfm; \
 	fi
 
 site: site-deps ## Render docs/ into build/site/ (open build/site/index.html)
 	@mkdir -p $(BUILD_DIR)/site
 	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS) SITE_REF="$(SITE_REF)" \
-	  $(CHEZ) --program build-site.sps
+	  SITE_OUT=$(BUILD_DIR)/site $(CHEZ) --program build-site.sps
 	@cp site/style.css $(BUILD_DIR)/site/style.css
 	@echo "site: $(BUILD_DIR)/site ready (open $(BUILD_DIR)/site/index.html)"
 
 check-reference: ## Fail unless docs/reference.md has one entry per public export, in the modules that export it
 	@CHEZSCHEMELIBDIRS=. $(CHEZ) --program tests/reference-check.sps
 
-check-site: check-reference site-deps ## Render the site in memory: every page in the nav, every link and anchor resolves, no .md link leaks, no <pre> reflows
+# The generator's own suites first (SRFI-64, so `deps` too), then the real
+# site, rendered in memory and checked. They are not tests/test-*.sps:
+# `make test` needs no chez-cmark-gfm.
+check-site: check-reference site-deps deps ## Test the site generator, then render docs/ in memory: nav, links, anchors (GitHub's too), no .md leak, no <pre> reflow
+	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS):$(SRFI_LIBS) $(CHEZ) --program tests/site-unit.sps
+	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS):$(SRFI_LIBS) $(CHEZ) --program tests/site-render-unit.sps
 	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS) SITE_REF="$(SITE_REF)" \
 	  $(CHEZ) --program tests/site-check.sps
 

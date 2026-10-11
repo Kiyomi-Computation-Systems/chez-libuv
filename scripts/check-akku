@@ -42,10 +42,16 @@ manifest=$(cd "$root" && "$CHEZ" -q --script "$work/manifest.ss")
 package=${manifest% *}
 version=${manifest#* }
 
-# --no-recursion keeps a submodule's directory empty, as it is in an archive.
+# --no-recursion keeps a submodule's directory empty, as it is in an archive;
+# GNU tar applies it only to names after it, so it comes before -T. Each
+# step writes a file rather than feeding a pipe, so a failure in any of them
+# (a tracked file deleted from the working tree) stops the check: in a pipe,
+# only the last command's status counts.
 mkdir -p "$work/pkg/$package"
-(cd "$root" && git ls-files -z | tar --null --no-recursion -T - -cf -) |
-  (cd "$work/pkg/$package" && tar -xf -)
+(cd "$root" && git ls-files -z) > "$work/files" || fail "git ls-files failed"
+(cd "$root" && tar --null --no-recursion -T "$work/files" -cf "$work/pkg.tar") ||
+  fail "could not archive the tracked files"
+tar -xf "$work/pkg.tar" -C "$work/pkg/$package" || fail "could not unpack the package"
 
 mkdir "$work/consumer"
 cd "$work/consumer"
