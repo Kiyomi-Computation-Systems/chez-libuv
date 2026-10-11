@@ -837,7 +837,15 @@
       (if (and (equal? a "127.0.0.1") (positive? p))
           'has-a-local-name (list 'unexpected a p)))))
 
-(test-equal "an unconnected handle refuses with ENOTCONN"
+(test-equal "a handle with no socket yet refuses with EBADF"
+  'EBADF
+  (let ((u (make-uv-tcp pa-loop)))
+    (guard (e ((uv-errno-error? e) (uv-errno-error-errno e))
+              (#t (list 'wrong-condition e)))
+      (uv-tcp-peer-address u)
+      'no-raise)))
+
+(test-equal "a bound, unconnected handle refuses with ENOTCONN"
   'ENOTCONN
   (let ((u (make-uv-tcp pa-loop)))
     (uv-tcp-bind! u "127.0.0.1" 0)

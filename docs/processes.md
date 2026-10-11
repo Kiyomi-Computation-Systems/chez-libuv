@@ -312,7 +312,21 @@ not. Anything else is refused with `&uv-invalid-argument`, reason
 `'signal-unknown`. A failed send raises `&uv-errno-error`, such as `'ESRCH`
 for a process that is gone.
 
-A negative pid keeps its `kill(2)` meaning: it names a process group.
+The pid keeps its `kill(2)` meaning:
+
+- a positive pid is that one process;
+- `0` is every process in your own process group;
+- `-1` is every process you are allowed to signal;
+- any other negative pid, such as `-1234`, is every process in process
+  group 1234.
+
+> ⚠️ `-1` is not a process group. `(uv-kill! -1 'sigkill)` kills every
+> process you are allowed to signal. Negating a group id of 1 gives exactly
+> that, so check a pid you computed before you send to it.
+
+A pid must fit a C `int`, from -2147483648 to 2147483647. Any other is
+refused with `&uv-invalid-argument`, reason `'pid-out-of-range`, before
+anything is sent.
 
 ```scheme
 (import (rnrs) (libuv))

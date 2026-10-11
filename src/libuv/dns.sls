@@ -3,7 +3,6 @@
 ;;; records before libuv-owned memory is released.
 (library (libuv dns)
   (export uv-getaddrinfo! uv-getnameinfo! uv-cancel! uv-dns-request?
-          addrinfo-chain->list
           make-uv-addrinfo uv-addrinfo?
           uv-addrinfo-family uv-addrinfo-socktype uv-addrinfo-protocol
           uv-addrinfo-address uv-addrinfo-port uv-addrinfo-canonname)
@@ -13,7 +12,8 @@
           (libuv private native)
           (only (libuv private lists) fold-flags)
           (libuv private handles)
-          (libuv private addrinfo))
+          (libuv private addrinfo)
+          (libuv private addrinfo-chain))
 
   ;; uv-addrinfo? : object -> boolean
   ;; uv-addrinfo-family : uv-addrinfo -> symbol
@@ -251,50 +251,6 @@
               ((or (eq? rc 'done) (eqv? rc busy)) #f)
               ((owner-mismatch? rc) (raise (step-refusal rc 'uv-cancel! #f)))
               (else (uv-check rc 'uv-cancel!))))))
-
-  ;; addrinfo-chain->list : uptr -> (listof uv-addrinfo)
-  ;; Read fields through shim offsets, skip unsupported families, and copy all
-  ;; strings so the records outlive the native chain.
-  (define (addrinfo-chain->list chain)
-    (let walk ((node chain) (acc '()))
-      (if (zero? node)
-          (reverse acc)
-          (let ((next (c-uptr-ref (+ node (offsetof-addrinfo-ai-next))))
-                (family-int (c-int-ref (+ node (offsetof-addrinfo-ai-family)))))
-            (cond
-              ((= family-int (af-inet))
-               (walk next (cons (decode-entry node 'inet
-                                              (offsetof-sockaddr-in-sin-port))
-                                acc)))
-              ((= family-int (af-inet6))
-               (walk next (cons (decode-entry node 'inet6
-                                              (offsetof-sockaddr-in6-sin6-port))
-                                acc)))
-              (else (walk next acc)))))))
-
-  (define (decode-entry node family port-offset)
-    (let* ((addr-ptr (c-uptr-ref (+ node (offsetof-addrinfo-ai-addr))))
-           (address (sockaddr->address-string addr-ptr))
-           (port (if (zero? addr-ptr) 0 (read-net-u16 addr-ptr port-offset)))
-           (socktype (decode-socktype
-                      (c-int-ref (+ node (offsetof-addrinfo-ai-socktype)))))
-           (protocol (decode-protocol
-                      (c-int-ref (+ node (offsetof-addrinfo-ai-protocol)))))
-           (canonname (c-string->string
-                       (c-uptr-ref (+ node (offsetof-addrinfo-ai-canonname))))))
-      (make-uv-addrinfo family socktype protocol address port canonname)))
-
-  ;; Preserve unknown socket types and protocols as their raw integers.
-  (define (decode-socktype n)
-    (cond ((= n (sock-stream)) 'stream)
-          ((= n (sock-dgram))  'dgram)
-          ((= n (sock-raw))    'raw)
-          (else n)))
-
-  (define (decode-protocol n)
-    (cond ((= n (ipproto-tcp)) 'tcp)
-          ((= n (ipproto-udp)) 'udp)
-          (else n)))
 
   ;; Convert first, then free the chain unconditionally before user delivery.
   ;; A conversion failure frees the request without fabricating callback data.

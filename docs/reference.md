@@ -10,7 +10,7 @@ this binding, how do you call it, and which libraries export it?
 
 | Library | Purpose |
 |---|---|
-| `(libuv)` | Everything below except `addrinfo-chain->list`. |
+| `(libuv)` | Everything below. |
 | `(libuv loop)` | Loops: construction, running, closing and teardown. |
 | `(libuv handle)` | Handle predicates, state, buffer sizes and `uv-close!`. |
 | `(libuv timer)` | Timers. |
@@ -604,10 +604,10 @@ Sends a signal to the child. `signal` is `'sigterm`, `'sigkill`, `'sigint`, `'si
 
 `(uv-kill! pid signal) -> unspecified`
 
-Sends a signal to a process id, with the same signals as `uv-process-kill!`. A negative pid means a process group.
+Sends a signal to a process id, with the same signals as `uv-process-kill!`. As in `kill(2)`, a pid of `0` means your own process group, `-1` every process you are allowed to signal, and any other negative pid `-N` process group `N`. The pid must fit a C `int`.
 
 **Available from:** `(libuv)`, `(libuv process)`\
-**Raises:** `&uv-invalid-argument` with reason `'pid-not-an-exact-integer` or `'signal-unknown`, `&uv-errno-error` (`'ESRCH` for a missing process)\
+**Raises:** `&uv-invalid-argument` with reason `'pid-not-an-exact-integer`, `'pid-out-of-range` or `'signal-unknown`, `&uv-errno-error` (`'ESRCH` for a missing process)\
 **Details:** [Child processes](processes.md)
 
 ### `uv-process-pid` (procedure)
@@ -784,17 +784,6 @@ Returns the port, from 0 to 65535.
 Returns the canonical name. It is `#f` except on the first record when the `canonname` hint flag is set.
 
 **Available from:** `(libuv)`, `(libuv dns)`\
-**Details:** [DNS](dns.md)
-
-### `addrinfo-chain->list` (procedure)
-
-`(addrinfo-chain->list chain) -> (listof uv-addrinfo)`
-
-Converts a native `addrinfo` chain, given as an address, into address records. It copies every string and skips families other than `'inet` and `'inet6`. You do not need it to resolve names: `uv-getaddrinfo!` hands its callback the records already.
-
-> ⚠️ It reads memory at whatever address it is given, and checks nothing. Any number that is not the start of a live `addrinfo` chain crashes the process or returns garbage.
-
-**Available from:** `(libuv dns)`\
 **Details:** [DNS](dns.md)
 
 ## Async

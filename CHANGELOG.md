@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Fixed
+
+- **`uv-kill!` refuses a pid outside a C `int`'s range.** libuv takes the
+  pid as a C `int`, and Chez's `int` argument also takes the unsigned
+  range and wraps it. So 2147483648 reached `kill(2)` as the process group
+  -2147483648, and 4294967295 as -1, which signals every process the
+  caller may signal. A pid past 2^32 raised a malformed Chez condition
+  ("invalid who argument"). Every pid outside -2147483648 to 2147483647 now
+  raises `&uv-invalid-argument` with reason `'pid-out-of-range`, before
+  anything is sent.
+- **`uv-kill!` works as a process's first call into libuv.** It was the one
+  verb that did not load the native constants first, so as the first call
+  it raised `&uv-invalid-argument` with reason `'constants-not-initialized`
+  in place of the signal's result. It loads them now, as `uv-os-getpid`
+  and `uv-version` do.
+
+### Changed
+
+- **`(libuv dns)` no longer exports `addrinfo-chain->list`.** It was never
+  meant for programs: it reads memory at whatever address it is given, and
+  any number that is not a live `addrinfo` chain crashes the process or
+  answers garbage. `(libuv)` never exported it, and `uv-getaddrinfo!`
+  hands its callback the records already. It now lives in
+  `(libuv private addrinfo-chain)`, which, like every `(libuv private …)`
+  library, is not part of the API and can change in any release.
+
 ## 0.9.0 — 2026-10-11
 
 This release refuses a run before its thread's C stack runs out. A

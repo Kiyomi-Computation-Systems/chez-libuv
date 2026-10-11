@@ -134,11 +134,12 @@
       (raise (make-uv-invalid-argument who reason)))
     (for-each (lambda (bv) (check-string bv who reason)) lst))
 
-  ;; The C types the options block holds a caller's number in: an fd is a C
-  ;; int, a uid or gid an unsigned 32-bit int. The checks refuse a number
-  ;; outside its type before anything is allocated, and the fill, inside the
-  ;; step that spawns, writes none (fill-options-block!).
-  (define (c-int-fd? x) (and (integer? x) (exact? x) (<= 0 x 2147483647)))
+  ;; The C types a caller's number reaches libuv in: a pid or an fd is a C
+  ;; int, a uid or gid an unsigned 32-bit int. The options block's checks
+  ;; refuse a number outside its type before anything is allocated, and the
+  ;; fill, inside the step that spawns, writes none (fill-options-block!).
+  (define (c-int? x) (and (integer? x) (exact? x) (<= -2147483648 x 2147483647)))
+  (define (c-int-fd? x) (and (c-int? x) (>= x 0)))
   (define (u32? x) (and (integer? x) (exact? x) (<= 0 x 4294967295)))
 
   (define (require-u32 n who reason)
@@ -641,10 +642,20 @@
         (raise (step-refusal sent 'uv-process-kill! proc)))))
 
   ;; uv-kill! : exact-integer (or symbol 0) -> unspecified
-  ;; Negative pids retain kill(2)'s process-group meaning.
+  ;; The pid keeps kill(2)'s meaning: above 0 one process, 0 the caller's
+  ;; process group, -1 every process the caller may signal, and below -1 the
+  ;; group it negates. uv_kill takes the pid as a C int, and Chez's int
+  ;; argument also takes the unsigned range and wraps it, so 4294967295
+  ;; would reach kill(2) as -1: a pid outside the signed range is refused.
+  ;; The verb takes no loop, so no constructor has loaded the native
+  ;; constants before it, and it reads them to name its signal and its
+  ;; errno: it loads them itself.
   (define (uv-kill! pid sig)
     (unless (and (integer? pid) (exact? pid))
       (raise (make-uv-invalid-argument 'uv-kill! 'pid-not-an-exact-integer)))
+    (unless (c-int? pid)
+      (raise (make-uv-invalid-argument 'uv-kill! 'pid-out-of-range)))
+    (ensure-native-loaded!)
     (let ((signum (signal-symbol->int sig 'uv-kill!)))
       (uv-check (uv-kill pid signum) 'uv-kill!)))
 
