@@ -1,0 +1,91 @@
+#!/bin/sh
+# check-akku: install this package with Akku the way a consumer would, and
+# check which of its libraries land on the consumer's library path.
+#
+# `akku install` in this checkout installs it as the root project, which
+# takes every library, tests included; only a dependency is filtered (Akku
+# skips test paths, and whatever .akkuignore names). So a consumer project is
+# made in a temporary directory, with an Akku.lock that points this package
+# at a directory holding only the files git tracks -- what Akku's archive
+# builds a package from. Files are copied from the working tree, so
+# uncommitted edits to tracked files are what gets tested.
+#
+# This package's rows in the consumer's .akku/list must be exactly the .sls
+# files git tracks under src/: a site, tool or test library would land on
+# every consumer's library path, and a missing one would fail at import.
+#
+# Needs akku, chez and git on PATH; AKKU and CHEZ override the first two.
+# Akku.manifest has no `depends`, so nothing else is fetched.
+set -eu
+
+AKKU=${AKKU:-akku}
+CHEZ=${CHEZ:-chez}
+root=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d "${TMPDIR:-/tmp}/check-akku.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+fail() { echo "check-akku: $*" >&2; exit 1; }
+
+# The package's name and version, from Akku.manifest.
+cat > "$work/manifest.ss" <<'EOF'
+(with-input-from-file "Akku.manifest"
+  (lambda ()
+    (let loop ()
+      (let ((d (read)))
+        (cond ((eof-object? d) (error 'check-akku "no akku-package form"))
+              ((and (pair? d) (eq? (car d) 'akku-package))
+               (display (car (cadr d))) (display " ")
+               (display (cadr (cadr d))) (newline))
+              (else (loop)))))))
+EOF
+manifest=$(cd "$root" && "$CHEZ" -q --script "$work/manifest.ss")
+package=${manifest% *}
+version=${manifest#* }
+
+# --no-recursion keeps a submodule's directory empty, as it is in an archive.
+mkdir -p "$work/pkg/$package"
+(cd "$root" && git ls-files -z | tar --null --no-recursion -T - -cf -) |
+  (cd "$work/pkg/$package" && tar -xf -)
+
+mkdir "$work/consumer"
+cd "$work/consumer"
+cat > Akku.manifest <<EOF
+#!r6rs
+(import (akku format manifest))
+(akku-package ("check-akku-consumer" "0.0.0")
+  (synopsis "check-akku's consumer") (authors "check-akku") (license "MIT")
+  (depends ("$package" "^$version")))
+EOF
+cat > Akku.lock <<EOF
+#!r6rs
+(import (akku format lockfile))
+(projects ((name "$package") (location (directory "$work/pkg/$package"))))
+EOF
+
+echo "check-akku: installing $package $version as a dependency"
+"$AKKU" install > install.log 2>&1 || { cat install.log >&2; fail "akku install failed"; }
+
+# Akku installs a library that imports (chezscheme) as NAME.chezscheme.sls,
+# so that suffix is folded back to .sls before comparing with src/.
+awk -F '\t' -v p="$package" '$2 == p && $3 == "r6rs-library" { sub("^\\.akku/lib/", "", $1); print $1 }' \
+  .akku/list | sed 's/\.chezscheme\.sls$/.sls/' | sort > installed.txt
+# A library whose name has one part, (libuv), is installed twice: as
+# libuv.sls and, for Schemes that look in a directory, as libuv/main.sls.
+# The second counts only as a byte-for-byte copy of the first.
+while read -r f; do
+  case $f in
+    */main.sls)
+      twin=${f%/main.sls}.sls
+      if grep -qxF "$twin" installed.txt &&
+         cmp -s ".akku/lib/$f" ".akku/lib/$twin"; then
+        continue
+      fi ;;
+  esac
+  echo "$f"
+done < installed.txt > installed.dedup && mv installed.dedup installed.txt
+(cd "$root" && git ls-files -- 'src/*.sls' | sed 's#^src/##' | sort) > expected.txt
+[ -s expected.txt ] || fail "git tracks no src/*.sls; nothing to compare against"
+diff -u expected.txt installed.txt > libraries.diff ||
+  { cat libraries.diff >&2; fail "$package installs a different set of libraries than src/ (- missing, + extra)"; }
+
+echo "check-akku: $(wc -l < installed.txt | tr -d ' ') libraries installed, exactly src/"

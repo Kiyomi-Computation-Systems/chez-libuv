@@ -171,7 +171,7 @@
   ;;   it while holding the claim, so a run that claims after the close
   ;;   finds the loop closed, never a freed pointer.
   ;; - With TAKE-OWNER?, a successful claim also makes this thread the
-  ;;   loop's owner, in the same step: uv-run's hand-off (docs/api.md), and
+  ;;   loop's owner, in the same step: uv-run's hand-off (docs/threads.md), and
   ;;   a teardown's, whose drain runs the loop. A refused claim changes
   ;;   nothing.
   ;; - The acquire after the take and the release before the clear order

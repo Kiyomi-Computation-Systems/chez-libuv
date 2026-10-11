@@ -172,7 +172,7 @@ PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
 # here.
 MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 
-.PHONY: all build deps require-toolchain relink-guard check-pins check-history check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside
+.PHONY: all build deps require-toolchain relink-guard check-pins check-history check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside site-deps site check-site check-reference check-site-deps check-akku
 
 .DEFAULT_GOAL := help
 
@@ -377,6 +377,52 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 # before it scans, so a pattern edited into uselessness fails here first.
 check-history: ## Fail if source, tests, build files or user docs cite plans, issues, dates or release numbers
 	@scripts/check-history-refs
+
+# --- the docs site ------------------------------------------------------
+# docs/*.md rendered to build/site/ through chez-cmark-gfm, a development
+# dependency that Akku.manifest declares and Akku.lock pins. None of these
+# targets builds the shim or needs libuv: the site needs Chez and the
+# system cmark-gfm library, and check-reference reads src/ with `read`.
+#
+# chez-cmark-gfm comes from an `akku install` tree when there is one, and
+# otherwise from the archive Akku.lock pins, downloaded and checked against
+# the lock's sha256 by scripts/fetch-akku-lock. Run `make site-deps` once
+# where there is a network; after that it needs none.
+SITE_CMARK    := $(if $(wildcard .akku/lib/cmark/gfm.sls),.akku/lib,$(BUILD_DIR)/akku/chez-cmark-gfm/src)
+SITE_LIBDIRS  := .:$(SITE_CMARK)
+SITE_REF      ?= main
+
+site-deps: ## Get chez-cmark-gfm as Akku.lock pins it: an `akku install` tree, else the locked archive
+	@if [ -f .akku/lib/cmark/gfm.sls ]; then \
+	  echo "site-deps: using .akku/lib (akku install)"; \
+	else \
+	  scripts/fetch-akku-lock chez-cmark-gfm; \
+	fi
+
+site: site-deps ## Render docs/ into build/site/ (open build/site/index.html)
+	@mkdir -p $(BUILD_DIR)/site
+	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS) SITE_REF="$(SITE_REF)" \
+	  $(CHEZ) --program build-site.sps
+	@cp site/style.css $(BUILD_DIR)/site/style.css
+	@echo "site: $(BUILD_DIR)/site ready (open $(BUILD_DIR)/site/index.html)"
+
+check-reference: ## Fail unless docs/reference.md has one entry per public export, in the modules that export it
+	@CHEZSCHEMELIBDIRS=. $(CHEZ) --program tests/reference-check.sps
+
+check-site: check-reference site-deps ## Render the site in memory: every page in the nav, every link and anchor resolves, no .md link leaks, no <pre> reflows
+	@CHEZSCHEMELIBDIRS=$(SITE_LIBDIRS) SITE_REF="$(SITE_REF)" \
+	  $(CHEZ) --program tests/site-check.sps
+
+# What Akku installs into a consumer's .akku/lib: install this package as a
+# dependency of a throwaway project and require exactly src/'s libraries.
+# .akkuignore keeps site/ (the docs generator) out. Needs akku and a Chez on
+# the host: `guix shell akku chez-scheme -- make check-akku CHEZ=scheme`.
+AKKU ?= akku
+check-akku: ## Install as an Akku dependency and check exactly src/'s libraries land
+	@AKKU="$(AKKU)" CHEZ="$(CHEZ)" scripts/check-akku
+
+check-site-deps: ## Test scripts/fetch-akku-lock offline: sha256 checked, a second run needs no network, a re-pin replaces the tree
+	@sh tests/fetch-akku-lock.sh
 
 # Nothing outside private/ may see a raw uv_* symbol or pointer.
 # test-conditions.sps exercises the pure &uv-* condition

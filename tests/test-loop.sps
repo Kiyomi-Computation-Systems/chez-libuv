@@ -288,7 +288,7 @@
 (test-equal "...and that timer was live: the loop fires it once it runs"
   'satisfied rn-drive)
 
-;; Loop thread only, and checked (docs/api.md, "One thread per loop"). The
+;; Loop thread only, and checked (docs/threads.md, "The wrong thread"). The
 ;; owner field is pointed at a thread id no real thread holds --
 ;; test-async.sps's technique, so no second thread is needed -- and the
 ;; refusal must come BEFORE the write: the clock is let past the cached now

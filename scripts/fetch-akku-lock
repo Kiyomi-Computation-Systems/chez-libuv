@@ -1,0 +1,116 @@
+#!/bin/sh
+# scripts/fetch-akku-lock NAME...
+#
+# Gets each named package exactly as Akku.lock pins it, for a machine
+# without the akku tool: downloads the archive the lock names, checks its
+# sha256 against the lock, and unpacks it to $AKKU_DEST/NAME/. A package
+# whose unpacked tree already records the lock's sha256 is left alone, so a
+# second run needs no network (the Guix container has none).
+#
+# AKKU_LOCK (default Akku.lock) and AKKU_DEST (default build/akku) exist so
+# tests/fetch-akku-lock.sh can run it on a lock of its own.
+#
+# Prints one line per package and exits 0, or names what failed and exits
+# 1: a package missing from the lock, a download that failed, or an archive
+# whose sha256 differs from the lock's. A failed check deletes the archive
+# and unpacks nothing.
+set -eu
+
+lock=${AKKU_LOCK:-Akku.lock}
+dest=${AKKU_DEST:-build/akku}
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: fetch-akku-lock NAME..." >&2
+  exit 2
+fi
+if [ ! -f "$lock" ]; then
+  echo "fetch-akku-lock: $lock not found" >&2
+  exit 1
+fi
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Prints "URL SHA256" for the project NAME in the lock, or nothing. The
+# lock is `akku lock`'s output: each project's (name "…"), then its url,
+# then its sha256, each string on a line of its own or after its key.
+lookup() {
+  awk -v want="$1" '
+    /\(name "/ { split($0, a, "\""); name = a[2]; url = ""; next }
+    name == want && /\(url "/ { split($0, a, "\""); url = a[2]; next }
+    name == want && url != "" && /"[0-9a-f]+"/ {
+      split($0, a, "\""); print url, a[2]; exit
+    }' "$lock"
+}
+
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -sSfL -o "$2" "$1"
+  else
+    wget -q -O "$2" "$1"
+  fi
+}
+
+mkdir -p "$dest/dl"
+status=0
+for name in "$@"; do
+  set -- $(lookup "$name")
+  if [ "$#" -ne 2 ]; then
+    echo "fetch-akku-lock: $name is not in $lock" >&2
+    status=1
+    continue
+  fi
+  url=$1 want=$2
+  tree=$dest/$name
+  if [ -d "$tree" ] && [ "$(cat "$tree.sha256" 2>/dev/null)" = "$want" ]; then
+    echo "fetch-akku-lock: $name is up to date ($tree)"
+    continue
+  fi
+  archive=$dest/dl/$name.tar.xz
+  if [ ! -f "$archive" ] || [ "$(sha256 "$archive")" != "$want" ]; then
+    rm -f "$archive"
+    if ! fetch "$url" "$archive.part"; then
+      rm -f "$archive.part"
+      echo "fetch-akku-lock: could not download $url" >&2
+      echo "fetch-akku-lock: run it where there is a network (on a Guix host, outside scripts/guix-env), then again here" >&2
+      status=1
+      continue
+    fi
+    mv "$archive.part" "$archive"
+  fi
+  got=$(sha256 "$archive")
+  if [ "$got" != "$want" ]; then
+    rm -f "$archive"
+    echo "fetch-akku-lock: $name's archive has sha256 $got, but $lock pins $want" >&2
+    status=1
+    continue
+  fi
+  # tar reads the archive itself and finds the xz compression: piped from
+  # xz, a missing xz left bsdtar an empty stream, which it unpacks as an
+  # empty archive and calls success. The new tree is unpacked beside the
+  # old one, which is replaced only once the new one is whole.
+  rm -rf "$tree.tmp"
+  mkdir -p "$tree.tmp"
+  if ! tar -xf "$archive" -C "$tree.tmp"; then
+    rm -rf "$tree.tmp"
+    echo "fetch-akku-lock: could not unpack $archive (tar needs xz to read it)" >&2
+    status=1
+    continue
+  fi
+  if [ -z "$(ls -A "$tree.tmp")" ]; then
+    rm -rf "$tree.tmp"
+    echo "fetch-akku-lock: $archive unpacked to nothing" >&2
+    status=1
+    continue
+  fi
+  rm -rf "$tree" "$tree.sha256"
+  mv "$tree.tmp" "$tree"
+  echo "$want" > "$tree.sha256"
+  echo "fetch-akku-lock: $name unpacked to $tree"
+done
+exit $status

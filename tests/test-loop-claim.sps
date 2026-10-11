@@ -600,7 +600,7 @@
 ;;
 ;; Each body leaves its callback by a continuation, and that strands the
 ;; C frames of the uv_run it left on its thread's stack for as long as the
-;; thread lives (docs/api.md, "A callback ends only by returning"). 20,000
+;; thread lives (docs/callbacks.md, "What an escape costs"). 20,000
 ;; of them overflowed an 8 MB stack on Linux, and 2,000 a secondary
 ;; thread's on macOS, which then hung instead of crashing. So the bodies
 ;; run in batches of exit-race-batch, each on a thread of its own, whose

@@ -1,7 +1,7 @@
 #!r6rs
 ;;; SRFI-64 suite for loops that run on different threads at once.
 ;;;
-;;; docs/api.md gives each loop to one thread, and lets several threads each
+;;; docs/threads.md gives each loop to one thread, and lets several threads each
 ;;; run a loop of their own at once, a thread per core for instance. Every
 ;;; such thread writes the binding's process-wide state, and each piece of
 ;;; it goes wrong when two threads write it unguarded:

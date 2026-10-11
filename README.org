@@ -144,10 +144,24 @@ runs them in a pinned container. CI runs on Linux; macOS is tested locally.
 
 * Documentation
 
-| [[file:docs/quickstart.md][Quickstart]]         | An echo server start to finish, and the rules that make it work |
-| [[file:docs/api.md][API reference]]             | Every export of every module, with its semantics                |
-| [[file:docs/building.md][Building & testing]]   | Acquisition paths, ~CHEZ_LIBUV_SHIM~, release builds, test gates |
-| [[file:CHANGELOG.md][CHANGELOG]]                | Per-release history                                             |
+The guides start at [[file:docs/README.md][docs/README.md]]. ~make site~
+renders them into ~build/site/~, the pages published on GitHub Pages.
+
+| [[file:docs/installing.md][Installing]]             | What you need, building the shim, importing ~(libuv)~             |
+| [[file:docs/quickstart.md][Quickstart]]             | An echo server start to finish, and the rules that make it work   |
+| [[file:docs/loops.md][The event loop]]              | Making, running, stopping and tearing down a loop                 |
+| [[file:docs/callbacks.md][Callbacks]]               | What a callback may do, raises, escapes and engines               |
+| [[file:docs/threads.md][Threads]]                   | One thread per loop, handing a loop over, async wakeups           |
+| [[file:docs/timers.md][Timers]]                     | One-shot and repeating timers                                     |
+| [[file:docs/tcp.md][TCP and streams]]               | Listening, connecting, reading and writing                        |
+| [[file:docs/flow-control.md][Flow control]]         | Buffers, the write queue, pausing reads                           |
+| [[file:docs/processes.md][Processes and pipes]]     | Running a child and talking to it                                 |
+| [[file:docs/signals.md][Signals]]                   | Catching signals on the loop                                      |
+| [[file:docs/dns.md][DNS]]                           | Names to addresses and back                                       |
+| [[file:docs/errors.md][Errors]]                     | Every condition the library raises                                |
+| [[file:docs/reference.md][API reference]]           | Every exported binding, checked against the source                |
+| [[file:docs/building.md][Building and testing]]     | Acquisition paths, release builds, test gates, the docs site      |
+| [[file:CHANGELOG.md][CHANGELOG]]                    | Per-release history                                               |
 
 * Contributing
 

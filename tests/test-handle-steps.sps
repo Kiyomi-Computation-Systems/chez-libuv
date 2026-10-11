@@ -630,7 +630,7 @@
   (reach handoff-sweeps))
 
 ;; Of the loop queries only uv-update-time! is loop-thread-only by a check:
-;; the other three are by contract, unchecked (docs/api.md).
+;; the other three are by contract, unchecked (docs/threads.md).
 (define loop-handoff-sweeps
   (list (cons 'uv-update-time! (split-sweep 'uv-update-time! 'handoff))))
 (report! 'handoff loop-handoff-sweeps)

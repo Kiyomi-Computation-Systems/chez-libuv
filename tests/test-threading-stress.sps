@@ -346,7 +346,7 @@
 ;; pool below holds that). It cannot tell a worker which of its items arrive:
 ;; a close drops a wake still pending, and a refused send may follow an item
 ;; its worker already queued. Exact delivery is the caller's, and this block
-;; exercises the discipline for it (docs/api.md, Async):
+;; exercises the discipline for it (docs/threads.md):
 ;;   - a worker holds QM while it checks OPEN?, queues its item, and sends,
 ;;     so it queues an item only while the loop thread will still drain it;
 ;;   - the loop thread clears OPEN? under QM, then calls uv-close!, so no item
@@ -540,7 +540,7 @@
 ;; progress, can fail a correct build: at a load average of 140 the starved
 ;; loop thread lets one worker reach a cap of 1,000,000 sends before the
 ;; 50th wake. What ends a worker on a build that never refuses is the
-;; contract instead (docs/api.md, Async): a send made once a close has begun
+;; contract instead (docs/threads.md): a send made once a close has begun
 ;; is refused. Workers spin while the loop thread is stalled, and that
 ;; spinning is what races the close: with an unfenced send, backing off in
 ;; stalls cuts the failing rounds from 150 to 35 in 40 runs.
