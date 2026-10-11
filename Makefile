@@ -1079,7 +1079,8 @@ prod: ## Rebuild the shim with optimizations and verify the release artifact
 # by running it rather than trusting the recipe: a shim carrying
 # -DCHEZ_LIBUV_DEBUG_COUNTERS reports live allocation counts while a loop and
 # a bound tcp handle are alive, a prod shim's queries are a constant 0
-# (src/libuv-shim.c), and only a dev shim exports the pool hold (#127). tests/check-prod.sps establishes that the scope really
+# (src/libuv-shim.c), and only a dev shim exports the pool hold.
+# tests/check-prod.sps establishes that the scope really
 # was live using two witnesses that do not go through the counters, so
 # all-zero cannot also mean "the probe allocated nothing".
 #

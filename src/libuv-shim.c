@@ -409,19 +409,22 @@ long chez_uv_live_block(void) { return 0; }
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
 
-/* A pool hold, in dev builds only, for tests/test-dns.sps (#127): a
- * threadpool item that keeps the worker running it until the caller
- * releases it, or until its bound passes. With the pool pinned to one
- * worker, and that worker inside a hold, a lookup queued after it cannot
- * start until the release, and stays cancellable. Two of the suite's rows
- * bet on that state without a hold, and on one CI run the teardown row
- * lost all 16 of its draws.
+/* A pool hold, in dev builds only, for tests/test-dns.sps: a threadpool
+ * item that keeps the worker running it until the caller releases it, or
+ * until its bound passes. With the pool pinned to one worker, and that
+ * worker inside a hold, a lookup queued after it cannot start until the
+ * release, and stays cancellable. Without a hold, two of the suite's rows
+ * would bet on that state, and a bet can lose: the teardown row has lost
+ * all 16 of its draws on CI.
  *
  * The caller allocates the block, zeroed, at chez_uv_debug_pool_hold_size
  * bytes, and frees it only once the hold has finished: until then the
  * worker or the loop can still touch it. So the shim keeps no state of its
- * own (rule 6 of tests/test-source-rules.sps). A release build has none of
- * these entries (ADR-0002's dev-only kind; tests/check-prod.sps). */
+ * own (rule 6 of tests/test-source-rules.sps). These are the shim's only
+ * exports that call into libuv, and the binding never calls them. They
+ * are compiled only under -DCHEZ_LIBUV_DEBUG_COUNTERS, with no release
+ * stub, and tests/check-prod.sps fails a release shim that exports any
+ * of them. */
 struct chez_uv_pool_hold {
   uv_work_t req; /* first, so a callback's uv_work_t * is the block */
   uv_mutex_t mutex;

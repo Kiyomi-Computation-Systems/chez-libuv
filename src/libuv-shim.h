@@ -126,7 +126,7 @@ long chez_uv_live_async(void);
 long chez_uv_live_block(void);
 
 #ifdef CHEZ_LIBUV_DEBUG_COUNTERS
-/* A pool hold, for tests only and in dev builds only (#127): a threadpool
+/* A pool hold, for tests only and in dev builds only: a threadpool
  * item that keeps its worker until released, or until BOUND_NS passes.
  * The caller's zeroed block of chez_uv_debug_pool_hold_size bytes holds
  * it. chez_uv_debug_pool_hold queues it on LOOP, from LOOP's thread, and
