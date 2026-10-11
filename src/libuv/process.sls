@@ -60,7 +60,7 @@
   ;; order. A list changed once during the read is read as it was
   ;; before the change or after it; one changed several times can be read as
   ;; a mix of its versions, as a string can, or found malformed though every
-  ;; version was a list (docs/api.md). test-process.sps's cross-thread list
+  ;; version was a list. test-process.sps's cross-thread list
   ;; races and test-native.sps's one-change race hold this.
   ;;
   ;; The read raises nothing, so a bare interrupt pair, such as read-utf8

@@ -290,7 +290,7 @@ None is obvious from reading the code.
   against what one escape strands on the platform running it. A new path
   into `uv_run` goes through `run-step!` or it is unchecked. A suite that
   escapes callbacks in bulk (test-loop-claim's exit race) runs them in
-  batches on threads it lets end, and docs/api.md tells users the cost.
+  batches on threads it lets end, and docs/callbacks.md tells users the cost.
   Each escape also strands a heap block, the `jmp_buf` Chez's `S_call_help`
   mallocs for the call into Scheme (312 B on aarch64 glibc), which even a
   thread's end does not free; so does an engine dropped inside a callback. Valgrind calls it reachable or definitely
@@ -330,7 +330,7 @@ None is obvious from reading the code.
   - an engine resumed from inside a callback entered after it stopped: the
     engine finishes, and that callback's `uv-run` raises.
   A round-robin scheduler has the first shape, and a scheduler driven by
-  libuv's own timers has the other two. docs/api.md promised that resuming
+  libuv's own timers has the other two. The user docs promised that resuming
   always finishes the run. The first statement of this rule named only the
   first shape, and two rounds of review found the others (PR #115).
   - The same jump gives the stack back. 40,000 escapes, in batches of

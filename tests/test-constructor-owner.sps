@@ -5,7 +5,7 @@
 ;;; on uv-cancel!, which a lookup's completion races.
 ;;;
 ;;; A loop belongs to one thread: the one that made it, then whichever
-;;; thread most recently entered uv-run on it (docs/api.md). Without the
+;;; thread most recently entered uv-run on it (docs/threads.md). Without the
 ;;; check, a verb calls libuv's init from any thread, and an init links the
 ;;; handle into the loop's handle queue, which the loop's own thread unlinks
 ;;; from as it finishes closes: a second thread making timers on a loop the

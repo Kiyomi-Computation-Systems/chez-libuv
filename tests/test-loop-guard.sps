@@ -78,7 +78,7 @@
 
 ;; The cost of the refusal: the guard that did not match sees the
 ;; condition twice, once from the body and once from the re-entry, and so
-;; tests its clauses twice. docs/api.md says so.
+;; tests its clauses twice. docs/callbacks.md says so.
 (test-equal "a guard whose clauses do not match tests them twice"
   '(the-bodys-own 2)
   (let ((tests 0))
@@ -236,7 +236,7 @@
              (begin (set! tries 3) (later 'back-in))
              (done (list 'later-returned tries))))))))
 
-;; The costs docs/api.md states, held so that a change to them is made on
+;; The costs docs/callbacks.md states, held so that a change to them is made on
 ;; purpose. A handler between the guard that does not match and the body
 ;; sees the condition twice, as the guard's clauses do.
 (test-equal "a handler between a guard that does not match and the body sees the body's condition twice"

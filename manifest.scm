@@ -78,6 +78,9 @@
      "pkg-config" "gcc-toolchain" "cmake"
      ;; The memory gate (make test-memory).
      "valgrind"
+     ;; `make site` renders docs/ through chez-cmark-gfm, which loads
+     ;; this C library when it is imported.
+     "cmark-gfm"
      ;; `make deps`, `make vendor` and `make check-pins` read the
      ;; repository and its submodules. The container gives git no
      ;; identity, credentials or network.
