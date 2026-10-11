@@ -39,6 +39,10 @@
         (libuv handle)
         (libuv timer)
         (libuv dns)
+        ;; The chain walker reads raw memory, so (libuv dns) does not
+        ;; export it; row k drives it with chains built here.
+        (only (libuv private addrinfo-chain) addrinfo-chain->list)
+        (only (rnrs eval) eval environment)
         (libuv private handles)
         (libuv private conditions)
         ;; alloc-zeroed/free!/copy-in!/c-int-set!/fill-sockaddr! build the
@@ -984,6 +988,20 @@
 (test-equal "the sweeps left no request registered or counted, and no block allocated"
   (list 0 (+ registry-with-loop 1) blocks-before-sweeps)   ; loop + probe-timer
   (list (live-count 'getaddrinfo-req) (registry-count) (live-count 'block)))
+
+;; A program that imports (libuv dns) cannot reach the walker: given any
+;; number that is not a live chain, it crashes the process or answers
+;; garbage. The control shows that the lookup finds a name the library
+;; does export.
+(test-equal "(libuv dns) exports its verbs but not the raw chain walker"
+  '(exported not-exported)
+  (map (lambda (name)
+         (guard (e ((undefined-violation? e) 'not-exported)
+                   (#t (list 'raised e)))
+           (if (procedure? (eval name (environment '(libuv dns))))
+               'exported
+               'not-a-procedure)))
+       '(uv-getaddrinfo! addrinfo-chain->list)))
 
 ;; --- row k: synthetic chains through addrinfo-chain->list ----------------
 ;; Hand-built struct addrinfo nodes: alloc-zeroed memory, fields written at

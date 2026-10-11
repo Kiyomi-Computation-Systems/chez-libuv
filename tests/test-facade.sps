@@ -580,8 +580,8 @@
 ;; lookup exercises the re-export end to end -- hermetic: numeric-only,
 ;; so no resolver configuration, no network, no /etc/hosts
 ;; policy can decide the answer -- and the remaining names are exercised
-;; directly. addrinfo-chain->list is a test seam of (libuv dns) and
-;; deliberately NOT a facade export, so it must not appear here.
+;; directly. addrinfo-chain->list lives in (libuv private addrinfo-chain),
+;; which no public library exports, so it must not appear here.
 (define dl (make-uv-loop))
 (define d-err 'callback-never-fired)
 (define d-results 'callback-never-fired)

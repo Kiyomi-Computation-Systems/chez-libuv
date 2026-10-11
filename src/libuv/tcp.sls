@@ -140,7 +140,8 @@
 
   ;; uv-tcp-peer-address : uv-tcp
   ;;                       -> (values (or string #f) exact-nonnegative-integer)
-  ;; An unconnected handle raises the native ENOTCONN condition.
+  ;; A handle with no socket yet raises EBADF, and a bound, unconnected one
+  ;; ENOTCONN.
   (define (uv-tcp-peer-address tcp)
     (let ((answer (query-sockaddr tcp uv-tcp-getpeername-native #t
                                   'uv-tcp-peer-address)))

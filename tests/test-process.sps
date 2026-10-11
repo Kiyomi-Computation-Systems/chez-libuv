@@ -32,6 +32,7 @@
         (spawn-list-races)
         (only (uv-meter) fewest-bytes)
         (uv-level-3)
+        (only (uv-child) child-run child-entry)
         ;; The engine-sweep driver caps the changing-data sweeps' resumes;
         ;; a state sweep hands its loop to other-thread, and the drop sweeps
         ;; check that no run leaves interrupts off.
@@ -412,6 +413,11 @@
      'stdio-fd-not-an-fd
      (reason-of (spawn-with "/bin/sh" ok-args
                             '((stdio . ((inherit-fd . 2147483648)))) #f)))
+   ;; -1 is a C int but no fd. Let through, it reaches libuv, which refuses
+   ;; it with an errno that reason-of passes through.
+   (test-equal "an inherit-fd value below 0" 'stdio-fd-not-an-fd
+     (reason-of (spawn-with "/bin/sh" ok-args
+                            '((stdio . ((inherit-fd . -1)))) #f)))
    (test-equal "an on-exit that is neither procedure nor #f"
      'on-exit-not-a-procedure
      (reason-of (spawn-with "/bin/sh" ok-args 'not-a-proc)))
@@ -681,6 +687,29 @@
                                            (eq? 'closed (uv-handle-state fd3-pipe))))
                            128))))
 
+;; --- inherit-fd 0 passes the fd check ------------------------------------
+;; 0 is an fd: stdin. libuv may still refuse it with an errno where the
+;; suite's own stdin is closed, so the row asks only that the check lets 0
+;; through.
+(with-loop
+ (lambda (loop)
+   (define proc
+     (guard (e ((uv-errno-error? e) 'refused-by-libuv)
+               ((uv-invalid-argument? e)
+                (list 'refused (uv-invalid-argument-reason e)))
+               (#t (list 'raised (describe e))))
+       (uv-spawn! loop "/bin/sh" '("sh" "-c" "exit 0")
+                  '((stdio . ((inherit-fd . 0)))) #f)))
+   (test-equal "an inherit-fd value of 0, stdin, passes the fd check"
+     'passed-the-check
+     (if (or (uv-process? proc) (eq? proc 'refused-by-libuv))
+         'passed-the-check
+         proc))
+   (when (uv-process? proc)
+     (run-until/ticking loop (lambda () (process-exited? proc)) 4096)
+     (uv-close! proc)
+     (run-until loop (lambda () (eq? 'closed (uv-handle-state proc))) 64))))
+
 ;; --- inherit-fd (child writes an inherited temp-file fd) ----------------
 ;; tests/tmp/ is .gitignored, so a fresh checkout (any CI runner) does NOT
 ;; have it and open-file-output-port below would raise unhandled, aborting
@@ -817,6 +846,17 @@
    (define (reason-of thunk)
      (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e)))
        (thunk) 'no-raise))
+   ;; uv_kill takes the pid as a C int. Chez's int argument also takes the
+   ;; unsigned range and wraps it: 4294967295 reaches kill(2) as -1, which
+   ;; signals every process the caller may signal. Signal 0 checks for the
+   ;; process and sends nothing, so a pid let through by mistake signals no
+   ;; one.
+   (define (range-of pid)
+     (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-reason e))
+               ((uv-errno-error? e) 'in-range)
+               (#t (list 'raised (describe e))))
+       (uv-kill! pid 0)
+       'in-range))
    (test-equal 'signal-unknown
      (reason-of (lambda () (uv-process-kill! proc 'sigfoo))))
    (test-equal 'signal-unknown
@@ -825,6 +865,15 @@
      (reason-of (lambda () (uv-kill! 99999999 'sigfoo)))) ;; validated BEFORE the errno path
    (test-equal 'pid-not-an-exact-integer
      (reason-of (lambda () (uv-kill! "42" 'sigterm))))
+   (test-equal "uv-kill! refuses a pid above a C int's range by name"
+     '(pid-out-of-range pid-out-of-range pid-out-of-range)
+     (list (range-of (expt 2 40)) (range-of 4294967295) (range-of 2147483648)))
+   (test-equal "uv-kill! refuses a pid below a C int's range by name"
+     '(pid-out-of-range pid-out-of-range)
+     (list (range-of (- (expt 2 40))) (range-of -2147483649)))
+   (test-equal "uv-kill! hands either end of a C int's range to kill(2)"
+     '(in-range in-range)
+     (list (range-of 2147483647) (range-of -2147483648)))
    (test-assert "uv-kill! on a vanished pid raises an errno symbol"
      (guard (e ((uv-errno-error? e)
                 ;; ESRCH normally; EPERM if the pid was recycled to another
@@ -2313,6 +2362,38 @@
       (test-equal "at --optimize-level 3, uv-spawn! refuses each of its lists improper or circular, for that list, and never walks one forever"
         malformed-reasons
         (level-3-entry level-3-report 'malformed))))
+
+;; --- uv-kill! as a process's first call into libuv ------------------------
+;; Importing (libuv) reads no constants. uv-kill! needs them both to name its
+;; signal and to name kill(2)'s errno, so as the first call in a process it
+;; has to load them itself. tests/first-kill-child.sps makes that call in a
+;; process of its own, once for each of those two needs.
+(define first-kill-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
+
+;; first-kill : symbol -> (or alist list)
+(define (first-kill signal)
+  (child-run first-kill-chez '() "tests/first-kill-child.sps" (list signal)))
+
+;; missing-pid-refusal : object -> object
+;; 'refused-as-missing for an errno kill(2) gives a pid no process has, or
+;; the child's entry as it came.
+(define (missing-pid-refusal kill)
+  (if (and (pair? kill) (eq? (car kill) 'errno) (memq (cadr kill) '(ESRCH EPERM)))
+      'refused-as-missing
+      kill))
+
+(if (not first-kill-chez)
+    (test-equal "first-call uv-kill! rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
+      'skipped 'skipped)
+    (let ((zero (first-kill 'zero)) (sigterm (first-kill 'sigterm)))
+      (test-equal "seed: the first-call children had no constants until uv-kill!"
+        '(#f #f)
+        (list (child-entry zero 'initialized-before)
+              (child-entry sigterm 'initialized-before)))
+      (test-equal "uv-kill! with signal 0 as the first call names kill(2)'s errno"
+        'refused-as-missing (missing-pid-refusal (child-entry zero 'kill)))
+      (test-equal "uv-kill! with 'sigterm as the first call names kill(2)'s errno"
+        'refused-as-missing (missing-pid-refusal (child-entry sigterm 'kill)))))
 
 (collect)
 (test-assert "counters all zero at suite end"
