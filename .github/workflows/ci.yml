@@ -54,7 +54,7 @@ jobs:
     # burn the whole billing budget for nothing.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -250,7 +250,7 @@ jobs:
     # ~14min on a Chez-cache miss, as the job above; a few minutes on a hit.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 

@@ -23,7 +23,7 @@ runs:
     # finished, say) -- a new suffix means no run can be served the poisoned
     # entry under the old key.
     #
-    # restore/save rather than the combined actions/cache@v4: the combined
+    # restore/save rather than the combined actions/cache: the combined
     # action writes the cache from an implicit post-job step, and GitHub
     # skips that step when the job fails. With it, every red run -- a
     # failing suite, a Valgrind report, a flake -- throws away a ~10-minute
@@ -50,7 +50,7 @@ runs:
 
     - name: Restore built Chez Scheme
       id: cache-chez
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ${{ github.workspace }}/.chez-install
         key: chez-${{ inputs.chez-version }}-${{ steps.image.outputs.id }}-${{ runner.arch }}-v2
@@ -94,7 +94,7 @@ runs:
     # drift apart if the key expression is ever edited.
     - name: Save built Chez Scheme
       if: steps.cache-chez.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: ${{ github.workspace }}/.chez-install
         key: ${{ steps.cache-chez.outputs.cache-primary-key }}
