@@ -9,6 +9,7 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
+          (libuv private c-types)
           (libuv private handles)
           (only (libuv private lists) read-proper-list let-fixed-list)
           (only (libuv private c-string) read-utf8 nul-free?)
@@ -135,15 +136,14 @@
     (for-each (lambda (bv) (check-string bv who reason)) lst))
 
   ;; The C types a caller's number reaches libuv in: a pid or an fd is a C
-  ;; int, a uid or gid an unsigned 32-bit int. The options block's checks
-  ;; refuse a number outside its type before anything is allocated, and the
-  ;; fill, inside the step that spawns, writes none (fill-options-block!).
-  (define (c-int? x) (and (integer? x) (exact? x) (<= -2147483648 x 2147483647)))
+  ;; int, a uid or gid an unsigned 32-bit int ((libuv private c-types)).
+  ;; The options block's checks refuse a number outside its type before
+  ;; anything is allocated, and the fill, inside the step that spawns,
+  ;; writes none (fill-options-block!).
   (define (c-int-fd? x) (and (c-int? x) (>= x 0)))
-  (define (u32? x) (and (integer? x) (exact? x) (<= 0 x 4294967295)))
 
   (define (require-u32 n who reason)
-    (unless (u32? n)
+    (unless (c-unsigned-int? n)
       (raise (make-uv-invalid-argument who reason))))
 
   (define (require-open-process proc who)
@@ -388,35 +388,39 @@
                #t
                (let ((spec (car ss))
                      (data (+ c (offsetof-uv-stdio-container-t-data))))
-                 (c-int-set! (+ c (offsetof-uv-stdio-container-t-flags))
-                             (stdio-spec-flags spec))
-                 (case (stdio-spec-kind spec)
-                   ((inherit-fd) (c-int-set! data (stdio-spec-value spec)))
-                   ((inherit-stream pipe)
-                    (c-uptr-set! data (handle-ptr (stdio-spec-value spec)))))
-                 (fill (cdr ss) (+ c (sizeof-uv-stdio-container-t))))))))
+                 (and (try-c-int-set! (+ c (offsetof-uv-stdio-container-t-flags))
+                                      (stdio-spec-flags spec))
+                      (case (stdio-spec-kind spec)
+                        ((inherit-fd) (try-c-int-set! data (stdio-spec-value spec)))
+                        ((inherit-stream pipe)
+                         (c-uptr-set! data (handle-ptr (stdio-spec-value spec)))
+                         #t)
+                        (else #t))
+                      (fill (cdr ss) (+ c (sizeof-uv-stdio-container-t)))))))))
 
   ;; fill-scalars! : uptr spawn-options exact-nonnegative-integer -> boolean
   ;; Setting uid or gid must also set the corresponding libuv flag. Answers
-  ;; #f, writing nothing, for a uid or gid that is no unsigned 32-bit int.
+  ;; #f, writing nothing, for a uid or gid that is no unsigned 32-bit int,
+  ;; or a stdio count that is no C int. It runs inside the spawn step, so
+  ;; each write is one that answers rather than raises.
   (define (fill-scalars! block options n-stdio)
     (let ((uid (spawn-options-uid options))
           (gid (spawn-options-gid options)))
-      (and (or (not uid) (u32? uid))
-           (or (not gid) (u32? gid))
+      (and (or (not uid) (c-unsigned-int? uid))
+           (or (not gid) (c-unsigned-int? gid))
+           (try-c-int-set! (+ block (offsetof-uv-process-options-t-stdio-count)) n-stdio)
            (begin
-             (c-int-set! (+ block (offsetof-uv-process-options-t-stdio-count)) n-stdio)
              (when (positive? n-stdio)
                (c-uptr-set! (+ block (offsetof-uv-process-options-t-stdio))
                             (+ block (stdio-offset))))
-             (c-int-set! (+ block (offsetof-uv-process-options-t-flags))
-                         (bitwise-ior
-                          (if (spawn-options-detached? options) (uv-process-detached-flag) 0)
-                          (if uid (uv-process-setuid-flag) 0)
-                          (if gid (uv-process-setgid-flag) 0)))
-             (when uid (c-u32-set! (+ block (offsetof-uv-process-options-t-uid)) uid))
-             (when gid (c-u32-set! (+ block (offsetof-uv-process-options-t-gid)) gid))
-             #t))))
+             #t)
+           (try-c-int-set! (+ block (offsetof-uv-process-options-t-flags))
+                           (bitwise-ior
+                            (if (spawn-options-detached? options) (uv-process-detached-flag) 0)
+                            (if uid (uv-process-setuid-flag) 0)
+                            (if gid (uv-process-setgid-flag) 0)))
+           (or (not uid) (try-c-u32-set! (+ block (offsetof-uv-process-options-t-uid)) uid))
+           (or (not gid) (try-c-u32-set! (+ block (offsetof-uv-process-options-t-gid)) gid)))))
 
   ;; alloc-options-block : exact-positive-integer -> uptr
   ;; A zeroed options block of SIZE bytes, counted, or 0, uncounted, when it

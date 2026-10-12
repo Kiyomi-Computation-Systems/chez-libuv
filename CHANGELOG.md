@@ -23,6 +23,11 @@ All notable changes to this project are documented here. This project follows
 
 ### Changed
 
+- **`uv-write*!` refuses a list of 2^32 segments or more** with reason
+  `'too-many-segments`, before anything is allocated. libuv takes the
+  count as an unsigned int. Chez's own check of a larger count raised
+  inside the write's interrupt-free step, leaving interrupts disabled, and
+  at `--optimize-level 3` it wrapped the count instead.
 - **`(libuv dns)` no longer exports `addrinfo-chain->list`.** It was never
   meant for programs: it reads memory at whatever address it is given, and
   any number that is not a live `addrinfo` chain crashes the process or

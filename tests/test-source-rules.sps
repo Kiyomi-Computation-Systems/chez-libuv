@@ -194,6 +194,33 @@
 ;;;    installed at run time, as uv-close!'s close is (its sweep covers it),
 ;;;    or a name imported under another one.
 ;;;
+;;; 14. No caller's number reaches a C integer parameter unchecked for its
+;;;    type. Chez's integer argument types each take -2^(N-1) .. 2^N-1 and
+;;;    wrap, so an int given 4294967295 reaches C as -1, and uv-kill!
+;;;    given it sends kill(2) -1, every process, unless it checks first.
+;;;    At --optimize-level 3 they check nothing, and Chez's own refusal,
+;;;    inside an interrupt-free step, leaves interrupts disabled. So this
+;;;    suite finds every integer parameter of every foreign call in src/,
+;;;    and words each place its value comes from: each definition that
+;;;    names the binding, and, where that definition passes its own
+;;;    parameter through, each that names it in turn. A place a caller's
+;;;    number comes from passes its own variable there and checks it first
+;;;    with the predicate of (libuv private c-types) for the parameter's
+;;;    type, or with one defined as that predicate and more. A constant or
+;;;    libuv place passes no parameter of its own, and a place that makes
+;;;    no call names the procedure it hands the binding to. A new place
+;;;    fails here until it is worded. Each C type's bounds are computed in
+;;;    c-types.sls and written out nowhere else in src/, as a number or a
+;;;    power of two, and tests/test-c-types.sps holds each predicate's
+;;;    edges. src/ writes ints only inside interrupt-free steps, so it names
+;;;    neither raising int writer, and no foreign call takes a boolean.
+;;;    What the scan cannot see: whether a constant, libuv, size or via
+;;;    word is true beyond that; a variable read by spelling, so one
+;;;    rebound or aliased between the check and the call; a check that
+;;;    precedes the call in the source but does not guard it; a binding
+;;;    called through apply or a procedure it is passed to; and values
+;;;    carried through records or arithmetic.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -201,7 +228,8 @@
         (rnrs eval)
         (srfi :64)
         (only (chezscheme) expand oblist)
-        (uv-source))
+        (uv-source)
+        (libuv private c-types))
 
 ;; SRFI-64 sets no process exit status; the runner's fail count drives it.
 (define runner (test-runner-simple))
@@ -1552,7 +1580,7 @@
 (define src-definitions
   (apply append
          (map (lambda (e)
-                (let ((body (list-tail (cdr e) 4)))  ; after library, name, export, import
+                (let ((body (top-level-forms (cdr e))))
                   (apply append
                          (map (lambda (form)
                                 (let ((names (symbols-of form)))
@@ -2086,6 +2114,418 @@
         (list 'unswept (filter (lambda (v) (not (memq v swept-verbs))) records)
               'not-exported (filter (lambda (v) (not (memq v facade-exports))) swept-verbs))
         swept-verbs)))
+
+;; --- C integer parameters (rule 14) ----------------------------------------------
+
+;; The integer types: rule 5's scalars less these, the floats, the chars,
+;; the booleans, and uptr and void*, which carry addresses. A type rule 5
+;; comes to list is an integer type here unless it is listed below.
+(define non-integer-scalars
+  '(boolean char double double-float float single-float stdbool uptr void* wchar wchar_t))
+
+(define integer-types
+  (filter (lambda (t) (not (memq t non-integer-scalars))) scalar-types))
+
+;; Each predicate of (libuv private c-types), with the foreign types whose
+;; range it is.
+(define type-predicates
+  '((c-int? int integer-32) (c-unsigned-int? unsigned unsigned-int unsigned-32)
+    (c-u64? unsigned-64) (c-size? size_t) (c-uptr? uptr)))
+
+;; The procedure each predicate is, for checking a literal argument.
+(define type-predicate-procedures
+  (list (cons 'c-int? c-int?) (cons 'c-unsigned-int? c-unsigned-int?)
+        (cons 'c-u64? c-u64?) (cons 'c-size? c-size?) (cons 'c-uptr? c-uptr?)))
+
+;; The top-level definitions in src/ that hold a foreign call, as (name .
+;; calls).
+(define foreign-definitions
+  (filter (lambda (d) (pair? (cdr d)))
+          (apply append
+                 (map (lambda (e)
+                        (map (lambda (f) (cons (definition-name f) (foreign-calls f)))
+                             (filter (lambda (f) (and (pair? f) (eq? (car f) 'define)))
+                                     (top-level-forms (cdr e)))))
+                      libraries))))
+
+;; Each integer parameter of a foreign call in src/, as (binding index type),
+;; the binding being the definition that holds the call.
+(define integer-parameters
+  (apply append
+         (map (lambda (d)
+                (let walk ((types (call-types (cadr d))) (i 1) (acc '()))
+                  (cond ((null? types) (reverse acc))
+                        ((memq (car types) integer-types)
+                         (walk (cdr types) (+ i 1) (cons (list (car d) i (car types)) acc)))
+                        (else (walk (cdr types) (+ i 1) acc)))))
+              foreign-definitions)))
+
+;; appliers : symbol -> (list-of symbol)
+;; The top-level definitions in src/ that name NAME outside quoted data,
+;; called or passed as a value, but for NAME's own.
+(define (appliers name)
+  (let collect ((ds src-definitions) (acc '()))
+    (cond ((null? ds) (reverse acc))
+          ((and (car (car ds)) (not (eq? (car (car ds)) name))
+                (memq name (cdr (car ds))) (not (memq (car (car ds)) acc)))
+           (collect (cdr ds) (cons (car (car ds)) acc)))
+          (else (collect (cdr ds) acc)))))
+
+;; Each place a caller's number can reach a C integer parameter from, as
+;; (binding index applier) with a word, where the applier is a definition
+;; that names the binding:
+;; - constant: a literal, a constant, or a symbol's mapping to one;
+;; - libuv: a value libuv or the system answered;
+;; - size: a size, offset or index the binding computes, or a caller's
+;;   offset it has bounded by a buffer it holds;
+;; - (forwards j): the applier passes its own Jth parameter there, so each
+;;   definition that names the applier is a place too;
+;; - (via H): the applier makes no call itself, but hands the binding to H,
+;;   which calls it;
+;; - (caller P v): the applier's own variable V, which it checks with P,
+;;   the predicate of (libuv private c-types) for the parameter's type, or
+;;   with a predicate defined with P (valid-port?, valid-milliseconds?).
+(define integer-arguments
+  '((raw-errno-name 1 errno-name-at (forwards 1))
+    (errno-name-at 1 ensure-native-loaded! (via constants-init!))
+    (raw-errno-value 1 ensure-native-loaded! (via constants-init!))
+    (raw-copy-in 3 copy-in-unchecked! (forwards 3))
+    (raw-copy-in 4 copy-in-unchecked! (forwards 4))
+    (raw-copy-in 3 try-copy-in! (caller c-size? start))
+    (raw-copy-in 4 try-copy-in! (caller c-size? len))
+    (raw-copy-out 3 copy-out (caller c-size? len))
+    (raw-zero 2 zero-out! (caller c-size? len))
+    (raw-alloc 1 alloc-block (caller c-size? n))
+    (raw-strerror-r 1 errno->message (forwards 1))
+    (errno->message 1 uv-errno-condition (caller c-int? rc))
+    (raw-strerror-r 3 errno->message constant)
+    (raw-err-name-r 1 errno->symbol (forwards 1))
+    (raw-err-name-r 3 errno->symbol constant)
+    (uv-handle-size 1 make-uv-async constant)
+    (uv-handle-size 1 make-uv-pipe constant)
+    (uv-handle-size 1 layout-options-block constant)
+    (uv-handle-size 1 make-uv-signal constant)
+    (uv-handle-size 1 make-uv-tcp constant)
+    (uv-handle-size 1 uv-accept! constant)
+    (uv-handle-size 1 make-uv-timer constant)
+    (uv-req-size 1 start-getaddrinfo! constant)
+    (uv-req-size 1 start-getnameinfo! constant)
+    (uv-req-size 1 uv-write! constant)
+    (uv-req-size 1 uv-write*! constant)
+    (uv-req-size 1 uv-shutdown! constant)
+    (uv-req-size 1 uv-tcp-connect! constant)
+    (uv-loop-run 2 run-step! (forwards 2))
+    (raw-timer-start 3 uv-timer-start-native (forwards 2))
+    (raw-timer-start 4 uv-timer-start-native (forwards 3))
+    (uv-timer-set-repeat 2 uv-timer-set-repeat! (caller c-u64? repeat-ms))
+    (uv-tcp-bind 3 bind! constant)
+    (uv-tcp-nodelay 2 uv-tcp-nodelay! constant)
+    (uv-tcp-keepalive 2 uv-tcp-keepalive! constant)
+    (uv-tcp-keepalive 3 uv-tcp-keepalive! (caller c-unsigned-int? delay))
+    (raw-ip4-addr 2 try-fill-sockaddr! (caller c-int? port))
+    (raw-ip6-addr 2 try-fill-sockaddr! (caller c-int? port))
+    (raw-listen 2 uv-listen-native (forwards 2))
+    (raw-write 4 uv-write-native (forwards 4))
+    (raw-getnameinfo 5 uv-getnameinfo-native (forwards 4))
+    (raw-ip-name 3 sockaddr->address-string constant)
+    (uv-process-kill 2 uv-process-kill! constant)
+    (uv-kill 1 uv-kill! (caller c-int? pid))
+    (uv-kill 2 uv-kill! constant)
+    (uv-pipe-init 3 init-pipe constant)
+    (raw-signal-start 3 uv-signal-start-native (forwards 2))
+    (raw-signal-start-oneshot 3 uv-signal-start-oneshot-native (forwards 2))
+    (copy-in-unchecked! 3 fill-strings-and-arrays! size)
+    (copy-in-unchecked! 4 fill-strings-and-arrays! size)
+    (copy-in-unchecked! 3 uv-write! (caller c-size? start))
+    (copy-in-unchecked! 4 uv-write! size)
+    (copy-in-unchecked! 3 place-spans! size)
+    (copy-in-unchecked! 4 place-spans! size)
+    (run-step! 2 uv-run constant)
+    (run-step! 2 drain-step! constant)
+    (uv-timer-start-native 2 uv-timer-start! (caller c-u64? timeout-ms))
+    (uv-timer-start-native 3 uv-timer-start! (caller c-u64? repeat-ms))
+    (uv-listen-native 2 uv-listen! (caller c-int? backlog))
+    (uv-write-native 4 start-write! (forwards 5))
+    (start-write! 5 uv-write! constant)
+    (start-write! 5 uv-write*! (caller c-unsigned-int? n))
+    (uv-getnameinfo-native 4 start-getnameinfo! constant)
+    (uv-signal-start-native 2 uv-signal-start! (via start-signal!))
+    (uv-signal-start-oneshot-native 2 uv-signal-start-oneshot! (via start-signal!))))
+
+;; The position a key's binding and index name, with its C type: a binding's
+;; own, or the position it forwards to.
+(define (position-type binding index)
+  (let ((p (find (lambda (p) (and (eq? (car p) binding) (= (cadr p) index)))
+                 integer-parameters)))
+    (if p
+        (caddr p)
+        (let ((f (find (lambda (e) (let ((w (cadddr e)))
+                                     (and (eq? (caddr e) binding) (pair? w)
+                                          (eq? (car w) 'forwards) (= (cadr w) index))))
+                       integer-arguments)))
+          (and f (position-type (car f) (cadr f)))))))
+
+;; required-places : -> (list-of (list symbol integer symbol))
+;; Every (binding index applier) the table must word: each applier of each
+;; integer parameter, and of each position a worded place forwards to.
+(define (required-places)
+  (let grow ((positions (map (lambda (p) (list (car p) (cadr p))) integer-parameters))
+             (done '()))
+    (if (null? positions)
+        (reverse done)
+        (let* ((pos (car positions))
+               (places (map (lambda (a) (list (car pos) (cadr pos) a))
+                            (appliers (car pos))))
+               (forwarded
+                (apply append
+                       (map (lambda (place)
+                              (let ((e (find (lambda (e) (equal? (list (car e) (cadr e) (caddr e)) place))
+                                             integer-arguments)))
+                                (if (and e (pair? (cadddr e)) (eq? (car (cadddr e)) 'forwards))
+                                    (list (list (caddr place) (cadr (cadddr e))))
+                                    '())))
+                            places))))
+          (grow (append (cdr positions)
+                        (filter (lambda (p) (not (member p positions))) forwarded))
+                (append (reverse places) done))))))
+
+;; defining-form : symbol -> (or datum #f)
+;; The one top-level form in src/ that binds NAME, or #f.
+(define (defining-form name)
+  (let ((forms (defining-forms name)))
+    (and (= (length forms) 1) (cdar forms))))
+
+;; arms : datum -> (list-of (pair (list-of symbol) (list-of datum)))
+;; Each arm of a definition, as (parameters . body): a (define (f p ...)
+;; body ...)'s one, a lambda's, or each of a case-lambda's.
+(define (arms form)
+  (define (names ps)
+    (cond ((pair? ps) (cons (car ps) (names (cdr ps))))
+          ((symbol? ps) (list ps))
+          (else '())))
+  (cond ((not (and (pair? form) (eq? (car form) 'define) (pair? (cdr form)))) '())
+        ((pair? (cadr form)) (list (cons (names (cdadr form)) (cddr form))))
+        ((and (pair? (cddr form)) (pair? (caddr form)))
+         (let ((value (caddr form)))
+           (case (car value)
+             ((lambda) (if (pair? (cdr value)) (list (cons (names (cadr value)) (cddr value))) '()))
+             ((case-lambda)
+              (map (lambda (arm) (cons (names (car arm)) (cdr arm))) (filter pair? (cdr value))))
+             (else '()))))
+        (else '())))
+
+;; parameters : datum -> (list-of symbol)
+;; Every arm's parameters.
+(define (parameters form) (apply append (map car (arms form))))
+
+;; binding-call? : symbol -> (datum -> boolean)
+;; Whether a form calls BINDING: (BINDING a ...); a handle-call!, which
+;; calls BINDING with the handle's pointer ahead of its own arguments,
+;; (handle-call! handle who BINDING a2 ...); or an r-call, which calls it
+;; with its code and a scratch buffer it supplies, (r-call BINDING code).
+(define (binding-call? binding)
+  (lambda (c)
+    (and (list? c)
+         (or (eq? (car c) binding)
+             (and (eq? (car c) 'handle-call!) (>= (length c) 4) (eq? (list-ref c 3) binding))
+             (and (eq? (car c) 'r-call) (>= (length c) 2) (eq? (cadr c) binding))))))
+
+;; call-arguments : symbol integer datum -> (list-of datum)
+;; What each call to BINDING within X passes at INDEX, by binding-call?'s
+;; shapes.
+(define (call-arguments binding index x)
+  (define (nth xs k) (if (< k (length xs)) (list-ref xs k) '(no-argument)))
+  (map (lambda (c)
+         (case (car c)
+           ((handle-call!) (if (>= index 2) (nth c (+ index 2)) '(the-handle)))
+           ((r-call) (if (= index 1) (nth c 2) '(supplied-by r-call)))
+           (else (nth c index))))
+       (filter (binding-call? binding)
+               (forms-headed (list binding 'handle-call! 'r-call) x))))
+
+;; predicate-family : symbol -> (list-of symbol)
+;; P, and each predicate in src/ defined as (define (f x) (P x)) or
+;; (define (f x) (and (P x) ...)), which holds no value P does not:
+;; valid-port? holds a C int, and only some.
+(define (predicate-family p)
+  (define (narrows-p? form)
+    (and (list? form) (= (length form) 3) (eq? (car form) 'define)
+         (list? (cadr form)) (= (length (cadr form)) 2)
+         (let ((x (cadr (cadr form))) (body (caddr form)))
+           (or (equal? body (list p x))
+               (and (list? body) (pair? body) (eq? (car body) 'and) (pair? (cdr body))
+                    (equal? (cadr body) (list p x)))))))
+  (cons p (map (lambda (f) (car (cadr f)))
+               (filter narrows-p? (apply append (map (lambda (e) (top-level-forms (cdr e)))
+                                                     libraries))))))
+
+;; first-position : (datum -> boolean) datum -> (or exact-integer #f)
+;; Where the first form within X that satisfies PRED comes, counting X's
+;; forms in source order outside quoted data.
+(define (first-position pred x)
+  (let ((count 0))
+    (let walk ((x x))
+      (and (pair? x) (not (eq? (car x) 'quote))
+           (begin
+             (set! count (+ count 1))
+             (if (pred x)
+                 count
+                 (let elements ((xs x))
+                   (and (pair? xs) (or (walk (car xs)) (elements (cdr xs)))))))))))
+
+;; check-position : (list-of symbol) symbol datum -> (or exact-integer #f)
+;; Where X first applies one of PREDICATES to V.
+(define (check-position predicates v x)
+  (first-position (lambda (c) (and (list? c) (= (length c) 2) (memq (car c) predicates)
+                                   (eq? (cadr c) v)))
+                  x))
+
+;; argument-fault : list -> (or #f list)
+;; Why a table entry's word does not hold, or #f.
+(define (argument-fault entry)
+  (let* ((binding (car entry)) (index (cadr entry)) (applier (caddr entry))
+         (word (cadddr entry))
+         (form (defining-form applier))
+         (args (if form (call-arguments binding index form) '()))
+         (params (if form (parameters form) '()))
+         (type (position-type binding index)))
+    (cond
+      ((not form) '(applier-not-defined-once))
+      ((not type) '(no-such-position))
+      ((and (pair? word) (eq? (car word) 'via) (pair? (cdr word)))
+       (if (exists (lambda (c) (memq binding (cdr c))) (forms-headed (list (cadr word)) form))
+           #f
+           (list 'not-handed-to (cadr word))))
+      ((null? args) '(no-call-site))
+      ((memq word '(constant libuv))
+       (let ((passed (filter (lambda (a) (memq a params)) args)))
+         (and (pair? passed) (list 'passes-its-parameter passed))))
+      ((eq? word 'size) #f)
+      ((and (pair? word) (eq? (car word) 'forwards) (pair? (cdr word)))
+       (let* ((j (cadr word))
+              (wrong (filter (lambda (arm)
+                               (let ((arm-args (call-arguments binding index (cdr arm))))
+                                 (and (pair? arm-args)
+                                      (not (and (<= 1 j (length (car arm)))
+                                                (for-all (lambda (a) (eq? a (list-ref (car arm) (- j 1))))
+                                                         arm-args))))))
+                             (arms form))))
+         (and (pair? wrong) (list 'does-not-pass-parameter j (map car wrong)))))
+      ((and (pair? word) (eq? (car word) 'caller) (= (length word) 3))
+       (let* ((p (cadr word)) (v (caddr word))
+              (types (cdr (or (assq p type-predicates) '(#f))))
+              (test (cdr (or (assq p type-predicate-procedures) '(#f . #f))))
+              (family (predicate-family p))
+              (passes-v? (lambda (c) (and ((binding-call? binding) c)
+                                          (equal? (call-arguments binding index c) (list v)))))
+              ;; In each arm, a call that passes V comes after V's check.
+              (unchecked (filter (lambda (arm)
+                                   (let ((called (first-position passes-v? (cdr arm))))
+                                     (and called
+                                          (let ((checked (check-position family v (cdr arm))))
+                                            (not (and checked (< checked called)))))))
+                                 (arms form))))
+         (cond ((not (memq type types)) (list 'predicate-not-for type p))
+               ((null? (arms form)) '(not-a-procedure-definition))
+               ((not (for-all (lambda (a) (or (eq? a v) (and (number? a) (test a)))) args))
+                (list 'passes-other-than v args))
+               ((pair? unchecked) (list 'not-checked-before-the-call v p))
+               (else #f))))
+      (else '(unknown-word)))))
+
+(define (places-of entries) (map (lambda (e) (list (car e) (cadr e) (caddr e))) entries))
+
+;; Live: a scan that found no foreign call would find no position.
+(test-equal "rule 14 is live: the scan finds uv_kill's pid an int at position 1, and uv_timer_start's timeout an unsigned-64"
+  '((raw-timer-start 3 unsigned-64) (uv-kill 1 int))
+  (filter (lambda (p) (member p '((uv-kill 1 int) (raw-timer-start 3 unsigned-64))))
+          integer-parameters))
+
+(test-equal "rule 14: every definition in src/ that holds a foreign call holds one"
+  '()
+  (map car (filter (lambda (d) (not (= (length (cdr d)) 1))) foreign-definitions)))
+
+(test-equal "rule 14: every foreign call in src/, but shim-procedure's template, is held by a top-level define the scan reads"
+  '()
+  (let ((held (apply append (map cdr foreign-definitions))))
+    (map call-entry
+         (filter (lambda (c) (not (memq c held)))
+                 (apply append
+                        (map (lambda (e)
+                               (apply append
+                                      (map foreign-calls
+                                           (filter (lambda (f) (not (and (pair? f) (eq? (car f) 'define-syntax))))
+                                                   (top-level-forms (cdr e))))))
+                             libraries))))))
+
+(test-equal "rule 14: no foreign call in src/ takes a boolean, which passes 0 to C as 1"
+  '()
+  (map car (filter (lambda (d) (exists (lambda (t) (memq t '(boolean stdbool)))
+                                       (call-types (cadr d))))
+                   foreign-definitions)))
+
+;; Each side is non-empty on its own: a scan that found nothing would leave
+;; every worded place unrequired.
+(test-equal "rule 14: the table words every place a C integer parameter takes its value from, and no other"
+  '(unworded () not-a-place ())
+  (let ((required (required-places)) (worded (places-of integer-arguments)))
+    (list 'unworded (filter (lambda (p) (not (member p worded))) required)
+          'not-a-place (filter (lambda (p) (not (member p required))) worded))))
+
+(test-equal "rule 14: each place's word holds: a forwarded parameter is passed through, a caller's number is checked for its C type"
+  '()
+  (filter cdr (map (lambda (e) (cons (places-of (list e)) (argument-fault e))) integer-arguments)))
+
+(test-equal "rule 14: each predicate of (libuv private c-types) is defined once in src/, there"
+  '()
+  (filter (lambda (x) (not (equal? (cdr x) '("src/libuv/private/c-types.sls"))))
+          (map (lambda (p) (cons p (map car (defining-forms p)))) (map car type-predicates))))
+
+;; The bounds of the C integer types, which only c-types.sls writes out.
+(define c-type-bounds
+  (list (- (expt 2 31)) (- (expt 2 31) 1) (expt 2 31) (- (expt 2 32) 1) (expt 2 32)
+        (- (expt 2 63)) (- (expt 2 63) 1) (expt 2 63) (- (expt 2 64) 1) (expt 2 64)))
+
+;; bound-writings : datum -> (list-of datum)
+;; Each place within X outside quoted data that writes a C type's bound: as
+;; a number, or as (expt 2 k), (ash 1 k) or either less one, for k one of
+;; the bounds' exponents or computed from foreign-sizeof.
+(define (bound-writings x)
+  (define (power? y)
+    (and (list? y) (= (length y) 3)
+         (or (and (eq? (car y) 'expt) (eqv? (cadr y) 2))
+             (and (eq? (car y) 'ash) (eqv? (cadr y) 1)))
+         (or (memv (caddr y) '(31 32 63 64)) (mentions? (caddr y) 'foreign-sizeof))))
+  (cond ((and (number? x) (exact? x) (memv x c-type-bounds)) (list x))
+        ((power? x) (list x))
+        ((and (list? x) (= (length x) 3) (eq? (car x) '-) (power? (cadr x)) (eqv? (caddr x) 1))
+         (list x))
+        ((not (pair? x)) '())
+        ((eq? (car x) 'quote) '())
+        (else (let elements ((xs x) (acc '()))
+                (if (pair? xs)
+                    (elements (cdr xs) (append acc (bound-writings (car xs))))
+                    (append acc (bound-writings xs)))))))
+
+(test-equal "rule 14 is live: the bound scan finds each way of writing a bound, and nothing in quoted data"
+  '(2147483648 (expt 2 64) (ash 1 31) (- (expt 2 32) 1) (expt 2 (* 8 (foreign-sizeof 'int))))
+  (bound-writings '(define (f x) (list 2147483648 (expt 2 64) (ash 1 31) (- (expt 2 32) 1)
+                                       (expt 2 (* 8 (foreign-sizeof 'int)))
+                                       '4294967295 65536 (expt 2 40)))))
+
+(test-equal "rule 14: no library in src/ but c-types.sls writes out a C integer type's bound"
+  '()
+  (filter (lambda (e) (pair? (cdr e)))
+          (map (lambda (e) (cons (car e) (bound-writings (library-body (cdr e)))))
+               (filter (lambda (e) (not (string=? (car e) "src/libuv/private/c-types.sls")))
+                       libraries))))
+
+;; c-int-set! and c-u32-set! raise, and src/ writes ints and uids only
+;; inside interrupt-free steps, where nothing may raise: it writes with
+;; try-c-int-set! and try-c-u32-set!, which answer.
+(test-equal "rule 14: no definition in src/ names c-int-set! or c-u32-set!, which raise"
+  '()
+  (append (namers-in-src 'c-int-set!) (namers-in-src 'c-u32-set!)))
 
 (test-end "source-rules")
 

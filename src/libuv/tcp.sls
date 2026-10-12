@@ -14,6 +14,7 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
+          (only (libuv private c-types) c-int? c-unsigned-int?)
           (only (libuv private lists) fold-flags)
           (libuv private handles)
           (libuv stream))
@@ -164,8 +165,7 @@
   ;; (tests/test-handle-steps.sps).
   (define (uv-listen! tcp backlog on-connection)
     (require-open-tcp tcp 'uv-listen!)
-    (unless (and (integer? backlog) (exact? backlog) (>= backlog 0)
-                 (< backlog 2147483648))
+    (unless (and (c-int? backlog) (>= backlog 0))
       (raise (make-uv-invalid-argument 'uv-listen! 'backlog-out-of-range)))
     (require-callback on-connection 'uv-listen! 'on-connection-not-a-procedure)
     (let ((rc (one-step
@@ -280,7 +280,6 @@
        (require-open-tcp tcp 'uv-tcp-keepalive!)
        (unless (boolean? enable?)
          (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'enable-not-a-boolean)))
-       (unless (and (integer? delay) (exact? delay) (positive? delay)
-                    (< delay 4294967296))
+       (unless (and (c-unsigned-int? delay) (positive? delay))
          (raise (make-uv-invalid-argument 'uv-tcp-keepalive! 'delay-out-of-range)))
        (handle-call! tcp 'uv-tcp-keepalive! uv-tcp-keepalive (if enable? 1 0) delay)))))
