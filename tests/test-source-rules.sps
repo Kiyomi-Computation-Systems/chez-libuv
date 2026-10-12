@@ -173,6 +173,27 @@
 ;;;    see: a dev-only entry named without the prefix, or a definition not
 ;;;    written as the shim writes them, from column 0 to its opening brace.
 ;;;
+;;; 13. A public verb reaches native code only once the native library is
+;;;    loaded. Importing (libuv) loads the shim but checks no version and
+;;;    reads no constant: ensure-native-loaded! does both, and every
+;;;    constructor calls it. A verb that takes a loop, handle or request
+;;;    runs after a constructor has; one that takes none has had nothing
+;;;    run before it, and uv-kill!, which did not load for itself, raised
+;;;    'constants-not-initialized as a process's first call. So this suite
+;;;    lists each export of (libuv) that reaches a foreign binding or a
+;;;    constant reader, with the word for why it may run first: `loads`,
+;;;    whose body loads before it names any native code, or `record`, which
+;;;    names its record's check. A new one fails here until it is listed,
+;;;    and each word is checked against the form that binds the export.
+;;;    Every export must be bound by exactly one form in src/, and no public
+;;;    library may export a name (libuv) does not. tests/test-first-call.sps
+;;;    holds the order the scan cannot see: each `loads` verb as a process's
+;;;    first call, and each `record` verb, given a symbol for its record,
+;;;    refusing it before anything loads. This suite holds both of its lists
+;;;    to the table. What the scan cannot see: a reach through a procedure
+;;;    installed at run time, as uv-close!'s close is (its sweep covers it),
+;;;    or a name imported under another one.
+;;;
 ;;; PURE: it reads source files and imports no native code (PURE_TESTS).
 ;;; Rules 3 to 5 also ask Chez's expander about types, in forms it expands
 ;;; and never runs, so no entry is resolved.
@@ -1467,20 +1488,78 @@
   '(require-loop-thread owned-loop-ptr owned-handle-ptr loop-owner-mismatch))
 
 ;; symbols-of : datum -> (list-of symbol)
+;; Every symbol X names outside quoted data. A refusal's 'uv-getaddrinfo!
+;; names the verb it is for; it calls nothing. Only a form's head makes it
+;; quoted data: a quote among a call's arguments does not.
 (define (symbols-of x)
   (cond ((symbol? x) (list x))
-        ((pair? x) (append (symbols-of (car x)) (symbols-of (cdr x))))
+        ((pair? x)
+         (if (eq? (car x) 'quote)
+             '()
+             (let elements ((xs x) (acc '()))
+               (if (pair? xs)
+                   (elements (cdr xs) (append acc (symbols-of (car xs))))
+                   (append acc (symbols-of xs))))))
         ((vector? x) (symbols-of (vector->list x)))
         (else '())))
 
+;; name-append : string symbol string -> symbol
+(define (name-append prefix name suffix)
+  (string->symbol (string-append prefix (symbol->string name) suffix)))
+
+;; field-clause-names : symbol datum -> (list-of symbol)
+;; The accessor and mutator a define-record-type field spec binds, spelled
+;; out or by R6RS's defaults for TYPE.
+(define (field-clause-names type spec)
+  (cond ((symbol? spec) (list (name-append "" type (string-append "-" (symbol->string spec)))))
+        ((and (pair? spec) (pair? (cdr spec)) (symbol? (cadr spec)))
+         (let ((field (symbol->string (cadr spec))))
+           (cond ((pair? (cddr spec)) (filter symbol? (cddr spec)))
+                 ((eq? (car spec) 'mutable)
+                  (list (name-append "" type (string-append "-" field))
+                        (name-append "" type (string-append "-" field "-set!"))))
+                 (else (list (name-append "" type (string-append "-" field)))))))
+        (else '())))
+
+;; type-clause-names : datum -> (list-of symbol)
+;; The names a define-record-type or define-condition-type form binds
+;; besides its type's own: constructor, predicate, accessors and mutators.
+(define (type-clause-names form)
+  (cond
+    ((and (pair? form) (eq? (car form) 'define-record-type) (pair? (cdr form)))
+     (let* ((spec (cadr form))
+            (type (if (pair? spec) (car spec) spec))
+            (fields (find (lambda (c) (and (pair? c) (eq? (car c) 'fields)))
+                          (if (list? (cddr form)) (cddr form) '()))))
+       (if (symbol? type)
+           (append (if (pair? spec)
+                       (filter symbol? (cdr spec))
+                       (list (name-append "make-" type "") (name-append "" type "?")))
+                   (if fields
+                       (apply append (map (lambda (f) (field-clause-names type f)) (cdr fields)))
+                       '()))
+           '())))
+    ((and (pair? form) (eq? (car form) 'define-condition-type) (list? form)
+          (>= (length form) 5))
+     (append (filter symbol? (list (list-ref form 3) (list-ref form 4)))
+             (map cadr (filter (lambda (c) (and (pair? c) (pair? (cdr c))))
+                               (list-tail form 5)))))
+    (else '())))
+
 ;; Each top-level definition in src/, as (name . the names its form
-;; mentions).
+;; mentions), and each name a record or condition type's form binds, with
+;; that form's names.
 (define src-definitions
   (apply append
          (map (lambda (e)
                 (let ((body (list-tail (cdr e) 4)))  ; after library, name, export, import
-                  (map (lambda (form) (cons (definition-name form) (symbols-of form)))
-                       (filter definition-name body))))
+                  (apply append
+                         (map (lambda (form)
+                                (let ((names (symbols-of form)))
+                                  (map (lambda (n) (cons n names))
+                                       (cons (definition-name form)
+                                             (type-clause-names form)))))
+                              (filter definition-name body)))))
               libraries)))
 
 ;; reaching : (list-of symbol) -> (list-of symbol)
@@ -1802,6 +1881,211 @@
     (list 'outside-dev (map car (filter (lambda (d) (not (cdr d))) shim-dev-only))
           'unchecked (filter (lambda (n) (not (member n check-prod-entries))) names)
           'not-defined (filter (lambda (n) (not (member n names))) check-prod-entries))))
+
+;; --- loading before native code (rule 13) ---------------------------------------
+
+;; What needs the native library loaded: every foreign binding, which an
+;; incompatible libuv must not be called through before the version check,
+;; and require-initialized, which every constant reader goes through.
+(define foreign-bindings
+  (map car (filter (lambda (d) (or (memq 'foreign-procedure (cdr d))
+                                   (memq 'shim-procedure (cdr d))))
+                   src-definitions)))
+
+(define native-reachers (reaching (cons 'require-initialized foreign-bindings)))
+
+;; defining-forms : symbol -> (list-of (string . datum))
+;; The top-level forms in src/ that bind NAME, by a definition or as a
+;; record or condition type's clause, as (file . form). (libuv)'s own
+;; definition, where it has one, shadows what it imports: uv-version is
+;; native.sls's foreign binding and the facade's loading verb.
+(define (defining-forms name)
+  (let ((all (apply append
+                    (map (lambda (e)
+                           (map (lambda (f) (cons (car e) f))
+                                (filter (lambda (f)
+                                          (or (eq? (definition-name f) name)
+                                              (memq name (type-clause-names f))))
+                                        (top-level-forms (cdr e)))))
+                         libraries))))
+    (let ((own (filter (lambda (d) (string=? (car d) "src/libuv.sls")) all)))
+      (if (null? own) all own))))
+
+;; export-form : symbol -> (or datum #f)
+;; The one form that binds NAME, or #f when there is none or more than one.
+(define (export-form name)
+  (let ((forms (defining-forms name)))
+    (and (= (length forms) 1) (cdar forms))))
+
+;; reaches-native? : symbol -> boolean
+;; Whether the form that binds NAME names a definition that reaches a
+;; foreign binding or a constant reader.
+(define (reaches-native? name)
+  (let ((form (export-form name)))
+    (and form
+         (exists (lambda (s) (and (not (eq? s name)) (memq s native-reachers)))
+                 (symbols-of form))
+         #t)))
+
+;; Every procedure (libuv) exports that reaches native code, with the word
+;; for why it can run before anything else has loaded it:
+;; - loads: it takes no loop, handle or request, so nothing has loaded the
+;;   library before it, and its first body form is (ensure-native-loaded!)
+;;   with no native code named ahead of it;
+;; - record: it takes a loop, handle or request, which only a constructor
+;;   that loaded can make, and it names that record's check.
+(define native-verbs
+  '((make-uv-loop . loads) (call-with-uv-loop . loads) (uv-kill! . loads)
+    (uv-os-getpid . loads) (uv-version . loads) (uv-version-compatible? . loads)
+    (uv-run . record) (uv-stop! . record) (uv-loop-alive? . record) (uv-now . record)
+    (uv-update-time! . record) (uv-loop-close! . record) (uv-loop-teardown! . record)
+    (uv-send-buffer-size . record) (uv-send-buffer-size! . record)
+    (uv-recv-buffer-size . record) (uv-recv-buffer-size! . record)
+    (make-uv-timer . record) (uv-timer-start! . record) (uv-timer-stop! . record)
+    (uv-timer-again! . record) (uv-timer-repeat . record) (uv-timer-set-repeat! . record)
+    (make-uv-tcp . record) (uv-tcp-bind! . record) (uv-tcp-getsockname-port . record)
+    (uv-tcp-sockname-address . record) (uv-tcp-peer-address . record)
+    (uv-listen! . record) (uv-accept! . record) (uv-tcp-connect! . record)
+    (uv-write! . record) (uv-write*! . record) (uv-shutdown! . record)
+    (uv-tcp-nodelay! . record) (uv-tcp-keepalive! . record)
+    (uv-read-start! . record) (uv-read-stop! . record)
+    (uv-stream-write-queue-size . record)
+    (uv-getaddrinfo! . record) (uv-getnameinfo! . record) (uv-cancel! . record)
+    (make-uv-pipe . record) (uv-spawn! . record) (uv-process-kill! . record)
+    (uv-process-pid . record)
+    (make-uv-signal . record) (uv-signal-start! . record)
+    (uv-signal-start-oneshot! . record) (uv-signal-stop! . record)
+    (make-uv-async . record) (uv-async-send! . record)))
+
+;; The checks that refuse anything but a loop, handle or request.
+(define record-checks
+  '(require-loop require-open-loop require-loop-thread require-handle
+    require-open-handle uv-async-record? uv-dns-request?))
+
+(define record-checkers (reaching record-checks))
+
+;; loads-first? : datum -> boolean
+;; Whether FORM is a (define (f ...) body ...) whose body has
+;; (ensure-native-loaded!) as one of its own forms, with no form ahead of
+;; it that names a definition reaching native code.
+(define (loads-first? form)
+  (and (pair? form) (eq? (car form) 'define)
+       (pair? (cdr form)) (pair? (cadr form))
+       (let ahead ((body (cddr form)))
+         (and (pair? body)
+              (or (equal? (car body) '(ensure-native-loaded!))
+                  (and (not (exists (lambda (s) (memq s native-reachers))
+                                    (symbols-of (car body))))
+                       (ahead (cdr body))))))))
+
+;; word-holds? : symbol symbol -> boolean
+(define (word-holds? verb word)
+  (let ((form (export-form verb)))
+    (and form
+         (case word
+           ((loads) (loads-first? form))
+           ((record) (and (exists (lambda (s) (and (not (eq? s verb)) (memq s record-checkers)))
+                                  (symbols-of form))
+                          #t))
+           (else #f)))))
+
+;; The libraries under src/libuv/ that a program may import: all but the
+;; private ones.
+(define public-libraries
+  (filter (lambda (e)
+            (let ((path (car e)) (prefix "src/libuv/private/"))
+              (and (not (string=? path "src/libuv.sls"))
+                   (not (and (>= (string-length path) (string-length prefix))
+                             (string=? (substring path 0 (string-length prefix)) prefix))))))
+          libraries))
+
+;; exported-names : datum -> (list-of symbol)
+;; The names a library form exports, a rename's under its new name.
+(define (exported-names lib)
+  (apply append
+         (map (lambda (spec)
+                (cond ((symbol? spec) (list spec))
+                      ((and (pair? spec) (eq? (car spec) 'rename))
+                       (map cadr (filter (lambda (p) (and (pair? p) (pair? (cdr p)))) (cdr spec))))
+                      (else '())))
+              (library-exports lib))))
+
+;; defined-datum : string symbol -> object
+;; The datum of PATH's top-level (define NAME 'datum) or (define NAME
+;; (list ...)), or a list saying why there is none.
+(define (defined-datum path name)
+  (guard (e (#t (list 'unreadable path)))
+    (let ((defs (filter (lambda (f) (and (pair? f) (eq? (car f) 'define)
+                                         (pair? (cdr f)) (eq? (cadr f) name)
+                                         (pair? (cddr f))))
+                        (read-forms path))))
+      (if (null? defs)
+          (list 'no-definition name path)
+          (caddr (car defs))))))
+
+;; The verbs tests/test-first-call.sps makes a process's first call.
+(define first-call-verbs
+  (let ((d (defined-datum "tests/test-first-call.sps" 'first-call-verbs)))
+    (if (and (pair? d) (eq? (car d) 'quote) (list? (cadr d)))
+        (map car (cadr d))
+        d)))
+
+;; The verbs tests/first-call-child.sps's sweep calls with a symbol for
+;; their record: each (shape verb arg ...) of its two lists.
+(define swept-verbs
+  (let ((lists (map (lambda (name) (defined-datum "tests/first-call-child.sps" name))
+                    '(unloading-shapes loading-shapes))))
+    (if (for-all (lambda (d) (and (pair? d) (eq? (car d) 'list))) lists)
+        (map cadr (filter (lambda (x) (and (pair? x) (eq? (car x) 'shape) (pair? (cdr x))))
+                          (apply append (map cdr lists))))
+        lists)))
+
+(test-equal "rule 13: every export of (libuv) is bound by exactly one form in src/, a definition or a record or condition type's clause"
+  '()
+  (map (lambda (name) (list name (map car (defining-forms name))))
+       (filter (lambda (name) (not (export-form name))) facade-exports)))
+
+;; Live: a reader that read no library would find no public one.
+(test-equal "rule 13: no public library exports a name (libuv) does not, so the table sees every public verb"
+  '()
+  (if (< (length public-libraries) 5)
+      (list 'too-few-public-libraries (map car public-libraries))
+      (apply append
+             (map (lambda (e)
+                    (map (lambda (name) (list (car e) name))
+                         (filter (lambda (name) (not (memq name facade-exports)))
+                                 (exported-names (cdr e)))))
+                  public-libraries))))
+
+;; Each side is non-empty on its own: a scan that found nothing would leave
+;; every listed verb not native.
+(test-equal "rule 13: the table lists every export of (libuv) that reaches native code, and no other"
+  '(unlisted () not-native ())
+  (list 'unlisted (filter (lambda (v) (and (reaches-native? v) (not (assq v native-verbs))))
+                          facade-exports)
+        'not-native (filter (lambda (v) (not (reaches-native? v))) (map car native-verbs))))
+
+(test-equal "rule 13: each verb the table lists loads first, or names its record's check, as its word says"
+  '()
+  (filter (lambda (e) (not (word-holds? (car e) (cdr e)))) native-verbs))
+
+(test-equal "rule 13: test-first-call makes every verb the table says loads a process's first call, and no other"
+  '(not-run () not-loads ())
+  (let ((loads (map car (filter (lambda (e) (eq? (cdr e) 'loads)) native-verbs))))
+    (if (list? first-call-verbs)
+        (list 'not-run (filter (lambda (v) (not (memq v first-call-verbs))) loads)
+              'not-loads (filter (lambda (v) (not (memq v loads))) first-call-verbs))
+        first-call-verbs)))
+
+;; uv-close! is swept too: it takes a handle, and reaches libuv's close
+;; through a procedure installed at run time, which the scan cannot follow.
+(test-equal "rule 13: the first-call sweep calls every verb the table says takes a record, and only verbs (libuv) exports"
+  '(unswept () not-exported ())
+  (let ((records (map car (filter (lambda (e) (eq? (cdr e) 'record)) native-verbs))))
+    (if (list? swept-verbs)
+        (list 'unswept (filter (lambda (v) (not (memq v swept-verbs))) records)
+              'not-exported (filter (lambda (v) (not (memq v facade-exports))) swept-verbs))
+        swept-verbs)))
 
 (test-end "source-rules")
 
