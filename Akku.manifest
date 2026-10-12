@@ -9,7 +9,7 @@
 ;; newest version a range allows, and the test suites use the chez-srfi
 ;; submodule, which `make check-pins` holds to the commit Akku.lock names.
 ;; Change the two together.
-(akku-package ("chez-libuv" "0.9.0")
+(akku-package ("chez-libuv" "0.10.0")
   (synopsis "Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme")
   (authors "Kiyomi Computation Systems LLC")
   (license "BSD-3-Clause")
