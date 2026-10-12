@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Fixed
+
+- **The docs site's light/dark toggle did nothing where the browser
+  refuses the page storage** (site data blocked, some private modes). The
+  page's script threw at its first `localStorage` call, before it wired the
+  toggle; the page still followed the system setting. Each call is now
+  inside a `try`, so the toggle works for the page's life and is not
+  remembered. `tests/site-unit.sps` holds every access to a `try` block.
+  The same fix is in chez-cmark-gfm, whose site generator this one copies.
+
 ## 0.10.0 — 2026-10-12
 
 This release takes `addrinfo-chain->list` out of `(libuv dns)`. It read
