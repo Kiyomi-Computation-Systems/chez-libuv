@@ -1,32 +1,119 @@
 #!/bin/sh
-# check-akku: install this package with Akku the way a consumer would, and
-# check which of its libraries land on the consumer's library path.
+# check-akku: install this package with Akku the way consumers do, and check
+# what they get: the libraries, a shim that loads, and the install hook's
+# answer in each case where it must not simply build.
 #
-# `akku install` in this checkout installs it as the root project, which
-# takes every library, tests included; only a dependency is filtered (Akku
-# skips test paths, and whatever .akkuignore names). So a consumer project is
-# made in a temporary directory, with an Akku.lock that points this package
-# at a directory holding only the files git tracks -- what Akku's archive
-# builds a package from. Files are copied from the working tree, so
-# uncommitted edits to tracked files are what gets tested.
+# Akku runs two kinds of scripts: the current project's own Akku.manifest
+# scripts, and those of each Akku.lock entry, which `akku lock` copies only
+# from the Akku index. So chez-libuv's hook reaches a consumer two ways, and
+# both run scripts/akku-install:
+#   - the index route: the lock entry carries Akku.manifest's (scripts ...);
+#   - the consumer route: the consumer's own manifest runs the script by path.
 #
-# This package's rows in the consumer's .akku/list must be exactly the .sls
-# files git tracks under src/: a site, tool or test library would land on
-# every consumer's library path, and a missing one would fail at import.
+# Every package is made from the files git tracks, copied from the working
+# tree, so uncommitted edits to tracked files are what gets tested. Akku runs
+# with its log at debug level, so the hook's own output is in each log under
+# every Akku; with both prompts answered y on stdin, since Akku before 1.1.1
+# has no --yes; and with MAKEFLAGS cleared, except where a row sets it.
+# Akku before 1.1.1 ignores a script's exit status, so where a failing hook
+# stops 1.1.1's install, an older Akku's install goes on and the failure
+# shows at the program's first call instead. The rows expect whichever this
+# Akku does.
 #
-# Needs akku, chez and git on PATH; AKKU and CHEZ override the first two.
-# Akku.manifest has no `depends`, so nothing else is fetched.
+# Rows:
+#   1. index route, from an archive, under a parent make's MAKEFLAGS: one
+#      hook run; exactly src/'s libraries plus config.sls; a program gets a
+#      fired timer, libuv's version and a release shim in this consumer's
+#      .akku/ffi, which on macOS carries its own path as its install name;
+#   2. reinstall: again, and then with a compiler that fails, which must
+#      leave the working install in place, or (older Akku) name the failure;
+#   3. no usable libuv on a fresh install from a directory: the stub
+#      config.sls raises the reason, naming the hook's log;
+#      3b. a second consumer of the same directory replaces that stub;
+#      3c. a reinstall from it replaces the config.sls the hook wrote;
+#      3d. a reinstall with no make leaves no earlier config.sls behind;
+#   4. chez-libuv's own checkout, entered through a symbolic link: the hook
+#      does nothing;
+#   5. a built checkout used as a directory source: left alone;
+#   6. consumer route, through `akku lock`, with a compiler that warns, named
+#      by a relative CC: the lock carries no scripts; build/ and vendor/ stay
+#      out of .akku/lib;
+#   7. failures the hook names before it builds: a path make cannot take, no
+#      compiler, a source it cannot write (skipped as root, which writes
+#      whatever the modes);
+#   8. the hook interrupted while it builds leaves no build directory,
+#      under sh and, where there is one, dash.
+#
+# Needs akku, chez, git, pkg-config with libuv, and a C compiler on PATH;
+# AKKU and CHEZ override; CC, if set, is the compiler for the check's own
+# setup and for the hook. CHECK_AKKU_KEEP=1 keeps the work directory.
 set -eu
 
 AKKU=${AKKU:-akku}
 CHEZ=${CHEZ:-chez}
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+
+fail() { echo "check-akku: FAIL: $*" >&2; exit 1; }
+say() { echo "check-akku: $*"; }
+
+# Every consumer lives in the work directory, and the hook refuses a project
+# path make cannot take, so such a TMPDIR would fail every row.
+case ${TMPDIR:-/tmp} in
+  *[[:space:]]* | *'$'* | *:* | *%* | *"'"* | *'"'* | *'\'*)
+    fail "TMPDIR ($TMPDIR) holds a character make cannot take, so the install hook would refuse every project under it; set TMPDIR to a plain path" ;;
+esac
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-akku.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+work=$(cd "$work" && pwd -P)
+if [ -n "${CHECK_AKKU_KEEP:-}" ]; then
+  echo "check-akku: keeping $work"
+else
+  # A row makes a directory unwritable; give it back before removing.
+  trap 'chmod -R u+w "$work" 2> /dev/null; rm -rf "$work"' EXIT
+fi
 
-fail() { echo "check-akku: $*" >&2; exit 1; }
+# fail_log LOG MESSAGE: fail, showing the end of LOG, and the install hook's
+# own log when LOG sits in a consumer that has one: Akku before 1.1.1 shows
+# a script's output only at debug level, and the hook's reason is there.
+fail_log() {
+  tail -n 40 "$1" >&2 || true
+  _hook_log=$(dirname "$1")/.akku/ffi/chez-libuv-install.log
+  if [ -f "$_hook_log" ]; then
+    echo "--- the install hook's log, $_hook_log:" >&2
+    tail -n 20 "$_hook_log" >&2 || true
+  fi
+  fail "$2"
+}
 
-# The package's name and version, from Akku.manifest.
+# The compiler the check's own setup uses (row 5's make build, row 6's
+# wrapper), found by the hook's own rule. CC is not set for Akku's runs: the
+# hook looks for itself.
+setup_cc=$(sh "$root/scripts/find-cc") ||
+  fail "no C compiler: set CC, or put cc, gcc or clang on PATH"
+
+# The rows need the libuv the hook needs: at the floor, where pkg-config sees it.
+floor=$(cd "$root" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make -s akku-facts FLAVOR=prod |
+          sed -n 's/^floor=//p')
+[ -n "$floor" ] || fail "make akku-facts printed no libuv floor"
+pkg-config --atleast-version="$floor" libuv ||
+  fail "pkg-config finds no libuv $floor or newer (it finds $(pkg-config --modversion libuv 2> /dev/null || echo none)); every row needs one"
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi |
+    cut -d ' ' -f 1
+}
+
+# Akku 1.1.1 stops an install whose script fails; earlier ones go on. An
+# Akku that prints no version is not one the rows can read.
+akku_version=$("$AKKU" version 2> /dev/null | tail -n 1) || true
+case $akku_version in
+  0.* | 1.0.* | 1.1.0) hook_failure=ignored ;;
+  [0-9]*) hook_failure=stops ;;
+  *) fail "$AKKU version printed no version ('$akku_version'); is it an Akku that runs?" ;;
+esac
+say "akku $akku_version: a failing hook's install $( [ $hook_failure = stops ] && echo stops || echo goes on)"
+
+# The package's name, version and (scripts ...) form, from Akku.manifest.
 cat > "$work/manifest.ss" <<'EOF'
 (with-input-from-file "Akku.manifest"
   (lambda ()
@@ -34,64 +121,453 @@ cat > "$work/manifest.ss" <<'EOF'
       (let ((d (read)))
         (cond ((eof-object? d) (error 'check-akku "no akku-package form"))
               ((and (pair? d) (eq? (car d) 'akku-package))
-               (display (car (cadr d))) (display " ")
-               (display (cadr (cadr d))) (newline))
+               (display (car (cadr d))) (newline)
+               (display (cadr (cadr d))) (newline)
+               (let ((s (assq 'scripts (cddr d))))
+                 (when s (write s)))
+               (newline))
               (else (loop)))))))
 EOF
-manifest=$(cd "$root" && "$CHEZ" -q --script "$work/manifest.ss")
-package=${manifest% *}
-version=${manifest#* }
+(cd "$root" && "$CHEZ" -q --script "$work/manifest.ss") > "$work/manifest.out" ||
+  fail "could not read Akku.manifest"
+package=$(sed -n 1p "$work/manifest.out")
+version=$(sed -n 2p "$work/manifest.out")
+scripts=$(sed -n 3p "$work/manifest.out")
 
-# --no-recursion keeps a submodule's directory empty, as it is in an archive;
-# GNU tar applies it only to names after it, so it comes before -T. Each
-# step writes a file rather than feeding a pipe, so a failure in any of them
-# (a tracked file deleted from the working tree) stops the check: in a pipe,
-# only the last command's status counts.
-mkdir -p "$work/pkg/$package"
+# The tracked files. --no-recursion keeps a submodule's directory empty, as
+# it is in an archive; GNU tar applies it only to names after it, so it
+# comes before -T. Each step writes a file rather than feeding a pipe, so a
+# failure in any of them stops the check.
 (cd "$root" && git ls-files -z) > "$work/files" || fail "git ls-files failed"
 (cd "$root" && tar --null --no-recursion -T "$work/files" -cf "$work/pkg.tar") ||
   fail "could not archive the tracked files"
-tar -xf "$work/pkg.tar" -C "$work/pkg/$package" || fail "could not unpack the package"
+mkdir "$work/clean"
+tar -xf "$work/pkg.tar" -C "$work/clean" || fail "could not unpack the package"
 
-mkdir "$work/consumer"
-cd "$work/consumer"
-cat > Akku.manifest <<EOF
+# copy_package NAME: a fresh copy of the tracked files at $work/NAME.
+copy_package() { cp -Rp "$work/clean" "$work/$1"; }
+
+# An archive of the tracked files plus a library under build/ and one under
+# vendor/, which a source tree can hold and no consumer may install. It is
+# put in a private Akku cache under its sha256, so Akku extracts it with its
+# own reader, which keeps no file modes, and downloads nothing.
+copy_package archive
+mkdir -p "$work/archive/build" "$work/archive/vendor/stray"
+printf '#!r6rs\n(library (stray) (export stray) (import (rnrs)) (define stray 1))\n' \
+  > "$work/archive/build/stray.sls"
+printf '#!r6rs\n(library (stray stray) (export stray) (import (rnrs)) (define stray 2))\n' \
+  > "$work/archive/vendor/stray/stray.sls"
+# ustar, with no macOS metadata: Akku's tar reader decodes pax header values
+# as UTF-8 and fails on the binary extended attributes macOS tar stores.
+(cd "$work/archive" && COPYFILE_DISABLE=1 tar --format ustar -czf "$work/pkg.tar.gz" $(ls -A)) ||
+  fail "could not make the archive"
+archive_sha=$(sha256 "$work/pkg.tar.gz")
+mkdir -p "$work/cache/akku"
+cp "$work/pkg.tar.gz" "$work/cache/akku/$package-$archive_sha"
+archive_location="(location (url \"https://invalid.example/$package.tar.gz\")) (content (sha256 \"$archive_sha\"))"
+
+expected_version=$(pkg-config --modversion libuv) || fail "pkg-config finds no libuv"
+mkdir "$work/no-pkgconfig"
+
+# consumer NAME LOCATION SCRIPTS: a project at $work/NAME whose Akku.lock
+# has this package at LOCATION, with SCRIPTS in its entry.
+consumer() {
+  mkdir "$work/$1"
+  cat > "$work/$1/Akku.manifest" <<EOF
 #!r6rs
 (import (akku format manifest))
 (akku-package ("check-akku-consumer" "0.0.0")
   (synopsis "check-akku's consumer") (authors "check-akku") (license "MIT")
   (depends ("$package" "^$version")))
 EOF
-cat > Akku.lock <<EOF
+  cat > "$work/$1/Akku.lock" <<EOF
 #!r6rs
 (import (akku format lockfile))
-(projects ((name "$package") (location (directory "$work/pkg/$package"))))
+(projects ((name "$package") $2 $3))
+EOF
+}
+
+# run_akku DIR LOG [NAME=VALUE ...] ARGS...: Akku in DIR with ARGS, both
+# prompts answered y, its output in LOG. Leading NAME=VALUE arguments, each
+# one word, are added to Akku's environment.
+run_akku() {
+  _dir=$1 _log=$2
+  shift 2
+  (cd "$_dir" && printf 'y\ny\n' |
+     env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL AKKU_LOG_LEVEL=debug \
+       XDG_CACHE_HOME="$work/cache" "$@") > "$_log" 2>&1
+}
+
+# install_failing ROW CONSUMER REASON [NAME=VALUE ...]: `akku install` in
+# CONSUMER, whose hook fails with REASON, as this Akku shows it: the install
+# stops and its output gives REASON, or (an older Akku) it goes on.
+install_failing() {
+  _row=$1 _c=$2 _reason=$3
+  shift 3
+  if run_akku "$_c" "$_c/install.log" "$@" "$AKKU" install; then
+    [ $hook_failure = ignored ] ||
+      fail_log "$_c/install.log" "$_row: akku install succeeded; the hook should have stopped it"
+  else
+    [ $hook_failure = stops ] || fail_log "$_c/install.log" "$_row: akku install failed"
+    # Akku logs each line of a script's output as a Scheme string, written:
+    # \ and " escaped.
+    _written=$(printf '%s' "$_reason" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    grep -qF "$_written" "$_c/install.log" ||
+      fail_log "$_c/install.log" "$_row: akku's output does not give the hook's reason ($_reason)"
+  fi
+}
+
+# The libraries this package installed into DIR/.akku/lib, one per line.
+# Akku installs a library that imports (chezscheme) as NAME.chezscheme.sls,
+# so that suffix is folded back to .sls. A library whose name has one part,
+# (libuv), is installed twice, as libuv.sls and as libuv/main.sls; the
+# second counts only as a byte-for-byte copy of the first.
+installed_libraries() {
+  awk -F '\t' -v p="$package" '$2 == p && $3 == "r6rs-library" { sub("^\\.akku/lib/", "", $1); print $1 }' \
+    "$1/.akku/list" | sed 's/\.chezscheme\.sls$/.sls/' | sort > "$1/installed.all"
+  while read -r f; do
+    case $f in
+      */main.sls)
+        twin=${f%/main.sls}.sls
+        if grep -qxF "$twin" "$1/installed.all" &&
+           cmp -s "$1/.akku/lib/$f" "$1/.akku/lib/$twin"; then
+          continue
+        fi ;;
+    esac
+    echo "$f"
+  done < "$1/installed.all"
+}
+(cd "$root" && git ls-files -- 'src/*.sls' | sed 's#^src/##'; echo libuv/private/config.sls) |
+  sort > "$work/expected.txt"
+[ "$(wc -l < "$work/expected.txt")" -gt 1 ] || fail "git tracks no src/*.sls; nothing to compare against"
+
+# check_libraries ROW DIR: exactly src/'s libraries and config.sls.
+check_libraries() {
+  installed_libraries "$2" > "$2/installed.txt"
+  diff -u "$work/expected.txt" "$2/installed.txt" > "$2/libraries.diff" ||
+    { cat "$2/libraries.diff" >&2
+      fail "$1: the installed libraries are not exactly src/'s plus config.sls (- missing, + extra)"; }
+}
+
+# A program that needs a loaded shim for every line it prints: a timer's
+# callback, libuv's own version string, which entries the shim has, and the
+# shim's path.
+cat > "$work/program.sps" <<'EOF'
+(import (rnrs) (libuv)
+        (only (libuv private native) shim-file)
+        (only (chezscheme) foreign-entry?))
+(define fired 'never-fired)
+(define loop (make-uv-loop))
+(define timer (make-uv-timer loop))
+(uv-timer-start! timer (lambda (t) (set! fired 'fired) (uv-close! t)) 0 0)
+(uv-run loop 'default)
+(uv-loop-teardown! loop)
+(display (uv-version)) (newline)
+(display fired) (newline)
+(display (if (foreign-entry? "chez_uv_constant") 'has-constant 'no-constant)) (newline)
+(display (if (foreign-entry? "chez_uv_debug_pool_hold") 'dev-shim 'release-shim)) (newline)
+(display (shim-file)) (newline)
 EOF
 
-echo "check-akku: installing $package $version as a dependency"
-"$AKKU" install > install.log 2>&1 || { cat install.log >&2; fail "akku install failed"; }
+# run_program LIBDIR OUT: the program on LIBDIR alone; its status.
+run_program() {
+  env -u CHEZ_LIBUV_SHIM CHEZSCHEMELIBDIRS="$1" "$CHEZ" --program "$work/program.sps" > "$2" 2>&1
+}
 
-# Akku installs a library that imports (chezscheme) as NAME.chezscheme.sls,
-# so that suffix is folded back to .sls before comparing with src/.
-awk -F '\t' -v p="$package" '$2 == p && $3 == "r6rs-library" { sub("^\\.akku/lib/", "", $1); print $1 }' \
-  .akku/list | sed 's/\.chezscheme\.sls$/.sls/' | sort > installed.txt
-# A library whose name has one part, (libuv), is installed twice: as
-# libuv.sls and, for Schemes that look in a directory, as libuv/main.sls.
-# The second counts only as a byte-for-byte copy of the first.
-while read -r f; do
-  case $f in
-    */main.sls)
-      twin=${f%/main.sls}.sls
-      if grep -qxF "$twin" installed.txt &&
-         cmp -s ".akku/lib/$f" ".akku/lib/$twin"; then
-        continue
-      fi ;;
+# check_program ROW DIR: the program, on DIR's .akku/lib, works.
+check_program() {
+  run_program "$2/.akku/lib" "$2/program.out" ||
+    fail_log "$2/program.out" "$1: the program failed on the installed libraries"
+  [ "$(sed -n 1p "$2/program.out")" = "$expected_version" ] ||
+    fail_log "$2/program.out" "$1: uv-version is not libuv $expected_version, the version pkg-config reports"
+  [ "$(sed -n 2p "$2/program.out")" = fired ] ||
+    fail_log "$2/program.out" "$1: the timer's callback did not fire"
+  [ "$(sed -n 3p "$2/program.out")" = has-constant ] ||
+    fail_log "$2/program.out" "$1: the loaded shim has no chez_uv_constant (the release-shim control)"
+  [ "$(sed -n 4p "$2/program.out")" = release-shim ] ||
+    fail_log "$2/program.out" "$1: the installed shim is a dev build (it exports the pool hold)"
+  case $(sed -n 5p "$2/program.out") in
+    "$2/.akku/ffi/"*) ;;
+    *) fail_log "$2/program.out" "$1: the loaded shim is not in this consumer's .akku/ffi" ;;
   esac
-  echo "$f"
-done < installed.txt > installed.dedup && mv installed.dedup installed.txt
-(cd "$root" && git ls-files -- 'src/*.sls' | sed 's#^src/##' | sort) > expected.txt
-[ -s expected.txt ] || fail "git tracks no src/*.sls; nothing to compare against"
-diff -u expected.txt installed.txt > libraries.diff ||
-  { cat libraries.diff >&2; fail "$package installs a different set of libraries than src/ (- missing, + extra)"; }
+}
 
-echo "check-akku: $(wc -l < installed.txt | tr -d ' ') libraries installed, exactly src/"
+# check_raises ROW LIBDIR OUT REASON LOG: the program's first call raises
+# the hook's failure, naming REASON and the hook's LOG.
+check_raises() {
+  if run_program "$2" "$3"; then
+    fail_log "$3" "$1: the program ran; expected the hook's failure to be raised"
+  fi
+  grep -qF "Exception in chez-libuv: $4" "$3" ||
+    fail_log "$3" "$1: the program did not raise the hook's reason ($4)"
+  grep -qF "$5" "$3" ||
+    fail_log "$3" "$1: the raised message does not name the hook's log ($5)"
+}
+
+no_libuv_reason="pkg-config finds no libuv"
+
+# --- 1. the index route -------------------------------------------------
+row="row 1 (index route, archive, a parent make's MAKEFLAGS)"
+say "$row"
+consumer c1 "$archive_location" "$scripts"
+run_akku "$work/c1" "$work/c1/install.log" MAKEFLAGS=HAVE_PKG=no FLAVOR=bogus "$AKKU" install ||
+  fail_log "$work/c1/install.log" "$row: akku install failed"
+runs=$(grep -c 'Running ".*akku-install' "$work/c1/install.log" || true)
+[ "$runs" = 1 ] || fail_log "$work/c1/install.log" "$row: the hook ran $runs times, not once"
+grep -qF "chez-libuv: built $work/c1/.akku/ffi/libchezlibuv." "$work/c1/install.log" ||
+  fail_log "$work/c1/install.log" "$row: the hook did not say it built the shim into .akku/ffi"
+check_libraries "$row" "$work/c1"
+check_program "$row" "$work/c1"
+# Each name on its own: an unmatched glob stays literal, and does not exist.
+for left in "$work/c1/.akku/ffi/".chez-libuv-build.* "$work/c1/.akku/ffi/".libchezlibuv.*; do
+  [ ! -e "$left" ] || fail "$row: the hook left $left in .akku/ffi"
+done
+# A macOS library records an install name, its own path unless the link
+# says otherwise; the shim was linked under a temporary name.
+shim=$(sed -n 5p "$work/c1/program.out")
+case $shim in
+  *.dylib)
+    [ "$(otool -D "$shim" | sed -n 2p)" = "$shim" ] ||
+      fail "$row: the shim's install name is $(otool -D "$shim" | sed -n 2p), not its own path" ;;
+esac
+
+# --- 2. reinstall -------------------------------------------------------
+row="row 2 (reinstall)"
+say "$row"
+run_akku "$work/c1" "$work/c1/reinstall.log" "$AKKU" install ||
+  fail_log "$work/c1/reinstall.log" "$row: akku install failed the second time"
+check_program "$row" "$work/c1"
+# A compiler that fails, so the hook gets as far as building before it
+# fails, past every check that could stop it sooner.
+row="row 2 (reinstall with a compiler that fails)"
+say "$row"
+printf '#!/bin/sh\necho "check-akku: this compiler fails" >&2\nexit 1\n' > "$work/cc-fail"
+chmod +x "$work/cc-fail"
+compile_reason="compiling the shim failed"
+mv "$work/c1/install.log" "$work/c1/install-first.log"
+install_failing "$row" "$work/c1" "$compile_reason" "CC=$work/cc-fail"
+if [ $hook_failure = stops ]; then
+  check_program "$row: the previous install" "$work/c1"
+else
+  check_raises "$row" "$work/c1/.akku/lib" "$work/c1/reinstall-fail.out" \
+    "$compile_reason" "$work/c1/.akku/ffi/chez-libuv-install.log"
+fi
+
+# --- 3. no usable libuv, fresh, from a directory --------------------------
+row="row 3 (no libuv visible, fresh install)"
+say "$row"
+copy_package d3
+consumer c3 "(location (directory \"$work/d3\"))" "$scripts"
+install_failing "$row" "$work/c3" "$no_libuv_reason" \
+  "PKG_CONFIG_LIBDIR=$work/no-pkgconfig" "PKG_CONFIG_PATH="
+if [ $hook_failure = ignored ]; then
+  check_raises "$row" "$work/c3/.akku/lib" "$work/c3/program.out" \
+    "$no_libuv_reason" "$work/c3/.akku/ffi/chez-libuv-install.log"
+fi
+check_raises "$row: the source's own config.sls" "$work/d3/src" "$work/c3/source-program.out" \
+  "$no_libuv_reason" "$work/c3/.akku/ffi/chez-libuv-install.log"
+# Another consumer of the same directory, with libuv visible: the first
+# one's stub is the hook's own, so it is replaced, not refused.
+row="row 3b (a second consumer of the same directory)"
+say "$row"
+consumer c3b "(location (directory \"$work/d3\"))" "$scripts"
+run_akku "$work/c3b" "$work/c3b/install.log" "$AKKU" install ||
+  fail_log "$work/c3b/install.log" "$row: akku install failed"
+check_program "$row" "$work/c3b"
+# The build's own files went elsewhere: the directory holds only what it
+# held, and config.sls.
+[ ! -e "$work/d3/build" ] || fail "$row: the hook wrote a build/ directory into the source"
+# Now the directory's config.sls is the hook's own, built: a reinstall
+# replaces it rather than taking it for a checkout's make build.
+row="row 3c (a reinstall from a directory the hook built)"
+say "$row"
+case $(sed -n 2p "$work/d3/src/libuv/private/config.sls") in
+  ';; GENERATED by akku-install -- '*) ;;
+  *) fail "$row: the directory's config.sls does not say the hook wrote it: $(sed -n 2p "$work/d3/src/libuv/private/config.sls")" ;;
+esac
+run_akku "$work/c3b" "$work/c3b/reinstall.log" "$AKKU" install ||
+  fail_log "$work/c3b/reinstall.log" "$row: akku install failed"
+grep -qF "chez-libuv: built $work/c3b/.akku/ffi/libchezlibuv." "$work/c3b/reinstall.log" ||
+  fail_log "$work/c3b/reinstall.log" "$row: the hook did not rebuild"
+check_program "$row" "$work/c3b"
+# A hook that fails before make has said what config.sls exports can write
+# no stub; it must not leave the last run's config.sls to be installed.
+row="row 3d (a reinstall with no make)"
+say "$row"
+mkdir "$work/no-make-bin"
+(IFS=:
+ for d in $PATH; do
+   [ -d "$d" ] || continue
+   for f in "$d"/*; do
+     b=${f##*/}
+     case $b in make | gmake) continue ;; esac
+     [ -e "$work/no-make-bin/$b" ] || [ -L "$work/no-make-bin/$b" ] ||
+       ln -s "$f" "$work/no-make-bin/$b" 2> /dev/null || true
+   done
+ done)
+! PATH=$work/no-make-bin command -v make > /dev/null 2>&1 || fail "$row: could not make a PATH without make"
+install_failing "$row" "$work/c3b" "make could not read chez-libuv's Makefile" "PATH=$work/no-make-bin"
+[ ! -e "$work/d3/src/libuv/private/config.sls" ] ||
+  fail "$row: the last run's config.sls is still in the source: $(sed -n 2p "$work/d3/src/libuv/private/config.sls")"
+if [ $hook_failure = ignored ]; then
+  if run_program "$work/c3b/.akku/lib" "$work/c3b/no-make.out"; then
+    fail_log "$work/c3b/no-make.out" "$row: the program ran on a config.sls the failed hook should not have left"
+  fi
+  grep -qF 'library (libuv private config) not found' "$work/c3b/no-make.out" ||
+    fail_log "$work/c3b/no-make.out" "$row: the program found a config.sls"
+fi
+
+# --- 4. chez-libuv's own checkout ---------------------------------------
+row="row 4 (akku install in chez-libuv's own checkout)"
+say "$row"
+copy_package d4
+printf '#!r6rs\n(import (akku format lockfile))\n(projects)\n' > "$work/d4/Akku.lock"
+# Entered through a symbolic link, as a checkout under macOS's /tmp or
+# $TMPDIR is: Akku's paths are physical, and so must the hook's be.
+ln -s "$work/d4" "$work/d4-link"
+run_akku "$work/d4-link" "$work/d4/install.log" "$AKKU" install ||
+  fail_log "$work/d4/install.log" "$row: akku install failed"
+grep -qF "chez-libuv: this is chez-libuv's own checkout" "$work/d4/install.log" ||
+  fail_log "$work/d4/install.log" "$row: the hook did not say it skipped chez-libuv's own checkout"
+[ ! -e "$work/d4/src/libuv/private/config.sls" ] ||
+  fail "$row: the hook wrote src/libuv/private/config.sls into the checkout"
+! ls "$work/d4/.akku/ffi/"libchezlibuv.* > /dev/null 2>&1 ||
+  fail "$row: the hook built a shim for the checkout's own akku install"
+
+# --- 5. a built checkout as a directory source --------------------------
+row="row 5 (a built checkout as a directory source)"
+say "$row"
+copy_package d5
+(cd "$work/d5" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make build CHEZ="$CHEZ" CC="$setup_cc") \
+  > "$work/d5-build.log" 2>&1 || fail_log "$work/d5-build.log" "$row: make build failed in the copy"
+cp "$work/d5/src/libuv/private/config.sls" "$work/d5-config.before"
+consumer c5 "(location (directory \"$work/d5\"))" "$scripts"
+install_failing "$row" "$work/c5" "chez-libuv: $work/d5 is a make build"
+grep -qF "chez-libuv: $work/d5 is a make build" "$work/c5/install.log" ||
+  fail_log "$work/c5/install.log" "$row: the hook did not refuse the built checkout"
+cmp -s "$work/d5-config.before" "$work/d5/src/libuv/private/config.sls" ||
+  fail "$row: the built checkout's config.sls changed"
+
+# --- 6. the consumer route ----------------------------------------------
+row="row 6 (consumer route through akku lock, a compiler that warns, a relative CC)"
+say "$row"
+mkdir "$work/c6"
+printf '#warning "check-akku-compiler-warning"\n' > "$work/warn.h"
+# In the consumer's directory, named relative to it: the hook changes to
+# its own directory before it builds.
+printf '#!/bin/sh\nexec %s -include %s "$@"\n' "$setup_cc" "$work/warn.h" > "$work/c6/cc-warn"
+chmod +x "$work/c6/cc-warn"
+cat > "$work/c6/Akku.manifest" <<EOF
+#!r6rs
+(import (akku format manifest))
+(akku-package ("check-akku-consumer" "0.0.0")
+  (synopsis "check-akku's consumer") (authors "check-akku") (license "MIT")
+  (depends ("$package" (version "$version") $archive_location))
+  (scripts
+    (cond-expand
+      ((and pre-install (or darwin linux))
+       (run "sh .akku/src/$package/scripts/akku-install")))))
+EOF
+run_akku "$work/c6" "$work/c6/lock.log" "$AKKU" lock || fail_log "$work/c6/lock.log" "$row: akku lock failed"
+! grep -q scripts "$work/c6/Akku.lock" ||
+  fail "$row: akku lock copied scripts into the lock; the consumer route's premise is gone"
+run_akku "$work/c6" "$work/c6/install.log" CC=./cc-warn "$AKKU" install || true
+# The compiler's diagnostics are in the hook's own log, whether it built or
+# not. clang and gcc both put "warning:" or "error:" before the text.
+hook_log=$work/c6/.akku/ffi/chez-libuv-install.log
+[ -f "$hook_log" ] || fail_log "$work/c6/install.log" "$row: the hook wrote no log in .akku/ffi"
+grep -qF "building with $work/c6/./cc-warn" "$hook_log" ||
+  fail_log "$hook_log" "$row: the hook did not take CC=./cc-warn from the consumer's directory"
+grep 'check-akku-compiler-warning' "$hook_log" > "$work/c6/diagnostics" || true
+! grep -q 'error:' "$work/c6/diagnostics" ||
+  fail_log "$hook_log" "$row: the compiler's warning failed the hook's build (-Werror)"
+grep -q 'warning:' "$work/c6/diagnostics" ||
+  fail_log "$hook_log" "$row: the hook's build did not show the compiler's warning"
+grep -qF "chez-libuv: built $work/c6/.akku/ffi/libchezlibuv." "$work/c6/install.log" ||
+  fail_log "$work/c6/install.log" "$row: the hook did not say it built the shim into .akku/ffi"
+check_libraries "$row" "$work/c6"
+check_program "$row" "$work/c6"
+
+# --- 7. failures the hook names before it builds -----------------------
+# A path make cannot take. The double quote also has to survive into the
+# stub's Scheme string, so the message names the log exactly.
+row="row 7 (a project path with a space and a double quote)"
+say "$row"
+copy_package d7
+odd='c7 "odd"'
+odd_reason="the path $work/$odd/.akku/ffi holds a character make cannot take"
+consumer "$odd" "(location (directory \"$work/d7\"))" "$scripts"
+install_failing "$row" "$work/$odd" "$odd_reason"
+if [ $hook_failure = ignored ]; then
+  check_raises "$row" "$work/$odd/.akku/lib" "$work/$odd/program.out" \
+    "$odd_reason" "$work/$odd/.akku/ffi/chez-libuv-install.log"
+fi
+check_raises "$row: the source's own config.sls" "$work/d7/src" "$work/d7-program.out" \
+  "$odd_reason" "$work/$odd/.akku/ffi/chez-libuv-install.log"
+
+row="row 7 (no C compiler)"
+say "$row"
+copy_package d7b
+consumer c7b "(location (directory \"$work/d7b\"))" "$scripts"
+install_failing "$row" "$work/c7b" "no C compiler" "CC=$work/no-such-compiler"
+if [ $hook_failure = ignored ]; then
+  check_raises "$row" "$work/c7b/.akku/lib" "$work/c7b/program.out" \
+    "no C compiler" "$work/c7b/.akku/ffi/chez-libuv-install.log"
+fi
+
+# A source the hook cannot write: no stub either, so it says so and stops,
+# and an Akku that goes on installs no config.sls at all. Root writes
+# whatever a directory's modes say, so as root there is nothing to test.
+row="row 7 (a source directory the hook cannot write)"
+if [ "$(id -u)" = 0 ]; then
+  say "$row: skipped, running as root"
+else
+  say "$row"
+  copy_package d7c
+  chmod a-w "$work/d7c/src/libuv/private"
+  consumer c7c "(location (directory \"$work/d7c\"))" "$scripts"
+  install_failing "$row" "$work/c7c" "chez-libuv: cannot write into $work/d7c/src/libuv/private"
+  chmod u+w "$work/d7c/src/libuv/private"
+  grep -qF "chez-libuv: cannot write into $work/d7c/src/libuv/private" "$work/c7c/install.log" ||
+    fail_log "$work/c7c/install.log" "$row: the hook did not say it cannot write into the source"
+  [ ! -e "$work/d7c/src/libuv/private/config.sls" ] ||
+    fail "$row: a config.sls appeared in the unwritable source"
+fi
+
+# --- 8. the hook interrupted while it builds ----------------------------
+# The hook run directly, as Akku runs it, with a compiler that waits; a
+# TERM once its build directory exists must still remove that directory.
+# Under each shell here that Akku may run it with: bash, macOS's sh, runs
+# the EXIT trap when a signal ends it, and dash, Debian's and Ubuntu's sh,
+# only when the script traps that signal.
+printf '#!/bin/sh\nsleep 3\nexit 1\n' > "$work/cc-slow"
+chmod +x "$work/cc-slow"
+hook_shells=sh
+if command -v dash > /dev/null 2>&1; then hook_shells="sh dash"; fi
+for hook_sh in $hook_shells; do
+  row="row 8 (the hook interrupted while it builds, under $hook_sh)"
+  say "$row"
+  copy_package "d8-$hook_sh"
+  mkdir -p "$work/c8-$hook_sh/.akku/ffi"
+  sh -c 'cd "$1" && exec env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL akku_path_root="$2/.akku" \
+           akku_path_lib_ffi="$2/.akku/ffi" CC="$3" "$4" scripts/akku-install' \
+    sh "$work/d8-$hook_sh" "$work/c8-$hook_sh" "$work/cc-slow" "$hook_sh" \
+    > "$work/c8-$hook_sh/hook.out" 2>&1 &
+  hook=$!
+  tries=0
+  until ls -d "$work/c8-$hook_sh/.akku/ffi/".chez-libuv-build.* > /dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ $tries -gt 200 ]; then
+      kill "$hook" 2> /dev/null || true
+      fail_log "$work/c8-$hook_sh/hook.out" "$row: the hook never made its build directory"
+    fi
+    sleep 0.05
+  done
+  kill -TERM "$hook"
+  wait "$hook" || true
+  for left in "$work/c8-$hook_sh/.akku/ffi/".chez-libuv-build.*; do
+    [ ! -e "$left" ] || fail "$row: the interrupted hook left $left in .akku/ffi"
+  done
+done
+
+say "$package $version: $(wc -l < "$work/c1/installed.txt" | tr -d ' ') libraries, a release shim in .akku/ffi, by both routes; each refusal held"

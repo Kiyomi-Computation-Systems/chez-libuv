@@ -92,9 +92,15 @@ every upgrade: a shim built from older sources fails the import with
 [[file:docs/building.md][docs/building.md]] covers acquisition paths,
 ~CHEZ_LIBUV_SHIM~ and release builds.
 
-Install from a git checkout as above. The shim and ~config.sls~ are
-per-machine build products, so a source-only install cannot work. Akku
-manages the Scheme dependency of the test suites (~chez-srfi~); ~(libuv)~
+The shim and ~config.sls~ are per-machine build products, so a copy of
+the sources alone cannot load. A project that depends on chez-libuv
+through Akku gets them from its install hook, ~scripts/akku-install~,
+which ~akku install~ runs before it installs the libraries: it builds a
+release shim into the project's ~.akku/ffi~ against the libuv pkg-config
+finds, and writes ~config.sls~ naming it.
+[[file:docs/installing.md#akku][docs/installing.md]] has the lines a
+project's ~Akku.manifest~ needs to run it, and what each failure says. Akku
+also manages the test suites' Scheme dependency (~chez-srfi~); ~(libuv)~
 itself depends on nothing beyond ~(rnrs)~.
 
 * Use
