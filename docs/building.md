@@ -461,10 +461,12 @@ Two more checks run on the host, outside the container:
   Where Akku 1.1.0 and 1.1.1 differ (a failing hook stops 1.1.1's install),
   each row expects what the Akku running it does. `.akkuignore` keeps the
   site generator, `build/` and `vendor/` out. It needs `akku`, a Chez, a C
-  compiler and pkg-config's libuv:
+  compiler and pkg-config's libuv at the floor. On a Guix host, use the
+  repository's pinned toolchain plus Akku, since Guix's own `libuv` is
+  below the floor:
 
   ```sh
-  guix shell akku chez-scheme -- make check-akku CHEZ=scheme
+  guix time-machine -C channels.scm -- shell --pure -m manifest.scm akku -- make check-akku CHEZ=scheme
   ```
 - `make akku-facts` prints what the install hook reads from the Makefile:
   pkg-config's verdict on libuv, the libuv floor, the shared-library

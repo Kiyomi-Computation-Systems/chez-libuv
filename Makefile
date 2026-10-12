@@ -431,8 +431,10 @@ check-site: check-reference site-deps deps ## Test the site generator, then rend
 # each required to give exactly src/'s libraries plus config.sls and a
 # release shim that loads; and the install hook's refusals and failures, as
 # the Akku running it shows them. .akkuignore keeps site/, build/ and vendor/
-# out. Needs akku, a Chez, a C compiler and pkg-config's libuv on the host:
-# `guix shell akku chez-scheme -- make check-akku CHEZ=scheme`.
+# out. Needs akku, a Chez, a C compiler and pkg-config's libuv at the floor.
+# On a Guix host, the pinned toolchain and Akku (Guix's own libuv is below
+# the floor): `guix time-machine -C channels.scm -- shell --pure
+# -m manifest.scm akku -- make check-akku CHEZ=scheme`.
 AKKU ?= akku
 check-akku: ## Install with Akku by both routes; check the libraries, the shim, and the install hook's refusals
 	@AKKU="$(AKKU)" CHEZ="$(CHEZ)" scripts/check-akku

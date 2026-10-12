@@ -125,8 +125,57 @@ each mutant rerun:
 - **Without Akku's environment the hook exits 2:** run by hand, not by a
   row. It printed "akku-install: akku install runs this (akku_path_root and
   akku_path_lib_ffi are unset)" and exited 2.
-- **Linux:** not run. The brief holds the Linux leg for the user's go;
-  Guix's `akku` is 1.1.0, the version every 1.1.0 row above ran on.
+## Linux, on kishu
+
+kishu-libuv-issues-b ran the check at d9e0108, in a fresh worktree and a
+`guix shell --pure`. A non-pure shell keeps the host's `/usr/bin/cc`, so the
+hook would never look for gcc.
+
+- **`CC` unset, Guix's packages** (Akku 1.1.0, libuv-for-node-lts 1.52.1,
+  gcc 16.2.0, Chez 10.4.0, no `cc`):
+  - rows 1-4 passed;
+  - the hook found gcc itself: c3b's log says "building with gcc, libuv
+    1.52.1";
+  - row 5 failed in the check's own setup: "make build: cc not found", then
+    "row 5 (a built checkout as a directory source): make build failed in
+    the copy" (finding A).
+- **`CC=gcc`, same shell:** rows 1-7 pass.
+- **`CC=gcc`, the repo's pinned toolchain** (`guix time-machine -C
+  channels.scm -- shell --pure -m manifest.scm akku`; Chez 10.4.1): rows 1-7
+  pass, in 47 s.
+- **Guix's plain `libuv` (1.44.2):** the hook refused it correctly. Its log
+  said "pkg-config finds no libuv 1.48.0 or newer". But the check reported
+  only "row 1: the hook did not say it built the shim", and the tail it
+  printed lacked the reason, since 1.1.0 shows script output only at debug
+  level (finding B).
+- **`make test` through `scripts/guix-env`:** 39 suites, 2,354 passes. The
+  dev build still compiles with `-Werror`.
+
+### The two findings, reproduced on macOS and fixed
+
+- **A: the check's setup took the caller's compiler.** Row 5 ran `make
+  build` with `CC` unset, and row 6's warning wrapper executed `$CC`, which
+  defaulted to `cc`.
+  - **Reproduced:** with `CC` unset and a `PATH` holding every tool but `cc`
+    (symlinks to all of this Mac's `PATH`, `gcc` included), the committed
+    check failed exactly as on kishu.
+  - **Fixed:** the check finds its setup compiler the way the hook does
+    (`CC`, else `cc`, `gcc`, `clang`) and passes it to row 5's make and row
+    6's wrapper. The same no-`cc` run now passes under 1.1.1 and 1.1.0.
+- **B: a libuv below the floor failed row 1 without its reason.**
+  - **Reproduced:** a `libuv.pc` copy that says 1.44.2, under
+    `PKG_CONFIG_LIBDIR`.
+  - **Fixed:**
+    - the check reads the floor from `make akku-facts` and refuses up front:
+      "pkg-config finds no libuv 1.48.0 or newer (it finds 1.44.2); every
+      row needs one";
+    - a failing row's `fail_log` also prints the consumer's
+      `.akku/ffi/chez-libuv-install.log`. Seen under 1.1.0 with the
+      `makeflags` mutant: row 1's failure is now followed by the hook's log,
+      which names the reason.
+- **Docs:** the documented Guix command used Guix's own `libuv`, which is
+  1.44.2. It now uses the pinned toolchain plus Akku, in the Makefile
+  comment and docs/building.md.
 
 ## Gates
 

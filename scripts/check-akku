@@ -37,12 +37,12 @@
 #      lock carries no scripts; build/ and vendor/ stay out of .akku/lib.
 #
 # Needs akku, chez, git, pkg-config with libuv, and a C compiler on PATH;
-# AKKU, CHEZ and CC override. CHECK_AKKU_KEEP=1 keeps the work directory.
+# AKKU and CHEZ override; CC, if set, is the compiler for the check's own
+# setup and for the hook. CHECK_AKKU_KEEP=1 keeps the work directory.
 set -eu
 
 AKKU=${AKKU:-akku}
 CHEZ=${CHEZ:-chez}
-CC=${CC:-cc}
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-akku.XXXXXX")
 work=$(cd "$work" && pwd -P)
@@ -54,8 +54,38 @@ fi
 
 fail() { echo "check-akku: FAIL: $*" >&2; exit 1; }
 say() { echo "check-akku: $*"; }
-# fail_log LOG MESSAGE: fail, showing the end of LOG.
-fail_log() { tail -n 40 "$1" >&2 || true; fail "$2"; }
+# fail_log LOG MESSAGE: fail, showing the end of LOG, and the install hook's
+# own log when LOG sits in a consumer that has one: Akku before 1.1.1 shows
+# a script's output only at debug level, and the hook's reason is there.
+fail_log() {
+  tail -n 40 "$1" >&2 || true
+  _hook_log=$(dirname "$1")/.akku/ffi/chez-libuv-install.log
+  if [ -f "$_hook_log" ]; then
+    echo "--- the install hook's log, $_hook_log:" >&2
+    tail -n 20 "$_hook_log" >&2 || true
+  fi
+  fail "$2"
+}
+
+# The compiler the check's own setup uses (row 5's make build, row 6's
+# wrapper), found the way the hook finds one: CC, else cc, gcc or clang.
+# CC is not set for Akku's runs: the hook looks for itself.
+if [ -n "${CC:-}" ]; then
+  setup_cc=$CC
+else
+  setup_cc=
+  for c in cc gcc clang; do
+    if command -v "$c" > /dev/null 2>&1; then setup_cc=$c; break; fi
+  done
+fi
+[ -n "$setup_cc" ] || fail "no C compiler: set CC, or put cc, gcc or clang on PATH"
+
+# The rows need the libuv the hook needs: at the floor, where pkg-config sees it.
+floor=$(cd "$root" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make -s akku-facts FLAVOR=prod |
+          sed -n 's/^floor=//p')
+[ -n "$floor" ] || fail "make akku-facts printed no libuv floor"
+pkg-config --atleast-version="$floor" libuv ||
+  fail "pkg-config finds no libuv $floor or newer (it finds $(pkg-config --modversion libuv 2> /dev/null || echo none)); every row needs one"
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi |
@@ -340,7 +370,7 @@ grep -qF "chez-libuv: this is chez-libuv's own checkout" "$work/d4/install.log" 
 row="row 5 (a built checkout as a directory source)"
 say "$row"
 copy_package d5
-(cd "$work/d5" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make build CHEZ="$CHEZ") \
+(cd "$work/d5" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make build CHEZ="$CHEZ" CC="$setup_cc") \
   > "$work/d5-build.log" 2>&1 || fail_log "$work/d5-build.log" "$row: make build failed in the copy"
 cp "$work/d5/src/libuv/private/config.sls" "$work/d5-config.before"
 consumer c5 "(location (directory \"$work/d5\"))" "$scripts"
@@ -359,7 +389,7 @@ cmp -s "$work/d5-config.before" "$work/d5/src/libuv/private/config.sls" ||
 row="row 6 (consumer route through akku lock, a compiler that warns)"
 say "$row"
 printf '#warning "check-akku-compiler-warning"\n' > "$work/warn.h"
-printf '#!/bin/sh\nexec %s -include %s "$@"\n' "$CC" "$work/warn.h" > "$work/cc-warn"
+printf '#!/bin/sh\nexec %s -include %s "$@"\n' "$setup_cc" "$work/warn.h" > "$work/cc-warn"
 chmod +x "$work/cc-warn"
 mkdir "$work/c6"
 cat > "$work/c6/Akku.manifest" <<EOF
