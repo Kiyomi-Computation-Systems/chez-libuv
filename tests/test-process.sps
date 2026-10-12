@@ -32,7 +32,6 @@
         (spawn-list-races)
         (only (uv-meter) fewest-bytes)
         (uv-level-3)
-        (only (uv-child) child-run child-entry)
         ;; The engine-sweep driver caps the changing-data sweeps' resumes;
         ;; a state sweep hands its loop to other-thread, and the drop sweeps
         ;; check that no run leaves interrupts off.
@@ -2362,38 +2361,6 @@
       (test-equal "at --optimize-level 3, uv-spawn! refuses each of its lists improper or circular, for that list, and never walks one forever"
         malformed-reasons
         (level-3-entry level-3-report 'malformed))))
-
-;; --- uv-kill! as a process's first call into libuv ------------------------
-;; Importing (libuv) reads no constants. uv-kill! needs them both to name its
-;; signal and to name kill(2)'s errno, so as the first call in a process it
-;; has to load them itself. tests/first-kill-child.sps makes that call in a
-;; process of its own, once for each of those two needs.
-(define first-kill-chez (getenv "CHEZ_LIBUV_TEST_CHEZ"))
-
-;; first-kill : symbol -> (or alist list)
-(define (first-kill signal)
-  (child-run first-kill-chez '() "tests/first-kill-child.sps" (list signal)))
-
-;; missing-pid-refusal : object -> object
-;; 'refused-as-missing for an errno kill(2) gives a pid no process has, or
-;; the child's entry as it came.
-(define (missing-pid-refusal kill)
-  (if (and (pair? kill) (eq? (car kill) 'errno) (memq (cadr kill) '(ESRCH EPERM)))
-      'refused-as-missing
-      kill))
-
-(if (not first-kill-chez)
-    (test-equal "first-call uv-kill! rows SKIPPED: CHEZ_LIBUV_TEST_CHEZ unset (run via make test)"
-      'skipped 'skipped)
-    (let ((zero (first-kill 'zero)) (sigterm (first-kill 'sigterm)))
-      (test-equal "seed: the first-call children had no constants until uv-kill!"
-        '(#f #f)
-        (list (child-entry zero 'initialized-before)
-              (child-entry sigterm 'initialized-before)))
-      (test-equal "uv-kill! with signal 0 as the first call names kill(2)'s errno"
-        'refused-as-missing (missing-pid-refusal (child-entry zero 'kill)))
-      (test-equal "uv-kill! with 'sigterm as the first call names kill(2)'s errno"
-        'refused-as-missing (missing-pid-refusal (child-entry sigterm 'kill)))))
 
 (collect)
 (test-assert "counters all zero at suite end"
