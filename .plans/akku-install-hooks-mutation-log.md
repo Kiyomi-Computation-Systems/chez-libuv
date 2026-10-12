@@ -366,3 +366,31 @@ once under each Akku.
   `early-rm-moved-back` were rerun under both Akkus, with the results above.
 - `make test` (39 suites, 2,354 passes), `check-site`, `check-pins` and
   `check-help` pass on macOS.
+
+### The retest at 8f25e14, on kishu, with `CC` unset
+
+kishu-libuv-issues-b ran these with nothing on the branch changed.
+
+1. **Guix, the documented command verbatim:** rows 1-8 pass in 55 s,
+   including 3c, 3d, the relative `CC`, and row 8 under `sh`, which is bash
+   there.
+2. **The same, with `dash` added to the shell:** rows 1-8 pass in 62 s, and
+   row 8 also runs under dash.
+3. **Ubuntu 26.04 with Akku 1.1.0's official bundle** (Chez 10.4.1, libuv
+   1.51.0, gcc 15.2 as `cc`, `/bin/sh` dash): rows 1-8 pass in 18 s.
+4. **`make clean && make test` through `scripts/guix-env`:** 39 suites,
+   2,354 passes.
+   - A first run without the clean reused a shim built at d9e0108 and passed
+     too. But the shim's rule depends on its sources and stamps, not on the
+     Makefile, so the new link line never ran.
+   - The clean run's link line has `-shared -fPIC  -o`: the double space is
+     the empty `SHIM_LDFLAGS`.
+
+**The same held on macOS.** The `make test` recorded above for the review
+fixes reused a shim built at 16:06, before `SHIM_LDFLAGS` existed. Rerun as
+`make clean && make test` at 8f25e14, the shim relinks (`-dynamiclib  -o
+build/lib/libchezlibuv.dylib`), and 39 suites pass with 2,354 passes.
+
+A change to the link recipe alone does not relink an existing dev shim.
+That behaviour predates this PR, and the hook always links in a fresh
+temporary build directory, so it does not reach Akku installs.
