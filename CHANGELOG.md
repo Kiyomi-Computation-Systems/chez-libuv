@@ -5,6 +5,35 @@ All notable changes to this project are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- **Akku can install chez-libuv for a project that depends on it.** Until
+  now `akku install` landed the libraries but no shim and no `config.sls`,
+  so the import failed with "library (libuv private config) not found". An
+  install hook, `scripts/akku-install`, now runs before Akku installs the
+  libraries. It builds a release shim into the project's `.akku/ffi`
+  against the libuv pkg-config finds, and writes `config.sls` naming it.
+  - `akku lock` copies a package's scripts into a project's lock only from
+    the Akku index, so for now a project's own `Akku.manifest` runs the
+    hook, by path. `docs/installing.md` has the lines. `Akku.manifest`
+    carries the same hook for the index.
+  - It needs a C compiler, pkg-config and libuv 1.48.0 or newer, and runs
+    on macOS and Linux.
+  - A failure stops the install under Akku 1.1.1 and later. Under 1.1.0,
+    which ignores a script's exit status, the program's first call raises
+    the reason and names the hook's log.
+  - It does nothing in chez-libuv's own checkout, and leaves alone a
+    checkout that `make build` built and that is used as a directory
+    dependency.
+  - `.akkuignore` now keeps `build/` and `vendor/` out of an install as
+    well as `site/`.
+  - `make check-akku` installs by both routes and checks each case, under
+    whichever Akku runs it. `make akku-facts` prints what the hook reads
+    from the Makefile.
+  - Release and dev builds keep `-Werror`; the hook turns it off
+    (`WERROR=`), since it builds with the consumer's compiler and libuv
+    headers.
+
 ### Fixed
 
 - **The docs site's light/dark toggle did nothing where the browser

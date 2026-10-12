@@ -160,6 +160,8 @@ message and stops.
 | `&uv-shim-unavailable` | the shim is missing, unreadable, or built from older sources, or `CHEZ_LIBUV_SHIM` is not an absolute path to a file | run `make build`; check `CHEZ_LIBUV_SHIM` |
 | `&uv-libuv-unavailable` | the libuv library recorded in `config.sls` could not be loaded | reinstall libuv, or run `make build` again |
 | `chez-libuv needs a threaded Chez Scheme` | your Chez was built with `--nothreads` | use a threaded Chez |
+| `library (libuv private config) not found` | the shim was never built: no `make build`, or [Akku's install hook](#akku) did not run | run `make build`, or `akku install` and answer `y` |
+| `Exception in chez-libuv: … The install hook's log is …` | [Akku's install hook](#akku) could not build the shim, for the reason it names | fix that, then run `akku install` again |
 
 The non-threaded refusal reads:
 
@@ -172,14 +174,111 @@ loading conditions.
 
 ## Akku
 
-Akku cannot install chez-libuv on its own. The shim and `config.sls` are
-built for each machine, so a copy of the source alone cannot load. Install
-from a git checkout, as above.
+A project can depend on chez-libuv through [Akku](https://akkuscm.org/).
+The libraries alone cannot load, since the shim and `config.sls` are built
+for each machine. So chez-libuv has an **install hook**: a script that
+`akku install` runs before it installs the libraries. It does what
+`make build` does, in your project:
 
-The repository does have an `Akku.manifest`. It lists only development
-dependencies: `chez-srfi`, which the test suites use, and `chez-cmark-gfm`,
-which renders the docs site. A project that depends on chez-libuv installs
-neither, and `(libuv)` itself needs neither.
+- it builds a release shim into `.akku/ffi/` (`libchezlibuv.dylib` on
+  macOS, `libchezlibuv.so` on Linux);
+- it writes `config.sls` naming that shim, and Akku installs it with the
+  other libraries;
+- it logs every step to `.akku/ffi/chez-libuv-install.log`.
+
+### What the hook needs
+
+- **A C compiler:** `CC` if you set it, otherwise the first of `cc`, `gcc`
+  and `clang` on your `PATH`.
+- **pkg-config, and libuv 1.48.0 or newer** where pkg-config can see it:
+  `brew install libuv pkg-config` on macOS, `libuv1-dev` and `pkg-config` on
+  Ubuntu. The hook does not build the copy of libuv the repository pins: an
+  Akku install has none.
+- **`make`,** and macOS or Linux. Elsewhere the hook does not run.
+
+### Running the hook
+
+Akku copies a package's install scripts into your `Akku.lock` only from
+the Akku index. A direct dependency, which is how a project depends on a
+package that is not in the index, gets none. So your own `Akku.manifest`
+runs the hook. Add this to your `akku-package` form, beside your
+`depends`:
+
+```scheme
+(scripts
+  (cond-expand
+    ((and pre-install (or darwin linux))
+     (run "sh .akku/src/chez-libuv/scripts/akku-install"))))
+```
+
+For a `(location (directory D))` dependency, use D's path in place of
+`.akku/src/chez-libuv`. `chez-libuv`'s own `Akku.manifest` carries the
+same hook, which is what the index would copy.
+
+`akku install` asks before it runs a script nobody has vetted:
+
+```
+Run these commands (y/N)?
+```
+
+Answer `y`. It may ask twice, before and after it installs. An answer of
+no, or no answer at all (a pipe that ends), skips the hook, and
+chez-libuv cannot load. Akku 1.1.1 and later also take `akku install --yes`.
+
+Run `akku install` again after upgrading libuv, and after moving the
+project: `config.sls` holds absolute paths. Homebrew's libuv path names its
+version (`/opt/homebrew/Cellar/libuv/1.52.1/lib`), and Guix's `gc` can
+remove a libuv no profile uses, so either can take away the libuv the hook
+found. A `.akku` folder works only on the machine that built it.
+
+### When the hook fails
+
+Akku 1.1.1 and later stop `akku install` and show the hook's output.
+
+Akku 1.1.0 goes on with the install, and shows the hook's output only
+with `AKKU_LOG_LEVEL=debug`. The hook leaves a `config.sls` that raises the
+reason instead, so your program's first call into chez-libuv stops with it:
+
+```
+Exception in chez-libuv: pkg-config finds no libuv 1.48.0 or newer: install libuv (brew install libuv, or apt install libuv1-dev) and run akku install again. The install hook's log is /…/.akku/ffi/chez-libuv-install.log
+```
+
+Fix what it names, and run `akku install` again. `CHEZ_LIBUV_SHIM` does not
+get past this message, since the failure is raised before the shim is
+looked for.
+
+The hook replaces an installed shim only once a new one is built. Under
+Akku 1.1.1, a reinstall whose hook fails therefore leaves the previous
+install working.
+
+A hook that never ran leaves no `config.sls` on a first install, and the
+import fails with `library (libuv private config) not found`. On a
+reinstall, Akku installs whatever `config.sls` the hook last wrote into its
+copy of the package: the previous build's, with that build's shim, or the
+reason the hook last failed, even if that reason no longer holds. With the
+previous build's, an entry the new release's sources need and the old shim
+lacks raises `&uv-shim-unavailable`. Either way, run `akku install` again
+and answer `y`.
+
+### Directory dependencies and your own checkout
+
+The hook writes `config.sls` into the package's own `src/`, which for a
+`(location (directory D))` dependency is D's.
+
+- **A D that `make build` has built is left alone:** one with a shim in
+  `build/lib`, or a `config.sls` that make wrote. The hook says so and
+  stops, so a checkout you work in keeps its own build. Point the lock at
+  a clean copy, or run `make clean` there.
+- **Two projects installing from one D at the same moment** can each
+  install the other's `config.sls`.
+- **In chez-libuv's own checkout,** `akku install` fetches the docs site's
+  tools and runs the hook too. The hook does nothing there, since the
+  checkout builds with `make build`.
+
+The repository's `Akku.manifest` lists two development dependencies:
+`chez-srfi`, which the test suites use, and `chez-cmark-gfm`, which renders
+the docs site. A project that depends on chez-libuv installs neither, and
+`(libuv)` itself needs neither.
 
 ## Read next
 

@@ -9,9 +9,21 @@
 ;; newest version a range allows, and the test suites use the chez-srfi
 ;; submodule, which `make check-pins` holds to the commit Akku.lock names.
 ;; Change the two together.
+;;
+;; The install hook builds the shim and config.sls on the consumer's machine
+;; before Akku installs the libraries (scripts/akku-install says how). It
+;; runs in the pre-install phase only, on the two systems chez-libuv
+;; supports, which Akku names by `uname -s`: darwin and linux. `akku lock`
+;; copies these scripts into a consumer's lock only from the Akku index; a
+;; consumer that depends on chez-libuv directly runs the same script from
+;; its own manifest (docs/installing.md). make check-akku runs both.
 (akku-package ("chez-libuv" "0.10.0")
   (synopsis "Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme")
   (authors "Kiyomi Computation Systems LLC")
   (license "BSD-3-Clause")
   (depends/dev ("chez-srfi" "0.0.0-akku.181.7879b52")
-               ("chez-cmark-gfm" "^2.0.0")))
+               ("chez-cmark-gfm" "^2.0.0"))
+  (scripts
+    (cond-expand
+      ((and pre-install (or darwin linux))
+       (run "sh scripts/akku-install")))))

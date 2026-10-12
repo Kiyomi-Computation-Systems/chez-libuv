@@ -442,13 +442,33 @@ Two more checks run on the host, outside the container:
 - `make check-site-deps` tests the archive download offline: the sha256 is
   checked, a second run needs no network, and a failed unpack leaves the old
   tree alone.
-- `make check-akku` installs this package into a throwaway Akku project and
-  fails unless exactly the libraries in `src/` land there. `.akkuignore`
-  keeps the site generator out. It needs `akku` and a Chez:
+- `make check-akku` installs this package into throwaway Akku projects, by
+  both of the [routes](installing.md#running-the-hook) that run its install
+  hook: a lock entry carrying `Akku.manifest`'s scripts, as the Akku index
+  writes one, and a project whose own manifest runs
+  `scripts/akku-install`. Each install must give exactly the libraries in
+  `src/` plus `config.sls`, and a program on them alone must load a release
+  shim from that project's `.akku/ffi`, fire a timer and report libuv's
+  version. Its other rows check the hook's other answers:
+  - a reinstall, and a reinstall whose compiler fails, which must leave the
+    previous install working under Akku 1.1.1;
+  - a first install with no libuv in sight, whose `config.sls` raises the
+    reason and names the hook's log;
+  - chez-libuv's own checkout, where it does nothing;
+  - a built checkout used as a directory dependency, which it leaves alone;
+  - a compiler that warns, which must not fail the build.
+
+  Where Akku 1.1.0 and 1.1.1 differ (a failing hook stops 1.1.1's install),
+  each row expects what the Akku running it does. `.akkuignore` keeps the
+  site generator, `build/` and `vendor/` out. It needs `akku`, a Chez, a C
+  compiler and pkg-config's libuv:
 
   ```sh
   guix shell akku chez-scheme -- make check-akku CHEZ=scheme
   ```
+- `make akku-facts` prints what the install hook reads from the Makefile:
+  pkg-config's verdict on libuv, the libuv floor, the shared-library
+  suffix, `config.sls`'s exports and the libuv paths it will name.
 
 ## Read next
 
