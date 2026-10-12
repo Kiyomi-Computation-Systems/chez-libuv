@@ -208,6 +208,32 @@ hook would never look for gcc.
 The command as now documented (with `tar gzip`) is the one kishu ran in the
 second item, less `CHECK_AKKU_KEEP=1`.
 
+## Linux in Docker, without Guix
+
+At ed1a9bc, in a fresh clone of the branch, with `CC` unset.
+
+**The container:** the project's Ubuntu 26.04 mirror image
+(`chez-libuv-resolute-scratch:10.4.1`: arm64, Chez 10.4.1 as `scheme`, apt's
+libuv 1.51.0, gcc as `cc`), with apt's Guile 3.0.11.
+
+**Akku:** Ubuntu's apt has no `akku` package, and neither has Debian 12's,
+whose libuv (1.44.2) is below the floor anyway. So this Mac's two Akku
+installs were copied in:
+- their Scheme sources only, without the `.go` files built for macOS;
+- with the launcher's and `akku/config.scm`'s paths rewritten.
+
+**Akku 1.1.1-beta.0:** rows 1-7 pass, in 61 s, which includes Guile
+compiling Akku on first use.
+
+**Akku 1.1.0 does not load under Guile 3.0.11:**
+- Auto-compiled, its second run failed with "Unbound variable:
+  maximum-tier" (`akku/lib/solver/logging.scm`).
+- Interpreted (`--no-auto-compile`, as its own launcher runs), `akku version`
+  failed with "Unbound variable: t-24e5d3f8e861790-9", from a top-level
+  `define-values` in `(akku lib solver internals)`.
+- Homebrew's and Guix's 1.1.0 run from their own builds, so neither shows
+  this. 1.1.0 on Linux is covered by kishu's Guix run above.
+
 ## Gates
 
 On the final tree, macOS arm64:
