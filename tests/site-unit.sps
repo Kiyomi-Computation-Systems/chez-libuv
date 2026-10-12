@@ -179,6 +179,51 @@
        (not (string-contains-sub? doc-html "&amp;"))
        (not (string-contains-sub? doc-html "&lt;"))
        (not (string-contains-sub? doc-html "&gt;"))))
+
+;; index-of : string string integer -> (or integer #f)
+;; The first offset at or after START where NEEDLE begins in HAY.
+(define (index-of hay needle start)
+  (let ((h (string-length hay)) (n (string-length needle)))
+    (let loop ((i start))
+      (cond ((> (+ i n) h) #f)
+            ((string=? needle (substring hay i (+ i n))) i)
+            (else (loop (+ i 1)))))))
+
+;; offsets-of : string string -> (list-of integer)
+;; Every offset where NEEDLE begins in HAY, in order.
+(define (offsets-of hay needle)
+  (let loop ((i (index-of hay needle 0)) (acc '()))
+    (if i
+        (loop (index-of hay needle (+ i 1)) (cons i acc))
+        (reverse acc))))
+
+;; script-of : string -> string
+;; The text of the first <script> element in HTML; raises if there is none.
+(define (script-of html)
+  (let* ((open (index-of html "<script>" 0))
+         (start (+ open (string-length "<script>"))))
+    (substring html start (index-of html "</script>" start))))
+
+;; unguarded-storage : string -> (list-of integer)
+;; The offset of each `localStorage` in SCRIPT that no try block holds:
+;; no `try{` comes before it, or a `}` closes something between the last
+;; `try{` and it.
+(define (unguarded-storage script)
+  (filter (lambda (at)
+            (let ((tries (filter (lambda (t) (< t at)) (offsets-of script "try{"))))
+              (or (null? tries)
+                  (let ((last (apply max tries)))
+                    (index-of (substring script last at) "}" 0)))))
+          (offsets-of script "localStorage")))
+
+;; A browser that refuses the page storage (site data blocked, some private
+;; modes) throws from localStorage. Unguarded, that ends the script before
+;; it wires the toggle, and the toggle does nothing.
+(test-equal "the theme script reaches localStorage twice, each time inside a try block"
+  '(2 ())
+  (let ((js (script-of doc-html)))
+    (list (length (offsets-of js "localStorage")) (unguarded-storage js))))
+
 (test-assert "the mode toggle carries the knob icon"
   (string-contains-sub? doc-html "class=\"knob\""))
 (test-assert "the footer nav links the previous and next pages"

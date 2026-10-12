@@ -53,12 +53,20 @@
   ;; with === and nested ternaries instead of &&/</> so it survives
   ;; serialization byte-for-byte. Do not introduce any of those characters
   ;; here without giving the serializer script-awareness first.
+  ;;
+  ;; A browser that refuses the page storage (site data blocked, some private
+  ;; modes) throws from localStorage, so g and p reach it only inside a try:
+  ;; the toggle then works for the life of the page and is not remembered.
+  ;; tests/site-unit.sps holds every access to a try block.
   (define theme-script
     (string-append
      "(function(){var r=document.documentElement,b=document.getElementById('theme'),"
-     "l=document.getElementById('theme-label');function m(){var s=localStorage.getItem('theme');"
+     "l=document.getElementById('theme-label');"
+     "function g(){try{return localStorage.getItem('theme');}catch(e){return null;}}"
+     "function p(x){try{localStorage.setItem('theme',x);}catch(e){}}"
+     "function m(){var s=g();"
      "return s?s:(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');}"
-     "function a(x){r.setAttribute('data-mode',x);localStorage.setItem('theme',x);"
+     "function a(x){r.setAttribute('data-mode',x);p(x);"
      "l.textContent=x==='dark'?'Light mode':'Dark mode';}a(m());"
      "b.addEventListener('click',function(){a(r.getAttribute('data-mode')==='dark'?'light':'dark');});})();"))
 
