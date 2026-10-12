@@ -232,7 +232,45 @@ compiling Akku on first use.
   failed with "Unbound variable: t-24e5d3f8e861790-9", from a top-level
   `define-values` in `(akku lib solver internals)`.
 - Homebrew's and Guix's 1.1.0 run from their own builds, so neither shows
-  this. 1.1.0 on Linux is covered by kishu's Guix run above.
+  this. 1.1.0 on Linux is covered by kishu's Guix run above, and by the
+  official bundle below.
+
+### Akku 1.1.0's official amd64 bundle, in Docker on kishu
+
+kishu-libuv-issues-b ran this at a6356c1, in a fresh clone from GitHub, as
+user `dev` with `CC` unset.
+
+**The bundle:**
+- Akku's own GitLab release v1.1.0 links
+  `akku-1.1.0.amd64-linux.tar.xz`: 3,709,432 bytes, sha256
+  `40efd832c6b517e37060c3c237499749682e6599a6d906f683e5348ea6f998a4`.
+- gpg reports a good signature from Göran Weinholt, by a subkey of
+  E33E61A2E9B8C3A2, the release key the bundle's README names. The key came
+  from keys.openpgp.org and keyserver.ubuntu.com into a throwaway keyring,
+  so its trust is unknown.
+  - The key was revoked as "superseded" in 2024, after the 2021 signature.
+- `install.sh` was read before it ran: it copies files and makes the link.
+- This Akku runs on the bundle's own Chez runtime (petite), not on Guile.
+  `akku version` reports 1.1.0.
+
+**The image:**
+- `ubuntu:26.04`, amd64;
+- Chez 10.4.1, built from the release tarball the way
+  `docker/valgrind.Dockerfile` builds it;
+- apt's libuv1-dev 1.51.0;
+- `cc` is gcc 15.2.0.
+
+**The run:** `make check-akku CHEZ=/usr/local/bin/scheme
+AKKU=$HOME/.local/bin/akku` passes rows 1-7, under "akku 1.1.0: a failing
+hook's install goes on". A second run with `CHECK_AKKU_KEEP=1` passed too.
+The first decision lines of the hook's logs:
+- c3b: "building with cc, libuv 1.51.0". Here the hook took `cc`; the Guix
+  runs exercised the `gcc` fallback.
+- c3: the floor refusal.
+- c6: the warning wrapper.
+- c7b: "no C compiler".
+
+The clone and both runs took 17 s in all.
 
 ## Gates
 
