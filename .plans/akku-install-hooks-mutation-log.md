@@ -177,6 +177,37 @@ hook would never look for gcc.
   1.44.2. It now uses the pinned toolchain plus Akku, in the Makefile
   comment and docs/building.md.
 
+### The rerun at f3fecf0, on kishu, with `CC` unset
+
+- **The documented command, as written, failed in 3 s:** "tar: not found",
+  then "could not archive the tracked files" (finding C). The `--pure`
+  shell holds only manifest.scm's packages, and those have no `tar` or
+  `gzip`. kishu probed that shell for every tool the check and the hook
+  call, and only those two were missing. `shasum`, `cc` and `clang` are
+  absent too, but each is only a fallback.
+  - **Fix:** the documented command adds `tar gzip` after `akku`.
+    manifest.scm is unchanged, since a change there would also change the
+    guix-env container and its pin check.
+- **The same command plus `tar gzip`:** rows 1-7 pass, in 47 s. The first
+  decision line of each consumer's hook log:
+
+  | Consumer | First decision line |
+  |---|---|
+  | c3b | "building with gcc, libuv 1.52.1" (the fallback with `CC` unset) |
+  | c3 | "pkg-config finds no libuv 1.48.0 or newer ..." |
+  | c6 | "building with .../cc-warn" |
+  | c7b | "no C compiler ..." |
+  | c7 "odd" | "the path ... holds a character make cannot take ..." |
+  | c5, c7c | the header line alone: their refusals went to the hook's output, and both rows passed |
+
+  Row 5 passes, so finding A holds fixed on Linux.
+- **Guix's plain libuv (1.44.2), `CC` unset:** the check stopped in 2 s,
+  before any row: "pkg-config finds no libuv 1.48.0 or newer (it finds
+  1.44.2); every row needs one". So finding B holds fixed on Linux.
+
+The command as now documented (with `tar gzip`) is the one kishu ran in the
+second item, less `CHECK_AKKU_KEEP=1`.
+
 ## Gates
 
 On the final tree, macOS arm64:
