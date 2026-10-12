@@ -9,23 +9,38 @@
 # from the consumer's own manifest, by path. Run it with sh: an install from
 # an archive keeps no file modes.
 #
-# It reads akku_path_root and akku_path_lib_ffi, which Akku sets. Every make
-# it runs has the environment's MAKEFLAGS, MFLAGS and MAKELEVEL cleared, so a
-# parent make's variables cannot reach it, and FLAVOR=prod on its command
-# line. It writes nothing into the package but config.sls: the build's own
-# files go to a temporary directory under .akku/ffi.
+# It reads akku_path_root and akku_path_lib_ffi, which Akku sets, and CC: a
+# command on PATH or a path, a relative one taken from the directory the
+# hook was started in. Every make it runs has the environment's MAKEFLAGS,
+# MFLAGS and MAKELEVEL cleared, so a parent make's variables cannot reach it,
+# and FLAVOR=prod on its command line. It writes nothing into the package
+# but config.sls: the build's own files go to a temporary directory under
+# .akku/ffi, removed on exit or interruption.
 #
 # When chez-libuv itself is the project Akku installs, it does nothing: the
 # checkout builds with `make build`. It refuses a package directory outside
 # .akku/src that `make build` has built (a directory source pointing at a
 # checkout), and writes nothing there.
 #
-# On failure it writes a stub in place of config.sls, whose first use raises
-# the reason and names this hook's log ($akku_path_lib_ffi/
-# chez-libuv-install.log); prints the log; and exits 1. Akku stops the
-# install on that status from 1.1.1 on, and an older Akku installs the stub.
-# The previous install's shim is replaced only once a new one is built.
+# Otherwise it first deletes the package's config.sls, so that no earlier
+# run's file outlives a failure. On failure it writes a stub in its place,
+# whose first use raises the reason and names this hook's log
+# ($akku_path_lib_ffi/chez-libuv-install.log); prints the log; and exits 1.
+# Akku stops the install on that status from 1.1.1 on, and an older Akku
+# installs the stub. Failing before make has said what config.sls exports,
+# it can write no stub, and leaves none. The previous install's shim is
+# replaced only once a new one is built.
 set -u
+
+# CC's command (its first word), when a relative path, is taken from here,
+# before the cd below.
+case ${CC:-} in
+  '' | /*) ;;
+  *)
+    case ${CC%% *} in
+      */*) CC="$(pwd)/$CC" ;;
+    esac ;;
+esac
 
 cd "$(dirname "$0")/.." || exit 2
 pkg=$(pwd -P)
@@ -70,6 +85,7 @@ esac
   echo "chez-libuv: cannot write into $pkg/src/libuv/private"
   exit 1
 }
+rm -f "$config"
 
 run_make() {
   env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make FLAVOR=prod "$@"
@@ -117,16 +133,7 @@ case $ffi in
     fail "the path $ffi holds a character make cannot take (whitespace, or one of \$ : % ' \" \\)" ;;
 esac
 
-if [ -n "${CC:-}" ]; then
-  cc=$CC
-else
-  cc=
-  for c in cc gcc clang; do
-    if command -v "$c" > /dev/null 2>&1; then cc=$c; break; fi
-  done
-fi
-[ -n "$cc" ] && command -v "${cc%% *}" > /dev/null 2>&1 ||
-  fail "no C compiler: set CC, or put cc, gcc or clang on PATH"
+cc=$(sh scripts/find-cc) || fail "no C compiler: set CC, or put cc, gcc or clang on PATH"
 
 command -v pkg-config > /dev/null 2>&1 ||
   fail "pkg-config not found: install it (brew install pkg-config, or apt install pkg-config)"
@@ -135,11 +142,17 @@ command -v pkg-config > /dev/null 2>&1 ||
 
 shim=$ffi/libchezlibuv.$ext
 new=$ffi/.libchezlibuv.$ext.new
+# On macOS the linker records the -o path as the install name; give it the
+# shim's final one.
+install_name=
+[ "$ext" = dylib ] && install_name="-Wl,-install_name,$shim"
 build=$(mktemp -d "$ffi/.chez-libuv-build.XXXXXX") || fail "could not make a build directory in $ffi"
 trap 'rm -rf "$build"' EXIT
-rm -f "$config" "$new"
+trap 'exit 130' INT
+trap 'exit 143' TERM
+rm -f "$new"
 note "building with $cc, libuv $(pkg-config --modversion libuv)"
-run_make CC="$cc" WERROR= BUILD_DIR="$build" SHIM="$new" "$new" >> "$log" 2>&1 ||
+run_make CC="$cc" WERROR= BUILD_DIR="$build" SHIM="$new" SHIM_LDFLAGS="$install_name" "$new" >> "$log" 2>&1 ||
   fail "compiling the shim failed"
 [ -f "$new" ] || fail "make built no shim"
 mv -f "$new" "$shim" || fail "could not move the shim into $ffi"

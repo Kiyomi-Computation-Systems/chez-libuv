@@ -18,7 +18,8 @@ All notable changes to this project are documented here. This project follows
     hook, by path. `docs/installing.md` has the lines. `Akku.manifest`
     carries the same hook for the index.
   - It needs a C compiler, pkg-config and libuv 1.48.0 or newer, and runs
-    on macOS and Linux.
+    on macOS and Linux, in a project whose path holds no spaces and none of
+    `$ : % ' " \`, which make cannot take.
   - A failure stops the install under Akku 1.1.1 and later. Under 1.1.0,
     which ignores a script's exit status, the program's first call raises
     the reason and names the hook's log.

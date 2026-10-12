@@ -160,7 +160,7 @@ message and stops.
 | `&uv-shim-unavailable` | the shim is missing, unreadable, or built from older sources, or `CHEZ_LIBUV_SHIM` is not an absolute path to a file | run `make build`; check `CHEZ_LIBUV_SHIM` |
 | `&uv-libuv-unavailable` | the libuv library recorded in `config.sls` could not be loaded | reinstall libuv, or run `make build` again |
 | `chez-libuv needs a threaded Chez Scheme` | your Chez was built with `--nothreads` | use a threaded Chez |
-| `library (libuv private config) not found` | the shim was never built: no `make build`, or [Akku's install hook](#akku) did not run | run `make build`, or `akku install` and answer `y` |
+| `library (libuv private config) not found` | the shim was never built: no `make build`, or [Akku's install hook](#akku) did not run or failed before it read the Makefile (its log, `.akku/ffi/chez-libuv-install.log`, says why) | run `make build`, or `akku install` and answer `y` |
 | `Exception in chez-libuv: … The install hook's log is …` | [Akku's install hook](#akku) could not build the shim, for the reason it names | fix that, then run `akku install` again |
 
 The non-threaded refusal reads:
@@ -189,12 +189,18 @@ for each machine. So chez-libuv has an **install hook**: a script that
 ### What the hook needs
 
 - **A C compiler:** `CC` if you set it, otherwise the first of `cc`, `gcc`
-  and `clang` on your `PATH`.
+  and `clang` on your `PATH`. Give `CC` as a command on your `PATH` or an
+  absolute path: a relative path is taken from the folder Akku runs the
+  hook in, which is your project's on the route below, and the package's
+  own (`.akku/src/chez-libuv`) on the index's.
 - **pkg-config, and libuv 1.48.0 or newer** where pkg-config can see it:
   `brew install libuv pkg-config` on macOS, `libuv1-dev` and `pkg-config` on
   Ubuntu. The hook does not build the copy of libuv the repository pins: an
   Akku install has none.
 - **`make`,** and macOS or Linux. Elsewhere the hook does not run.
+- **A project path make can take:** no spaces, and none of `$ : % ' " \`.
+  The shim is built into the project's `.akku/ffi`, and make cannot name a
+  file whose path holds those. The hook refuses such a project, saying so.
 
 ### Running the hook
 
@@ -213,7 +219,9 @@ runs the hook. Add this to your `akku-package` form, beside your
 
 For a `(location (directory D))` dependency, use D's path in place of
 `.akku/src/chez-libuv`. `chez-libuv`'s own `Akku.manifest` carries the
-same hook, which is what the index would copy.
+same hook, which is what the index would copy. If your `Akku.lock` ever
+gets chez-libuv from the index, drop these lines: the lock's copy runs the
+same hook, and with both it runs twice.
 
 `akku install` asks before it runs a script nobody has vetted:
 
@@ -251,6 +259,11 @@ The hook replaces an installed shim only once a new one is built. Under
 Akku 1.1.1, a reinstall whose hook fails therefore leaves the previous
 install working.
 
+A hook that fails before it has read chez-libuv's Makefile (with no
+`make`, for one) cannot write that `config.sls`. It removes the one an
+earlier run left instead, so the import fails with `library (libuv private
+config) not found`, and its log says why.
+
 A hook that never ran leaves no `config.sls` on a first install, and the
 import fails with `library (libuv private config) not found`. On a
 reinstall, Akku installs whatever `config.sls` the hook last wrote into its
@@ -267,8 +280,11 @@ The hook writes `config.sls` into the package's own `src/`, which for a
 
 - **A D that `make build` has built is left alone:** one with a shim in
   `build/lib`, or a `config.sls` that make wrote. The hook says so and
-  stops, so a checkout you work in keeps its own build. Point the lock at
-  a clean copy, or run `make clean` there.
+  writes nothing there, so a checkout you work in keeps its own build.
+  Akku 1.1.1 then stops the install. Akku 1.1.0 goes on and installs D's
+  own `config.sls`, so your project runs D's development shim, with its
+  debug counters, from D's `build/lib`, and stops working when D is
+  cleaned. Point the lock at a clean copy, or run `make clean` there.
 - **Two projects installing from one D at the same moment** can each
   install the other's `config.sls`.
 - **In chez-libuv's own checkout,** `akku install` fetches the docs site's

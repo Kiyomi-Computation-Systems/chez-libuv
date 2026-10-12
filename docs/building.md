@@ -453,10 +453,22 @@ Two more checks run on the host, outside the container:
   - a reinstall, and a reinstall whose compiler fails, which must leave the
     previous install working under Akku 1.1.1;
   - a first install with no libuv in sight, whose `config.sls` raises the
-    reason and names the hook's log;
+    reason and names the hook's log; a second project, and a reinstall,
+    from the same directory, which replace the hook's own `config.sls`;
+    and a reinstall with no `make`, which must leave no earlier
+    `config.sls` behind;
   - chez-libuv's own checkout, where it does nothing;
   - a built checkout used as a directory dependency, which it leaves alone;
-  - a compiler that warns, which must not fail the build.
+  - a compiler that warns, named by a relative `CC`, which must not fail
+    the build;
+  - a project path make cannot take, no compiler, and a source the hook
+    cannot write (skipped as root);
+  - the hook interrupted while it builds, which must leave no build
+    directory.
+
+  The macOS shim must carry its own path as its install name. The check
+  refuses to start under a `TMPDIR` the hook would refuse, or with an Akku
+  that prints no version.
 
   Where Akku 1.1.0 and 1.1.1 differ (a failing hook stops 1.1.1's install),
   each row expects what the Akku running it does. `.akkuignore` keeps the

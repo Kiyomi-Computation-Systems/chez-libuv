@@ -519,7 +519,13 @@ $(FLAVOR_STAMP): | $(LIB_DIR)
 # the fixture differs from the shim only by the flags $(1) adds. $(call), not
 # a target-specific variable: make hands a target's variables on to its
 # prerequisites, and the shim is the fixture's.
-LINK_SHIM = $(CC) $(CFLAGS_SHIM) $(1) $(UV_CFLAGS) $(SHLIB_LDFLAGS) \
+#
+# SHIM_LDFLAGS is empty here. Akku's install hook links the shim under a
+# temporary name and renames it once built, and on macOS sets it to
+# -Wl,-install_name,<final path>: the linker otherwise records the -o path
+# as the library's install name.
+SHIM_LDFLAGS :=
+LINK_SHIM = $(CC) $(CFLAGS_SHIM) $(1) $(UV_CFLAGS) $(SHLIB_LDFLAGS) $(SHIM_LDFLAGS) \
             -o $@ src/libuv-shim.c $(UV_LIBS)
 
 $(SHIM): src/libuv-shim.c src/libuv-shim.h $(ACQ_STAMP) $(FLAVOR_STAMP) | $(LIB_DIR)

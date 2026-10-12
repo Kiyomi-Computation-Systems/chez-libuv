@@ -1,0 +1,19 @@
+#!/bin/sh
+# find-cc: print the C compiler command to build the shim with: CC when it
+# is set, otherwise the first of cc, gcc and clang on PATH. Exits 1, printing
+# nothing, when CC's command (its first word) or every fallback is missing.
+#
+# Akku's install hook (scripts/akku-install) and make check-akku both use
+# it, so the check's own setup finds the compiler the hook would.
+if [ -n "${CC:-}" ]; then
+  command -v "${CC%% *}" > /dev/null 2>&1 || exit 1
+  printf '%s\n' "$CC"
+  exit 0
+fi
+for c in cc gcc clang; do
+  if command -v "$c" > /dev/null 2>&1; then
+    printf '%s\n' "$c"
+    exit 0
+  fi
+done
+exit 1
