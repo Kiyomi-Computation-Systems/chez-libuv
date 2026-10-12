@@ -8,15 +8,13 @@
           (libuv private conditions)
           (libuv private constants)
           (libuv private native)
+          (only (libuv private c-types) c-u64?)
           (libuv private handles))
 
+  ;; valid-milliseconds? : object -> boolean
   ;; libuv takes milliseconds as a uint64_t. Chez's own check of a larger
   ;; argument would raise inside a verb's step, where nothing may raise.
-  (define uint64-limit (expt 2 64))
-
-  ;; valid-milliseconds? : object -> boolean
-  (define (valid-milliseconds? n)
-    (and (integer? n) (exact? n) (>= n 0) (< n uint64-limit)))
+  (define (valid-milliseconds? n) (c-u64? n))
 
   ;; require-open-timer : object symbol -> uv-timer
   ;; libuv's timer calls take any handle's address as a uv_timer_t's, so

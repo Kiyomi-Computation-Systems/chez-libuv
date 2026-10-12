@@ -25,7 +25,7 @@
           alloc-zeroed zero-out! free! copy-in! try-copy-in! copy-out
           alloc-block free-block! copy-in-unchecked!
           c-int-size c-int-ref c-int-set! try-c-int-set! c-uptr-ref read-net-u16
-          c-uptr-size c-uptr-set! c-u32-set!
+          c-uptr-size c-uptr-set! c-u32-set! try-c-u32-set!
 
           ;; uv_buf_t
           uv-buf-set! uv-buf-base uv-buf-len uv-buf-ftype-layout
@@ -114,6 +114,7 @@
           (libuv private config)
           (libuv private conditions)
           (libuv private constants)
+          (libuv private c-types)
           (only (libuv private c-string) c-string-bytes c-string?))
 
   (define (regular-file? path)
@@ -553,7 +554,7 @@
   (define (zero-out! addr len)
     (unless (and (integer? addr) (exact? addr) (positive? addr))
       (raise (make-uv-invalid-argument 'uv-zero-out! 'null-or-invalid-destination)))
-    (unless (and (integer? len) (exact? len) (>= len 0))
+    (unless (c-size? len)
       (raise (make-uv-invalid-argument 'uv-zero-out! 'length-out-of-range)))
     (raw-zero addr len))
 
@@ -570,9 +571,10 @@
 
   ;; alloc-block : object -> uptr
   ;; A zeroed block of N bytes, or 0 when N is not a positive fixnum or the
-  ;; allocator refuses.
+  ;; allocator refuses. A fixnum is a size_t on every supported platform
+  ;; (tests/test-c-types.sps), and c-size? says so here.
   (define (alloc-block n)
-    (if (and (fixnum? n) (fx>? n 0))
+    (if (and (c-size? n) (fixnum? n) (fx>? n 0))
         (raw-alloc n)
         0))
 
@@ -580,7 +582,7 @@
   ;; Frees a block alloc-block answered. Anything that cannot be an address
   ;; is ignored, 0 included.
   (define (free-block! addr)
-    (when (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616))
+    (when (and (c-uptr? addr) (positive? addr))
       (raw-free addr)))
 
   ;; copy-in-unchecked! : uptr bytevector exact-nonnegative-integer
@@ -606,7 +608,7 @@
   ;; Reject zero because stored pointers are cleared immediately after free,
   ;; and anything past the address space, which free-block! would ignore.
   (define (free! addr)
-    (unless (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616))
+    (unless (and (c-uptr? addr) (positive? addr))
       (raise (make-uv-invalid-argument 'uv-free! 'null-or-invalid-pointer)))
     (free-block! addr))
 
@@ -623,14 +625,14 @@
   ;; a caller makes beforehand can rule it out, since the bytevector can
   ;; shrink after it, and a caller holding a block it has not yet handed on
   ;; must free that block first (the write verbs, stream.sls). The other
-  ;; refusals are the caller's own mistakes and raise.
+  ;; refusals, a start or length no size_t holds among them, are the
+  ;; caller's own mistakes and raise.
   (define (try-copy-in! dst bv start len)
     (unless (and (integer? dst) (exact? dst) (positive? dst))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'null-or-invalid-destination)))
     (unless (bytevector? bv)
       (raise (make-uv-invalid-argument 'uv-copy-in! 'source-not-a-bytevector)))
-    (unless (and (integer? start) (exact? start) (>= start 0)
-                 (integer? len) (exact? len) (>= len 0))
+    (unless (and (c-size? start) (c-size? len))
       (raise (make-uv-invalid-argument 'uv-copy-in! 'span-out-of-range)))
     (with-interrupts-disabled
       (if (<= (+ start len) (bytevector-length bv))
@@ -661,19 +663,16 @@
       (raise (make-uv-invalid-argument 'uv-c-int-set! 'null-or-invalid-destination)))
     (unless (and (integer? value) (exact? value))
       (raise (make-uv-invalid-argument 'uv-c-int-set! 'value-not-an-exact-integer)))
+    (unless (c-int? value)
+      (raise (make-uv-invalid-argument 'uv-c-int-set! 'value-out-of-range)))
     (foreign-set! 'int addr 0 value))
-
-  ;; The range of a C int on this platform.
-  (define c-int-max (- (expt 2 (- (* 8 (foreign-sizeof 'int)) 1)) 1))
-  (define c-int-min (- -1 c-int-max))
 
   ;; try-c-int-set! : object object -> boolean
   ;; c-int-set! for an interrupt-free step, where nothing may raise: writes
   ;; VALUE at ADDR and answers #t, or answers #f, writing nothing, when ADDR
   ;; is no address or VALUE no C int.
   (define (try-c-int-set! addr value)
-    (and (integer? addr) (exact? addr) (< 0 addr 18446744073709551616)
-         (integer? value) (exact? value) (<= c-int-min value c-int-max)
+    (and (c-uptr? addr) (positive? addr) (c-int? value)
          (begin (foreign-set! 'int addr 0 value) #t)))
 
   (define (c-uptr-size) (foreign-sizeof 'uptr))
@@ -688,10 +687,15 @@
   (define (c-u32-set! addr value)
     (unless (and (integer? addr) (exact? addr) (positive? addr))
       (raise (make-uv-invalid-argument 'uv-c-u32-set! 'null-or-invalid-destination)))
-    (unless (and (integer? value) (exact? value) (>= value 0)
-                 (< value 4294967296))
+    (unless (c-unsigned-int? value)
       (raise (make-uv-invalid-argument 'uv-c-u32-set! 'value-out-of-range)))
     (foreign-set! 'unsigned-32 addr 0 value))
+
+  ;; try-c-u32-set! : object object -> boolean
+  ;; c-u32-set! for an interrupt-free step, as try-c-int-set! is c-int-set!'s.
+  (define (try-c-u32-set! addr value)
+    (and (c-uptr? addr) (positive? addr) (c-unsigned-int? value)
+         (begin (foreign-set! 'unsigned-32 addr 0 value) #t)))
 
   ;; read-net-u16 : uptr exact-nonnegative-integer -> exact-nonnegative-integer
   ;; Read bytes explicitly so network order is independent of host endianness.
@@ -707,7 +711,7 @@
   (define (copy-out src len)
     (unless (and (integer? src) (exact? src) (positive? src))
       (raise (make-uv-invalid-argument 'uv-copy-out 'null-or-invalid-source)))
-    (unless (and (integer? len) (exact? len) (>= len 0))
+    (unless (c-size? len)
       (raise (make-uv-invalid-argument 'uv-copy-out 'length-out-of-range)))
     (let ((bv (make-bytevector len)))
       (raw-copy-out bv src len)
@@ -760,7 +764,7 @@
   ;; The port check the verbs make on entry and try-fill-sockaddr! makes in
   ;; their steps.
   (define (valid-port? port)
-    (and (integer? port) (exact? port) (>= port 0) (<= port 65535)))
+    (and (c-int? port) (<= 0 port 65535)))
 
   (define (require-port port who)
     (unless (valid-port? port)
@@ -833,8 +837,9 @@
     (if (zero? rc) rc (raise (uv-errno-condition rc who))))
 
   ;; uv-errno-condition : exact-integer symbol -> condition
+  ;; A code no C int holds has no message: libuv would never answer one.
   (define (uv-errno-condition rc who)
-    (let ((message (errno->message rc)))
+    (let ((message (if (c-int? rc) (errno->message rc) "unknown error")))
       (condition
        (make-uv-errno-error (errno-value->symbol rc) rc message)
        (make-who-condition who)

@@ -521,7 +521,7 @@ Writes a bytevector, or its span from `start` to `end`. The bytes are copied dur
 Writes a non-empty list of segments as one request with one completion. A segment is a bytevector or a list `(bytevector start end)`.
 
 **Available from:** `(libuv)`, `(libuv stream)`, `(libuv tcp)`\
-**Raises:** `&uv-invalid-argument` with reason `'segments-not-a-list`, `'empty-segment-list`, `'segment-not-a-bytevector` or `'segment-span-out-of-range`, `&uv-handle-closed`, `&uv-wrong-thread`, `&uv-errno-error`\
+**Raises:** `&uv-invalid-argument` with reason `'segments-not-a-list`, `'empty-segment-list`, `'segment-not-a-bytevector`, `'segment-span-out-of-range` or `'too-many-segments` (2<sup>32</sup> segments or more), `&uv-handle-closed`, `&uv-wrong-thread`, `&uv-errno-error`\
 **Details:** [Flow control](flow-control.md)
 
 ### `uv-shutdown!` (procedure)

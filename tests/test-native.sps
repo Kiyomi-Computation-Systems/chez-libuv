@@ -695,6 +695,15 @@
     (uv-check (uv-eof) 'test-who)
     'no-raise))
 
+;; uv_strerror_r takes the code as a C int; a code no C int holds is no
+;; libuv code, and Chez's own refusal of it would raise in its place.
+(test-equal "a code no C int holds gets the message unknown error, not a raise"
+  '("unknown error" "unknown error")
+  (map (lambda (rc)
+         (guard (e (#t (list 'raised (describe e))))
+           (condition-message (uv-errno-condition rc 'test-who))))
+       (list (expt 2 31) (- (expt 2 40)))))
+
 ;; The compound also carries &who, so a caller sees WHICH call failed. `who`
 ;; is the sentinel symbol passed in above, which no failure path invents.
 (test-equal "the raised condition names the calling procedure via &who"
@@ -800,6 +809,25 @@
             (#t 'wrong-condition))
     (zero-out! 0 64)
     'no-raise))
+
+;; Chez's size_t argument would raise its own condition for 2^64, or, at
+;; --optimize-level 3, pass the bits of a bignum's address.
+(test-equal "zero-out!, copy-out and try-copy-in! refuse a length or start no size_t holds, naming who and why"
+  '((uv-zero-out! length-out-of-range) (uv-copy-out length-out-of-range)
+    (uv-copy-in! span-out-of-range) (uv-copy-in! span-out-of-range))
+  (let ((addr (alloc-zeroed 8)) (bv (make-bytevector 8 0)))
+    (define (refusal thunk)
+      (guard (e ((uv-invalid-argument? e)
+                 (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                (#t (list 'wrong-condition (describe e))))
+        (thunk)
+        'no-raise))
+    (let ((answer (list (refusal (lambda () (zero-out! addr (expt 2 64))))
+                        (refusal (lambda () (copy-out addr (expt 2 64))))
+                        (refusal (lambda () (try-copy-in! addr bv (expt 2 64) 0)))
+                        (refusal (lambda () (try-copy-in! addr bv 0 (expt 2 64)))))))
+      (free! addr)
+      answer)))
 
 ;; The rejection must happen BEFORE any write. The buffer is seeded #xff,
 ;; asserted #xff, then must still be #xff afterwards. No single mutation of
@@ -1473,6 +1501,20 @@
         (c-int-set! cell 1.5)))
     'no-raise))
 
+;; Chez's int argument would take 2147483648 and write -2147483648.
+(test-equal "c-int-set! rejects a value no C int holds, naming who and why"
+  '((uv-c-int-set! value-out-of-range) (uv-c-int-set! value-out-of-range))
+  (map (lambda (value)
+         (guard (e ((uv-invalid-argument? e)
+                    (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                   (#t 'wrong-condition))
+           (let ((cell (alloc-zeroed (c-int-size))))
+             (guard (inner (#t (free! cell) (raise inner)))
+               (c-int-set! cell value)
+               (free! cell)))
+           'no-raise))
+       '(2147483648 -2147483649)))
+
 (test-equal "c-int-ref rejects a null source, naming who"
   'uv-c-int-ref
   (guard (e ((uv-invalid-argument? e) (uv-invalid-argument-who e))
@@ -1758,9 +1800,47 @@
         (try-c-int-answer 'x)))
 
 (test-equal "try-c-int-set! refuses an address that is none, raising nothing"
+  '(#f #f #f #f)
+  (guard (e (#t (list 'raised (describe e))))
+    (list (try-c-int-set! 0 1) (try-c-int-set! -8 1) (try-c-int-set! 'x 1)
+          (try-c-int-set! 18446744073709551616 1))))
+
+;; A seeded unsigned 32-bit cell, to see that a refused write leaves it
+;; alone. The spawn step writes a uid and a gid this way.
+(define (try-c-u32-answer value)
+  (let ((addr (alloc-zeroed 4)))
+    (c-u32-set! addr 77)
+    (let ((answer (guard (e (#t (list 'raised (describe e))))
+                    (list (try-c-u32-set! addr value) (foreign-ref 'unsigned-32 addr 0)))))
+      (free! addr)
+      answer)))
+
+(test-equal "try-c-u32-set! writes an unsigned 32-bit int, and refuses anything else, writing nothing"
+  '((#t 0) (#t 4294967295) (#f 77) (#f 77) (#f 77))
+  (list (try-c-u32-answer 0)
+        (try-c-u32-answer 4294967295)
+        (try-c-u32-answer 4294967296)
+        (try-c-u32-answer -1)
+        (try-c-u32-answer 'x)))
+
+(test-equal "try-c-u32-set! refuses an address that is none, raising nothing"
   '(#f #f #f)
   (guard (e (#t (list 'raised (describe e))))
-    (list (try-c-int-set! 0 1) (try-c-int-set! -8 1) (try-c-int-set! 'x 1))))
+    (list (try-c-u32-set! 0 1) (try-c-u32-set! 'x 1)
+          (try-c-u32-set! 18446744073709551616 1))))
+
+(test-equal "c-u32-set! rejects a value no unsigned 32-bit int holds, naming who and why"
+  '((uv-c-u32-set! value-out-of-range) (uv-c-u32-set! value-out-of-range))
+  (map (lambda (value)
+         (guard (e ((uv-invalid-argument? e)
+                    (list (uv-invalid-argument-who e) (uv-invalid-argument-reason e)))
+                   (#t 'wrong-condition))
+           (let ((cell (alloc-zeroed 4)))
+             (guard (inner (#t (free! cell) (raise inner)))
+               (c-u32-set! cell value)
+               (free! cell)))
+           'no-raise))
+       '(4294967296 -1)))
 
 ;; --- fold-flags: a caller's flag list, read once ---------------------------
 ;; uv-tcp-bind! and uv-getnameinfo! fold their flag lists through fold-flags,

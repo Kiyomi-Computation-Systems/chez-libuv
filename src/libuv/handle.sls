@@ -10,7 +10,8 @@
   (import (rnrs)
           (libuv private conditions)
           (libuv private handles)
-          (libuv private native))
+          (libuv private native)
+          (only (libuv private c-types) c-int?))
 
   ;; uv-handle? : object -> boolean
   ;; uv-timer? : object -> boolean
@@ -69,7 +70,7 @@
   ;; require-buffer-size : object symbol -> exact-positive-integer
   ;; Keep the value inside positive C int range; foreign-set! would truncate.
   (define (require-buffer-size n who)
-    (unless (and (integer? n) (exact? n) (positive? n) (< n 2147483648))
+    (unless (and (c-int? n) (positive? n))
       (raise (make-uv-invalid-argument who 'buffer-size-out-of-range)))
     n)
 
