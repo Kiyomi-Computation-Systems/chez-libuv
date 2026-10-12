@@ -3,38 +3,113 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.10.0 — 2026-10-12
+
+This release takes `addrinfo-chain->list` out of `(libuv dns)`. It read
+memory at whatever address it was given, and `uv-getaddrinfo!` already
+hands its callback the address records. Its removal is why this is a
+minor release. `uv-kill!` refuses a pid no C `int` holds: Chez had
+wrapped 4294967295 to -1, which signals every process the caller may
+signal. It also works now as a process's first call into libuv. The docs
+are rewritten as plain-language guides with a checked API reference, and
+render as a site. A project that depends on chez-libuv no longer
+installs chez-srfi. The release shim compiles to the same code as
+0.9.0's.
 
 ### Fixed
 
-- **`uv-kill!` refuses a pid outside a C `int`'s range.** libuv takes the
-  pid as a C `int`, and Chez's `int` argument also takes the unsigned
-  range and wraps it. So 2147483648 reached `kill(2)` as the process group
-  -2147483648, and 4294967295 as -1, which signals every process the
-  caller may signal. A pid past 2^32 raised a malformed Chez condition
-  ("invalid who argument"). Every pid outside -2147483648 to 2147483647 now
-  raises `&uv-invalid-argument` with reason `'pid-out-of-range`, before
-  anything is sent.
-- **`uv-kill!` works as a process's first call into libuv.** It was the one
-  verb that did not load the native constants first, so as the first call
-  it raised `&uv-invalid-argument` with reason `'constants-not-initialized`
-  in place of the signal's result. It loads them now, as `uv-os-getpid`
-  and `uv-version` do.
+- **`uv-kill!` refuses a pid outside a C `int`'s range** (#137). libuv
+  takes the pid as a C `int`, and Chez's `int` argument also takes the
+  unsigned range and wraps it. So 2147483648 reached `kill(2)` as the
+  process group -2147483648, and 4294967295 as -1, which signals every
+  process the caller may signal. A pid past 2^32 raised a malformed Chez
+  condition ("invalid who argument"). Every pid outside -2147483648 to
+  2147483647 now raises `&uv-invalid-argument` with reason
+  `'pid-out-of-range`, before anything is sent.
+- **`uv-kill!` works as a process's first call into libuv** (#137). It
+  was the one verb that did not load the native constants first, so as
+  the first call it raised `&uv-invalid-argument` with reason
+  `'constants-not-initialized` in place of the signal's result. It loads
+  them now, as `uv-os-getpid` and `uv-version` do.
 
 ### Changed
 
+- **`(libuv dns)` no longer exports `addrinfo-chain->list`** (#137). It
+  was never meant for programs: it reads memory at whatever address it is
+  given, and any number that is not a live `addrinfo` chain crashes the
+  process or answers garbage. `(libuv)` never exported it, and
+  `uv-getaddrinfo!` hands its callback the records already. It now lives
+  in `(libuv private addrinfo-chain)`, which, like every
+  `(libuv private …)` library, is not part of the API and can change in
+  any release.
 - **`uv-write*!` refuses a list of 2^32 segments or more** with reason
-  `'too-many-segments`, before anything is allocated. libuv takes the
-  count as an unsigned int. Chez's own check of a larger count raised
-  inside the write's interrupt-free step, leaving interrupts disabled, and
-  at `--optimize-level 3` it wrapped the count instead.
-- **`(libuv dns)` no longer exports `addrinfo-chain->list`.** It was never
-  meant for programs: it reads memory at whatever address it is given, and
-  any number that is not a live `addrinfo` chain crashes the process or
-  answers garbage. `(libuv)` never exported it, and `uv-getaddrinfo!`
-  hands its callback the records already. It now lives in
-  `(libuv private addrinfo-chain)`, which, like every `(libuv private …)`
-  library, is not part of the API and can change in any release.
+  `'too-many-segments`, before anything is allocated (#139). libuv takes
+  the count as an unsigned int. Chez's own check of a larger count raised
+  inside the write's interrupt-free step, leaving interrupts disabled,
+  and at `--optimize-level 3` it wrapped the count instead.
+- **A project that depends on chez-libuv installs neither chez-srfi nor
+  chez-cmark-gfm** (#135). Both are development dependencies in
+  `Akku.manifest`: the test suites use chez-srfi, and `make site` uses
+  chez-cmark-gfm. No library in `src/` imports either. chez-srfi's
+  version is exact, so that `akku lock` takes the commit the test suites'
+  submodule names. `make check-akku` holds that an Akku install lands
+  exactly `src/`'s libraries, 21 of them.
+- **Costs.** Every figure the release meter prints is unchanged from
+  0.9.0: bytes on the Scheme heap per call, the fewest of 64, the same on
+  two runs of each build, measured on Linux x86-64. `call-with-uv-loop`
+  takes 1,008 B when its body returns and 1,760 B when the body raises to
+  a guard outside; refusals on another thread take 672 B for
+  `uv-update-time!` and 688 B for `uv-timer-start!`. The meter covers the
+  loop and timer verbs. Time was not measured.
+
+### Notes
+
+- **The docs** (#135, #137). `docs/` is fifteen plain-language pages,
+  indexed by `docs/README.md`: installing, a quickstart, loops,
+  callbacks, threads, timers, TCP and streams, flow control, processes
+  and pipes, signals, DNS, errors, and building and testing.
+  `docs/reference.md` has one entry per public binding and replaces
+  `docs/api.md`.
+  - `make check-reference` fails unless every export has one entry,
+    listed under exactly the libraries that export it. It checks that
+    each entry is there, not what it says.
+  - `make site` renders `docs/` into `build/site/`, through
+    chez-cmark-gfm, and `make check-site` checks its navigation, links and
+    anchors. `.github/workflows/pages.yml` deploys it on a `v*` tag, once
+    GitHub Pages is enabled for the repository.
+  - `docs/processes.md` says what 0 and negative pids mean to
+    `uv-kill!`, and warns about -1.
+- **Shipped files state facts, not their history** (#132, #134). The
+  comments in `src/` and `tests/`, the docs, README.org and the build
+  files no longer cite issues, plans, dates or releases. About forty
+  comments that did not match the code were corrected. `make
+  check-history` holds this, and `make test` runs it. README.org is
+  rewritten for developers, and a new NOTICE file gives the licences of
+  libuv, chez-srfi and Chez Scheme.
+- **test-dns no longer depends on winning a race** (#127, #133), which
+  was 0.9.0's known failure. Its queued-tail teardown and double-cancel
+  rows wait until the threadpool's only worker is inside a hold before
+  they queue their lookups, so every cancel finds its lookup queued. The
+  hold is compiled only into the dev shim. `check-prod` refuses a release
+  shim that exports it, and rule 12 of `tests/test-source-rules.sps`
+  holds `check-prod`'s list to the shim's dev-only functions. ADR-0002 is
+  amended for it.
+- **New checks** (#138, #139):
+  - Rule 13 of `tests/test-source-rules.sps` holds every public verb to
+    loading the native library before its first native call, or to
+    checking its record first. `tests/test-first-call.sps` calls each
+    verb that takes no record as a process's first call, and gives each
+    other verb a symbol in place of its record, each in a fresh process.
+  - Rule 14 holds every caller's number to its C type's predicate before
+    it reaches a foreign call. `(libuv private c-types)` defines each
+    range once, from `foreign-sizeof`, and the pure suite
+    `tests/test-c-types.sps` holds each range's edges. The spawn step's
+    memory writes no longer raise inside the step.
+- `.plans/release-meter.sps` and `.plans/release-bench.sps` keep the
+  programs behind the cost figures, so each release can run them against
+  the last (#131).
+- Known: the test suites assume a POSIX host (#125).
+- The evidence is in `.plans/*-mutation-log.md`, one log per change.
 
 ## 0.9.0 — 2026-10-11
 
