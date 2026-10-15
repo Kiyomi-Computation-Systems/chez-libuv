@@ -28,12 +28,20 @@ All notable changes to this project are documented here. This project follows
     dependency.
   - `.akkuignore` now keeps `build/` and `vendor/` out of an install as
     well as `site/`.
+  - `Akku.manifest` gains a `description` and a `homepage`, which Akku
+    copies into the package's index entry, and a shorter `synopsis`.
   - `make check-akku` installs by both routes and checks each case, under
     whichever Akku runs it. `make akku-facts` prints what the hook reads
     from the Makefile.
   - Release and dev builds keep `-Werror`; the hook turns it off
     (`WERROR=`), since it builds with the consumer's compiler and libuv
     headers.
+- **The README and the docs site's front page say chez-libuv is not a
+  web server,** but something to build one on, or anything else that
+  needs async I/O.
+- **The docs site links to the source.** Its top bar has a "Source code"
+  link to the GitHub repository, and every page carries a description and
+  keywords. Sidebar links underline on hover.
 
 ### Fixed
 
