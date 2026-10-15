@@ -9,16 +9,20 @@ DNS, child processes, pipes and signals.
 ✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
 #+end_quote
 
-* What it is
+* What it is and isn't
 
-A thin, legible mirror of libuv. The API follows libuv's own verbs
+:warning: *This is not a web server.*
+
+You can use this to /build/ a server, or anything that needs async I/O using
+libuv.
+
+It is a thin, legible mirror of libuv. The API follows libuv's own verbs
 (~accept~, ~read-start~, ~write~, ~shutdown~, ~timer~, ~getaddrinfo~,
-~spawn~, ~close~) closely enough that a caller who knows libuv recognises
-it at once.
+~spawn~, ~close~) closely.
 
-It is transport only. It parses nothing, understands no protocol above
-raw bytes, and has no connection-state or backpressure policy of its own.
-Those belong to the layers built on top of it.
+It is transport only. It parses nothing, only understands raw bytes, and
+has no connection-state or backpressure policy of its own. Those belong
+to layers built on top of it.
 
 * Why it is built this way
 
@@ -31,7 +35,7 @@ Those belong to the layers built on top of it.
   Scheme object is shared with C while libuv holds it.
 - *Errors have names.* libuv's error codes arrive as symbols
   (~'ECONNREFUSED~) inside R6RS conditions, and every refusal the binding
-  makes names its reason, by condition type (~&uv-handle-closed~) or by a
+  makes is named by condition type (~&uv-handle-closed~) or by a
   reason symbol (~'loop-running~).
 - *A blocked loop does not stall the collector.* A thread waiting in
   ~uv-run~ lets other Scheme threads collect garbage. Each loop belongs to
