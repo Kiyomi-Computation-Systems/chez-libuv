@@ -17,7 +17,7 @@
 ;; copies these scripts into a consumer's lock only from the Akku index; a
 ;; consumer that depends on chez-libuv directly runs the same script from
 ;; its own manifest (docs/installing.md). make check-akku runs both.
-(akku-package ("chez-libuv" "0.10.0")
+(akku-package ("chez-libuv" "0.11.0")
   (synopsis "libuv bindings for R6RS/Chez")
   (description "Thin Chez FFI bindings for libuv. Provides: Event loops, timers, TCP streams, child processes and their pipes, signals, DNS lookups and wakeups from other threads. Requires threaded Chez and a C compiler.")
   (authors "Kiyomi Computation Systems LLC")

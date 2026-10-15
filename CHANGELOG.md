@@ -3,7 +3,15 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.11.0 — 2026-10-15
+
+This release lets Akku install chez-libuv. An install hook, which
+`akku install` runs, builds the shim and `config.sls` in the project that
+depends on chez-libuv; until now an Akku install could not load. The hook
+is new, so this is a minor release. No library changed: nothing in `src/`
+differs from 0.10.0, and a checkout's release shim is the same as
+0.10.0's, byte for byte on macOS. The README and the docs site now say
+what chez-libuv is and is not, and the site links to the source.
 
 ### Added
 
@@ -15,7 +23,8 @@ All notable changes to this project are documented here. This project follows
   against the libuv pkg-config finds, and writes `config.sls` naming it.
   - `akku lock` copies a package's scripts into a project's lock only from
     the Akku index, so for now a project's own `Akku.manifest` runs the
-    hook, by path. `docs/installing.md` has the lines. `Akku.manifest`
+    hook, by path. `docs/installing.md` has the lines, with the entry that
+    names chez-libuv's git repository, tag and commit. `Akku.manifest`
     carries the same hook for the index.
   - It needs a C compiler, pkg-config and libuv 1.48.0 or newer, and runs
     on macOS and Linux, in a project whose path holds no spaces and none of
