@@ -11,7 +11,7 @@ DNS, child processes, pipes and signals.
 
 * What it is and isn't
 
-:warning: *This is not a web server.*
+*This is not a web server.*
 
 You can use this to /build/ a server, or anything that needs async I/O using
 libuv.
