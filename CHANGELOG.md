@@ -28,6 +28,8 @@ All notable changes to this project are documented here. This project follows
     dependency.
   - `.akkuignore` now keeps `build/` and `vendor/` out of an install as
     well as `site/`.
+  - `Akku.manifest` gains a `description` and a `homepage`, which Akku
+    copies into the package's index entry, and a shorter `synopsis`.
   - `make check-akku` installs by both routes and checks each case, under
     whichever Akku runs it. `make akku-facts` prints what the hook reads
     from the Makefile.

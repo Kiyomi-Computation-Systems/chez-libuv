@@ -18,8 +18,10 @@
 ;; consumer that depends on chez-libuv directly runs the same script from
 ;; its own manifest (docs/installing.md). make check-akku runs both.
 (akku-package ("chez-libuv" "0.10.0")
-  (synopsis "Thin R6RS bindings to libuv asynchronous I/O for Chez Scheme")
+  (synopsis "libuv bindings for R6RS/Chez")
+  (description "Thin Chez FFI bindings for libuv. Provides: Event loops, timers, TCP streams, child processes and their pipes, signals, DNS lookups and wakeups from other threads. Requires threaded Chez and a C compiler.")
   (authors "Kiyomi Computation Systems LLC")
+  (homepage "https://github.com/Kiyomi-Computation-Systems/chez-libuv")
   (license "BSD-3-Clause")
   (depends/dev ("chez-srfi" "0.0.0-akku.181.7879b52")
                ("chez-cmark-gfm" "^2.0.0"))
