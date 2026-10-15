@@ -10,6 +10,9 @@ is ready. chez-libuv lets a Scheme program do the same. The names follow
 libuv's own verbs (`accept`, `read-start`, `write`, `timer`, `spawn`,
 `close`), so if you know libuv you will recognise them.
 
+⚠️ **This is not a web server.** You can use it to *build* a server, or
+anything that needs async I/O using libuv.
+
 It moves bytes and nothing more. It parses no protocol and has no policy of
 its own about connections or backpressure: those belong to the code you build
 on top.

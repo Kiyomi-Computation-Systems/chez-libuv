@@ -36,6 +36,9 @@ All notable changes to this project are documented here. This project follows
   - Release and dev builds keep `-Werror`; the hook turns it off
     (`WERROR=`), since it builds with the consumer's compiler and libuv
     headers.
+- **The README and the docs site's front page say chez-libuv is not a
+  web server,** but something to build one on, or anything else that
+  needs async I/O.
 
 ### Fixed
 
