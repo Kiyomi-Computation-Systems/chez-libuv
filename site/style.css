@@ -48,6 +48,9 @@ body{margin:0;background:var(--ground);color:var(--body);font-family:var(--sans)
 
 .topbar{display:flex;justify-content:flex-end;align-items:center;padding:11px 15px;
   background:var(--surface);border-bottom:1px solid var(--bd)}
+a.source-link{display:inline-flex; gap: 7px; margin-right: 10px; color:var(--body);text-decoration:none;}
+a.source-link:hover{color:var(--link); text-decoration: underline;}
+
 .toggle{display:inline-flex;align-items:center;gap:7px;background:var(--bg);color:var(--body);
   border:1px solid var(--bd2);border-radius:999px;padding:5px 12px;font-family:var(--sans);
   font-size:12.5px;cursor:pointer;line-height:1}
@@ -60,10 +63,10 @@ body{margin:0;background:var(--ground);color:var(--body);font-family:var(--sans)
 
 .side{background:var(--surface);border-right:1px solid var(--bd);padding:22px 16px}
 .mark{display:block;font-family:var(--mono);font-size:14px;color:var(--tx);font-weight:500;
-  margin-bottom:3px;text-decoration:none}
+  margin-bottom:6px;text-decoration:none}
 .side nav a{display:block;font-size:14px;color:var(--body);text-decoration:none;
   padding:5px 12px;border-left:2px solid transparent;margin:1px 0}
-.side nav a:hover{color:var(--tx)}
+.side nav a:hover{color:var(--link); text-decoration: underline;}
 .side nav a.on{color:var(--link);font-weight:500;border-left-color:var(--link)}
 
 .main{background:var(--surface);padding:34px 40px;min-width:0}

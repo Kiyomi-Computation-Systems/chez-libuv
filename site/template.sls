@@ -76,10 +76,13 @@
        (head
         (meta (^ (charset "utf-8")))
         (meta (^ (name "viewport") (content "width=device-width, initial-scale=1")))
+        (meta (^ (name "description") (content "R6RS bindings to libuv for Chez Scheme")))
+        (meta (^ (name "keywords") (content "libuv scheme chez r6rs")))
         (title ,title)
         (link (^ (rel "stylesheet") (href "style.css"))))
        (body
         (div (^ (class "topbar"))
+             (a (^ (class "source-link") (href "https://github.com/Kiyomi-Computation-Systems/chez-libuv")) "Source code")
              (button (^ (id "theme") (class "toggle") (aria-label "Toggle theme"))
                      (span (^ (class "knob") (aria-hidden "true")))
                      (span (^ (id "theme-label")) "Dark mode")))

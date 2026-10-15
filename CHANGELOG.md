@@ -39,6 +39,9 @@ All notable changes to this project are documented here. This project follows
 - **The README and the docs site's front page say chez-libuv is not a
   web server,** but something to build one on, or anything else that
   needs async I/O.
+- **The docs site links to the source.** Its top bar has a "Source code"
+  link to the GitHub repository, and every page carries a description and
+  keywords. Sidebar links underline on hover.
 
 ### Fixed
 
