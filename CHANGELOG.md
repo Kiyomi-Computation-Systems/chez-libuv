@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Fixed
+
+- **`make check-site-deps` failed three of its rows on macOS** and passed
+  on Linux. `scripts/fetch-akku-lock` was right on both and is unchanged;
+  the test was not.
+  - Its wrong-sha256 fixture used a sed form BSD sed rejects, so the lock
+    pinned an empty string.
+  - Its "without xz" row expected a failure that macOS's tar never has: it
+    reads xz itself. The row now asserts what the host's tar can do, and a
+    new row has every platform refuse an archive tar cannot read.
+  - Under bash 3.2, macOS's `/bin/sh`, the row's PATH without xz outlived
+    it. That PATH now stays in a subshell, and a check fails if it leaks.
+  - The empty-archive row compared against a baseline taken before the
+    "without xz" row ran. It now takes its own.
+
 ## 0.11.0 — 2026-10-15
 
 This release lets Akku install chez-libuv. An install hook, which
