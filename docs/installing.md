@@ -207,15 +207,31 @@ for each machine. So chez-libuv has an **install hook**: a script that
 Akku copies a package's install scripts into your `Akku.lock` only from
 the Akku index. A direct dependency, which is how a project depends on a
 package that is not in the index, gets none. So your own `Akku.manifest`
-runs the hook. Add this to your `akku-package` form, beside your
-`depends`:
+names chez-libuv's git repository and runs the hook. Add chez-libuv to
+your `akku-package` form's `depends`, and the hook beside it:
 
 ```scheme
+(depends ("chez-libuv"
+          (version "X.Y.Z")
+          (location (git "https://github.com/Kiyomi-Computation-Systems/chez-libuv.git"))
+          (tag "vX.Y.Z")
+          (revision "COMMIT")))
 (scripts
   (cond-expand
     ((and pre-install (or darwin linux))
      (run "sh .akku/src/chez-libuv/scripts/akku-install"))))
 ```
+
+`X.Y.Z` is the release you want, and `COMMIT` is the commit its tag
+names, which this prints before the tag's name:
+
+```sh
+git ls-remote https://github.com/Kiyomi-Computation-Systems/chez-libuv.git 'refs/tags/vX.Y.Z^{}'
+```
+
+Akku requires a direct dependency to name its commit, and refuses to
+install if the tag no longer names it ("Tag does not match revision").
+Then run `akku lock` and `akku install`.
 
 For a `(location (directory D))` dependency, use D's path in place of
 `.akku/src/chez-libuv`. `chez-libuv`'s own `Akku.manifest` carries the
