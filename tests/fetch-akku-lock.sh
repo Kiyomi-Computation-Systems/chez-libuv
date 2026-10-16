@@ -25,8 +25,11 @@ mkdir -p "$scratch/src/pkg/src" "$scratch/srv"
 echo '(library (pkg) (export) (import (rnrs)))' > "$scratch/src/pkg/src/pkg.sls"
 tar -cf - -C "$scratch/src/pkg" . | xz -c > "$scratch/srv/pkg.tar.xz"
 good=$(sha256 "$scratch/srv/pkg.tar.xz")
-bad=$(printf '%s' "$good" | sed 's/^./0/; t; s/^/0/')
-[ "$bad" != "$good" ] || bad=1$(printf '%s' "$good" | cut -c2-)
+# A sha256 that differs from good's in its first digit only.
+case $good in
+  0*) bad=1${good#?} ;;
+  *) bad=0${good#?} ;;
+esac
 
 # A lock in `akku lock`'s own layout, plus a second project written the
 # older way, with every string after its key on one line.
@@ -114,28 +117,60 @@ else
   find "$scratch/dest/pkg" >&2
 fi
 
-# 7. Without xz, the archive cannot be read: the run fails, and the tree
-#    from before stays, still recording its own sha256. The PATH holds every
-#    tool the script uses except xz.
+# 7. An archive tar cannot read is refused: the run fails, and the tree
+#    from before stays, still recording its own sha256. The lock pins the
+#    unreadable bytes, so the sha256 check passes and tar is what refuses.
+printf 'not an archive\n' > "$scratch/srv/pkg.tar.xz"
+before=$(cat "$scratch/dest/pkg.sha256")
+write_lock "$(sha256 "$scratch/srv/pkg.tar.xz")"
+if ! run pkg && grep -q 'could not unpack' "$scratch/out" \
+   && [ -f "$scratch/dest/pkg/src/two.sls" ] \
+   && [ "$(cat "$scratch/dest/pkg.sha256")" = "$before" ]; then
+  pass "an archive tar cannot read is refused, and the tree from before stays"
+else
+  fail "an archive tar cannot read is refused, and the tree from before stays"; cat "$scratch/out" >&2
+fi
+
+# 8. Without xz, the run does what this host's tar can do. GNU tar needs
+#    xz to read the archive, so the run fails, and the tree from before
+#    stays, still recording its own sha256. bsdtar built with liblzma
+#    (macOS's) reads xz itself, so the run unpacks the archive whole. The
+#    PATH holds every tool the script uses except xz, and holds it only
+#    inside a subshell: bash 3.2, macOS's /bin/sh, keeps an assignment made
+#    before a function call once the call returns.
 mkdir -p "$scratch/srv3/src" "$scratch/noxz"
 echo three > "$scratch/srv3/src/three.sls"
 tar -cf - -C "$scratch/srv3" . | xz -c > "$scratch/srv/pkg.tar.xz"
+new=$(sha256 "$scratch/srv/pkg.tar.xz")
 before=$(cat "$scratch/dest/pkg.sha256")
-write_lock "$(sha256 "$scratch/srv/pkg.tar.xz")"
+write_lock "$new"
 for t in sh awk cut cat mkdir rm mv ls tar curl wget sha256sum shasum; do
   p=$(command -v "$t" 2>/dev/null) && ln -s "$p" "$scratch/noxz/$t"
 done
-if ! PATH=$scratch/noxz run pkg && grep -q 'could not unpack' "$scratch/out" \
+path=$PATH
+if PATH=$scratch/noxz "$scratch/noxz/tar" -tf "$scratch/srv/pkg.tar.xz" \
+     > /dev/null 2>&1; then
+  if (PATH=$scratch/noxz; run pkg) \
+     && [ -f "$scratch/dest/pkg/src/three.sls" ] \
+     && [ ! -e "$scratch/dest/pkg/src/two.sls" ] \
+     && [ "$(cat "$scratch/dest/pkg.sha256")" = "$new" ]; then
+    pass "without xz, a tar that reads xz itself unpacks the archive whole"
+  else
+    fail "without xz, a tar that reads xz itself unpacks the archive whole"; cat "$scratch/out" >&2
+  fi
+elif ! (PATH=$scratch/noxz; run pkg) && grep -q 'could not unpack' "$scratch/out" \
    && [ -f "$scratch/dest/pkg/src/two.sls" ] \
    && [ "$(cat "$scratch/dest/pkg.sha256")" = "$before" ]; then
   pass "without xz the run fails, and the tree from before stays"
 else
   fail "without xz the run fails, and the tree from before stays"; cat "$scratch/out" >&2
 fi
+[ "$PATH" = "$path" ] || fail "the PATH without xz ends with its row, but is still $PATH"
 
-# 8. An archive that unpacks to nothing is refused, and nothing is recorded.
+# 9. An archive that unpacks to nothing is refused, and nothing is recorded.
 mkdir -p "$scratch/empty"
 tar -cf - -C "$scratch/empty" --files-from /dev/null | xz -c > "$scratch/srv/pkg.tar.xz"
+before=$(cat "$scratch/dest/pkg.sha256")
 write_lock "$(sha256 "$scratch/srv/pkg.tar.xz")"
 if ! run pkg && grep -q 'unpacked to nothing' "$scratch/out" \
    && [ "$(cat "$scratch/dest/pkg.sha256")" = "$before" ]; then
