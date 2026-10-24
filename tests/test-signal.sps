@@ -25,6 +25,7 @@
         (libuv private conditions)
         (uv-testing)
         (only (uv-evidence) live-count)
+        (only (uv-describe) describe)
         (only (chezscheme) collect getenv))
 
 (define runner (test-runner-simple))
@@ -207,14 +208,15 @@
         sv-fired twin-fired))
 
 ;; --- stop is idempotent; closed handles refuse by state -----------------
-;; uv_signal_stop answers 0 on a watcher never started. The stops run
-;; outside the row, so one that raised would abort the suite there: the
-;; row itself only records that both returned.
+;; uv_signal_stop answers 0 on a watcher never started, so both stops
+;; return, and neither closes it. A refusal comes back as the row's value.
 (define never-started (make-uv-signal l2))
-(uv-signal-stop! never-started)
-(uv-signal-stop! never-started)
-(test-assert "stop on a never-started watcher is rc 0, twice"
-  #t)
+(test-equal "stop on a never-started watcher returns, twice, and leaves it open"
+  '(stopped-twice open)
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-signal-stop! never-started)
+    (uv-signal-stop! never-started)
+    (list 'stopped-twice (uv-handle-state never-started))))
 
 (uv-close! never-started)
 (run-until l2 (lambda () (eq? (uv-handle-state never-started) 'closed)) 64)
@@ -251,7 +253,11 @@
 (test-equal "…exactly once" 1 once-fired)
 (test-equal "a second send reaches only the guard" 'satisfied (send-usr1-and-wait-guard!))
 (test-equal "the oneshot stayed disarmed (auto-disarm)" 1 once-fired)
-(uv-signal-stop! once)   ; rc 0 on an auto-disarmed watcher
+(test-equal "stop on an auto-disarmed oneshot watcher returns, and leaves it open"
+  '(stopped open)
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-signal-stop! once)
+    (list 'stopped (uv-handle-state once))))
 (uv-signal-start-oneshot! once 'sigusr1
                           (lambda (s) (set! once-fired (+ once-fired 1)) (collect)))
 (test-equal "rearm from OUTSIDE the callback delivers again"
