@@ -29,6 +29,18 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
+- **Three signal-stop checks could not fail** (#136).
+  - test-signal's row for a stop on a never-started watcher asserted `#t`,
+    with both stops outside it.
+  - Its stop on an auto-disarmed one-shot watcher, and test-facade's stop
+    on a never-started one, were bare lines whose "rc 0" was a comment.
+
+  A stop that raised aborted its suite at that line, and no row was named:
+  test-signal lost 36 rows and test-facade 2. Each stop now runs inside a
+  row whose value is a sentinel only a returning stop produces, or the
+  condition it raised. test-signal's two rows also hold that the watcher
+  is still open afterwards. A stop that raises now fails its row by name,
+  and the rest of the suite still runs.
 - **`make check-site-deps` failed three of its rows on macOS** and passed
   on Linux. `scripts/fetch-akku-lock` was right on both and is unchanged;
   the test was not.

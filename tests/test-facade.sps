@@ -871,7 +871,12 @@
     (uv-signal-start! sig-h 'sigfoo (lambda (s) s))
     'no-raise))
 
-(uv-signal-stop! sig-h)   ; rc 0 on a never-started watcher
+(test-equal "uv-signal-stop! crosses the facade and returns on a never-started watcher"
+  'stopped
+  (guard (e (#t (list 'raised (describe e))))
+    (uv-signal-stop! sig-h)
+    'stopped))
+
 (uv-close! sig-h)
 (uv-loop-teardown! sig-loop)
 
