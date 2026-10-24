@@ -1,0 +1,180 @@
+#!/bin/sh
+# Fail unless the package a release would ship leaves out exactly the
+# repository's own records and holds every other tracked file, and unless
+# the install hook's makes treat the package as they treat the same tree
+# with those records in place.
+#
+# Usage: scripts/check-archive
+#
+# `akku install` unpacks the whole package into each consumer's
+# .akku/src/chez-libuv/, and GitHub serves the same files as a tag's source
+# tarball. scripts/archive-worktree makes that archive from the working
+# tree. These paths are for working on the repository, not for using it,
+# and .gitattributes marks each one export-ignore:
+#
+#   .plans, spike     design records, plans and the early experiments
+#   AGENTS.md         instructions for coding agents
+#   CONTRIBUTING.md   the contributor guide
+#   .github           CI and the issue and pull request templates
+#
+# Checks:
+#   1. every tracked name is one git and tar list alike: printable ASCII,
+#      with no quote or backslash;
+#   2. each left-out path is tracked, so its absence from the archive is
+#      the export rule's doing;
+#   3. the archive holds none of them;
+#   4. the archive holds every other tracked file, and nothing else;
+#   5. the install hook's three makes (scripts/akku-install), its facts and
+#      dry runs of its shim and config.sls builds with the arguments it
+#      passes, print the same and exit the same in the unpacked archive as
+#      in a copy with the left-out paths put back. In that copy the facts
+#      must name the floor, the library suffix and config.sls's exports,
+#      and each dry run must exit 0 and print what it builds, so a make
+#      that fails alike in both cannot pass. A dry run shows the rules and
+#      commands make would run, not what a recipe reads once it runs;
+#      `make check-akku` runs them.
+set -eu
+cd "$(dirname "$0")/.."
+
+left_out='.plans spike AGENTS.md CONTRIBUTING.md .github'
+
+fail() { echo "check-archive: FAIL: $*" >&2; exit 1; }
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/check-archive.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+scripts/archive-worktree "$work/pkg.tar" > "$work/tree.txt" || {
+  echo "check-archive: could not make the archive" >&2
+  exit 2
+}
+
+# under PATH FILE: the lines of FILE that are PATH or lie under it.
+under() { awk -v p="$1" '$0 == p || index($0, p "/") == 1' "$2"; }
+
+# Each step writes a file rather than feeding a pipe, so that under set -e
+# a failing git or tar stops the check.
+awk -F '\t' '{ split($1, f, " ") } f[2] == "blob" { print $2 }' \
+  "$work/tree.txt" > "$work/files.unsorted"
+sort "$work/files.unsorted" > "$work/files.txt"
+[ -s "$work/files.txt" ] || fail "the archived tree holds no files"
+tar -tf "$work/pkg.tar" > "$work/listing.txt"
+sed '/\/$/d' "$work/listing.txt" > "$work/archived.unsorted"
+sort "$work/archived.unsorted" > "$work/archived.txt"
+
+# 1. Names git and tar list alike. git quotes a name holding a quote, a
+# backslash or a control character, and tar in the C locale escapes
+# non-ASCII bytes, so either would fail check 4 with a confusing diff.
+status=0
+LC_ALL=C grep -nE '[^ -~]|["\\]' "$work/files.txt" > "$work/odd.txt" || status=$?
+case $status in
+  0) cat "$work/odd.txt" >&2
+     fail "these tracked names hold a character git and tar list differently (non-ASCII, a control character, a quote or a backslash); rename them" ;;
+  1) ;;
+  *) echo "check-archive: grep could not read the tracked names" >&2
+     exit 2 ;;
+esac
+
+# 2. Each left-out path is tracked.
+for p in $left_out; do
+  [ -n "$(under "$p" "$work/files.txt")" ] ||
+    fail "$p is not tracked, so leaving it out proves nothing; update this script and .gitattributes"
+done
+
+# 3. None of them ships.
+shipped=
+for p in $left_out; do
+  [ -z "$(under "$p" "$work/archived.txt")" ] || shipped="$shipped $p"
+done
+[ -z "$shipped" ] ||
+  fail "the archive ships$shipped; .gitattributes must mark each one export-ignore"
+
+# 4. Everything else ships.
+awk -v list="$left_out" '
+  BEGIN { n = split(list, l, " ") }
+  { for (i = 1; i <= n; i++) if ($0 == l[i] || index($0, l[i] "/") == 1) next
+    print }' "$work/files.txt" > "$work/expected.txt"
+diff -u "$work/expected.txt" "$work/archived.txt" > "$work/files.diff" || {
+  cat "$work/files.diff" >&2
+  fail "the archive is not the tracked files less the left-out paths (- tracked but not shipped, + shipped but not expected)"
+}
+
+# 5. The install hook's makes read the package as they read the same tree
+# with the left-out paths. The full copy takes those paths' files from the
+# working tree, which is what the archived tree holds.
+mkdir "$work/pkg" "$work/full"
+tar -xf "$work/pkg.tar" -C "$work/pkg"
+tar -xf "$work/pkg.tar" -C "$work/full"
+for p in $left_out; do under "$p" "$work/files.txt"; done > "$work/left-out.txt"
+tar -cf "$work/left-out.tar" -T "$work/left-out.txt"
+tar -xf "$work/left-out.tar" -C "$work/full"
+
+# mk DIR OUT ARGS...: make in DIR with ARGS, as the hook runs it. OUT.out
+# and OUT.err hold what it printed, with DIR's physical path, which make's
+# CURDIR is, written as @ROOT@; OUT.status holds its exit status.
+mk() {
+  _dir=$1 _out=$2
+  shift 2
+  _status=0
+  (cd "$_dir" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make FLAVOR=prod "$@") \
+    > "$_out.raw-out" 2> "$_out.raw-err" || _status=$?
+  echo "$_status" > "$_out.status"
+  _root=$(cd "$_dir" && pwd -P)
+  for _part in out err; do
+    ROOT=$_root awk '{ d = ENVIRON["ROOT"]
+      while ((i = index($0, d)) > 0)
+        $0 = substr($0, 1, i - 1) "@ROOT@" substr($0, i + length(d))
+      print }' "$_out.raw-$_part" > "$_out.$_part"
+  done
+}
+
+# same NAME: the package's and the full copy's runs of NAME agree.
+same() {
+  for _part in out err status; do
+    cmp -s "$work/full.$1.$_part" "$work/pkg.$1.$_part" || {
+      echo "--- $1, with the left-out paths, $_part:" >&2
+      cat "$work/full.$1.$_part" >&2
+      echo "--- $1, in the package, $_part:" >&2
+      cat "$work/pkg.$1.$_part" >&2
+      fail "the install hook's $1 make differs between the package and the same tree with the left-out paths"
+    }
+  done
+}
+
+# expect NAME WHAT: NAME's run in the full copy exited 0, and WHAT, a
+# command reading NAME's output on standard input, accepts it.
+expect() {
+  _name=$1
+  shift
+  if [ "$(cat "$work/full.$_name.status")" != 0 ] || ! "$@" < "$work/full.$_name.out"; then
+    echo "--- $_name, with the left-out paths, output and errors:" >&2
+    cat "$work/full.$_name.out" "$work/full.$_name.err" >&2
+    fail "the install hook's $_name make did not do its job even with the left-out paths, so comparing it proves nothing"
+  fi
+}
+has_facts() {
+  sed -nE 's/^(floor|ext|exports)=.+/\1/p' > "$work/facts-found"
+  [ "$(sort -u "$work/facts-found" | wc -l | tr -d ' ')" = 3 ]
+}
+
+mk "$work/full" "$work/full.facts" -s akku-facts
+expect facts has_facts
+ext=$(sed -n 's/^ext=//p' "$work/full.facts.out")
+mk "$work/pkg" "$work/pkg.facts" -s akku-facts
+same facts
+
+new=$work/hook/.libchezlibuv.$ext.new
+shim=$work/hook/libchezlibuv.$ext
+for t in full pkg; do
+  mk "$work/$t" "$work/$t.shim" -n CC=cc WERROR= BUILD_DIR="$work/hook/build" \
+    SHIM="$new" SHIM_LDFLAGS= "$new"
+  mk "$work/$t" "$work/$t.config" -n CC=cc WERROR= BUILD_DIR="$work/hook/build" \
+    SHIM="$shim" CONFIG_GENERATOR=akku-install -o "$shim" src/libuv/private/config.sls
+done
+expect shim grep -qF -- "-o $new"
+expect config grep -qF 'GENERATED by akku-install'
+same shim
+same config
+
+echo "check-archive: the package leaves out $left_out, holds the other $(wc -l < "$work/expected.txt" | tr -d ' ') tracked files, and the install hook's makes treat it as they treat the tree with those paths"

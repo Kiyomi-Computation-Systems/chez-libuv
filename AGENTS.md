@@ -20,6 +20,19 @@
 * Add entries to `CHANGELOG.md` for each release
 * Makefile should have a `help` command which lists all of the make commands.
 * Library should be distributable with Akku.
+* A release ships `git archive` of its tag: GitHub's source tarballs and
+  the Akku archive serve exactly that, and `akku install` unpacks all of it
+  into each consumer's project. `.gitattributes` keeps the repository's own
+  records out: `.plans`, `spike`, this file, CONTRIBUTING.md and `.github`.
+  A new file or directory for working on the repository, not using it,
+  gets an export-ignore line there and an entry in `scripts/check-archive`'s
+  list. `make check-archive`, which `make test` runs, fails when the two
+  disagree. It also fails when the install hook's makes, its facts and
+  dry runs of its builds, differ between the package and the same tree
+  with those paths. Nothing an install reads may live in a left-out path.
+  This check sees what make plans; what a recipe or the hook script reads
+  once it runs only `make check-akku` sees, and that needs Akku and does
+  not run in CI.
 * Closing Ritual: Squash merge PR, catchup local main, cleanup branches, reflect on session
 * Use TDD / test-driven development
 * A test that passes whether the code is right or wrong is worse than no test.

@@ -475,10 +475,10 @@ Two more checks run on the host, outside the container:
   site generator, `build/` and `vendor/` out. It needs `akku`, a Chez, a C
   compiler and pkg-config's libuv at the floor. On a Guix host, use the
   repository's pinned toolchain, since Guix's own `libuv` is below the
-  floor, plus Akku and the `tar` and `gzip` the check archives with:
+  floor, plus Akku and the `gzip` the check archives with:
 
   ```sh
-  guix time-machine -C channels.scm -- shell --pure -m manifest.scm akku tar gzip -- make check-akku CHEZ=scheme
+  guix time-machine -C channels.scm -- shell --pure -m manifest.scm akku gzip -- make check-akku CHEZ=scheme
   ```
 - `make akku-facts` prints what the install hook reads from the Makefile:
   pkg-config's verdict on libuv, the libuv floor, the shared-library

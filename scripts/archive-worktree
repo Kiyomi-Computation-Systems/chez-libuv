@@ -1,0 +1,61 @@
+#!/bin/sh
+# Write the archive a release made from this working tree would ship, and
+# print the tree it archives, as `git ls-tree -r` lists it.
+#
+# Usage: scripts/archive-worktree OUT.tar
+#
+# A release's package is `git archive` of its tag: GitHub's source tarballs
+# and the Akku archive both serve exactly that, so .gitattributes'
+# export-ignore lines decide what a package holds. The tree archived here
+# holds the tracked files as `git add -u` reads them from disk, deletions
+# included, plus any file added to the index. It is written through a copy
+# of the index, into a temporary object directory that borrows the
+# repository's objects, so neither the index nor .git is written.
+#
+# git archive reads attributes from the tree it archives, and also from the
+# system and global attributes files and $GIT_DIR/info/attributes, which no
+# other clone shares. The first two are switched off here. A rule in the
+# third is refused, since a macro the tree defines can set export-ignore
+# under another name.
+set -eu
+
+[ $# -eq 1 ] || { echo "usage: scripts/archive-worktree OUT.tar" >&2; exit 2; }
+case $1 in
+  /*) out=$1 ;;
+  *) out=$(pwd)/$1 ;;
+esac
+cd "$(dirname "$0")/.."
+root=$(pwd -P)
+
+# In a package unpacked inside another repository, a consumer's .akku/src
+# for one, git would find and archive that repository instead.
+top=$(git rev-parse --show-toplevel)
+if [ "$(cd "$top" && pwd -P)" != "$root" ]; then
+  echo "archive-worktree: $root is not the top of a git checkout (git finds $top)" >&2
+  exit 2
+fi
+
+info=$(git rev-parse --git-path info/attributes)
+if [ -f "$info" ] && grep -Eqv '^[[:space:]]*(#.*)?$' "$info"; then
+  echo "archive-worktree: $info holds attribute rules, which only this clone applies to git archive; move them to .gitattributes" >&2
+  exit 2
+fi
+
+objects=$(cd "$(git rev-parse --git-path objects)" && pwd -P)
+index=$(git rev-parse --git-path index)
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/archive-worktree.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cp "$index" "$tmp/index"
+mkdir "$tmp/objects"
+GIT_INDEX_FILE=$tmp/index
+GIT_OBJECT_DIRECTORY=$tmp/objects
+GIT_ALTERNATE_OBJECT_DIRECTORIES=$objects
+export GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
+git add -u
+tree=$(git write-tree)
+GIT_ATTR_NOSYSTEM=1 git -c core.attributesFile=/dev/null \
+  archive --format=tar "$tree" > "$out"
+git -c core.quotePath=false ls-tree -r --full-tree "$tree"

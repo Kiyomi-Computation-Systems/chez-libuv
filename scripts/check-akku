@@ -10,8 +10,10 @@
 #   - the index route: the lock entry carries Akku.manifest's (scripts ...);
 #   - the consumer route: the consumer's own manifest runs the script by path.
 #
-# Every package is made from the files git tracks, copied from the working
-# tree, so uncommitted edits to tracked files are what gets tested. Akku runs
+# Every package is the archive a release would ship, made from the working
+# tree by scripts/archive-worktree: `git archive`, as the Akku archive serves
+# a tag, so .gitattributes' export-ignore paths are left out and uncommitted
+# edits to tracked files are what gets tested. Akku runs
 # with its log at debug level, so the hook's own output is in each log under
 # every Akku; with both prompts answered y on stdin, since Akku before 1.1.1
 # has no --yes; and with MAKEFLAGS cleared, except where a row sets it.
@@ -134,20 +136,17 @@ package=$(sed -n 1p "$work/manifest.out")
 version=$(sed -n 2p "$work/manifest.out")
 scripts=$(sed -n 3p "$work/manifest.out")
 
-# The tracked files. --no-recursion keeps a submodule's directory empty, as
-# it is in an archive; GNU tar applies it only to names after it, so it
-# comes before -T. Each step writes a file rather than feeding a pipe, so a
-# failure in any of them stops the check.
-(cd "$root" && git ls-files -z) > "$work/files" || fail "git ls-files failed"
-(cd "$root" && tar --null --no-recursion -T "$work/files" -cf "$work/pkg.tar") ||
-  fail "could not archive the tracked files"
+# The package as a release would ship it; a submodule's directory is empty
+# in it, as in any archive.
+"$root/scripts/archive-worktree" "$work/pkg.tar" > /dev/null ||
+  fail "could not archive the working tree"
 mkdir "$work/clean"
 tar -xf "$work/pkg.tar" -C "$work/clean" || fail "could not unpack the package"
 
-# copy_package NAME: a fresh copy of the tracked files at $work/NAME.
+# copy_package NAME: a fresh copy of the package at $work/NAME.
 copy_package() { cp -Rp "$work/clean" "$work/$1"; }
 
-# An archive of the tracked files plus a library under build/ and one under
+# An archive of the package plus a library under build/ and one under
 # vendor/, which a source tree can hold and no consumer may install. It is
 # put in a private Akku cache under its sha256, so Akku extracts it with its
 # own reader, which keeps no file modes, and downloads nothing.

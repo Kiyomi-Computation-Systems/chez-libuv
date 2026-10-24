@@ -1,0 +1,14 @@
+# Kept in the repository, left out of what a release distributes: `git
+# archive`, the source tarballs GitHub builds from a tag, and the Akku
+# archive, which serves exactly `git archive` of the tag. `akku install`
+# unpacks the whole package into each consumer's .akku/src/chez-libuv/, so
+# whatever the archive holds reaches every consumer. These paths are for
+# working on the repository, not for using it: design records, plans and
+# the early experiments, instructions for coding agents, the contributor
+# guide, and CI. `make check-archive` fails if any of them would ship, or
+# if anything else would not.
+/.plans export-ignore
+/spike export-ignore
+/AGENTS.md export-ignore
+/CONTRIBUTING.md export-ignore
+/.github export-ignore

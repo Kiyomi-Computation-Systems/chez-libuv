@@ -107,6 +107,9 @@ jobs:
       - name: Check source and docs cite no plans or history
         run: make check-history
 
+      - name: Check a release archive leaves out the repository's own records
+        run: make check-archive
+
       - name: Scheme dependencies
         run: make deps
 

@@ -33,6 +33,9 @@ development container instead, e.g. `scripts/guix-env make test`
 A PR must keep these green — they are exactly what CI runs:
 
 - `make test` — every suite passes (`ALL SUITES PASSED`).
+- `make check-history` and `make check-archive`, which `make test` runs
+  first: no shipped file cites plans or history, and a release archive
+  leaves out the repository's own records and holds everything else.
 - `make check-pins` — submodule/lock/version/floor agreement.
 - `make check-purity` — the pure suites still import no native code.
 - `make test-memory` runs in CI; the Linux Valgrind leg is the only one

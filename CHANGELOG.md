@@ -5,6 +5,28 @@ All notable changes to this project are documented here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- **A release's package leaves out the repository's own records.**
+  0.11.0's package, on Akku and as GitHub's tarball, held the design
+  records and plans (137 files), the early experiments (35), the
+  instructions for coding agents, the contributor guide and the CI
+  configuration. `akku install` unpacks all of it into each consumer's
+  `.akku/src/chez-libuv/`. `.gitattributes` now marks them export-ignore,
+  so `git archive` of a tag, which the Akku archive and GitHub both serve,
+  leaves them out. Everything else still ships.
+  - The Makefile reads the Chez floor from CI's workflow only where that
+    file exists. Without that, every make in a package, the install
+    hook's included, printed `sed: can't read .github/workflows/ci.yml`.
+    The two Docker targets that need the floor refuse by name there.
+  - `make check-archive`, run by `make test` and CI, archives the working
+    tree and fails if a left-out path would ship, or if any other tracked
+    file would not. It also fails if the install hook's makes, its facts
+    and dry runs of its builds, differ between the package and the same
+    tree with the left-out paths.
+  - The Guix development container's manifest lists `tar`, which
+    `make check-archive` runs.
+
 ### Fixed
 
 - **`make check-site-deps` failed three of its rows on macOS** and passed

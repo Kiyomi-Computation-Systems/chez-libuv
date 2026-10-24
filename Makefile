@@ -177,7 +177,7 @@ PURE_TESTS   := $(wildcard tests/test-conditions.sps tests/test-addrinfo.sps \
 # here.
 MEMORY_TESTS := $(filter-out $(PURE_TESTS),$(TESTS))
 
-.PHONY: all build deps require-toolchain relink-guard check-pins check-history check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside site-deps site check-site check-reference check-site-deps check-akku akku-facts
+.PHONY: all build deps require-toolchain relink-guard check-pins check-history check-archive check-purity check-prod check-help check-memory-gate check-nothreads-docker help dev test test-root test-threading test-memory test-memory-docker vendor clean prod deps-info check-guix check-guix-inside site-deps site check-site check-reference check-site-deps check-akku akku-facts
 
 .DEFAULT_GOAL := help
 
@@ -385,6 +385,16 @@ check-pins: ## Verify chez-srfi/Akku.lock pins, vendored libuv range, README flo
 check-history: ## Fail if source, tests, build files or user docs cite plans, issues, dates or release numbers
 	@scripts/check-history-refs
 
+# A release's package is `git archive` of its tag, which GitHub's tarballs
+# and the Akku archive both serve, and `akku install` unpacks all of it
+# into each consumer's project. .gitattributes leaves the repository's own
+# records out. The script archives the working tree and fails if any of
+# them would ship, if any other tracked file would not, or if the install
+# hook's makes, its facts and dry runs of its builds, differ between the
+# package and the same tree with them.
+check-archive: ## Fail unless a release archive leaves out the repository's own records (.gitattributes) and holds every other file
+	@scripts/check-archive
+
 # --- the docs site ------------------------------------------------------
 # docs/*.md rendered to build/site/ through chez-cmark-gfm, a development
 # dependency that Akku.manifest declares and Akku.lock pins. None of these
@@ -432,10 +442,10 @@ check-site: check-reference site-deps deps ## Test the site generator, then rend
 # release shim that loads; and the install hook's refusals and failures, as
 # the Akku running it shows them. .akkuignore keeps site/, build/ and vendor/
 # out. Needs akku, a Chez, a C compiler and pkg-config's libuv at the floor.
-# On a Guix host, the pinned toolchain plus Akku, tar and gzip, which the
+# On a Guix host, the pinned toolchain plus Akku and gzip, which the
 # manifest lacks (Guix's own libuv is below the floor):
 # `guix time-machine -C channels.scm -- shell --pure -m manifest.scm
-# akku tar gzip -- make check-akku CHEZ=scheme`.
+# akku gzip -- make check-akku CHEZ=scheme`.
 AKKU ?= akku
 check-akku: ## Install with Akku by both routes; check the libraries, the shim, and the install hook's refusals
 	@AKKU="$(AKKU)" CHEZ="$(CHEZ)" scripts/check-akku
@@ -632,7 +642,7 @@ dev: build deps ## Start a REPL with the shim and dependencies on the library pa
 # broken suite cannot hide the others, then fail the target if any failed.
 # $(TESTS) is a $(wildcard), so a new tests/test-*.sps file is picked up
 # automatically -- no edit needed here.
-test: build deps check-pins check-history $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
+test: build deps check-pins check-history check-archive $(STALE_SHIM) ## Run every tests/test-*.sps suite (keep-going, aggregate exit)
 	@test -n "$(TIMEOUT_BIN)" || echo "note: no timeout(1) on PATH; a hung suite will not be capped (brew install coreutils)"
 	@fail=0; \
 	for t in $(TESTS); do \
@@ -1026,8 +1036,12 @@ VALGRIND_IMAGE  ?= chez-libuv-valgrind
 
 # ONE source of truth for the Chez floor: ci.yml. Deriving it is what stops
 # the Dockerfile becoming a fourth place the version is written down and a
-# fourth place it can drift.
-CHEZ_FLOOR_VERSION := $(shell sed -n 's/^  CHEZ_FLOOR_VERSION: *"\(.*\)"/\1/p' .github/workflows/ci.yml)
+# fourth place it can drift. A release archive leaves .github out, so there
+# the floor is empty, and the two Docker targets below refuse by name.
+# Reading the file only where it exists keeps every other make quiet there,
+# the install hook's included (scripts/check-archive).
+CI_WORKFLOW := .github/workflows/ci.yml
+CHEZ_FLOOR_VERSION := $(if $(wildcard $(CI_WORKFLOW)),$(shell sed -n 's/^  CHEZ_FLOOR_VERSION: *"\(.*\)"/\1/p' $(CI_WORKFLOW)))
 
 test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS dev boxes)
 	@command -v $(DOCKER) >/dev/null 2>&1 || { \
@@ -1036,8 +1050,8 @@ test-memory-docker: ## Run the Linux Valgrind memory gate in a container (macOS 
 	  exit 1; \
 	}
 	@test -n "$(CHEZ_FLOOR_VERSION)" || { \
-	  echo "test-memory-docker: could not read CHEZ_FLOOR_VERSION from" >&2; \
-	  echo "  .github/workflows/ci.yml -- has that key been renamed or reformatted?" >&2; \
+	  echo "test-memory-docker: could not read CHEZ_FLOOR_VERSION from $(CI_WORKFLOW):" >&2; \
+	  echo "  $(if $(wildcard $(CI_WORKFLOW)),has that key been renamed or reformatted?,it is absent. A release archive leaves .github out: run this from a checkout.)" >&2; \
 	  exit 1; \
 	}
 	@echo "=== building $(VALGRIND_IMAGE):$(CHEZ_FLOOR_VERSION) (cached after the first run) ==="
@@ -1112,8 +1126,8 @@ check-nothreads-docker: ## Verify a non-threaded Chez is refused by name at impo
 	  exit 1; \
 	}
 	@test -n "$(CHEZ_FLOOR_VERSION)" || { \
-	  echo "check-nothreads-docker: could not read CHEZ_FLOOR_VERSION from" >&2; \
-	  echo "  .github/workflows/ci.yml -- has that key been renamed or reformatted?" >&2; \
+	  echo "check-nothreads-docker: could not read CHEZ_FLOOR_VERSION from $(CI_WORKFLOW):" >&2; \
+	  echo "  $(if $(wildcard $(CI_WORKFLOW)),has that key been renamed or reformatted?,it is absent. A release archive leaves .github out: run this from a checkout.)" >&2; \
 	  exit 1; \
 	}
 	@echo "=== building $(NOTHREADS_IMAGE):$(CHEZ_FLOOR_VERSION) (cached after the first run) ==="
