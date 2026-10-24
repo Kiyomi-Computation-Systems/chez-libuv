@@ -88,4 +88,4 @@
      ;; What the Makefile, the scripts and the suites' children shell out
      ;; to. The container has nothing else.
      "bash" "coreutils" "make" "grep" "sed" "gawk" "findutils"
-     "diffutils"))))
+     "diffutils" "tar"))))

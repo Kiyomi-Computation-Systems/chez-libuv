@@ -83,10 +83,13 @@ if [ -n "$missed" ] || [ -n "$caught" ]; then
   exit 2
 fi
 
+no_plans_rule=
 if [ $# -eq 0 ]; then
   # Untracked files count too, so a new file is checked before its commit.
   # A tracked file deleted from the working tree is skipped. This file is
-  # left out: its planted references are the point.
+  # left out: its planted references are the point. scripts/check-archive
+  # names the paths a release leaves out, so it is checked below without
+  # the plans rule.
   list=$(git -c core.quotePath=false ls-files --cached --others \
            --exclude-standard -- src tests docs site build-site.sps \
            README.org NOTICE SECURITY.md Makefile scripts manifest.scm \
@@ -101,7 +104,11 @@ if [ $# -eq 0 ]; then
   set -f
   set --
   for f in $list; do
-    if [ "$f" != scripts/check-history-refs ] && [ -f "$f" ]; then
+    case $f in
+      scripts/check-history-refs) continue ;;
+      scripts/check-archive) [ -f "$f" ] && no_plans_rule=$f; continue ;;
+    esac
+    if [ -f "$f" ]; then
       set -- "$@" "$f"
     fi
   done
@@ -116,14 +123,25 @@ if [ $# -eq 0 ]; then
 fi
 
 # grep answers 1 for no match and 2 for a file it could not read; only 1
-# is a pass.
+# is a pass, for both greps.
 status=0
 grep -nHE "$pattern" "$@" || status=$?
+count=$#
+if [ -n "$no_plans_rule" ]; then
+  partial=0
+  grep -nHE "$issue|$date|$release|$own" "$no_plans_rule" || partial=$?
+  count=$((count + 1))
+  case $status:$partial in
+    *:0 | 0:*) status=0 ;;
+    1:1) ;;
+    *) status=2 ;;
+  esac
+fi
 case $status in
   0) echo "check-history-refs: the lines above cite plans, issues, dates or" >&2
      echo "release numbers. State the fact itself instead." >&2
      exit 1 ;;
-  1) echo "check-history-refs: $# files cite no plans, issues, dates or releases" ;;
+  1) echo "check-history-refs: $count files cite no plans, issues, dates or releases" ;;
   *) echo "check-history-refs: grep could not read every file (status $status)" >&2
      exit 2 ;;
 esac
