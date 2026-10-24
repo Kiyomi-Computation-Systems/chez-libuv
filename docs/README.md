@@ -11,7 +11,8 @@ libuv's own verbs (`accept`, `read-start`, `write`, `timer`, `spawn`,
 `close`), so if you know libuv you will recognise them.
 
 ⚠️ **This is not a web server.** You can use it to *build* a server, or
-anything that needs async I/O using libuv.
+anything that needs async I/O using libuv. This library powers
+[chez-http-server](https://github.com/Kiyomi-Computation-Systems/chez-http-server).
 
 It moves bytes and nothing more. It parses no protocol and has no policy of
 its own about connections or backpressure: those belong to the code you build

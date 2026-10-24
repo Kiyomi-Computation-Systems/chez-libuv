@@ -13,7 +13,7 @@ DNS, child processes, pipes and signals.
 
 ⚠ *This is not a web server.*
 
-You can use this to /build/ a server, or anything that needs async I/O using
+You can use this to /build/ a server like [[https://github.com/Kiyomi-Computation-Systems/chez-http-server][chez-http-server]], or anything that needs async I/O using
 libuv.
 
 It is a thin, legible mirror of libuv. The API follows libuv's own verbs
