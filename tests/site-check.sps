@@ -14,7 +14,7 @@
 ;;;     $CHEZ --program tests/site-check.sps
 ;;; or simply `make check-site`.
 ;;;
-;;; Asserts four invariants directly on render-site's return value -- no filesystem write, no
+;;; Asserts six invariants directly on render-site's return value -- no filesystem write, no
 ;;; `build/site/` dependency:
 ;;;   1. nav completeness -- (site pages) names exactly docs/*.md on disk,
 ;;;      README.md (the home page) included.
@@ -27,17 +27,14 @@
 ;;;      (site io) writes it to, or the stylesheet.
 ;;;   6. every link out to the repository (a ../ escape) names a file the
 ;;;      checkout has.
-;;;   7. every heading's anchor is the same on GitHub as on the site.
 ;;;
 ;;; Each invariant `die`s with its own name on failure and a non-zero exit,
 ;;; per AGENTS.md ("Expect a value only success can produce"): a caller
 ;;; grepping this program's stderr for which invariant broke gets an answer,
 ;;; not a guess.
 (import (rnrs) (only (chezscheme) getenv directory-list)
-        (cmark gfm)
         (site io) (site render) (site pages) (site serializer)
-        (only (site links) repo-blob) (only (site slug) slugify)
-        (site transform))
+        (only (site links) repo-blob))
 
 (define (die . parts)
   (for-each (lambda (x) (display x (current-error-port))) parts)
@@ -210,42 +207,6 @@
              (car pg) ": " bad))))
   (site-result-pages result))
 
-;; --- (7) every heading's anchor is GitHub's too ---------------------------
-;; docs/ is read on GitHub as well as on the site, so an anchor must be the
-;; same in both. GitHub keeps underscores and turns each space into a
-;; hyphen, where (site slug) drops underscores and collapses runs; the two
-;; agree on plain headings. A heading on which they differ is refused, so
-;; every page.md#anchor link works in both places.
-(define (github-slug text)
-  (list->string
-   (map (lambda (c) (if (char=? c #\space) #\- c))
-        (filter (lambda (c)
-                  (or (char-alphabetic? c) (char-numeric? c)
-                      (memv c '(#\space #\- #\_))))
-                (string->list (string-downcase (trim-spaces text)))))))
-
-(define (trim-spaces s)
-  (let* ((cs (string->list s))
-         (drop (lambda (cs) (let loop ((cs cs))
-                              (if (and (pair? cs) (char=? (car cs) #\space))
-                                  (loop (cdr cs))
-                                  cs)))))
-    (list->string (reverse (drop (reverse (drop cs)))))))
-
-(for-each
-  (lambda (in)
-    (let-values (((body toc) (transform-body (markdown->sxml (cdr in)
-                                                             (default-cmark-options)))))
-      (for-each
-        (lambda (entry)
-          (let ((text (cadr entry)))
-            (unless (string=? (slugify text) (github-slug text))
-              (die "check-site: a heading's anchor differs on GitHub, in "
-                   (car in) ": " text " -> site " (slugify text)
-                   ", GitHub " (github-slug text)))))
-        toc)))
-  (read-site-inputs))
-
 ;; --- (4) no <pre> reflow ----------------------------------------------------
 ;; A fixed probe, independent of the real corpus: a deeply-indented code
 ;; block must round-trip byte-for-byte, so `make check-site` alone catches
@@ -254,5 +215,5 @@
   (unless (string=? probe "<pre><code>a\n        b\n</code></pre>")
     (die "check-site: <pre> reflow FAILED: " probe)))
 
-(display "check-site: nav, anchors, no .md leak, every link written, repository links exist, GitHub anchors, no <pre> reflow -- all green\n")
+(display "check-site: nav, anchors, no .md leak, every link written, repository links exist, no <pre> reflow -- all green\n")
 (exit 0)

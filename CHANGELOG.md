@@ -29,6 +29,23 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
+- **A heading's anchor on the docs site is GitHub's** (#150). The site
+  dropped `_`, made each run of spaces and hyphens one hyphen, trimmed
+  hyphens from both ends, and kept circled digits such as `①`, which Chez's
+  `char-numeric?` counts as numeric. GitHub keeps `_`, makes each space a
+  hyphen of its own, trims nothing and drops circled digits, so
+  `make check-site` refused a heading such as `UV_EOF` or
+  `0.11.0 - 2026-10-15`. The site now uses GitHub's rule, as
+  chez-http-server's does: lower case; keep letters, marks, decimal digits,
+  connector punctuation, hyphens and spaces; each space becomes a hyphen. A
+  repeated heading is numbered as GitHub numbers it, so headings `echo`,
+  `echo`, `echo 1` are `echo`, `echo-1`, `echo-1-1`, where the site gave
+  `echo-1` twice. No anchor in `docs/` changes: the site renders byte for
+  byte as before.
+  - `tests/site-unit.sps` holds the rule to anchors GitHub gave: headings
+    from these docs and the other Kiyomi repositories, a Hindi README, and
+    github-slugger's fixtures. `make check-site` no longer keeps a second
+    copy of the rule, which went red only when one of the two was edited.
 - **Three signal-stop checks could not fail** (#136).
   - test-signal's row for a stop on a never-started watcher asserted `#t`,
     with both stops outside it.
