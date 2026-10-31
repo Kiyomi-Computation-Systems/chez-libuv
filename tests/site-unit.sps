@@ -12,6 +12,66 @@
             ((string=? needle (substring hay i (+ i n))) #t)
             (else (loop (+ i 1)))))))
 
+;; (heading . anchor) rows, each anchor the one GitHub gave that heading on a
+;; page it rendered: docs here and in the other Kiyomi repositories, a Hindi
+;; README, and github-slugger's fixtures, which it made from GitHub's
+;; rendering. No two rows share a slug, so each stands as if alone on its page.
+(define github-anchors
+  '(("Bodies and streaming" . "bodies-and-streaming")
+    ("Keep strings, not the request" . "keep-strings-not-the-request")
+    ("A file server, like Python's" . "a-file-server-like-pythons")
+    ("Testing: (http-server testing)" . "testing-http-server-testing")
+    ("&http-server-error, http-server-error?"
+     . "http-server-error-http-server-error")
+    ("1. Answer every request" . "1-answer-every-request")
+    ("Is the abandoned iteration's UV_EOF lost, or merely deferred?"
+     . "is-the-abandoned-iterations-uv_eof-lost-or-merely-deferred")
+    ("Q1 — THE GATE: C→Scheme re-entry from inside a blocking uv_run, under GC pressure"
+     . "q1--the-gate-cscheme-re-entry-from-inside-a-blocking-uv_run-under-gc-pressure")
+    ("8.1 Read side (peer → handler)" . "81-read-side-peer--handler")
+    ("§4 — reentrancy-test.sps" . "4--reentrancy-testsps")
+    ("① (uri query)" . "-uri-query")
+    ("Decisions to record (Slice ⓪)" . "decisions-to-record-slice-")
+    ("स\x94D;थ\x93E;पन\x93E; करन\x93E;"
+     . "स\x94D;थ\x93E;पन\x93E;-करन\x93E;")
+    ("heading with an _ underscore" . "heading-with-an-_-underscore")
+    ("I ♥ unicode" . "i--unicode")
+    ("Привет non-latin 你好" . "привет-non-latin-你好")
+    ("a_ ‿ ⁀ ⁔ ︳ ︴ ﹍ ﹎ ﹏ ＿b" . "a_-‿-⁀-⁔-︳-︴-﹍-﹎-﹏-＿b")
+    ("a\x488; \x489; \x1ABE; \x20DD; \x20DE; \x20DF; \x20E0; \x20E2; \x20E3; \x20E4; \xA670; \xA671; \xA672;b"
+     . "a\x488;-\x489;-\x1ABE;-\x20DD;-\x20DE;-\x20DF;-\x20E0;-\x20E2;-\x20E3;-\x20E4;-\xA670;-\xA671;-\xA672;b")
+    ;; This repository's docs, as GitHub renders them.
+    ("Living alongside Chez's own processes" . "living-alongside-chezs-own-processes")
+    ("uv-loop-alive? (procedure)" . "uv-loop-alive-procedure")
+    ("&uv-wrong-thread (condition type)" . "uv-wrong-thread-condition-type")
+    ("make-uv-addrinfo (record constructor)"
+     . "make-uv-addrinfo-record-constructor")))
+
+;; github-slugger's fixture rows on repeated headings, in their page order;
+;; the headings between them on that page share none of these slugs.
+(define github-repeats
+  '(("echo" . "echo") ("echo" . "echo-1") ("echo 1" . "echo-1-1")
+    ("echo-1" . "echo-1-2") ("echo" . "echo-2")
+    ("foxtrot-1" . "foxtrot-1") ("foxtrot" . "foxtrot") ("foxtrot" . "foxtrot-2")
+    (" a " . "-a-") ("-a-" . "-a--1")))
+
+;; slug-each : (String -> String) (Listof String) -> (Listof String)
+;; Calls slug on each heading in order, as a page meets them.
+(define (slug-each slug headings)
+  (let loop ((hs headings) (out '()))
+    (if (null? hs)
+        (reverse out)
+        (loop (cdr hs) (cons (slug (car hs)) out)))))
+
+;; This repository's reference page: entries whose names differ only in
+;; punctuation, in their page order, with the ids GitHub gave them. The
+;; headings between them share none of these slugs.
+(define reference-repeats
+  '(("uv-send-buffer-size (procedure)" . "uv-send-buffer-size-procedure")
+    ("uv-send-buffer-size! (procedure)" . "uv-send-buffer-size-procedure-1")
+    ("uv-write! (procedure)" . "uv-write-procedure")
+    ("uv-write*! (procedure)" . "uv-write-procedure-1")))
+
 (define runner (test-runner-simple))
 (test-runner-current runner)
 (test-begin "site-unit")
@@ -21,15 +81,19 @@
   "resource-limits" (slugify "Resource limits"))
 (test-equal "commas dropped, 'and' kept"
   "rhel-fedora-and-alpine" (slugify "RHEL, Fedora, and Alpine"))
+(for-each (lambda (row) (test-equal (car row) (cdr row) (slugify (car row))))
+          github-anchors)
+;; GitHub keeps a spacing mark that is not a letter. github-slugger's
+;; Spacing_Mark row shows it, but also holds code points newer than some
+;; Chez's Unicode tables; GitHub's rule goes a character at a time, so
+;; four of that row's marks stand here alone.
+(test-equal "spacing marks that are not letters are kept"
+  "a\xF3E;-\xF3F;-\x1B44;-\xA9C0;b" (slugify "a\xF3E; \xF3F; \x1B44; \xA9C0;b"))
 (test-equal "backtick code in a heading is stripped to its text"
   "What make build does" (heading-text '(h2 "What " (code "make build") " does")))
 (test-equal "the whole heading-to-slug path"
   "what-make-build-does"
   (slugify (heading-text '(h2 "What " (code "make build") " does"))))
-(test-equal "runs of spaces and punctuation collapse"
-  "wrap-width" (slugify "Wrap  width"))
-(test-equal "leading and trailing punctuation trimmed"
-  "supported-versions" (slugify "  Supported versions.  "))
 
 ;; --- make-slugger --------------------------------------------------------
 (test-equal "duplicate headings get -1, -2 suffixes"
@@ -38,6 +102,11 @@
 (test-equal "a repeated heading's second slug carries the -1 suffix"
   "timers-1"
   (let ((s (make-slugger))) (s "Timers") (s "Timers")))
+(test-equal "a taken slug moves on to the next number, as GitHub numbers it"
+  (map cdr github-repeats) (slug-each (make-slugger) (map car github-repeats)))
+(test-equal "the reference page's repeats are numbered as GitHub numbers them"
+  (map cdr reference-repeats)
+  (slug-each (make-slugger) (map car reference-repeats)))
 (test-equal "heading-text skips the ^ attr node and inline tags"
   "Some text" (heading-text '(h2 (^ (id "foo")) "Some " (code "text"))))
 

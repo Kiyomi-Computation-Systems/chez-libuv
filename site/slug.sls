@@ -1,35 +1,28 @@
 #!r6rs
+;; PURE. Imports no library that loads a shared object.
 (library (site slug)
   (export slugify heading-text make-slugger)
   (import (rnrs))
 
-  ;; GitHub's heading-anchor algorithm, ASCII subset: lowercase; keep only
-  ;; alphanumerics, spaces, and hyphens; collapse space runs to one hyphen;
-  ;; trim leading/trailing hyphens.
+  ;; slugify : String -> String
+  ;; GitHub's heading anchor: lower case; keep word characters (letters,
+  ;; marks, decimal digits, connector punctuation such as _), hyphens and
+  ;; spaces; then each space becomes a hyphen. Nothing collapses and nothing
+  ;; is trimmed, so "a - b" is a---b and a slug may start or end with -.
   (define (slugify str)
-    (let* ((lowered (string-downcase str))
-           (kept (list->string
-                   (filter (lambda (c)
-                             (or (char-alphabetic? c) (char-numeric? c)
-                                 (char=? c #\space) (char=? c #\-)))
-                           (string->list lowered)))))
-      (trim-hyphens (spaces->hyphen kept))))
+    (list->string
+      (map (lambda (c) (if (char=? c #\space) #\- c))
+           (filter kept? (string->list (string-downcase str))))))
 
-  (define (spaces->hyphen s)
-    ;; each maximal run of spaces (or existing hyphens) becomes one hyphen
-    (let loop ((cs (string->list s)) (out '()) (in-gap #f))
-      (cond
-        ((null? cs) (list->string (reverse out)))
-        ((or (char=? (car cs) #\space) (char=? (car cs) #\-))
-         (loop (cdr cs) (if in-gap out (cons #\- out)) #t))
-        (else (loop (cdr cs) (cons (car cs) out) #f)))))
+  ;; Chez's char-numeric? holds for circled digits, which GitHub drops, so
+  ;; digits are the decimal ones only.
+  (define (kept? c)
+    (or (char-alphabetic? c)
+        (memq (char-general-category c) '(Mn Mc Me Nd Pc))
+        (char=? c #\space)
+        (char=? c #\-)))
 
-  (define (trim-hyphens s)
-    (let* ((n (string-length s))
-           (a (let lo ((i 0)) (if (and (< i n) (char=? (string-ref s i) #\-)) (lo (+ i 1)) i)))
-           (b (let hi ((j n)) (if (and (> j a) (char=? (string-ref s (- j 1)) #\-)) (hi (- j 1)) j))))
-      (substring s a b)))
-
+  ;; heading-text : SXML -> String
   ;; Concatenate a heading's text descendants, ignoring the (^ …) attr node
   ;; and inline element tags (code, em, strong, a). SXML strings are text.
   (define (heading-text node)
@@ -45,12 +38,17 @@
                (else (for-each walk n))))
             (else #f))))))
 
-  ;; A per-page slug factory that disambiguates collisions GitHub-style.
+  ;; make-slugger : -> (String -> String)
+  ;; A per-page slug factory that numbers repeats as GitHub does: a slug
+  ;; already handed out gets -1, -2 and so on, counted per base slug, and a
+  ;; numbered slug already handed out moves on to the next number.
   (define (make-slugger)
-    (let ((seen '()))
+    (let ((seen '()))   ; (slug . count), newest first; count is for a base
       (lambda (str)
-        (let* ((base (slugify str))
-               (n (cond ((assoc base seen) => cdr) (else 0))))
-          (set! seen (cons (cons base (+ n 1))
-                           (filter (lambda (kv) (not (string=? (car kv) base))) seen)))
-          (if (zero? n) base (string-append base "-" (number->string n))))))))
+        (let ((base (slugify str)))
+          (let loop ((s base))
+            (if (assoc s seen)
+                (let ((n (+ 1 (cdr (assoc base seen)))))
+                  (set! seen (cons (cons base n) seen))
+                  (loop (string-append base "-" (number->string n))))
+                (begin (set! seen (cons (cons s 0) seen)) s))))))))
